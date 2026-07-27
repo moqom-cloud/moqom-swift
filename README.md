@@ -22,9 +22,12 @@ simulator needs nothing. The Team ID stays out of the repository because the
 Apple account is personal for now, and moving to an organisation account later
 is a change to that one file.
 
-The bundle prefix is `com.example.moqom` until the real domain is settled — the
-Terraform placeholders say `moqom.example.` for the same reason. If a personal
-team cannot register it, override `MOQOM_BUNDLE_PREFIX` locally.
+The bundle prefix is `example.moqom.cloud`, the reverse of `cloud.moqom.example`
+— the same hostname the Terraform uses for `dns_domain`, so the two stay in step.
+That name is still a placeholder: RFC 2606 reserves `.example`, so it cannot be
+registered. Harmless for a bundle identifier, which is only a unique string, and
+not harmless for DNS. If a personal team cannot register the identifier,
+override `MOQOM_BUNDLE_PREFIX` locally.
 
 ## What it actually does
 

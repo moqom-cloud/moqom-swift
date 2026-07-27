@@ -12,11 +12,17 @@
 // Local.xcconfig is gitignored. Without it the project still generates and still
 // builds to a simulator; only device deployment needs a team.
 
-// Reverse-DNS on a domain we control. Deliberately `example` until the domain is
-// settled — the Terraform placeholders say `moqom.example.` too, and picking a
-// real one in two places independently is how they end up different. Override
-// MOQOM_BUNDLE_PREFIX locally, and change this line once the domain exists.
-MOQOM_BUNDLE_PREFIX = com.example.moqom
+// Reverse-DNS of the platform hostname, which is `cloud.moqom.example` — the
+// same name `dns_domain` carries in deploy/envs/*/terraform.tfvars.example, so
+// the two cannot drift apart.
+//
+// Still a placeholder, and the `.example` is why: RFC 2606 reserves that TLD for
+// documentation, so it can never be registered and will never resolve. Nothing
+// here breaks on that — a bundle identifier is just a unique string and Apple
+// does not check DNS — but a Cloud DNS zone for it would serve records no client
+// on the internet can look up. Change both places together when the real domain
+// exists.
+MOQOM_BUNDLE_PREFIX = example.moqom.cloud
 
 PRODUCT_BUNDLE_IDENTIFIER = $(MOQOM_BUNDLE_PREFIX).room
 
