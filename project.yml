@@ -70,3 +70,22 @@ targets:
         # Not repeated here: PRODUCT_BUNDLE_IDENTIFIER, DEVELOPMENT_TEAM, and
         # CODE_SIGN_STYLE. A target-level setting beats an xcconfig, so naming
         # any of them would silently defeat Local.xcconfig.
+
+  # The only place the SwiftUI layer is executed. MoqomKit's 103 tests drive
+  # RoomSession directly and never render, so the @Observable bridge and the
+  # phase switch had no coverage until this existed.
+  MoqomRoomUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: MoqomRoomUITests
+    dependencies:
+      - target: MoqomRoom
+    settings:
+      base:
+        SWIFT_VERSION: "6.0"
+        # A UI test bundle talks to the app over XCTest's proxy rather than
+        # sharing its concurrency domain, so `complete` here would be checking
+        # a boundary that does not exist.
+        SWIFT_STRICT_CONCURRENCY: minimal
+        TEST_TARGET_NAME: MoqomRoom
