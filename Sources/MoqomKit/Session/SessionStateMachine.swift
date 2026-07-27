@@ -181,8 +181,7 @@ public struct SessionStateMachine: Sendable {
     @discardableResult
     public mutating func handle(_ event: SessionEvent) -> [SessionEffect] {
         switch (state, event) {
-        case (.idle, let .connectRequested(at: _)),
-             (.closed, let .connectRequested(at: _)):
+        case (.idle, .connectRequested), (.closed, .connectRequested):
             state = .connecting
             reconnectAttempts = 0
             return [.openTransport]
@@ -203,8 +202,8 @@ public struct SessionStateMachine: Sendable {
             reconnectAttempts = 1
             return [.scheduleReconnect(attempt: 1), .publishPresence(.reconnecting)]
 
-        case let (.reconnecting(since), .transportLost(at: _)),
-             let (.away(since), .transportLost(at: _)):
+        case let (.reconnecting(since), .transportLost),
+             let (.away(since), .transportLost):
             // A failed retry is not a new disconnection: the clock that decides
             // reconnecting-versus-away runs from the original loss, so retrying
             // must not reset it or a flapping link never resolves to away.
@@ -223,7 +222,7 @@ public struct SessionStateMachine: Sendable {
             state = .closed(event)
             return [.cancelReconnect, .tearDownTransport, .deliverTerminal(event)]
 
-        case let (.established, .appBackgrounded(at: _)):
+        case (.established, .appBackgrounded):
             // Not a state change. Broadcasting continues under a background
             // mode; what changes is only what peers are told, so the room can
             // distinguish a host who stepped away from one who vanished.
@@ -245,7 +244,7 @@ public struct SessionStateMachine: Sendable {
         case (.closed, _):
             return []
 
-        case let (_, .terminated(terminal, at: _)):
+        case let (_, .terminated(terminal, _)):
             state = .closed(terminal)
             return [
                 .cancelReconnect,

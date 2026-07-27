@@ -1,0 +1,420 @@
+import Foundation
+import Testing
+
+@testable import MoqomCore
+@testable import MoqomKit
+@testable import MoqomLoopback
+
+/// Poll until `condition` holds, so a test does not depend on how many task
+/// hops an announcement takes to propagate.
+func eventually(
+    timeout: Duration = .seconds(2),
+    _ condition: @Sendable () async -> Bool
+) async -> Bool {
+    let deadline = ContinuousClock.now.advanced(by: timeout)
+    while ContinuousClock.now < deadline {
+        if await condition() { return true }
+        try? await Task.sleep(for: .milliseconds(2))
+    }
+    return await condition()
+}
+
+func credentials(_ name: String, device: String = "iphone-0001") -> DeviceCredentials {
+    DeviceCredentials(
+        identity: identity(name, device: device),
+        token: Data("token-\(name)".utf8),
+        proofSigner: { challenge in challenge }
+    )
+}
+
+@Suite("Loopback transport")
+struct LoopbackTransportTests {
+    private let endpoint = RelayEndpoint(host: "loopback", alpn: ["moqt-19"])
+
+    @Test("objects written to a track reach everyone subscribed to it")
+    func objectsFanOut() async throws {
+        let relay = LoopbackRelay()
+        let transport = LoopbackTransport(relay: relay)
+        let publisher = try await transport.connect(to: endpoint, credentials: credentials("alice"))
+        let viewer = try await transport.connect(to: endpoint, credentials: credentials("bob"))
+
+        let track = try FullTrackName(
+            namespace: MoqomNamespaces.participant(
+                tenant: "acme", room: "room-42", identity: identity("alice")
+            ),
+            name: TrackName("video/360p")
+        )
+
+        let subscription = try await viewer.subscribe(SubscribeRequest(track: track, priority: 16))
+        let writer = try await publisher.publish(track, priority: 64)
+
+        try await writer.write(
+            TrackObject(group: 0, object: 0, payload: Data([1, 2, 3]), isKeyFrame: true)
+        )
+        try await writer.write(TrackObject(group: 0, object: 1, payload: Data([4])))
+
+        var received: [TrackObject] = []
+        for await object in subscription.objects {
+            received.append(object)
+            if received.count == 2 { break }
+        }
+
+        #expect(received.map(\.object) == [0, 1])
+        #expect(received[0].isKeyFrame)
+    }
+
+    @Test("a late subscriber to a prefix still sees who is already there")
+    func lateJoinerSeesExistingAnnouncements() async throws {
+        // The roster is namespace announcement, so a client that joins after
+        // the host must receive the announcements that already happened or the
+        // room would look empty until the next person arrived.
+        let relay = LoopbackRelay()
+        let transport = LoopbackTransport(relay: relay)
+        let host = try await transport.connect(to: endpoint, credentials: credentials("alice"))
+        let prefix = try MoqomNamespaces.room(tenant: "acme", room: "room-42")
+
+        _ = try await host.announce(
+            MoqomNamespaces.participant(
+                tenant: "acme", room: "room-42", identity: identity("alice")
+            )
+        )
+
+        let viewer = try await transport.connect(to: endpoint, credentials: credentials("bob"))
+        let stream = try await viewer.announcements(matching: prefix)
+
+        var first: AnnouncementEvent?
+        for await event in stream {
+            first = event
+            break
+        }
+
+        let expected = try MoqomNamespaces.participant(
+            tenant: "acme", room: "room-42", identity: identity("alice")
+        )
+        #expect(first == .announced(expected))
+    }
+
+    @Test("withdrawal reaches watchers and removes the announcement for late joiners")
+    func withdrawalPropagates() async throws {
+        let relay = LoopbackRelay()
+        let transport = LoopbackTransport(relay: relay)
+        let host = try await transport.connect(to: endpoint, credentials: credentials("alice"))
+        let prefix = try MoqomNamespaces.room(tenant: "acme", room: "room-42")
+
+        let handle = try await host.announce(
+            MoqomNamespaces.participant(
+                tenant: "acme", room: "room-42", identity: identity("alice")
+            )
+        )
+        #expect(await relay.announcements(under: prefix).count == 1)
+
+        await handle.withdraw()
+        #expect(await relay.announcements(under: prefix).isEmpty)
+    }
+
+    @Test("a connection failure surfaces as a typed transport error")
+    func connectionFailure() async {
+        let transport = LoopbackTransport(failure: .unreachable)
+        await #expect(throws: MoqomError.self) {
+            _ = try await transport.connect(
+                to: RelayEndpoint(host: "loopback"),
+                credentials: credentials("alice")
+            )
+        }
+    }
+}
+
+@Suite("Rooms over loopback")
+struct RoomSessionIntegrationTests {
+    private let endpoint = RelayEndpoint(host: "loopback")
+
+    private func session(
+        _ name: String,
+        relay: LoopbackRelay,
+        device: String = "iphone-0001"
+    ) async throws -> MoqomSession {
+        let session = MoqomSession(
+            transport: LoopbackTransport(relay: relay),
+            credentials: credentials(name, device: device),
+            tenant: "acme"
+        )
+        try await session.connect(to: endpoint)
+        return session
+    }
+
+    @Test("going live puts the broadcaster in every other client's roster")
+    func broadcastingPopulatesTheRoster() async throws {
+        let relay = LoopbackRelay()
+        let host = try await session("alice", relay: relay)
+        let viewer = try await session("bob", relay: relay)
+
+        let hostRoom = try await host.join(room: "room-42")
+        let viewerRoom = try await viewer.join(room: "room-42")
+
+        let source = FrameRelay(
+            format: CaptureFormat(size: PixelSize(width: 1280, height: 720), frameRate: 30)
+        )
+        _ = try await hostRoom.startBroadcast(from: source)
+
+        let appeared = await eventually {
+            await viewerRoom.roster.count == 1
+        }
+        #expect(appeared)
+
+        let roster = await viewerRoom.roster
+        #expect(roster.participants.first?.username.value == "alice")
+        #expect(roster.participants.first?.slot.isBackstage == false)
+    }
+
+    @Test("a backstage guest is invisible to the room prefix viewers watch")
+    func backstageDoesNotReachTheAudience() async throws {
+        let relay = LoopbackRelay()
+        let guest = try await session("guest", relay: relay)
+        let viewer = try await session("bob", relay: relay)
+
+        let guestRoom = try await guest.join(room: "room-42")
+        let viewerRoom = try await viewer.join(room: "room-42")
+
+        let source = FrameRelay(
+            format: CaptureFormat(size: PixelSize(width: 1280, height: 720), frameRate: 30)
+        )
+        _ = try await guestRoom.startBroadcast(from: source, backstage: true)
+
+        // Give any announcement a chance to arrive before asserting absence.
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(await viewerRoom.roster.count == 0)
+    }
+
+    @Test("stopping the broadcast withdraws the announcement and empties the roster")
+    func stoppingRemovesTheParticipant() async throws {
+        let relay = LoopbackRelay()
+        let host = try await session("alice", relay: relay)
+        let viewer = try await session("bob", relay: relay)
+        let hostRoom = try await host.join(room: "room-42")
+        let viewerRoom = try await viewer.join(room: "room-42")
+
+        let source = FrameRelay(
+            format: CaptureFormat(size: PixelSize(width: 1280, height: 720), frameRate: 30)
+        )
+        _ = try await hostRoom.startBroadcast(from: source)
+        _ = await eventually { await viewerRoom.roster.count == 1 }
+
+        await hostRoom.stopBroadcast()
+
+        #expect(await eventually { await viewerRoom.roster.count == 0 })
+    }
+
+    @Test("frames submitted from a render loop become published objects")
+    func framesBecomeObjects() async throws {
+        let relay = LoopbackRelay()
+        let host = try await session("alice", relay: relay)
+        let hostRoom = try await host.join(room: "room-42")
+
+        // Deeper than the default, because this test hands over a burst without
+        // ever yielding and the shallow default would legitimately drop most of
+        // it. Backpressure has its own test below.
+        let source = FrameRelay(
+            format: CaptureFormat(size: PixelSize(width: 1280, height: 720), frameRate: 30),
+            depth: 16
+        )
+        let ladder = LayerLadder(rungs: [
+            VideoLayer(
+                id: "video/360p",
+                size: PixelSize(width: 640, height: 360),
+                frameRate: 30,
+                bitrate: 600_000
+            ),
+        ])
+        let broadcast = try await hostRoom.startBroadcast(
+            from: source,
+            configuration: BroadcastConfiguration(ladder: ladder)
+        )
+
+        for index in 0 ..< 5 {
+            source.submit(
+                VideoFrame(
+                    timestamp: FrameTimestamp(nanoseconds: UInt64(index) * 33_000_000),
+                    size: PixelSize(width: 1280, height: 720),
+                    surface: .synthetic(byteCount: 1280 * 720 * 3 / 2),
+                    forcesKeyFrame: index == 0
+                )
+            )
+        }
+
+        #expect(await eventually { await broadcast.stats.objectsPublished == 5 })
+        let stats = await broadcast.stats
+        #expect(stats.framesSubmitted == 5)
+        #expect(stats.framesDropped == 0)
+    }
+
+    @Test("the frame buffer drops the oldest rather than blocking the render loop")
+    func backpressureDropsOldestFrames() async {
+        // A submit that could block would stall the display. Under pressure the
+        // frames worth keeping are the recent ones, because a frame past its
+        // deadline is not late but worthless.
+        let source = FrameRelay(
+            format: CaptureFormat(size: PixelSize(width: 640, height: 360), frameRate: 30),
+            depth: 2
+        )
+        for index in 0 ..< 100 {
+            source.submit(
+                VideoFrame(
+                    timestamp: FrameTimestamp(nanoseconds: UInt64(index)),
+                    size: PixelSize(width: 640, height: 360),
+                    surface: .synthetic(byteCount: 0)
+                )
+            )
+        }
+        source.stop()
+
+        var timestamps: [UInt64] = []
+        for await frame in source.frames() {
+            timestamps.append(frame.timestamp.nanoseconds)
+        }
+
+        #expect(timestamps.count == 2)
+        #expect(timestamps == [98, 99])
+    }
+
+    @Test("per-viewer mute never reaches the relay")
+    func localMuteIsPurelyLocal() async throws {
+        // Because the relay forwards rather than mixes, one viewer silencing
+        // one cohost is an unsubscribe. Sending a control message would turn a
+        // bandwidth saving into a round-trip for nothing.
+        let relay = LoopbackRelay()
+        let host = try await session("alice", relay: relay)
+        let viewer = try await session("bob", relay: relay)
+        let hostRoom = try await host.join(room: "room-42")
+        let viewerRoom = try await viewer.join(room: "room-42")
+
+        let source = FrameRelay(
+            format: CaptureFormat(size: PixelSize(width: 1280, height: 720), frameRate: 30)
+        )
+        _ = try await hostRoom.startBroadcast(from: source)
+        _ = await eventually { await viewerRoom.roster.count == 1 }
+
+        await relay.clearLog()
+        await viewerRoom.localMute(identity("alice"), .audio)
+        try await Task.sleep(for: .milliseconds(20))
+
+        let log = await relay.log
+        #expect(log.isEmpty)
+
+        let muted = await viewerRoom.roster[identity("alice")]?.mute
+        #expect(muted?.localToMe == .audio)
+        #expect(muted?.reason(for: .audio) == .localToMe)
+    }
+
+    @Test("a layout update issues subscriptions sized to the boxes")
+    func layoutDrivesSubscriptions() async throws {
+        let relay = LoopbackRelay()
+        let host = try await session("alice", relay: relay)
+        let viewer = try await session("bob", relay: relay)
+        let hostRoom = try await host.join(room: "room-42")
+        let viewerRoom = try await viewer.join(room: "room-42")
+
+        let source = FrameRelay(
+            format: CaptureFormat(size: PixelSize(width: 1280, height: 720), frameRate: 30)
+        )
+        _ = try await hostRoom.startBroadcast(from: source)
+        _ = await eventually { await viewerRoom.roster.count == 1 }
+
+        await relay.clearLog()
+        let changes = await viewerRoom.updateLayout([
+            identity("alice"): RenderBox(width: 160, height: 90, scale: 3),
+        ])
+
+        #expect(changes.count == 1)
+        guard case let .subscribe(_, layer, _) = changes[0] else {
+            Issue.record("expected a subscribe")
+            return
+        }
+        #expect(layer == "video/360p")
+
+        let subscribed = await relay.recorded { interaction in
+            if case let .subscribed(track, _) = interaction {
+                return track.name.value == "video/360p"
+            }
+            return false
+        }
+        #expect(subscribed)
+    }
+
+    @Test("moderation is refused locally when the capability is absent")
+    func moderationIsCheckedBeforeTheRoundTrip() async throws {
+        let relay = LoopbackRelay()
+        let viewer = try await session("bob", relay: relay)
+        let room = try await viewer.join(room: "room-42")
+
+        await #expect(throws: MoqomError.self) {
+            try await room.moderate(.kick(identity("alice")), as: Grants())
+        }
+    }
+
+    @Test("a recorder is attached with watchdog verbs and stays out of the roster")
+    func watchdogsUseTheirOwnVerbs() async throws {
+        let relay = LoopbackRelay()
+        let host = try await session("alice", relay: relay)
+        let room = try await host.join(room: "room-42")
+
+        let source = FrameRelay(
+            format: CaptureFormat(size: PixelSize(width: 1280, height: 720), frameRate: 30)
+        )
+        _ = try await room.startBroadcast(from: source)
+        _ = await eventually { await room.roster.count == 1 }
+
+        try await room.manageWatchdog(
+            .attach(
+                WatchdogRequest(
+                    kind: .recording,
+                    operatedBy: .tenant,
+                    descriptor: "Recording",
+                    scope: room.namespace,
+                    pinnedLayer: "video/1080p"
+                )
+            ),
+            as: Grants(moderation: .owner, isOwner: true)
+        )
+
+        #expect(await room.watchdogs.count == 1)
+        #expect(await room.roster.count == 1)
+        #expect(await room.currentState.isRecording)
+    }
+
+    @Test("managing watchdogs needs its own capability, not a moderation one")
+    func watchdogManagementIsItsOwnGrant() async throws {
+        let relay = LoopbackRelay()
+        let host = try await session("alice", relay: relay)
+        let room = try await host.join(room: "room-42")
+
+        await #expect(throws: MoqomError.self) {
+            try await room.manageWatchdog(
+                .detach("rec-1"),
+                as: Grants(moderation: .superModerator)
+            )
+        }
+    }
+
+    @Test("joining the same room twice returns the same session")
+    func joinIsIdempotent() async throws {
+        let relay = LoopbackRelay()
+        let client = try await session("alice", relay: relay)
+        let first = try await client.join(room: "room-42")
+        let second = try await client.join(room: "room-42")
+
+        #expect(first === second)
+    }
+
+    @Test("joining before connecting is a typed state error")
+    func joinRequiresAConnection() async {
+        let client = MoqomSession(
+            transport: LoopbackTransport(),
+            credentials: credentials("alice"),
+            tenant: "acme"
+        )
+
+        await #expect(throws: MoqomError.self) {
+            _ = try await client.join(room: "room-42")
+        }
+    }
+}

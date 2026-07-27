@@ -38,14 +38,6 @@ extension Username: CustomStringConvertible {
     public var description: String { value }
 }
 
-extension Username: ExpressibleByStringLiteral {
-    /// Traps on invalid input; for literals only.
-    public init(stringLiteral value: String) {
-        // swiftlint:disable:next force_try
-        try! self.init(value)
-    }
-}
-
 /// One installation of the app, identified by the key it holds.
 ///
 /// The value is derived from the JWK Thumbprint (`jkt`) of a non-exportable
@@ -82,14 +74,6 @@ public struct DeviceID: Hashable, Sendable, Codable {
 
 extension DeviceID: CustomStringConvertible {
     public var description: String { value }
-}
-
-extension DeviceID: ExpressibleByStringLiteral {
-    /// Traps on invalid input; for literals only.
-    public init(stringLiteral value: String) {
-        // swiftlint:disable:next force_try
-        try! self.init(value)
-    }
 }
 
 /// A user on a specific device: the thing that actually occupies a namespace.

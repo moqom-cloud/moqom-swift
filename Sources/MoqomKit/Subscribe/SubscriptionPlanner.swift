@@ -1,0 +1,138 @@
+// Turns a set of render boxes into a set of subscription changes.
+//
+// This exists because of one transition: switching a grid to speaker view
+// changes every tile at once, and emitting a subscription request per tile
+// produces a burst that arrives at the relay interleaved and out of order. The
+// planner collects the whole layout into a single diff so the caller issues one
+// batch, with the priorities already assigned relative to each other.
+//
+// Priority assignment is the second reason. Draft-19 subscriber priority lets a
+// viewer rank tracks directly and the relay sheds the lowest first, which is
+// exactly the right behaviour for a grid — but only if the ranking reflects the
+// layout. Assigning it from the render box means the speaker outranks the
+// thumbnails automatically, rather than through a heuristic somebody has to
+// keep in sync with the UI.
+
+import Foundation
+import MoqomCore
+
+/// A subscription change to apply.
+public enum SubscriptionChange: Hashable, Sendable {
+    case subscribe(ParticipantIdentity, LayerID, priority: UInt8)
+    case unsubscribeVideo(ParticipantIdentity)
+    case reprioritise(ParticipantIdentity, priority: UInt8)
+}
+
+/// Holds one selector per participant and produces batched diffs.
+public struct SubscriptionPlanner: Sendable {
+    private var selectors: [ParticipantIdentity: LayerSelector] = [:]
+    private var boxes: [ParticipantIdentity: RenderBox] = [:]
+    private var priorities: [ParticipantIdentity: UInt8] = [:]
+
+    /// Bounds how many video tracks are decoded at once.
+    ///
+    /// The host count is bounded by what a client can decode, not by what the
+    /// relay will carry — so when a stage exceeds this, the SDK degrades the
+    /// overflow to audio rather than refusing to render the room.
+    public var videoBudget: Int
+
+    public init(videoBudget: Int = 9) {
+        self.videoBudget = videoBudget
+    }
+
+    /// Register or replace the ladder a participant is offering.
+    public mutating func setLadder(_ ladder: LayerLadder, for identity: ParticipantIdentity) {
+        selectors[identity] = LayerSelector(ladder: ladder)
+    }
+
+    public mutating func remove(_ identity: ParticipantIdentity) {
+        selectors.removeValue(forKey: identity)
+        boxes.removeValue(forKey: identity)
+        priorities.removeValue(forKey: identity)
+    }
+
+    /// Pre-warm a participant's higher layer on an interaction that signals
+    /// intent, before the layout that will need it.
+    public mutating func prewarm(_ identity: ParticipantIdentity, for box: RenderBox) {
+        selectors[identity]?.prewarm(for: box)
+    }
+
+    /// Recompute the whole layout and return only what changed.
+    ///
+    /// `allowance` is per-track: the congestion controller's estimate is for
+    /// the link, and dividing it across tracks is the planner's job because
+    /// only the planner knows how many there are and how big each one is drawn.
+    public mutating func plan(
+        boxes newBoxes: [ParticipantIdentity: RenderBox],
+        linkBitrate: Int = .max
+    ) -> [SubscriptionChange] {
+        boxes = newBoxes
+
+        // Rank by drawn area. Ties broken by identity so a redraw with two
+        // equal tiles does not reshuffle priorities and churn the relay.
+        let ranked = newBoxes
+            .filter { $0.value.visibility == .visible }
+            .sorted { lhs, rhs in
+                let lhsArea = lhs.value.pixelSize.pixelCount
+                let rhsArea = rhs.value.pixelSize.pixelCount
+                if lhsArea != rhsArea { return lhsArea > rhsArea }
+                return lhs.key.description < rhs.key.description
+            }
+
+        let share = ranked.isEmpty || linkBitrate == .max
+            ? Int.max
+            : max(1, linkBitrate / ranked.count)
+
+        var changes: [SubscriptionChange] = []
+        var withinBudget = Set<ParticipantIdentity>()
+        for (index, entry) in ranked.enumerated() where index < videoBudget {
+            withinBudget.insert(entry.key)
+        }
+
+        for identity in selectors.keys.sorted(by: { $0.description < $1.description }) {
+            guard var selector = selectors[identity] else { continue }
+            let box = newBoxes[identity] ?? .hidden
+            let effectiveBox = withinBudget.contains(identity) || box.visibility != .visible
+                ? box
+                : RenderBox(width: 0, height: 0, scale: box.scale, visibility: .offScreen)
+
+            let allowance = NetworkAllowance(bitrate: share)
+            let previous = selector.current
+            let selection = selector.update(box: effectiveBox, allowance: allowance)
+            selectors[identity] = selector
+
+            let rank = ranked.firstIndex { $0.key == identity }
+            let priority = Self.priority(forRank: rank)
+            let priorityChanged = priorities[identity] != priority
+            priorities[identity] = priority
+
+            guard let selection else {
+                if priorityChanged, previous?.video != nil {
+                    changes.append(.reprioritise(identity, priority: priority))
+                }
+                continue
+            }
+
+            if let layer = selection.video {
+                changes.append(.subscribe(identity, layer, priority: priority))
+            } else if previous?.video != nil {
+                changes.append(.unsubscribeVideo(identity))
+            }
+        }
+
+        return changes
+    }
+
+    /// The selection currently in force for a participant.
+    public func selection(for identity: ParticipantIdentity) -> LayerSelection? {
+        selectors[identity]?.current
+    }
+
+    /// Map layout rank onto draft-19 subscriber priority, where lower is more
+    /// urgent. Spread out rather than sequential so a later insertion between
+    /// two tiles does not require renumbering everything after it.
+    private static func priority(forRank rank: Int?) -> UInt8 {
+        guard let rank else { return 255 }
+        return UInt8(min(250, 16 + rank * 8))
+    }
+}

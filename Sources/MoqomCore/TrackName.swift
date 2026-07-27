@@ -132,14 +132,16 @@ extension TrackNamespace: CustomStringConvertible {
     public var description: String { "(\(storage.joined(separator: ", ")))" }
 }
 
-extension TrackNamespace: ExpressibleByArrayLiteral {
-    /// Traps on invalid input, and is therefore only for literals in tests and
-    /// call sites where the fields are known-good constants.
-    public init(arrayLiteral elements: String...) {
-        // swiftlint:disable:next force_try
-        try! self.init(elements)
-    }
-}
+// No `ExpressibleByStringLiteral` or `ExpressibleByArrayLiteral` on the
+// validating types in this file, and the reason is a Swift overload-resolution
+// trap rather than taste. Given both a throwing `init(_:)` and a trapping
+// literal initialiser, `try TrackName("video/360p")` binds to the *trapping*
+// one, because the compiler prefers the non-throwing overload when the argument
+// is a literal. It even warns that the `try` is redundant — which reads as a
+// harmless lint rather than as "this call now crashes on bad input instead of
+// throwing". A convenience that quietly converts a recoverable error into a
+// process abort at exactly the call sites most likely to be written in a hurry
+// is not worth having.
 
 /// A track name within a namespace.
 public struct TrackName: Hashable, Sendable {
@@ -157,14 +159,6 @@ public struct TrackName: Hashable, Sendable {
 
 extension TrackName: CustomStringConvertible {
     public var description: String { value }
-}
-
-extension TrackName: ExpressibleByStringLiteral {
-    /// Traps on invalid input; for literals only.
-    public init(stringLiteral value: String) {
-        // swiftlint:disable:next force_try
-        try! self.init(value)
-    }
 }
 
 /// A namespace paired with a track name, uniquely identifying a track.

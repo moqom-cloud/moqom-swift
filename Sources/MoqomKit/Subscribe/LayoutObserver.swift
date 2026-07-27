@@ -1,0 +1,141 @@
+// Getting the layout into the subscription planner.
+//
+// Render-aware layer selection only works if something tells it what the layout
+// is, and asking every integrator to plumb view sizes into an actor by hand is
+// how the feature ends up unused. The view already knows its size; the job is
+// to collect the sizes for a whole layout pass and hand them over as one.
+//
+// Batched deliberately. SwiftUI resolves geometry one view at a time, so a
+// nine-tile grid rotating produces nine size changes, and forwarding each one
+// would produce nine rounds of subscription churn for a layout that settles in
+// a single frame. Coalescing to the end of the run loop turns that into one
+// diff — which is also the only form the relay should ever see, since the
+// intermediate states were never rendered.
+
+import Foundation
+import MoqomCore
+
+#if canImport(SwiftUI)
+    import SwiftUI
+
+    /// Collects render geometry from a view hierarchy and forwards it to a room.
+    ///
+    /// Main-actor bound because it is driven by layout, and `@Observable` so a
+    /// debug overlay can watch what the selector is being told.
+    @MainActor
+    @Observable
+    public final class LayoutObserver {
+        private var boxes: [ParticipantIdentity: RenderBox] = [:]
+        private var flush: Task<Void, Never>?
+        private weak var room: RoomSession?
+
+        /// The most recent estimate of the downlink, shared across everything
+        /// being drawn. `.max` means unconstrained, which is the right default:
+        /// guessing low costs quality that the render size did not ask to lose.
+        public var linkBitrate: Int = .max
+
+        /// What the planner was last told, for diagnostics.
+        public private(set) var lastReported: [ParticipantIdentity: RenderBox] = [:]
+
+        public init(room: RoomSession? = nil) {
+            self.room = room
+        }
+
+        public func bind(to room: RoomSession) {
+            self.room = room
+        }
+
+        /// Record where a participant is being drawn.
+        public func report(_ box: RenderBox, for identity: ParticipantIdentity) {
+            guard boxes[identity] != box else { return }
+            boxes[identity] = box
+            scheduleFlush()
+        }
+
+        /// Record that a participant is no longer on screen.
+        ///
+        /// Distinct from a zero-sized box: a tile scrolled out of a list keeps
+        /// its size and stops being drawn, and the planner treats those the
+        /// same way only because both end in dropping video.
+        public func withdraw(_ identity: ParticipantIdentity) {
+            guard boxes.removeValue(forKey: identity) != nil else { return }
+            scheduleFlush()
+        }
+
+        /// Push the current layout without waiting for the coalescing window.
+        public func flushNow() async {
+            flush?.cancel()
+            flush = nil
+            await deliver()
+        }
+
+        private func scheduleFlush() {
+            guard flush == nil else { return }
+            flush = Task { [weak self] in
+                // One turn of the main actor, which is after SwiftUI has
+                // finished resolving the pass that triggered this.
+                await Task.yield()
+                guard let self, !Task.isCancelled else { return }
+                flush = nil
+                await deliver()
+            }
+        }
+
+        private func deliver() async {
+            guard let room else { return }
+            let snapshot = boxes
+            lastReported = snapshot
+            _ = await room.updateLayout(snapshot, linkBitrate: linkBitrate)
+        }
+    }
+
+    public extension View {
+        /// Report this view's size to the layer selector.
+        ///
+        /// Apply it to the view the remote video is drawn into, not to a
+        /// container: the selector is choosing a decode resolution and a
+        /// padding difference is the difference between two rungs.
+        ///
+        /// ```swift
+        /// RemoteVideoView(participant: person)
+        ///     .moqomRenderBox(for: person.identity, reportingTo: layout)
+        /// ```
+        func moqomRenderBox(
+            for identity: ParticipantIdentity,
+            reportingTo observer: LayoutObserver
+        ) -> some View {
+            modifier(RenderBoxReporter(identity: identity, observer: observer))
+        }
+    }
+
+    private struct RenderBoxReporter: ViewModifier {
+        let identity: ParticipantIdentity
+        let observer: LayoutObserver
+
+        // Points are not pixels and the ladder is in pixels. A 320pt tile is
+        // two different subscriptions on a 2x phone and a 3x one, and taking
+        // the scale from the environment is the only way to get it right on an
+        // external display.
+        @Environment(\.displayScale) private var displayScale
+
+        func body(content: Content) -> some View {
+            content
+                .background {
+                    GeometryReader { proxy in
+                        Color.clear
+                            .onChange(of: proxy.size, initial: true) { _, size in
+                                observer.report(
+                                    RenderBox(
+                                        width: size.width,
+                                        height: size.height,
+                                        scale: displayScale
+                                    ),
+                                    for: identity
+                                )
+                            }
+                    }
+                }
+                .onDisappear { observer.withdraw(identity) }
+        }
+    }
+#endif
