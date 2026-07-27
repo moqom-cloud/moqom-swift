@@ -9,6 +9,6 @@
 DEVELOPMENT_TEAM = ABCDE12345
 
 // Optional. A personal team cannot register a bundle ID someone else already
-// owns, so if `example.moqom.cloud.room` collides, or you want a throwaway
-// identifier, set your own prefix here.
+// owns, so if `cloud.moqom.room` collides, or you want a throwaway identifier,
+// set your own prefix here.
 // MOQOM_BUNDLE_PREFIX = com.yourname.moqom
