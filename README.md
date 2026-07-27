@@ -91,29 +91,43 @@ test.
   the priority mapping, and the transport contract are all exercised without a
   GPU. Connecting `VideoEncoder` to `TrackWriter` is the missing wire.
 
-## Blocked on Xcode
+## What still has not run
 
-`xcode-select -p` is `/Library/Developer/CommandLineTools`. Changing it needs
-`sudo`. Until it points at Xcode:
+Xcode is selected now, so the iOS branches compile, the sample builds, and the
+UI tests drive it on a simulator. What remains unobserved is narrower than it
+was, and specific:
 
-- **No iOS build of anything.** The package compiles for macOS only, so the
-  `#if os(iOS)` branches — three of them, all small — have never been through a
-  compiler. Everything else is gated on `canImport`, which resolves true on
-  macOS, so the platform layer above is genuinely compiled.
-- **The sample app cannot be built or run.** Its Swift sources do typecheck;
-  see below.
-- **No device or simulator testing**, so nothing in "compiles, never runs" has
-  been observed to work.
-- **iOS 26 APIs are invisible.** This SDK has no
-  `RealityView.renderingEffects.customPostProcessing` and no
-  `NetworkConnection<QUIC>`, both of which the plan expects to use. Verified by
-  probe, not assumed. `SceneCapture.submit(texture:at:on:)` is deliberately not
-  typed against RealityKit so the newer callback can call it unchanged.
+- **Nothing touching hardware.** The VideoToolbox encoder, the Metal scene
+  capture, the RealityKit tap, `AVCaptureSession`, and display-layer rendering
+  compile and have never executed. A simulator does not exercise any of them.
+- **Encoded bytes still do not reach the transport**, per the list above. The
+  UI tests going green means the room, the roster and the layer math work; it
+  does not mean video moves.
 
-### How the sample was typechecked without Xcode
+### The iOS 26 APIs are present after all
 
-The sample's sources were compiled as a macOS library target against this
-package, under Swift 6 with complete strict concurrency:
+An earlier probe here reported that this SDK had neither
+`RealityView.renderingEffects.customPostProcessing` nor
+`NetworkConnection<QUIC>`. That probe ran against the Command Line Tools SDK,
+which is macOS-only — it was measuring the absence of an iOS SDK, not the
+absence of the APIs. Against iPhoneOS 26.2 both are there:
+
+| API | Where |
+| --- | --- |
+| `renderingEffects.customPostProcessing` | `_RealityKit_SwiftUI.swiftinterface` |
+| `NetworkConnection<Network.QUIC>` | `Network.swiftinterface`, alongside `QUICStream` and `QUICDatagram` |
+
+The deployment floor is now 26 across every platform, so both are reachable
+unconditionally and the SDK contains no availability checks. `SceneCapture` is
+still not typed against RealityKit, which remains the right call for a
+different reason than before: it keeps the capture surface testable without a
+renderer, rather than working around an SDK that lacked the callback.
+
+### How the sample was typechecked before Xcode
+
+Kept because it is a useful trick when a machine has no iOS SDK: the sample's
+sources compiled as a macOS library target against this package, under Swift 6
+with complete strict concurrency:
 
 ```sh
 mkdir -p /tmp/samplecheck/Sources

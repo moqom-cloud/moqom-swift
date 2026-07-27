@@ -48,7 +48,7 @@ struct MuteTests {
 @Suite("Stage management")
 struct StageTests {
     @Test("accepting a promotion grants publish rights and starts nothing")
-    func promotionIsAnOfferNotAnAct() {
+    func promotionIsAnOfferNotAnAct() async {
         // Getting this wrong is a privacy incident rather than a bug: a scope
         // change must never turn a camera on.
         var invitation = StageInvitation(
@@ -66,9 +66,12 @@ struct StageTests {
         let idle = IdleFrameSource(
             format: CaptureFormat(size: PixelSize(width: 1280, height: 720), frameRate: 30)
         )
+        // Awaited here rather than in a `Task`. The task version asserted
+        // before the child had run, so it held for a source that emitted
+        // continuously; an idle source finishes its stream immediately, which
+        // makes the inline loop terminate and the count meaningful.
         var produced = 0
-        let stream = idle.frames()
-        Task { for await _ in stream { produced += 1 } }
+        for await _ in idle.frames() { produced += 1 }
         #expect(produced == 0)
     }
 

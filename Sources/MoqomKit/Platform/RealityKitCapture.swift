@@ -3,13 +3,14 @@
 // There are three of these on Apple's platforms and they are not variations of
 // one API:
 //
-//   - `ARView.renderCallbacks.postProcess` — iOS 15 through 25, and macOS. What
-//     this file implements, because it is the one the current SDK exposes.
-//   - `RealityView.renderingEffects.customPostProcessing` — iOS 26 and later,
-//     the SwiftUI-native replacement. Same shape of handoff: a source texture,
-//     a target texture, and a command buffer. ``SceneCapture/submit(texture:at:on:)``
-//     is deliberately not typed against RealityKit so that the newer callback
-//     can call it unchanged.
+//   - `ARView.renderCallbacks.postProcess` — the UIKit-era hook, still present
+//     on the 26 SDKs. What this file implements.
+//   - `RealityView.renderingEffects.customPostProcessing` — the SwiftUI-native
+//     replacement, and the one this file should be using now that the floor is
+//     26. Same shape of handoff: a source texture, a target texture, and a
+//     command buffer, which is why ``SceneCapture/submit(texture:at:on:)`` is
+//     not typed against RealityKit and can be called from either unchanged.
+//     Not yet written; tracked in the plan as ios-realityview.
 //   - `RealityRenderer` — visionOS, where there is no post-process hook at all
 //     and the app drives an offscreen render whose output texture goes to the
 //     same place.

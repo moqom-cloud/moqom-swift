@@ -1,4 +1,7 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.2
+//
+// 6.2 rather than 6.0 because `.v26` is not a platform SwiftPM 6.0 can name.
+// Raising the floor therefore raises the toolchain floor with it.
 
 import PackageDescription
 
@@ -14,9 +17,20 @@ let strict: [SwiftSetting] = [
 let package = Package(
     name: "MoqomKit",
     // visionOS is listed because the room, layer, and session logic is shared
-    // with it verbatim; only the capture backend differs. See README for what
-    // is actually reachable without an iOS/visionOS SDK installed.
-    platforms: [.iOS(.v17), .macOS(.v14), .visionOS(.v1), .tvOS(.v17)],
+    // with it verbatim; only the capture backend differs.
+    //
+    // The 26 floor across the board is a deliberate trade. The two APIs this
+    // SDK is designed around -- RealityView's customPostProcessing and
+    // NetworkConnection<QUIC> -- both arrived in the 26 release train, and
+    // supporting anything older means carrying a second capture path and a
+    // second transport path forever, each of which would need a device to test
+    // and neither of which is the product. Everything here is unconditional as
+    // a result: there is not one availability check in the SDK.
+    //
+    // macOS is on the same floor rather than a lower one because the package's
+    // tests run there, so a lower macOS floor would reintroduce exactly the
+    // gating this removes the moment shared code touches either API.
+    platforms: [.iOS(.v26), .macOS(.v26), .visionOS(.v26), .tvOS(.v26)],
     products: [
         .library(name: "MoqomKit", targets: ["MoqomKit"]),
         .library(name: "MoqomLoopback", targets: ["MoqomLoopback"]),

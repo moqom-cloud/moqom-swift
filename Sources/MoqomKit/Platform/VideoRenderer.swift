@@ -222,16 +222,22 @@ import MoqomCore
         /// recovery is to rebuild the layer and the caller cannot do anything
         /// useful per frame.
         public func enqueue(_ frame: EncodedFrame) throws(MoqomError) {
-            if layer.status == .failed {
-                layer.flush()
+            // `sampleBufferRenderer` rather than the layer's own status, enqueue
+            // and flush, which are deprecated as of the 15/26 SDKs. Invisible
+            // while the floor was macOS 14; raising it to 26 is what surfaced
+            // them. Same object underneath, so this is a rename, not a
+            // behaviour change.
+            let renderer = layer.sampleBufferRenderer
+            if renderer.status == .failed {
+                renderer.flush()
                 return
             }
             guard
-                layer.isReadyForMoreMediaData,
+                renderer.isReadyForMoreMediaData,
                 let sample = try assembler.sampleBuffer(for: frame)
             else { return }
 
-            layer.enqueue(sample)
+            renderer.enqueue(sample)
         }
 
         /// Discard everything queued.
@@ -239,7 +245,10 @@ import MoqomCore
         /// Called on a rung change and on resumption after a gap: the queued
         /// frames reference a format or a group that no longer applies.
         public func flush() {
-            layer.flushAndRemoveImage()
+            // Successor to the deprecated `flushAndRemoveImage()`. The
+            // completion handler is the only thing genuinely new and we do not
+            // want it: a rung change should not wait on the display pipeline.
+            layer.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil)
         }
     }
 #endif
