@@ -143,6 +143,15 @@ struct ParticipantTile: View {
         RemoteVideoView(participant: participant)
             .aspectRatio(16 / 9, contentMode: .fit)
             .clipShape(RoundedRectangle(cornerRadius: 12))
+            // The video area is black and so is the page, so without an edge a
+            // tile that has not received a frame is indistinguishable from no
+            // tile at all. Letterboxing has to stay black — a grey pillarbox
+            // around a 4:3 publisher would look like a rendering fault — which
+            // makes the border the only thing that can carry the boundary.
+            .overlay {
+                RoundedRectangle(cornerRadius: 12)
+                    .strokeBorder(.quaternary, lineWidth: 1)
+            }
             .overlay(alignment: .bottomLeading) {
                 HStack(spacing: 4) {
                     Text(participant.slot.identity.username.value)

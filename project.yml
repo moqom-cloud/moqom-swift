@@ -1,10 +1,8 @@
 # XcodeGen project definition.
 #
 # Chosen over a checked-in .xcodeproj because a pbxproj is thousands of lines of
-# generated UUIDs that could not be validated here — `xcode-select` points at
-# the Command Line Tools, so no iOS project can be opened or built in this
-# environment. A broken pbxproj fails in ways that are tedious to diagnose; this
-# file is forty lines a human can read and correct.
+# generated UUIDs, and a broken one fails in ways that are tedious to diagnose.
+# This file is eighty lines a human can read and correct.
 #
 # Chosen over a Package.swift executable because a SwiftPM executable cannot be
 # an iOS app: no bundle, no Info.plist, no camera usage description, no
@@ -52,6 +50,11 @@ targets:
       path: MoqomRoom/Info.plist
       properties:
         CFBundleDisplayName: MOQOM
+        # Dark is set here rather than with `.preferredColorScheme(.dark)` so
+        # that it covers what SwiftUI does not: the launch screen, the keyboard,
+        # and system alerts. A modifier on the root scene leaves those light and
+        # the app flashes white on every cold start.
+        UIUserInterfaceStyle: Dark
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
