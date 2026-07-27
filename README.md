@@ -1,16 +1,25 @@
 # MoqomKit
 
-The iOS, visionOS, and macOS client SDK.
+The Apple-platform client SDK for [MOQOM](https://github.com/moqom-cloud/moqom),
+a Media over QUIC platform. iOS, visionOS, macOS, and tvOS.
+
+```swift
+.package(url: "https://github.com/moqom-cloud/moqom-swift", from: "0.1.0")
+```
+
+This is its own repository rather than a directory in the platform monorepo for
+one reason: SwiftPM resolves a git dependency by looking for `Package.swift` at
+the repository *root*, with no way to point at a subdirectory. A package nested
+inside the monorepo cannot be consumed by URL at all.
 
 ```sh
-cd sdk/ios
 swift build
 swift test
 ```
 
-Swift 6 language mode, complete strict concurrency. Builds and tests on the
-host platform under the Command Line Tools alone — no Xcode required for
-anything in this package.
+Swift 6 language mode, complete strict concurrency. The deployment floor is 26
+on every platform — see [Why 26](#why-26) — so this needs a toolchain with a 26
+SDK.
 
 ## Targets
 
@@ -106,7 +115,14 @@ was, and specific:
   UI tests going green means the room, the roster and the layer math work; it
   does not mean video moves.
 
-### The iOS 26 APIs are present after all
+### Why 26
+
+The floor is 26 on every platform, which is a real cost — it excludes older
+devices — bought for a specific thing: the two APIs this SDK is designed around
+both arrived in that release train, and supporting anything earlier means a
+second capture path and a second transport path, each needing hardware to test.
+In practice the fallback is the one that never gets tested, running on the older
+devices. There is not one availability check in this package.
 
 An earlier probe here reported that this SDK had neither
 `RealityView.renderingEffects.customPostProcessing` nor
@@ -125,22 +141,23 @@ still not typed against RealityKit, which remains the right call for a
 different reason than before: it keeps the capture surface testable without a
 renderer, rather than working around an SDK that lacked the callback.
 
-### How the sample was typechecked before Xcode
+## The sample
 
-Kept because it is a useful trick when a machine has no iOS SDK: the sample's
-sources compiled as a macOS library target against this package, under Swift 6
-with complete strict concurrency:
+[`Samples/MoqomRoom`](Samples/MoqomRoom) is a SwiftUI room app, and it lives in
+this repository on purpose. It depends on `MoqomKit` by path, so it builds
+against the working tree and a breaking SDK change fails CI here rather than
+after a release. That is the property that makes it an integration test instead
+of a demo that rots.
 
 ```sh
-mkdir -p /tmp/samplecheck/Sources
-ln -s "$PWD/../../samples/ios/MoqomRoom/Sources" /tmp/samplecheck/Sources/MoqomRoomCheck
-# Package.swift: one macOS target depending on .package(path: "sdk/ios")
-cd /tmp/samplecheck && swift build
+cd Samples/MoqomRoom
+xcodegen generate
+xcodebuild test -scheme MoqomRoomUITests \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' CODE_SIGNING_ALLOWED=NO
 ```
 
-It builds clean. That covers the view models, the SwiftUI screens, the
-`NSViewRepresentable` branch, and every call into `MoqomKit`. It does not cover
-the `UIViewRepresentable` branch or `textInputAutocapitalization`.
+Its three UI tests are the only place the SwiftUI layer executes — the 103
+package tests drive `RoomSession` directly and never render.
 
 ## Decisions worth a second opinion
 

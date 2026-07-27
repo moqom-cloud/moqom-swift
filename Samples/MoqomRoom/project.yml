@@ -9,11 +9,11 @@
 # entitlements. The app target has to be an Xcode target.
 #
 #   brew install xcodegen
-#   cd samples/ios && xcodegen generate && open MoqomRoom.xcodeproj
+#   cd Samples/MoqomRoom && xcodegen generate && open MoqomRoom.xcodeproj
 #
 # Needs an Xcode with an iOS 26 SDK: the deployment floor below is 26, which is
 # what lets the SDK use customPostProcessing and NetworkConnection<QUIC> without
-# a single availability check. See sdk/ios/README.md.
+# a single availability check. See the repository README.
 
 name: MoqomRoom
 
@@ -31,9 +31,11 @@ configFiles:
 
 packages:
   MoqomKit:
-    # Relative to this file. The SDK is in the same repository rather than
-    # pinned to a version, because the two move together for now.
-    path: ../../sdk/ios
+    # The repository root, relative to this file. A path dependency rather than
+    # a version is the whole reason the sample lives in this repo: it builds
+    # against working-tree MoqomKit, so a breaking SDK change fails CI here
+    # instead of after a release.
+    path: ../..
 
 targets:
   MoqomRoom:

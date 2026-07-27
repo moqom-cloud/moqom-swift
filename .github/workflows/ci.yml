@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  swift:
+    name: Swift
+    # macos-26 for the iOS 26 SDK; the macos-15 image tops out below the floor.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+
+      # Asserts the requirement, not a version string. What the build actually
+      # needs is an iOS 26 SDK -- the deployment floor is 26, and SwiftPM must
+      # be new enough to parse `.v26` at all -- so that is what gets checked.
+      # Naming an exact Xcode here instead would rot at the next image bump and
+      # fail with "not found" rather than with the reason.
+      - name: Toolchain
+        run: |
+          latest=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          sudo xcode-select -s "$latest"
+          sdk=$(xcodebuild -showsdks | sed -n 's/.*-sdk iphoneos\([0-9][0-9]*\).*/\1/p' | sort -n | tail -1)
+          if [ -z "$sdk" ] || [ "$sdk" -lt 26 ]; then
+            echo "::error::need an iOS 26 SDK, newest on this image is '${sdk:-none}' ($latest)"
+            ls -d /Applications/Xcode*.app
+            exit 1
+          fi
+          swift --version && xcodebuild -version
+
+      # The package builds for macOS, so the shared logic -- rooms, layer
+      # selection, the session machine -- is tested on the host rather than in a
+      # simulator, which is faster and where all 103 tests live.
+      - name: Build and test the package
+        run: |
+          swift build
+          swift test
+
+      # The point of the sample living here. It depends on MoqomKit by path, so
+      # this step builds it against the working tree: an SDK change that breaks
+      # the sample fails now rather than after a release.
+      - name: Install xcodegen and xcbeautify
+        run: brew install xcodegen xcbeautify
+
+      # project.yml is the source and the pbxproj is generated, so this also
+      # confirms the generator still agrees with the file.
+      - name: Generate the sample project
+        working-directory: Samples/MoqomRoom
+        run: xcodegen generate
+
+      # Booted explicitly rather than letting xcodebuild pick, so a runner image
+      # that ships a different set of devices fails here with a clear message
+      # instead of somewhere inside the test run.
+      - name: Boot a simulator
+        id: sim
+        run: |
+          udid=$(xcrun simctl list devices available --json | python3 -c "
+          import json, sys
+          devices = json.load(sys.stdin)['devices']
+          # Runtime identifiers look like com.apple.CoreSimulator.SimRuntime.iOS-26-2.
+          # An iOS 17 device would install fine and then fail to launch an app
+          # built for 26, so the floor is enforced when picking, not after.
+          runtimes = sorted(
+              (rt for rt in devices if '.iOS-' in rt and int(rt.split('.iOS-')[1].split('-')[0]) >= 26),
+              key=lambda rt: [int(p) for p in rt.split('.iOS-')[1].split('-')],
+              reverse=True,
+          )
+          for rt in runtimes:
+              for dev in devices[rt]:
+                  if 'iPhone' in dev['name']:
+                      print(dev['udid'])
+                      sys.exit(0)
+          sys.exit('no iOS 26+ iPhone simulator on this image')
+          ")
+          echo "udid=$udid" >> "$GITHUB_OUTPUT"
+          xcrun simctl boot "$udid"
+          xcrun simctl bootstatus "$udid" -b
+
+      # The only place the SwiftUI layer runs. No signing: a simulator needs
+      # none, and the runner has no team.
+      #
+      # pipefail is load-bearing. Without it the pipeline reports xcbeautify's
+      # exit code, xcodebuild's failure is discarded, and the job goes green on
+      # a broken build -- which is worse than having no job at all.
+      - name: Run the sample's UI tests
+        working-directory: Samples/MoqomRoom
+        shell: bash
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project MoqomRoom.xcodeproj \
+            -scheme MoqomRoomUITests \
+            -destination "platform=iOS Simulator,id=${{ steps.sim.outputs.udid }}" \
+            CODE_SIGNING_ALLOWED=NO \
+            | xcbeautify --renderer github-actions
+        env:
+          NSUnbufferedIO: YES
