@@ -84,8 +84,4 @@ targets:
     settings:
       base:
         SWIFT_VERSION: "6.0"
-        # A UI test bundle talks to the app over XCTest's proxy rather than
-        # sharing its concurrency domain, so `complete` here would be checking
-        # a boundary that does not exist.
-        SWIFT_STRICT_CONCURRENCY: minimal
         TEST_TARGET_NAME: MoqomRoom

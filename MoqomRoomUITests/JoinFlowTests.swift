@@ -13,6 +13,11 @@
 
 import XCTest
 
+// XCUIElement and friends are `@MainActor` in the Xcode 16 SDK and not in 26's,
+// so leaving this off compiles locally on 26 and fails on CI's 16.4 with three
+// dozen isolation errors. Annotating is right on both: the proxy talks to the
+// app over an XPC connection that is main-thread-bound either way.
+@MainActor
 final class JoinFlowTests: XCTestCase {
     override func setUp() {
         super.setUp()
