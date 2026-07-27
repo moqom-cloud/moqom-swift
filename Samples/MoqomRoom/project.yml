@@ -1,0 +1,91 @@
+# XcodeGen project definition.
+#
+# Chosen over a checked-in .xcodeproj because a pbxproj is thousands of lines of
+# generated UUIDs, and a broken one fails in ways that are tedious to diagnose.
+# This file is eighty lines a human can read and correct.
+#
+# Chosen over a Package.swift executable because a SwiftPM executable cannot be
+# an iOS app: no bundle, no Info.plist, no camera usage description, no
+# entitlements. The app target has to be an Xcode target.
+#
+#   brew install xcodegen
+#   cd samples/ios && xcodegen generate && open MoqomRoom.xcodeproj
+#
+# Needs an Xcode with an iOS 26 SDK: the deployment floor below is 26, which is
+# what lets the SDK use customPostProcessing and NetworkConnection<QUIC> without
+# a single availability check. See sdk/ios/README.md.
+
+name: MoqomRoom
+
+options:
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+
+# Signing lives in an xcconfig rather than here, so the one value that is
+# personal — the Team ID — sits in a gitignored file instead of in the
+# repository. See Signing.xcconfig.
+configFiles:
+  Debug: Signing.xcconfig
+  Release: Signing.xcconfig
+
+packages:
+  MoqomKit:
+    # Relative to this file. The SDK is in the same repository rather than
+    # pinned to a version, because the two move together for now.
+    path: ../../sdk/ios
+
+targets:
+  MoqomRoom:
+    type: application
+    platform: iOS
+    sources:
+      - path: MoqomRoom/Sources
+    dependencies:
+      - package: MoqomKit
+        product: MoqomKit
+      - package: MoqomKit
+        product: MoqomLoopback
+    info:
+      path: MoqomRoom/Info.plist
+      properties:
+        CFBundleDisplayName: MOQOM
+        # Dark is set here rather than with `.preferredColorScheme(.dark)` so
+        # that it covers what SwiftUI does not: the launch screen, the keyboard,
+        # and system alerts. A modifier on the root scene leaves those light and
+        # the app flashes white on every cold start.
+        UIUserInterfaceStyle: Dark
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # Present even though the sample publishes synthetic frames: switching
+        # `RoomModel.startBroadcast` to `CameraSource` is a one-line change and
+        # the app would otherwise be terminated on the first capture attempt.
+        NSCameraUsageDescription: Publish your camera to the room.
+        NSMicrophoneUsageDescription: Publish your microphone to the room.
+    settings:
+      base:
+        SWIFT_VERSION: "6.0"
+        SWIFT_STRICT_CONCURRENCY: complete
+        TARGETED_DEVICE_FAMILY: "1,2"
+        GENERATE_INFOPLIST_FILE: NO
+        # Not repeated here: PRODUCT_BUNDLE_IDENTIFIER, DEVELOPMENT_TEAM, and
+        # CODE_SIGN_STYLE. A target-level setting beats an xcconfig, so naming
+        # any of them would silently defeat Local.xcconfig.
+
+  # The only place the SwiftUI layer is executed. MoqomKit's 103 tests drive
+  # RoomSession directly and never render, so the @Observable bridge and the
+  # phase switch had no coverage until this existed.
+  MoqomRoomUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: MoqomRoomUITests
+    dependencies:
+      - target: MoqomRoom
+    settings:
+      base:
+        SWIFT_VERSION: "6.0"
+        TEST_TARGET_NAME: MoqomRoom

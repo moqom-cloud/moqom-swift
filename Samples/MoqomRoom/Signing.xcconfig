@@ -1,0 +1,38 @@
+// Signing and identity for the sample app.
+//
+// A Team ID is not a secret in the cryptographic sense — it ships inside every
+// distributed binary — but it identifies a person while the account is personal,
+// and a repository that will be public should not carry it. So this file holds
+// the parts that are the same for everyone, and the optional include at the
+// bottom picks up whatever is local to you.
+//
+//   cp Local.xcconfig.example Local.xcconfig   # then fill in your Team ID
+//   xcodegen generate
+//
+// Local.xcconfig is gitignored. Without it the project still generates and still
+// builds to a simulator; only device deployment needs a team.
+
+// Reverse-DNS of moqom.cloud, the domain the platform actually runs on — the
+// same name `dns_domain` carries in deploy/envs/*/terraform.tfvars.example, so
+// the two cannot drift apart.
+//
+// Apple never resolves a bundle identifier, but owning the matching domain is
+// what makes it defensibly ours, and it is the prerequisite for associated
+// domains later: universal links to a stream, and the apple-app-site-association
+// file that has to be served from moqom.cloud itself.
+MOQOM_BUNDLE_PREFIX = cloud.moqom
+
+PRODUCT_BUNDLE_IDENTIFIER = $(MOQOM_BUNDLE_PREFIX).room
+
+// Automatic signing suits a personal team and a sample. The organisation
+// account, when it arrives, will want manual signing with an explicit profile;
+// that is a change to Local.xcconfig and this line, and nothing else.
+CODE_SIGN_STYLE = Automatic
+
+// Empty is a valid value: it builds for the simulator and fails only when you
+// ask for a device, which is the correct place to discover you have not set it.
+DEVELOPMENT_TEAM =
+
+// Last include wins, so anything below overrides everything above. The `?`
+// makes it optional — a fresh clone with no local file generates fine.
+#include? "Local.xcconfig"
