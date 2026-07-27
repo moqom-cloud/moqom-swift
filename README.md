@@ -52,13 +52,22 @@ real, and requires a device.
 
 ## Verification status
 
-The Swift sources typecheck under Swift 6 language mode with complete strict
-concurrency, against the macOS SDK. The `#if os(iOS)` branches — the
-`UIViewRepresentable` in `RemoteVideoView.swift` and one text field modifier in
-`MoqomRoomApp.swift` — cannot be compiled on a machine whose `xcode-select`
-points at the Command Line Tools, so CI builds this project for the iOS
-Simulator on a macOS runner, which is the only place those branches are read.
+The app runs. `MoqomRoomUITests` drives it on a simulator in CI: joining puts
+you in the room over the loopback relay, going live adds a tile under your
+username, and leaving comes back to the join screen. That is the only place the
+SwiftUI layer executes — `MoqomKit`'s 103 tests drive `RoomSession` directly and
+never render.
 
-The app has still never been run. A simulator build proves it compiles; it says
-nothing about the camera, the encoder, or the RealityKit tap, none of which
-exist in a simulator.
+What a green simulator run does **not** cover is everything a simulator does not
+have: the camera, the VideoToolbox encoder, the Metal scene capture, and the
+RealityKit tap. Those compile and have never executed. `Broadcast` also
+publishes a per-frame descriptor rather than encoded bytes, so a tile appearing
+means the roster works, not that video moves.
+
+Requires an Xcode with an iOS 26 SDK; the deployment floor is 26.
+
+```sh
+xcodegen generate
+xcodebuild test -project MoqomRoom.xcodeproj -scheme MoqomRoomUITests \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' CODE_SIGNING_ALLOWED=NO
+```
