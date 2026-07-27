@@ -1,0 +1,14 @@
+// Copy to Local.xcconfig and fill in. That file is gitignored.
+//
+// Find your Team ID in Xcode under Settings > Accounts > Manage Certificates,
+// or at developer.apple.com/account under Membership Details. It is ten
+// alphanumeric characters.
+//
+// Only needed to run on a physical device. The simulator does not care.
+
+DEVELOPMENT_TEAM = ABCDE12345
+
+// Optional. A personal team cannot register a bundle ID someone else already
+// owns, so if `com.example.moqom.room` collides, or you want a throwaway
+// identifier, set your own prefix here.
+// MOQOM_BUNDLE_PREFIX = com.yourname.moqom

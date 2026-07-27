@@ -1,0 +1,34 @@
+// Signing and identity for the sample app.
+//
+// A Team ID is not a secret in the cryptographic sense — it ships inside every
+// distributed binary — but it identifies a person while the account is personal,
+// and a repository that will be public should not carry it. So this file holds
+// the parts that are the same for everyone, and the optional include at the
+// bottom picks up whatever is local to you.
+//
+//   cp Local.xcconfig.example Local.xcconfig   # then fill in your Team ID
+//   xcodegen generate
+//
+// Local.xcconfig is gitignored. Without it the project still generates and still
+// builds to a simulator; only device deployment needs a team.
+
+// Reverse-DNS on a domain we control. Deliberately `example` until the domain is
+// settled — the Terraform placeholders say `moqom.example.` too, and picking a
+// real one in two places independently is how they end up different. Override
+// MOQOM_BUNDLE_PREFIX locally, and change this line once the domain exists.
+MOQOM_BUNDLE_PREFIX = com.example.moqom
+
+PRODUCT_BUNDLE_IDENTIFIER = $(MOQOM_BUNDLE_PREFIX).room
+
+// Automatic signing suits a personal team and a sample. The organisation
+// account, when it arrives, will want manual signing with an explicit profile;
+// that is a change to Local.xcconfig and this line, and nothing else.
+CODE_SIGN_STYLE = Automatic
+
+// Empty is a valid value: it builds for the simulator and fails only when you
+// ask for a device, which is the correct place to discover you have not set it.
+DEVELOPMENT_TEAM =
+
+// Last include wins, so anything below overrides everything above. The `?`
+// makes it optional — a fresh clone with no local file generates fine.
+#include? "Local.xcconfig"
