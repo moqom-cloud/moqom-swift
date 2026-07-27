@@ -70,7 +70,9 @@ test.
   frame reordering off, and a temporal base layer.
 - `Platform/SceneCapture.swift` — a pooled, IOSurface-backed blit from a
   renderer's `MTLTexture`. The frame never leaves the GPU.
-- `Platform/RealityKitCapture.swift` — `ARView.renderCallbacks.postProcess`.
+- `Platform/RealityKitCapture.swift` — `RealityView`'s
+  `renderingEffects.customPostProcessing` via `SceneCaptureEffect`, plus the
+  same handoff through `ARView.renderCallbacks.postProcess` for UIKit hosts.
 - `Platform/CameraSource.swift` — `AVCaptureSession` in the encoder's pixel
   format.
 - `Platform/VideoRenderer.swift` — sample buffer assembly and

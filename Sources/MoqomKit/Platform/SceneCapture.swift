@@ -139,17 +139,20 @@ import MoqomCore
             blit.copy(from: texture, to: destination)
             blit.endEncoding()
 
-            let size = PixelSize(width: texture.width, height: texture.height)
+            // Built here rather than inside the handler. `addCompletedHandler`
+            // takes a `@Sendable` closure and `CVPixelBuffer` is not Sendable,
+            // so capturing the buffer directly asks every call site to vouch for
+            // it. `FrameSurface` is where that judgement already lives — it is
+            // `@unchecked Sendable` with the reasoning attached — and a
+            // `VideoFrame` is Sendable outright, so handing the closure a frame
+            // keeps the unsafety in one documented place.
+            let frame = VideoFrame(
+                timestamp: timestamp,
+                size: PixelSize(width: texture.width, height: texture.height),
+                surface: .pixelBuffer(buffer)
+            )
             let relay = relay
-            commandBuffer.addCompletedHandler { _ in
-                relay.submit(
-                    VideoFrame(
-                        timestamp: timestamp,
-                        size: size,
-                        surface: .pixelBuffer(buffer)
-                    )
-                )
-            }
+            commandBuffer.addCompletedHandler { _ in relay.submit(frame) }
         }
 
         /// Hand over a buffer that is already in the right shape.
