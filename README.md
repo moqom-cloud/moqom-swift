@@ -1,7 +1,7 @@
 # MoqomKit
 
 The Apple-platform client SDK for [MOQOM](https://github.com/moqom-cloud/moqom),
-a Media over QUIC platform. iOS, visionOS, macOS, and tvOS.
+the Media Over QUIC Orchestration Mesh. iOS, visionOS, macOS, and tvOS.
 
 ```swift
 .package(url: "https://github.com/moqom-cloud/moqom-swift", from: "0.1.0")
