@@ -7,10 +7,14 @@ the Media Over QUIC Orchestration Mesh. iOS, visionOS, macOS, and tvOS.
 .package(url: "https://github.com/moqom-cloud/moqom-swift", from: "0.1.0")
 ```
 
-This is its own repository rather than a directory in the platform monorepo for
-one reason: SwiftPM resolves a git dependency by looking for `Package.swift` at
-the repository *root*, with no way to point at a subdirectory. A package nested
-inside the monorepo cannot be consumed by URL at all.
+This was the first piece to leave the monorepo, and for a reason peculiar to
+SwiftPM: it resolves a git dependency by looking for `Package.swift` at the
+repository *root*, with no way to point at a subdirectory, so a nested package
+cannot be consumed by URL at all. The rest followed later for their own reasons
+— [`moqom`](https://github.com/moqom-cloud/moqom) is now the platform,
+[`moqom-engine`](https://github.com/moqom-cloud/moqom-engine) the media path,
+and [`moqom-go`](https://github.com/moqom-cloud/moqom-go) and
+[`moqom-rust`](https://github.com/moqom-cloud/moqom-rust) the backend SDKs.
 
 ```sh
 swift build
@@ -318,11 +322,12 @@ specific:
 ## Interop
 
 `Tests/MoqomKitTests/RelayInteropTests.swift` runs against `moqom-relay`, which
-lives in the platform repository. It is skipped unless told where the binary is:
+lives in [`moqom-engine`](https://github.com/moqom-cloud/moqom-engine). It is
+skipped unless told where the binary is:
 
 ```sh
-(cd ../moqom/rs && cargo build --bin moqom-relay)
-MOQOM_RELAY_BIN=$PWD/../moqom/rs/target/debug/moqom-relay swift test
+(cd ../moqom-engine && cargo build --bin moqom-relay)
+MOQOM_RELAY_BIN=$PWD/../moqom-engine/target/debug/moqom-relay swift test
 ```
 
 Skipping rather than failing is the right trade for a client SDK whose CI has no
