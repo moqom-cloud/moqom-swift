@@ -151,9 +151,12 @@ public actor TrustedClock {
     static let leapWindow = Duration.seconds(1)
 
     private let authority: any TimeAuthority
-    private let continuous: @Sendable () -> Duration
+    private nonisolated let continuous: @Sendable () -> Duration
     private let suspending: @Sendable () -> Duration
     private let logger: MoqomLogger
+
+    /// The chosen anchor, mirrored where ``stamp`` can reach it.
+    private nonisolated let published = Published()
 
     private var anchors: [Anchor] = []
 
@@ -169,6 +172,9 @@ public actor TrustedClock {
     /// The sleep detector's last reading. See ``hasSlept()``.
     private var lastSuspending: Duration
     private var lastContinuous: Duration
+
+    /// The trust level last written to the log, so transitions are said once.
+    private var announced: TimeTrust?
 
     public init(
         authority: any TimeAuthority,
@@ -189,30 +195,66 @@ public actor TrustedClock {
     /// What time it is, and how well that is known.
     ///
     /// Never fails and never blocks. Before the first successful exchange this
-    /// returns ``Timecode/unchecked(_:)`` — the device's own clock, marked
-    /// unsynchronised and given an uncertainty wide enough that nothing will
-    /// mistakenly order two events by it.
+    /// returns ``Timecode/fallback(_:)`` — the device's own clock, marked as
+    /// such and given an uncertainty wide enough that nothing will mistakenly
+    /// order two events by it.
     public func now() -> Timecode {
         let reading = continuous()
-        guard let best = mostInformative(at: reading) else { return .unchecked() }
+        return Self.timecode(from: mostInformative(at: reading), at: reading)
+    }
 
-        let elapsed = reading - best.continuous
-        let uncertainty = best.uncertainty(after: elapsed)
+    /// A timecode from an anchor, or the fallback when there is no usable one.
+    ///
+    /// Pulled out as a static function of its inputs so that ``stamp`` can run
+    /// it off the actor, against a published copy of the same anchor.
+    private static func timecode(from anchor: Anchor?, at reading: Duration) -> Timecode {
+        guard let anchor else { return .fallback() }
+
+        let elapsed = reading - anchor.continuous
+        let uncertainty = anchor.uncertainty(after: elapsed)
+
+        // Two ways to fall out of trust, and both matter. The reading may have
+        // decayed past the ceiling, or the server may have told us its own
+        // clock is adrift — in which case it was never trustworthy and no
+        // amount of freshness makes it so.
+        guard anchor.disciplined, uncertainty <= trustCeiling else { return .fallback() }
+
         return Timecode(
-            nanoseconds: best.trusted &+ elapsed.wholeNanoseconds,
+            nanoseconds: anchor.trusted &+ elapsed.wholeNanoseconds,
             uncertainty: uncertainty,
-            // Two ways to fall out of trust, and both matter. The reading may
-            // have decayed past the ceiling, or the server may have told us its
-            // own clock is adrift — in which case it was never trustworthy and
-            // no amount of freshness makes it so.
-            trust: best.disciplined && uncertainty <= Self.trustCeiling
-                ? .synchronised
-                : .unsynchronised
+            trust: .synchronised
         )
+    }
+
+    /// Read the clock without awaiting it.
+    ///
+    /// Logging is synchronous and this is an actor, so a log sink cannot await
+    /// ``now()`` to stamp a record. Rather than make every call site async — or
+    /// worse, let records go unstamped and lose the trusted-versus-fallback
+    /// distinction exactly where it is most needed — the chosen anchor is
+    /// published into a lock-protected box whenever it changes, and this reads
+    /// that box against the monotonic clock.
+    ///
+    /// The result can be one poll interval staler than ``now()``, which the
+    /// uncertainty already accounts for: an anchor's error bound grows with
+    /// elapsed time whether or not anyone has looked at it.
+    public nonisolated var stamp: @Sendable () -> Timecode {
+        let published = published
+        let continuous = continuous
+        return { Self.timecode(from: published.load(), at: continuous()) }
     }
 
     /// Whether ``now()`` currently produces something worth comparing.
     public var isSynchronised: Bool { now().isTrusted }
+
+    /// Whether ``now()`` is currently coming from the device's own clock.
+    ///
+    /// Worth exposing rather than leaving callers to invert ``isSynchronised``,
+    /// because the two are used at different moments: one asks "can I order
+    /// this", the other asks "should I tell someone". A recording UI that wants
+    /// to warn before capture, or a host application deciding whether to upload
+    /// an audit trail, is asking this one.
+    public var isUsingFallback: Bool { !now().isTrusted }
 
     /// Take one exchange with the authority.
     ///
@@ -229,6 +271,11 @@ public actor TrustedClock {
             logger.debug(.session, "time exchange failed", [
                 LogField("error", .text(String(describing: error))),
             ])
+            // A single failure is not yet a fallback — the previous anchor is
+            // kept and stays good until it decays. But an unreachable reference
+            // is the ordinary way a device ends up on its own clock, so this is
+            // the path that most needs to notice when it finally has.
+            announceTrust()
             return false
         }
         let after = continuous()
@@ -259,7 +306,38 @@ public actor TrustedClock {
             LogField("roundTripMs", .number(Int(roundTrip.wholeNanoseconds / 1_000_000))),
             LogField("disciplined", .flag(reading.isDisciplined)),
         ])
+        announceTrust()
         return true
+    }
+
+    /// Say, once, when this clock starts or stops being believable.
+    ///
+    /// Falling back is not a failure the caller sees: ``now()`` keeps returning
+    /// a plausible-looking instant, and every consumer that does not inspect
+    /// ``Timecode/trust`` will carry on as though nothing happened. So the
+    /// transition has to be announced, or the first anyone knows of it is a
+    /// recording that will not line up weeks later.
+    ///
+    /// Deliberately not called from ``now()``. That is the method a log sink
+    /// uses to stamp a record, and logging from inside it would be a loop.
+    private func announceTrust() {
+        let trust = now().trust
+        guard trust != announced else { return }
+        let previous = announced
+        announced = trust
+
+        guard trust == .fallback else {
+            logger.info(.session, "trusted time established", [
+                LogField("uncertaintyMs", .number(
+                    Int(now().uncertainty.wholeNanoseconds / 1_000_000)
+                )),
+            ])
+            return
+        }
+        logger.warning(.session, "trusted time lost, using the device clock", [
+            LogField("previously", .text(previous?.rawValue ?? "never established")),
+            LogField("consequence", .text("timecodes cannot be ordered against other devices")),
+        ])
     }
 
     /// Take a new exchange, unless it is the only thing claiming what it claims.
@@ -329,6 +407,20 @@ public actor TrustedClock {
     private func trim() {
         if anchors.count > Self.window { anchors.removeFirst(anchors.count - Self.window) }
         if quarantine.count > Self.window { quarantine.removeFirst(quarantine.count - Self.window) }
+        published.store(mostInformative(at: continuous()))
+    }
+
+    /// The chosen anchor, behind a lock so ``stamp`` can read it off the actor.
+    ///
+    /// A whole-value swap under a lock rather than anything cleverer: it is
+    /// written once per exchange and read once per log record, so the lock is
+    /// never contended and the atomicity is worth more than the speed.
+    private final class Published: @unchecked Sendable {
+        private let lock = NSLock()
+        private var anchor: Anchor?
+
+        fileprivate func store(_ value: Anchor?) { lock.withLock { anchor = value } }
+        fileprivate func load() -> Anchor? { lock.withLock { anchor } }
     }
 
     /// The next UTC midnight at or after an instant, in nanoseconds.
@@ -364,7 +456,15 @@ public actor TrustedClock {
                 // is noticed promptly rather than at the end of an interval
                 // that started before the device went to sleep.
                 try? await Task.sleep(for: .seconds(10))
-                if await self.shouldSynchronise() { await self.synchronise() }
+                if await self.shouldSynchronise() {
+                    await self.synchronise()
+                } else {
+                    // Even when no exchange is due, the estimate may have aged
+                    // past the ceiling since the last check. Falling back
+                    // through decay is quieter than failing to reach the
+                    // server and deserves the same announcement.
+                    await self.announceTrust()
+                }
             }
         }
     }

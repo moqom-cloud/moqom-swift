@@ -100,9 +100,68 @@ struct LoggingTests {
                 LogField("first", .number(1)),
                 LogField("second", .number(2)),
                 LogField("third", .number(3)),
-            ]
+            ],
+            timecode: Timecode(
+                nanoseconds: 1_800_000_000_000_000_000,
+                uncertainty: .milliseconds(3),
+                trust: .synchronised
+            )
         )
-        #expect(record.line() == "sampled first=1 second=2 third=3")
+        #expect(record.line().hasSuffix("sampled first=1 second=2 third=3"))
+    }
+
+    @Test("a line says which clock stamped it")
+    func lineCarriesTrust() {
+        // Two logs from two machines only interleave if both were measured. A
+        // reader has to be able to see that on the line, before they start
+        // drawing conclusions from the order.
+        let measured = LogRecord(
+            level: .info,
+            category: .session,
+            message: "joined",
+            timecode: Timecode(
+                nanoseconds: 1_800_000_000_000_000_000,
+                uncertainty: .milliseconds(3),
+                trust: .synchronised
+            )
+        )
+        let guessed = LogRecord(
+            level: .info,
+            category: .session,
+            message: "joined",
+            timecode: .fallback(Date(timeIntervalSince1970: 1_800_000_000))
+        )
+
+        #expect(!measured.line().contains("fallback"))
+        #expect(guessed.line().contains("fallback"))
+    }
+
+    @Test("a logger with no clock stamps honestly rather than not at all")
+    func defaultClockIsMarkedFallback() {
+        // The tempting alternative is to leave records unstamped until a
+        // trusted clock exists. That loses the early ones, which are the
+        // connection and handshake records — the ones a support ticket is
+        // usually about.
+        let sink = RecordingLogSink()
+        MoqomLogger(sink: sink).info(.session, "connecting")
+
+        #expect(sink.records.first?.timecode.trust == .fallback)
+    }
+
+    @Test("a logger can be re-pointed at a clock once there is one")
+    func clockCanBeSwapped() {
+        let sink = RecordingLogSink()
+        let stamped = MoqomLogger(sink: sink).stamped(by: {
+            Timecode(
+                nanoseconds: 1_800_000_000_000_000_000,
+                uncertainty: .milliseconds(3),
+                trust: .synchronised
+            )
+        })
+        stamped.info(.session, "joined")
+
+        #expect(sink.records.first?.timecode.trust == .synchronised)
+        #expect(sink.records.first?.timecode.nanoseconds == 1_800_000_000_000_000_000)
     }
 
     @Test("every value kind renders without leaking anything")

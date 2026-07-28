@@ -151,7 +151,7 @@ struct TrustedTimeTests {
         )
         let now = await clock.now()
         #expect(!now.isTrusted)
-        #expect(now.trust == .unsynchronised)
+        #expect(now.trust == .fallback)
         // Wide enough that nothing will accidentally be ordered by it.
         #expect(now.uncertainty > .seconds(60))
     }
@@ -234,7 +234,7 @@ struct TrustedTimeTests {
         ticker.sleep(for: .seconds(4 * 3600))
         let later = await clock.now()
         #expect(later.uncertainty > TrustedClock.trustCeiling)
-        #expect(later.trust == .unsynchronised)
+        #expect(later.trust == .fallback)
     }
 
     @Test("Uncertainty grows with the time since the last exchange")
@@ -336,7 +336,111 @@ struct TrustedTimeTests {
         ticker.advance(.seconds(60))
         let after = await clock.now()
         #expect(after.uncertainty > .seconds(1))
-        #expect(after.trust == .unsynchronised)
+        #expect(after.trust == .fallback)
+    }
+
+    // MARK: - Saying so
+
+    @Test("Losing trusted time is announced, not just recorded")
+    func announcesTheFallback() async {
+        // The failure this guards against is silence. `now()` keeps returning a
+        // plausible instant when the reference is unreachable, and every
+        // consumer that does not inspect `trust` carries on as if nothing
+        // happened — so if nobody says it out loud, the first anyone knows is a
+        // recording that will not align weeks later.
+        let sink = RecordingLogSink()
+        let logger = MoqomLogger(sink: sink, minimum: .debug)
+        let ticker = Ticker()
+        let authority = ScriptedAuthority(ticker: ticker, epoch: Wire.epoch)
+        let clock = TrustedClock(
+            authority: authority,
+            logger: logger,
+            continuous: ticker.continuous,
+            suspending: ticker.suspending
+        )
+
+        await authority.expect(out: .milliseconds(5), back: .milliseconds(5))
+        #expect(await clock.synchronise())
+        #expect(sink.messages.contains("trusted time established"))
+        #expect(!(await clock.isUsingFallback))
+
+        // Long enough that the estimate decays past the ceiling. The device has
+        // not failed and the server has not lied; the reading has simply
+        // stopped being worth anything.
+        sink.clear()
+        ticker.sleep(for: .seconds(4 * 3600))
+
+        // A failed exchange, which is what a real device sees when the network
+        // is gone. The previous anchor is kept, not discarded.
+        #expect(!(await clock.synchronise()))
+
+        #expect(await clock.isUsingFallback)
+        #expect(sink.messages.contains("trusted time lost, using the device clock"))
+        let warning = sink.records.first { $0.message.hasPrefix("trusted time lost") }
+        #expect(warning?.level == .warning, "a silent fallback is the thing being prevented")
+    }
+
+    @Test("The announcement is made once, not on every exchange")
+    func doesNotRepeatTheAnnouncement() async {
+        // A clock that logs its state every poll buries the transition that
+        // matters in a stream of identical lines.
+        let sink = RecordingLogSink()
+        let logger = MoqomLogger(sink: sink, minimum: .debug)
+        let ticker = Ticker()
+        let authority = ScriptedAuthority(ticker: ticker, epoch: Wire.epoch)
+        let clock = TrustedClock(
+            authority: authority,
+            logger: logger,
+            continuous: ticker.continuous,
+            suspending: ticker.suspending
+        )
+
+        for _ in 0 ..< 4 {
+            await authority.expect(out: .milliseconds(5), back: .milliseconds(5))
+            #expect(await clock.synchronise())
+        }
+
+        let announcements = sink.messages.filter { $0 == "trusted time established" }
+        #expect(announcements.count == 1, "said \(announcements.count) times")
+    }
+
+    @Test("Coming back is announced too")
+    func announcesRecovery() async {
+        let sink = RecordingLogSink()
+        let logger = MoqomLogger(sink: sink, minimum: .debug)
+        let ticker = Ticker()
+        let authority = ScriptedAuthority(ticker: ticker, epoch: Wire.epoch)
+        let clock = TrustedClock(
+            authority: authority,
+            logger: logger,
+            continuous: ticker.continuous,
+            suspending: ticker.suspending
+        )
+
+        // No exchange queued, so the first attempt fails and the clock is on
+        // fallback time from the start.
+        #expect(!(await clock.synchronise()))
+        #expect(await clock.isUsingFallback)
+
+        sink.clear()
+        await authority.expect(out: .milliseconds(5), back: .milliseconds(5))
+        #expect(await clock.synchronise())
+
+        #expect(!(await clock.isUsingFallback))
+        #expect(sink.messages.contains("trusted time established"))
+    }
+
+    @Test("A fallback timecode is honest about being one")
+    func fallbackDescribesItself() {
+        let code = Timecode.fallback(Date(timeIntervalSince1970: 1_800_000_000))
+
+        #expect(code.trust == .fallback)
+        #expect(!code.isTrusted)
+        // A device clock is a user setting and can be wrong by years. A bound
+        // that implied otherwise would be the lie the type exists to stop.
+        #expect(code.uncertainty > .seconds(3600))
+        // And it says so where a human will see it.
+        #expect(code.description.contains("fallback"))
     }
 
     // MARK: - Ordering

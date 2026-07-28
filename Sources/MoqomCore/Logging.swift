@@ -181,22 +181,41 @@ public struct LogRecord: Sendable {
     public let message: String
     public let fields: [LogField]
 
+    /// When this happened, and how well that is known.
+    ///
+    /// Carried on the record rather than added by the sink, because the two
+    /// differ by however long the record was queued, and because a sink that
+    /// stamps has no way to know whether the clock was trustworthy at the
+    /// moment being described.
+    ///
+    /// ``TimeTrust/fallback`` here means the line is stamped from the device's
+    /// own clock and cannot be interleaved with another machine's — the single
+    /// most important thing to know when reading two logs side by side, and the
+    /// reason this is a field of its own rather than a formatted string.
+    public let timecode: Timecode
+
     public init(
         level: LogLevel,
         category: LogCategory,
         message: String,
-        fields: [LogField] = []
+        fields: [LogField] = [],
+        timecode: Timecode = .fallback()
     ) {
         self.level = level
         self.category = category
         self.message = message
         self.fields = fields
+        self.timecode = timecode
     }
 
     /// The record as one line, `key=value` after the message.
+    ///
+    /// The timecode leads, and says which clock it came from. A reader
+    /// correlating this against a relay's log needs to know that before
+    /// anything else on the line is worth acting on.
     public func line(privacy: LogPrivacy = .full) -> String {
         let rendered = fields.map { "\($0.name)=\($0.value.rendered(privacy))" }
-        return ([message] + rendered).joined(separator: " ")
+        return ([timecode.description, message] + rendered).joined(separator: " ")
     }
 }
 
@@ -295,9 +314,31 @@ public struct MoqomLogger: Sendable {
     /// Records below this are not built at all.
     public let minimum: LogLevel
 
-    public init(sink: any LogSink, minimum: LogLevel = .info) {
+    /// What stamps each record.
+    ///
+    /// Defaults to the device's own clock, marked as a fallback, so a logger
+    /// built before synchronisation is honest rather than silent about it. Wire
+    /// this to a `TrustedClock`'s `stamp` to get comparable timecodes; see
+    /// ``stamped(by:)``.
+    public let clock: @Sendable () -> Timecode
+
+    public init(
+        sink: any LogSink,
+        minimum: LogLevel = .info,
+        clock: @escaping @Sendable () -> Timecode = { .fallback() }
+    ) {
         self.sink = sink
         self.minimum = minimum
+        self.clock = clock
+    }
+
+    /// The same logger, stamping from a different clock.
+    ///
+    /// A session builds its logger before it has a synchronised clock, so this
+    /// is the seam that upgrades it afterwards without every holder needing to
+    /// be told.
+    public func stamped(by clock: @escaping @Sendable () -> Timecode) -> MoqomLogger {
+        MoqomLogger(sink: sink, minimum: minimum, clock: clock)
     }
 
     /// A logger that writes nothing.
@@ -336,7 +377,8 @@ public struct MoqomLogger: Sendable {
                 level: level,
                 category: category,
                 message: message(),
-                fields: fields()
+                fields: fields(),
+                timecode: clock()
             )
         )
     }

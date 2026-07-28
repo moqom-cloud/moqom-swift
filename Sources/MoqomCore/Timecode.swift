@@ -21,11 +21,29 @@
 // — unsettable, and unaffected by correction — plus a measured offset to the
 // server. See ``TrustedClock``, which is where the measurement happens.
 //
-// And a timecode says how much it should be believed. A process that does not
-// know the time says so, rather than serving a confident local guess that
-// everything downstream then treats as fact. An unsynchronised timecode is
-// still worth recording, because it is evidence about one machine; it is just
-// not evidence about the order of two.
+// And a timecode says how much it should be believed. A process that cannot
+// reach the reference falls back to its own clock — losing the observation
+// entirely would be worse — but it says so, rather than serving a confident
+// local guess that everything downstream then treats as fact. A fallback
+// timecode is still worth recording, because it is evidence about one machine;
+// it is just not evidence about the order of two.
+//
+// # On leap seconds
+//
+// The reference is `time.cloudflare.com`, which does not smear: it forwards the
+// leap indicator and lets the kernel step, so UTC really does repeat a second.
+// The smearing alternative — Google and AWS spread the second over 24 hours —
+// keeps the clock continuous at the cost of being knowingly up to half a second
+// from UTC for a whole day, undetectably, while every error bound in the system
+// continues to read a few milliseconds.
+//
+// For a design whose entire premise is an honest error bound, that trade is the
+// wrong way round. A one-second window that announces itself in advance is
+// something this type can represent — see ``TrustedClock``, which widens to ±1s
+// across the boundary — and a silent day-long half-second offset is not. The
+// usual argument for smearing, that wall-clock time must never go backwards, does
+// not apply here: every duration in this system is measured on a monotonic
+// clock, never on this one.
 
 import Foundation
 
@@ -41,14 +59,20 @@ public enum TimeTrust: String, Hashable, Sendable, Codable, CaseIterable {
     /// Measured against the authority, and recently enough to still be tight.
     case synchronised
 
-    /// No measurement stands behind this.
+    /// The local system clock, because the reference could not be reached.
     ///
-    /// Either synchronisation has never succeeded or it is too stale to mean
-    /// anything. The value is the best local guess and is recorded rather than
-    /// dropped — one machine's own account of itself is worth having — but it
-    /// cannot be placed against another machine's, and
+    /// Either synchronisation has never succeeded, or it has gone too stale to
+    /// mean anything. The value is still recorded rather than dropped — one
+    /// machine's own account of itself is worth having — but it cannot be
+    /// placed against another machine's, and
     /// ``Timecode/definitelyPrecedes(_:)`` will not pretend otherwise.
-    case unsynchronised
+    ///
+    /// Named for what it *is* rather than what it is not. "Unsynchronised"
+    /// describes a missing property and reads, in a log line, like a warning
+    /// somebody forgot to finish; "fallback" says which clock produced the
+    /// number, which is the question anyone reading that line is actually
+    /// asking.
+    case fallback
 }
 
 /// An instant on the trusted timeline, with the width of what is actually known.
@@ -109,8 +133,8 @@ public struct Timecode: Hashable, Sendable, Codable {
     /// devices synced to fifty are not ordered, and this returns `false` in both
     /// directions, which is the honest answer rather than a missing one.
     ///
-    /// Requires both to be synchronised. An unsynchronised timecode is one
-    /// machine's opinion and there is nothing to place it against.
+    /// Requires both to be trusted. A fallback timecode is one machine's
+    /// opinion of itself and there is nothing to place it against.
     ///
     /// > Note: For events from a *single* source, use that source's sequence
     /// > number instead — the room control log and the control plane's event
@@ -124,15 +148,15 @@ public struct Timecode: Hashable, Sendable, Codable {
 
     /// Whether these two could be the same instant.
     ///
-    /// True when the intervals overlap, and true whenever either is
-    /// unsynchronised, since there is then no basis for ruling it out.
+    /// True when the intervals overlap, and true whenever either is a
+    /// fallback, since there is then no basis for ruling it out.
     public func mayCoincide(with other: Timecode) -> Bool {
         guard isTrusted, other.isTrusted else { return true }
         return earliest <= other.latest && other.earliest <= latest
     }
 
     /// Whether this can be compared with another machine's.
-    public var isTrusted: Bool { trust != .unsynchronised }
+    public var isTrusted: Bool { trust != .fallback }
 
     /// The same estimate, known less precisely.
     ///
@@ -161,18 +185,21 @@ public struct Timecode: Hashable, Sendable, Codable {
         )
     }
 
-    /// A timecode from a clock nobody has checked.
+    /// The local system clock, for when the reference cannot be reached.
     ///
-    /// The fallback for a process that has never reached the authority. Marked
-    /// ``TimeTrust/unsynchronised`` so that everything downstream knows what it
-    /// has, and given a deliberately enormous uncertainty rather than a
-    /// plausible one: an unchecked device clock can be wrong by years, and a
-    /// bound that implied otherwise would be the lie this type exists to stop.
-    public static func unchecked(_ date: Date = Date()) -> Timecode {
+    /// The deliberate fallback, and it is deliberate: the alternative — refusing
+    /// to produce a timestamp at all — loses the one piece of evidence that is
+    /// still available, which is this machine's own account of when something
+    /// happened. What must not happen is that the fallback is *mistaken* for
+    /// measured time, so it is marked ``TimeTrust/fallback`` and given a
+    /// deliberately enormous uncertainty rather than a plausible one. A device
+    /// clock is a user setting and can be wrong by years; a bound implying
+    /// otherwise would be the lie this type exists to stop.
+    public static func fallback(_ date: Date = Date()) -> Timecode {
         Timecode(
             nanoseconds: Int64(date.timeIntervalSince1970 * 1_000_000_000),
             uncertainty: .seconds(86400),
-            trust: .unsynchronised
+            trust: .fallback
         )
     }
 
@@ -196,7 +223,7 @@ public struct Timecode: Hashable, Sendable, Codable {
         // An absent trust is the unsafe reading, so it is the one taken. A
         // document from something that did not know about this field has not
         // told us its clock is good.
-        trust = try container.decodeIfPresent(TimeTrust.self, forKey: .trust) ?? .unsynchronised
+        trust = try container.decodeIfPresent(TimeTrust.self, forKey: .trust) ?? .fallback
     }
 
     public func encode(to encoder: any Encoder) throws {
@@ -216,7 +243,7 @@ extension Timecode: CustomStringConvertible {
         let stamp = formatter.string(from: date)
         let plusMinus = Double(uncertainty.wholeNanoseconds) / 1_000_000
         return switch trust {
-        case .unsynchronised: "\(stamp) (unsynchronised)"
+        case .fallback: "\(stamp) (fallback clock)"
         default: String(format: "%@ ±%.1fms", stamp, plusMinus)
         }
     }
