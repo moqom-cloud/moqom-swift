@@ -38,6 +38,17 @@
 // is in the room, and they would disagree exactly when it mattered. A
 // participant appears because they announced. This says what they may do.
 //
+// Two mechanisms guard compatibility, and they answer different questions.
+// ``RoomUpdate/version`` is for a change of *meaning*: an entry a client would
+// misread is refused outright, because applying half of an authorisation change
+// is worse than applying none of it. An unrecognised ``RoomChange`` kind at a
+// version this build can read is the opposite case — something was added that
+// this build has no opinion about — and it is skipped while the sequence
+// advances, because the alternative is a hole that never fills. A reader that
+// stalled on it would sit in permanent repair, re-fetching a group whose
+// contents it still could not decode, and lose the entries it *did* understand
+// along with the one it did not.
+//
 // One consequence worth stating, because it decides who publishes this: presence
 // cannot come from the participant it describes. A client that has lost its
 // network is in no position to announce that it has lost its network. Only the
@@ -127,6 +138,23 @@ public enum RoomChange: Hashable, Sendable {
     /// with a stream that mysteriously stopped.
     case evicted(ParticipantIdentity)
 
+    /// How many viewers each cohost brought, in full.
+    ///
+    /// The whole set every time, including the cohorts that did not change,
+    /// because a per-cohost delta would drift the moment one entry was lost —
+    /// and these are the numbers a revenue split is argued over.
+    case audiences(Audiences)
+
+    /// A kind this build does not know, carrying its name and nothing else.
+    ///
+    /// Not an error. A newer authority is entitled to publish something this
+    /// client has never heard of, and the useful response is to stay current on
+    /// everything else rather than to stop reading. The payload is dropped
+    /// rather than retained, so this does not round-trip: re-encoding one
+    /// produces a change with no body, which is safe only because nothing
+    /// republishes an entry it received.
+    case unrecognised(String)
+
     /// Whether this sets a property *of* its subject, rather than something about
     /// the room that happens to name one.
     ///
@@ -136,7 +164,8 @@ public enum RoomChange: Hashable, Sendable {
     public var isAttribute: Bool {
         switch self {
         case .grants, .presence, .mute: true
-        case .spotlight, .stage, .lifecycle, .watchdogs, .evicted: false
+        case .spotlight, .stage, .lifecycle, .watchdogs, .evicted, .audiences,
+             .unrecognised: false
         }
     }
 
@@ -150,7 +179,7 @@ public enum RoomChange: Hashable, Sendable {
             identity
         case let .spotlight(identity):
             identity
-        case .stage, .lifecycle, .watchdogs:
+        case .stage, .lifecycle, .watchdogs, .audiences, .unrecognised:
             nil
         }
     }
@@ -185,6 +214,113 @@ public struct ParticipantControl: Hashable, Sendable, Codable {
         self.presence = presence
         self.mutedForEveryone = mutedForEveryone
         self.mutedForAudience = mutedForAudience
+    }
+}
+
+/// How many viewers came in through each cohost.
+///
+/// The one room figure that cannot be derived from anything else a client can
+/// see. A roster is built from announcements, so viewers are structurally absent
+/// from it — they publish nothing — and no amount of watching the room recovers
+/// *why* somebody is in it. When two cohosts bring their own followings to one
+/// room, "whose audience is this" is a fact about the moment each viewer
+/// arrived, and it is gone by the time anybody thinks to ask.
+///
+/// So it is asserted rather than inferred, by the only party that sees every
+/// arrival: the control plane mints the token, so it knows what the tenant said
+/// when it minted one, and it counts the sessions.
+///
+/// This is a count and deliberately not a membership list. Naming the viewers
+/// would make the control track a second answer to who is in the room, which the
+/// note at the top of this file exists to prevent, and would put a hundred
+/// thousand identities on a track every client subscribes to.
+public struct Audiences: Hashable, Sendable, Codable {
+    /// One cohort of viewers, and who brought them.
+    public struct Audience: Hashable, Sendable, Codable {
+        /// The cohost whose following these viewers arrived through, or `nil`
+        /// for the ones who found the room by themselves.
+        ///
+        /// A username rather than a ``ParticipantIdentity`` because people are
+        /// followed, not phones: a cohost on an iPad and a handset is one
+        /// audience, and splitting them by device would be an artefact of how
+        /// they happened to join.
+        ///
+        /// Not required to be in the room, and that is the normal case rather
+        /// than a defect. An audience arrives before its cohost does, and stays
+        /// for a while after they drop — a cohort that vanished the moment its
+        /// cohost's connection did would take the host's revenue split with it.
+        public var via: Username?
+
+        /// How many of them are here now.
+        ///
+        /// Live rather than cumulative. Peaks and totals are a question for a
+        /// warehouse, which can answer it about last Tuesday; this answers it
+        /// about now, which is the only thing a client can render.
+        public var viewers: Int
+
+        /// What ``viewers`` was rounded to. `1` is exact.
+        ///
+        /// Carried rather than assumed, for the same reason a ``Timecode``
+        /// carries its uncertainty: a number whose precision is unstated will be
+        /// read as exact, and a UI that prints "1,203,847 watching" from a
+        /// figure quantised to the nearest thousand is lying in a way nobody can
+        /// detect. Coarsening is what keeps this track quiet — a busy room's
+        /// exact count changes several times a second, and publishing every
+        /// change would spend the room's control bandwidth on a digit nobody
+        /// reads.
+        public var resolution: Int
+
+        public init(via: Username?, viewers: Int, resolution: Int = 1) {
+            self.via = via
+            self.viewers = viewers
+            self.resolution = max(1, resolution)
+        }
+
+        /// Whether this figure is precise.
+        public var isExact: Bool { resolution == 1 }
+    }
+
+    /// Every cohort, including the unattributed one.
+    ///
+    /// Unattributed is an entry with no ``Audience/via`` rather than a separate
+    /// field, because it is not a leftover: "found us on their own" is the
+    /// organic reach of the room and the number a host compares every cohost
+    /// against.
+    public var cohorts: [Audience]
+
+    public init(cohorts: [Audience] = []) {
+        self.cohorts = cohorts
+    }
+
+    /// Viewers attributed to one cohost, or zero if none are.
+    public subscript(via: Username) -> Int {
+        cohorts.first { $0.via == via }?.viewers ?? 0
+    }
+
+    /// Viewers who arrived by themselves.
+    public var unattributed: Int {
+        cohorts.first { $0.via == nil }?.viewers ?? 0
+    }
+
+    /// Everyone counted here.
+    ///
+    /// A sum of quantised parts, so it is approximate whenever any part is, and
+    /// need not equal a room's viewer count exactly.
+    public var total: Int {
+        cohorts.reduce(0) { $0 + $1.viewers }
+    }
+
+    /// Whether every figure in here is precise.
+    public var isExact: Bool { cohorts.allSatisfy(\.isExact) }
+
+    /// Cohorts brought by a cohost, largest first, excluding the organic one.
+    ///
+    /// Ordered here rather than by the authority so that the wire form has one
+    /// meaning and every client draws the same order.
+    public var attributed: [Audience] {
+        cohorts.filter { $0.via != nil }.sorted {
+            ($0.viewers, $1.via?.value ?? "") > ($1.viewers, $0.via?.value ?? "")
+        }
     }
 }
 
@@ -248,16 +384,25 @@ public struct RoomSnapshot: Hashable, Sendable, Codable {
     public var lifecycle: RoomLifecycle
     public var watchdogs: [Watchdog]
 
+    /// Who brought the viewers.
+    ///
+    /// Empty from an authority that does not attribute, which reads the same as a
+    /// room nobody was brought to — correct in both cases, since the honest
+    /// answer to "whose audience is this" is then "nobody knows".
+    public var audiences: Audiences
+
     public init(
         participants: [ParticipantControl] = [],
         stage: StageSnapshot = StageSnapshot(),
         lifecycle: RoomLifecycle = .live,
-        watchdogs: [Watchdog] = []
+        watchdogs: [Watchdog] = [],
+        audiences: Audiences = Audiences()
     ) {
         self.participants = participants
         self.stage = stage
         self.lifecycle = lifecycle
         self.watchdogs = watchdogs
+        self.audiences = audiences
     }
 
     public subscript(identity: ParticipantIdentity) -> ParticipantControl? {
@@ -304,6 +449,14 @@ public struct RoomSnapshot: Hashable, Sendable, Codable {
             self[identity] = nil
             if stage.spotlighted == identity { stage.spotlighted = nil }
             stage.queue.removeAll { $0 == identity }
+        case let .audiences(audiences):
+            self.audiences = audiences
+        case .unrecognised:
+            // Nothing, on purpose. The sequence has already advanced by the time
+            // this is reached, so the entry is accounted for; what it meant is
+            // simply not knowable here. Folding it into a snapshot as anything
+            // other than a no-op would mean this build republishing a guess.
+            break
         }
     }
 
@@ -356,6 +509,14 @@ public struct RoomLog: Sendable {
     /// Entries refused for being a version this build cannot read.
     public private(set) var rejected = 0
 
+    /// Entries applied as no-ops because their kind is unknown to this build.
+    ///
+    /// Counted separately from ``rejected`` because they mean opposite things. A
+    /// rejection is this reader declining to guess at something it might
+    /// misapply; this is it correctly ignoring something additive. Both say the
+    /// authority is newer, and only this one says the log is still whole.
+    public private(set) var unrecognised = 0
+
     /// Whether entries were dropped because the buffer filled.
     public private(set) var isTruncated = false
 
@@ -395,7 +556,7 @@ public struct RoomLog: Sendable {
             // buffer cannot: the entries thrown away were never held, so the
             // hole they left is permanent until a complete state replaces it.
             isTruncated = false
-            return [update.body] + drain()
+            return tally([update.body] + drain())
 
         case .change:
             guard update.sequence > applied else {
@@ -408,7 +569,7 @@ public struct RoomLog: Sendable {
             }
             applied = update.sequence
             accepted += 1
-            return [update.body] + drain()
+            return tally([update.body] + drain())
         }
     }
 
@@ -432,6 +593,17 @@ public struct RoomLog: Sendable {
 
     /// How many entries are waiting on a gap.
     public var holding: Int { held.count }
+
+    /// Note which of the entries about to be applied this build cannot read.
+    ///
+    /// Counted on the way out rather than at decode, so an entry held for a gap
+    /// is counted when it is applied and not twice.
+    private mutating func tally(_ bodies: [RoomUpdate.Body]) -> [RoomUpdate.Body] {
+        for body in bodies {
+            if case .change(.unrecognised) = body { unrecognised += 1 }
+        }
+        return bodies
+    }
 
     private mutating func hold(_ update: RoomUpdate) {
         guard held.count < policy.buffer else {
@@ -521,6 +693,7 @@ extension RoomChange: Codable {
         case stage
         case lifecycle
         case watchdogs
+        case audiences
     }
 
     public init(from decoder: any Decoder) throws {
@@ -557,12 +730,15 @@ extension RoomChange: Codable {
             self = .watchdogs(try container.decode([Watchdog].self, forKey: .watchdogs))
         case "evicted":
             self = .evicted(try subject())
+        case "audiences":
+            self = .audiences(try container.decode(Audiences.self, forKey: .audiences))
         case let other:
-            throw DecodingError.dataCorruptedError(
-                forKey: .change,
-                in: container,
-                debugDescription: "unknown change \(other)"
-            )
+            // Skipped rather than thrown, so a build that predates a case still
+            // tracks the room. Throwing here reaches the caller as an undecodable
+            // object, which does not advance the log's sequence, which is a hole
+            // that only a snapshot closes — and the next entry of the same new
+            // kind reopens it. See the note at the top of this file.
+            self = .unrecognised(other)
         }
     }
 
@@ -597,6 +773,14 @@ extension RoomChange: Codable {
         case let .evicted(identity):
             try container.encode("evicted", forKey: .change)
             try container.encode(identity, forKey: .identity)
+        case let .audiences(audiences):
+            try container.encode("audiences", forKey: .change)
+            try container.encode(audiences, forKey: .audiences)
+        case let .unrecognised(kind):
+            // Lossy, and only reachable by re-encoding something decoded by an
+            // older build. Kept writable rather than made to throw so that
+            // holding a log entry in a value type does not become a trap.
+            try container.encode(kind, forKey: .change)
         }
     }
 }

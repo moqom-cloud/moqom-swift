@@ -106,6 +106,16 @@ public struct RoomState: Sendable {
 
     public var lifecycle: RoomLifecycle
 
+    /// How many viewers each cohost brought, and how many arrived on their own.
+    ///
+    /// The only part of this type that is not derived from what this client can
+    /// observe. Everything else here comes from announcements a client sees for
+    /// itself; a viewer announces nothing, so viewers are absent from ``roster``
+    /// by construction and their provenance is not something any client could
+    /// work out. It arrives on the control track from the control plane, and is
+    /// empty until it does.
+    public var audiences: Audiences
+
     public init(
         tenant: TenantID,
         room: RoomID,
@@ -113,7 +123,8 @@ public struct RoomState: Sendable {
         roster: Roster = Roster(),
         watchdogs: WatchdogSet = WatchdogSet(),
         stage: StageState = StageState(),
-        lifecycle: RoomLifecycle = .live
+        lifecycle: RoomLifecycle = .live,
+        audiences: Audiences = Audiences()
     ) {
         self.tenant = tenant
         self.room = room
@@ -122,13 +133,34 @@ public struct RoomState: Sendable {
         self.watchdogs = watchdogs
         self.stage = stage
         self.lifecycle = lifecycle
+        self.audiences = audiences
     }
 
     /// The number to show, and the number to bill.
     ///
     /// Drawn from the roster, which cannot contain a watchdog, so the UI count
     /// and the meter cannot disagree about whether a recorder is a person.
+    ///
+    /// Counts the people on stage and backstage, not the audience: a viewer never
+    /// enters the roster. ``Audiences/total`` is the other number.
     public var participantCount: Int { roster.count }
+
+    /// The audience a cohost in this room brought, largest first.
+    ///
+    /// Pairs each cohort with the participant it names, when that participant is
+    /// present. A cohort whose cohost has left the room is deliberately not
+    /// dropped from ``audiences``; it is simply absent from here, because there
+    /// is no tile to put it on.
+    public var audiencesOnStage: [(participant: Participant, audience: Audiences.Audience)] {
+        audiences.attributed.compactMap { cohort in
+            guard let via = cohort.via,
+                  let participant = roster.participants.first(where: {
+                      $0.slot.identity.username == via && !$0.slot.isBackstage
+                  })
+            else { return nil }
+            return (participant, cohort)
+        }
+    }
 
     /// Whether to show the recording indicator.
     public var isRecording: Bool { watchdogs.isRecording }
@@ -177,6 +209,14 @@ public enum RoomEvent: Sendable {
 
     case stageChanged(StageState)
     case lifecycleChanged(RoomLifecycle)
+
+    /// Who brought the viewers, in full.
+    ///
+    /// Coarse and periodic rather than live: the authority quantises the counts
+    /// and publishes on a timer, so this arrives every few seconds in a busy room
+    /// and not at all in a quiet one. Treat it as a figure to display, never as a
+    /// tick to animate.
+    case audiencesChanged(Audiences)
 
     /// Who to draw, in what order, and which of them are talking.
     ///

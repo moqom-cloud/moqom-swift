@@ -425,6 +425,15 @@ public struct ControlStatistics: Hashable, Sendable {
     /// knowing before concluding that a missing grant is a bug.
     public var rejected: Int = 0
 
+    /// Entries this build read past because their kind is unknown to it.
+    ///
+    /// The benign half of the same signal ``rejected`` carries: the authority is
+    /// publishing something newer, and this reader is nonetheless current on
+    /// everything it does understand. Worth reporting from a fleet, because it is
+    /// how a rollout that has outrun its clients becomes visible before somebody
+    /// files a bug about a feature that appears not to work.
+    public var unrecognised: Int = 0
+
     /// Whether a snapshot is wanted.
     ///
     /// True from joining until the first one arrives, as well as when a hole
@@ -453,6 +462,7 @@ public struct ControlStatistics: Hashable, Sendable {
         accepted: Int = 0,
         duplicates: Int = 0,
         rejected: Int = 0,
+        unrecognised: Int = 0,
         needsSnapshot: Bool = false,
         isTruncated: Bool = false,
         isAuthority: Bool = false
@@ -462,6 +472,7 @@ public struct ControlStatistics: Hashable, Sendable {
         self.accepted = accepted
         self.duplicates = duplicates
         self.rejected = rejected
+        self.unrecognised = unrecognised
         self.needsSnapshot = needsSnapshot
         self.isTruncated = isTruncated
         self.isAuthority = isAuthority

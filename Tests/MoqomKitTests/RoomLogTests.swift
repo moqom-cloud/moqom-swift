@@ -353,3 +353,192 @@ struct RoomLogWireTests {
         #expect(try JSONDecoder().decode(TrackNamespace.self, from: encoded) == namespace)
     }
 }
+
+@Suite("Room log forward compatibility")
+struct RoomLogCompatibilityTests {
+    /// A change of a kind this build has never heard of, as an older build would
+    /// see one published by a newer authority.
+    private func fromTheFuture(_ sequence: UInt64, kind: String = "somethingNew") throws -> RoomUpdate {
+        let json = """
+        {"sequence":\(sequence),"version":1,"change":{"change":"\(kind)","whatever":{"x":1}}}
+        """
+        return try RoomUpdate.decode(Data(json.utf8))
+    }
+
+    @Test("an unknown change kind advances the log instead of holing it")
+    func unknownKindDoesNotStall() throws {
+        // The failure this prevents: a decode that throws never reaches the log,
+        // so the sequence stops, every later entry is held behind the gap, and
+        // the reader sits in repair fetching a group it still cannot read.
+        var log = RoomLog()
+        _ = log.accept(snapshot(1))
+
+        let applied = log.accept(try fromTheFuture(2))
+        #expect(applied.count == 1)
+        #expect(log.applied == 2)
+        #expect(!log.needsSnapshot)
+        #expect(log.holding == 0)
+
+        // And the reader is still current on what it does understand.
+        #expect(log.accept(change(3, grants(alice, .camera))).count == 1)
+        #expect(log.applied == 3)
+    }
+
+    @Test("skipping is counted apart from refusing, because they mean opposite things")
+    func skippingIsCountedSeparately() throws {
+        var log = RoomLog()
+        _ = log.accept(snapshot(1))
+        _ = log.accept(try fromTheFuture(2))
+
+        #expect(log.unrecognised == 1)
+        // Not a refusal: the entry was read past, and the log is whole.
+        #expect(log.rejected == 0)
+        #expect(!log.hasGapAfterUnknown)
+    }
+
+    @Test("a version this build cannot read is still refused outright")
+    func newerVersionsAreStillRefused() throws {
+        // The other half of the rule. An unknown *kind* is additive and safe to
+        // skip; an unknown *version* means the entries themselves may not mean
+        // what this build thinks, and guessing on an authorisation path is the
+        // thing the version field exists to prevent.
+        var log = RoomLog()
+        _ = log.accept(snapshot(1))
+
+        let ahead = RoomUpdate(
+            sequence: 2,
+            body: .change(.spotlight(alice)),
+            version: RoomUpdate.currentVersion + 1
+        )
+        #expect(log.accept(ahead).isEmpty)
+        #expect(log.rejected == 1)
+        #expect(log.unrecognised == 0)
+        #expect(log.applied == 1)
+    }
+
+    @Test("an unknown kind held behind a gap is counted once, when it applies")
+    func heldUnknownIsCountedOnce() throws {
+        var log = RoomLog()
+        _ = log.accept(snapshot(1))
+
+        #expect(log.accept(try fromTheFuture(3)).isEmpty)
+        #expect(log.unrecognised == 0, "not counted while it is merely held")
+
+        let released = log.accept(change(2, grants(alice, .camera)))
+        #expect(released.count == 2)
+        #expect(log.unrecognised == 1)
+        #expect(log.applied == 3)
+    }
+
+    @Test("folding an unknown kind into a snapshot changes nothing")
+    func unknownFoldsToNothing() throws {
+        var state = RoomSnapshot(participants: [ParticipantControl(identity: alice)])
+        let before = state
+        state.apply(.unrecognised("somethingNew"))
+        #expect(state == before)
+    }
+}
+
+private extension RoomLog {
+    /// Whether an unknown kind left the log wanting a snapshot, which it must not.
+    var hasGapAfterUnknown: Bool { isFounded && needsSnapshot }
+}
+
+@Suite("Audiences")
+struct AudienceTests {
+    private func user(_ name: String) throws -> Username { try Username(name) }
+
+    @Test("a cohort with no cohost is the organic audience, not a missing one")
+    func unattributedIsACohort() throws {
+        let audiences = Audiences(cohorts: [
+            .init(via: try user("bea"), viewers: 1200),
+            .init(via: nil, viewers: 300),
+        ])
+
+        #expect(audiences[try user("bea")] == 1200)
+        #expect(audiences.unattributed == 300)
+        #expect(audiences.total == 1500)
+        // Only the cohorts somebody brought, so a host UI cannot accidentally
+        // draw "nobody" as a cohost tile.
+        #expect(audiences.attributed.count == 1)
+    }
+
+    @Test("a cohost nobody brought viewers for reads as zero, not as absent")
+    func absentCohostIsZero() throws {
+        #expect(Audiences()[try user("bea")] == 0)
+        #expect(Audiences().total == 0)
+        #expect(Audiences().isExact)
+    }
+
+    @Test("cohorts are ordered largest first, so every client draws the same order")
+    func attributedIsOrdered() throws {
+        let audiences = Audiences(cohorts: [
+            .init(via: try user("ana"), viewers: 10),
+            .init(via: nil, viewers: 9000),
+            .init(via: try user("cy"), viewers: 500),
+            .init(via: try user("bea"), viewers: 500),
+        ])
+
+        #expect(audiences.attributed.map(\.viewers) == [500, 500, 10])
+        // Ties broken by name rather than left to dictionary order, or two
+        // clients would disagree about which of two equal cohorts comes first.
+        #expect(audiences.attributed.compactMap(\.via?.value) == ["bea", "cy", "ana"])
+    }
+
+    @Test("a coarsened count says so, so a UI cannot print it as exact")
+    func resolutionIsCarried() throws {
+        let coarse = Audiences.Audience(via: try user("bea"), viewers: 1_204_000, resolution: 1000)
+        #expect(!coarse.isExact)
+        #expect(!Audiences(cohorts: [coarse]).isExact)
+
+        // A resolution below one is meaningless rather than an error to throw:
+        // there is no such thing as finer than exact.
+        #expect(Audiences.Audience(via: nil, viewers: 3, resolution: 0).resolution == 1)
+    }
+
+    @Test("audiences survive the wire, in a snapshot and as a change")
+    func roundTrips() throws {
+        let audiences = Audiences(cohorts: [
+            .init(via: try user("bea"), viewers: 1_204_000, resolution: 1000),
+            .init(via: nil, viewers: 317),
+        ])
+
+        let asChange = try RoomUpdate(sequence: 4, .audiences(audiences)).encoded()
+        #expect(try RoomUpdate.decode(asChange).body == .change(.audiences(audiences)))
+
+        let asSnapshot = try RoomUpdate(sequence: 5, RoomSnapshot(audiences: audiences)).encoded()
+        guard case let .snapshot(state) = try RoomUpdate.decode(asSnapshot).body else {
+            Issue.record("not a snapshot")
+            return
+        }
+        #expect(state.audiences == audiences)
+    }
+
+    @Test("audiences replace wholesale, because a per-cohost delta would drift")
+    func foldsAsAWholeValue() throws {
+        var state = RoomSnapshot(audiences: Audiences(cohorts: [
+            .init(via: try user("ana"), viewers: 10),
+            .init(via: try user("bea"), viewers: 20),
+        ]))
+
+        state.apply(.audiences(Audiences(cohorts: [.init(via: try user("ana"), viewers: 11)])))
+
+        // Bea is gone rather than left at twenty. The authority's account is
+        // complete, so an omission is a statement.
+        #expect(state.audiences[try user("bea")] == 0)
+        #expect(state.audiences[try user("ana")] == 11)
+    }
+
+    @Test("an authority that does not attribute reads as nobody knowing")
+    func emptyIsHonest() throws {
+        let state = try RoomUpdate.decode(
+            try RoomUpdate(sequence: 1, RoomSnapshot()).encoded()
+        )
+        guard case let .snapshot(snapshot) = state.body else {
+            Issue.record("not a snapshot")
+            return
+        }
+        #expect(snapshot.audiences.cohorts.isEmpty)
+        #expect(snapshot.audiences.total == 0)
+    }
+}

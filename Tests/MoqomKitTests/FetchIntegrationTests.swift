@@ -745,6 +745,18 @@ struct CatchUpTests {
         let who = identity("alice")
         #expect(await eventually { await viewerRoom.roster[who] != nil })
 
+        // A roster entry is the announcement; the ladder is the catalog, which
+        // lands later, and layout in between plans against the default one —
+        // deliberately, so a tile can be drawn in the meantime. That default
+        // starts at 180p, so this box would select 180p rather than the bottom
+        // rung of the ladder actually being published, and the fetch below
+        // would never be issued. Waiting on published objects above does not
+        // establish it: those are the publisher's, and say nothing about what
+        // the viewer has read.
+        #expect(
+            await eventually { await viewerRoom.catalog(of: who)?.videoLadder.rungs.count == 2 }
+        )
+
         await viewerRoom.updateLayout(
             [who: RenderBox(width: 320, height: 180, scale: 1)],
             linkBitrate: 5_000_000

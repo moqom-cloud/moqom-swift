@@ -1343,6 +1343,7 @@ public actor RoomSession {
                 accepted: log.accepted,
                 duplicates: log.duplicates,
                 rejected: log.rejected,
+                unrecognised: log.unrecognised,
                 needsSnapshot: log.needsSnapshot,
                 isTruncated: log.isTruncated,
                 isAuthority: authority != nil
@@ -1647,11 +1648,23 @@ public actor RoomSession {
         state.stage = snapshot.stage.applied(to: state.stage)
         mirrorSpotlight()
         state.watchdogs = WatchdogSet(snapshot.watchdogs, limit: state.watchdogs.limit)
+        adopt(audiences: snapshot.audiences)
 
         eventContinuation.yield(.stageChanged(state.stage))
         eventContinuation.yield(.watchdogChanged(state.watchdogs))
         await adopt(lifecycle: snapshot.lifecycle)
         await refreshGallery()
+    }
+
+    /// Take new audience counts, and say so only if they actually moved.
+    ///
+    /// The authority republishes the whole set on every snapshot, so a room that
+    /// nobody is joining or leaving would otherwise emit an event per group
+    /// boundary forever, and every application watching would redraw for it.
+    private func adopt(audiences: Audiences) {
+        guard audiences != state.audiences else { return }
+        state.audiences = audiences
+        eventContinuation.yield(.audiencesChanged(audiences))
     }
 
     private func adopt(_ change: RoomChange) async {
@@ -1708,6 +1721,18 @@ public actor RoomSession {
                 return
             }
             await depart(who, reason: .evicted)
+        case let .audiences(audiences):
+            adopt(audiences: audiences)
+        case let .unrecognised(kind):
+            // Read past, counted, and logged once at debug. A newer authority is
+            // entitled to publish something this build has no opinion about, and
+            // the log's sequence has already advanced past it — so there is
+            // nothing to repair and nothing a person should be warned about.
+            logger.debug(
+                .control,
+                "control entry of an unknown kind",
+                [LogField("kind", .text(kind))]
+            )
         }
     }
 
