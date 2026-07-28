@@ -29,12 +29,74 @@ public actor RoomSession {
     /// This device.
     public nonisolated let identity: ParticipantIdentity
 
-    private let connection: any TransportSession
+    /// Where this room's diagnostics go.
+    ///
+    /// Silent unless the application asked for a sink, because a library has no
+    /// business writing to somebody else's log by default.
+    public nonisolated let logger: MoqomLogger
+
+    private var connection: any TransportSession
     private var state: RoomState
     private var planner = SubscriptionPlanner()
     private var subscriptions: [ParticipantIdentity: any SubscriptionHandle] = [:]
     private var broadcast: Broadcast?
+    private var audio: AudioPublication?
+    private var audioAnnouncement: (any AnnouncementHandle)?
+    private var encryption: RoomEncryption?
+    private var unprotector: MediaUnprotector?
+    private var catalogPublisher: CatalogPublisher?
+    private var catalogRefresh: Task<Void, Never>?
+    private var catalogs: [ParticipantIdentity: CatalogReader] = [:]
+    private var catalogTasks: [ParticipantIdentity: Task<Void, Never>] = [:]
+    private var pumps: [ParticipantIdentity: Task<Void, Never>] = [:]
+    private var media: [ParticipantIdentity: MediaSink] = [:]
+    private var depacketisers: [ParticipantIdentity: VideoDepacketiser] = [:]
+
+    /// Consumers decoding a participant's media for their own purposes.
+    ///
+    /// Keyed by participant and held as arrays because two taps on one person
+    /// is a real case — a safety classifier on keyframes and a transcriber on
+    /// everything are different cadences and should not have to agree.
+    private var videoTaps: [ParticipantIdentity: [ReceiveVideoPipe]] = [:]
+    private var audioTaps: [ParticipantIdentity: [ReceiveAudioPipe]] = [:]
+
+    /// Which rung each participant is currently subscribed at.
+    ///
+    /// Needed because the decoder configuration is per rung: reading the
+    /// catalog is not enough without knowing which of its tracks is the one
+    /// arriving.
+    private var subscribedLayers: [ParticipantIdentity: LayerID] = [:]
+
+    private var audioSubscriptions: [ParticipantIdentity: any SubscriptionHandle] = [:]
+    private var audioPumps: [ParticipantIdentity: Task<Void, Never>] = [:]
+    private var audioSinks: [ParticipantIdentity: AudioSink] = [:]
+    private var receivers: [ParticipantIdentity: AudioReceiver] = [:]
+    private var estimator = BandwidthEstimator()
     private var rosterTask: Task<Void, Never>?
+
+    private var speakers = ActiveSpeakers()
+    private var gallery = Gallery()
+
+    /// Occupancy of the Picture in Picture window, or `nil` when nothing has
+    /// asked for one.
+    ///
+    /// Optional rather than always-on so a room that never enters PiP does not
+    /// rank a second gallery on every speech transition. It is here rather than
+    /// in the AVKit layer because the two inputs it needs — who is in the room
+    /// and who is talking — are both here, and a PiP window that disagreed with
+    /// the grid about who matters would be visible the moment somebody
+    /// backgrounded the app mid-conversation.
+    private var pictureInPicture: PictureInPictureStage?
+    private var pictureInPictureContinuation: AsyncStream<[Gallery.Slot]>.Continuation?
+
+    /// Runs only while somebody is speaking.
+    ///
+    /// Speech has to be able to *end* without a packet arriving, because a
+    /// publisher using DTX stops sending when it stops talking — so the last
+    /// person to speak in a room that has gone quiet would stay lit forever. It
+    /// exits when nobody is speaking rather than ticking for the life of the
+    /// room, because an idle room should cost nothing.
+    private var speechTask: Task<Void, Never>?
 
     private let eventStream: AsyncStream<RoomEvent>
     private let eventContinuation: AsyncStream<RoomEvent>.Continuation
@@ -44,14 +106,20 @@ public actor RoomSession {
         room: RoomID,
         namespace: TrackNamespace,
         identity: ParticipantIdentity,
-        connection: any TransportSession
+        connection: any TransportSession,
+        logger: MoqomLogger = .silent
     ) {
         self.tenant = tenant
         self.room = room
         self.namespace = namespace
         self.identity = identity
         self.connection = connection
+        self.logger = logger
         state = RoomState(tenant: tenant, room: room, namespace: namespace)
+
+        // This device's own camera is a self view drawn from the capture session,
+        // not a subscription to its own upload.
+        gallery.excluded = [identity]
         (eventStream, eventContinuation) = AsyncStream.makeStream(
             of: RoomEvent.self,
             bufferingPolicy: .unbounded
@@ -59,7 +127,189 @@ public actor RoomSession {
     }
 
     /// Everything happening in the room.
+    ///
+    /// > Important: One consumer. Two `for await` loops over this split the
+    /// > events between them rather than each seeing all of them, which is an
+    /// > `AsyncStream` property and not a choice made here — but it is the kind
+    /// > of thing that looks like a dropped-event bug from a long way away, so
+    /// > an application wanting several readers should fan out from one loop of
+    /// > its own.
     public nonisolated var events: AsyncStream<RoomEvent> { eventStream }
+
+    /// Turn on end-to-end encryption for everything this session publishes and
+    /// receives.
+    ///
+    /// Set before going live. Changing it mid-broadcast would mean some objects
+    /// in a group are encrypted and some are not, which no receiver can be
+    /// expected to sort out.
+    public func useEncryption(_ encryption: RoomEncryption) {
+        self.encryption = encryption
+        unprotector = MediaUnprotector(receiver: encryption.receiver)
+    }
+
+    /// Media for a participant: metered, decrypted, and ready to decode.
+    ///
+    /// The SDK consumes the subscription itself rather than handing the raw
+    /// stream over, because it has to see every object to measure the link and
+    /// to decrypt. A design where the application owned the stream would mean
+    /// bandwidth estimation only worked if the application remembered to feed
+    /// it, which is the kind of optional correctness that is never there when
+    /// it matters.
+    public func media(from who: ParticipantIdentity) -> AsyncStream<TrackObject>? {
+        media[who]?.objects
+    }
+
+    /// The same media, reassembled into frames a decoder will accept.
+    ///
+    /// This is what a renderer wants. The SDK owns the reassembly for the same
+    /// reason it owns the metering: dropping objects that precede the first
+    /// keyframe, noticing gaps, and attaching the parameter sets the catalog
+    /// carried are all things every viewer must do identically, and an
+    /// application that got any of them subtly wrong would see it as a codec
+    /// bug rather than as its own.
+    ///
+    /// Independent of ``media(from:)``: both are fed from the same pump, so
+    /// consuming one does not starve the other.
+    public func frames(from who: ParticipantIdentity) -> AsyncStream<DepacketisedFrame>? {
+        media[who]?.frames
+    }
+
+    /// A participant's audio, paced by the jitter buffer.
+    ///
+    /// Subscribed automatically when their catalog says they have an audio
+    /// track, and unsubscribed when this viewer mutes them — which is where the
+    /// bandwidth saving in per-viewer mute actually comes from.
+    ///
+    /// The stream yields one item per packet slot, including the slots where
+    /// nothing arrived: a decoder needs to be told to conceal, and a caller
+    /// that only saw the packets that made it would have no way to know.
+    public func audio(from who: ParticipantIdentity) -> AsyncStream<JitterBufferOutput>? {
+        audioSinks[who]?.stream
+    }
+
+    // MARK: - Raw media
+
+    /// Decoded pictures from a participant, for processing the SDK does not do.
+    ///
+    /// This is the seam for anything that needs to look at what a remote person
+    /// is actually showing: a safety classifier, a gesture recogniser, a
+    /// re-render, a texture in a scene. Everything else on the receive path
+    /// hands out compressed media — ``media(from:)`` and ``frames(from:)`` are
+    /// both bitstream — because rendering goes through a display layer that
+    /// decodes privately and returns nothing.
+    ///
+    /// So this one costs something the others do not. It starts a decompression
+    /// session that would not otherwise exist, and on a phone those are a
+    /// bounded hardware resource. Two consequences follow:
+    ///
+    /// - Call ``MediaTap/stop()`` when the processing stops. The session is
+    ///   released then, or when the participant unsubscribes, or when the room
+    ///   ends — but not merely because nobody is reading.
+    /// - Ask for ``TapPolicy/classification`` rather than the default unless the
+    ///   work genuinely needs every frame. Keyframes decode standalone, so that
+    ///   policy is closer to a still image decode every couple of seconds than
+    ///   to running a decoder.
+    ///
+    /// Frames arrive after decryption, which is the point: an end-to-end
+    /// encrypted room is one a relay cannot classify and a participant can,
+    /// because the participant is who the media was encrypted for. Doing the
+    /// inference here is what makes those two facts compatible.
+    ///
+    /// Attaching before the participant's catalog arrives is fine. The decoder
+    /// is built when the codec is known, and rebuilt if a rung change moves it.
+    ///
+    /// > Important: Nothing stops a tap from sending what it sees somewhere
+    /// > else, and nothing here can tell that apart from on-device work. If
+    /// > media leaves the device, that is a disclosure the integrator owes the
+    /// > room; see ``Watchdog``.
+    public func tapVideo(
+        from who: ParticipantIdentity,
+        policy: TapPolicy = .everyFrame
+    ) -> MediaTap<TappedVideo> {
+        let pipe = ReceiveVideoPipe(policy: policy)
+        videoTaps[who, default: []].append(pipe)
+        logger.debug(
+            .media,
+            "video tap attached",
+            [LogField("participant", .participant(who))]
+        )
+        return pipe.tap
+    }
+
+    /// Decoded samples from a participant, for transcription and the like.
+    ///
+    /// Linear PCM at the format their catalog names, one element per jitter
+    /// buffer slot, in order. Every slot is delivered, including the ones where
+    /// nothing arrived — see ``TappedAudio/origin``, which is the difference
+    /// between a transcriber that knows the line dropped and one that stitches
+    /// a sentence across the hole.
+    ///
+    /// Cheaper than the video tap by a wide margin: audio decoding is software
+    /// either way and a speech track is a few kilobytes a second.
+    ///
+    /// Bounded by subscription, though, and that is worth knowing before
+    /// relying on it. A participant this viewer has muted is not merely silent,
+    /// they are unsubscribed — which is where per-viewer mute gets its bandwidth
+    /// saving — so their tap goes quiet too. A transcript of everyone in the
+    /// room is a job for a participant who is listening to everyone.
+    public func tapAudio(
+        from who: ParticipantIdentity,
+        policy: TapPolicy = .transcription
+    ) -> MediaTap<TappedAudio> {
+        let pipe = ReceiveAudioPipe(policy: policy)
+        audioTaps[who, default: []].append(pipe)
+        logger.debug(
+            .media,
+            "audio tap attached",
+            [LogField("participant", .participant(who))]
+        )
+        return pipe.tap
+    }
+
+    /// Frames this device is about to encode.
+    ///
+    /// `nil` when nothing is being broadcast, because there is nothing to watch
+    /// and returning an empty stream would be indistinguishable from a camera
+    /// that has stopped. See ``Broadcast/tapFrames(policy:)``.
+    public func tapCapturedVideo(policy: TapPolicy = .everyFrame) async -> MediaTap<VideoFrame>? {
+        await broadcast?.tapFrames(policy: policy)
+    }
+
+    /// Samples this device is about to encode, after echo cancellation.
+    ///
+    /// `nil` when this device is not publishing audio. See
+    /// ``AudioPublication/tapSamples(policy:)`` for why these samples are not
+    /// the same thing as opening a second microphone.
+    public func tapCapturedAudio(policy: TapPolicy = .transcription) async -> MediaTap<AudioFrame>? {
+        await audio?.tapSamples(policy: policy)
+    }
+
+    /// What the jitter buffer is doing for one participant.
+    public func audioStatistics(for who: ParticipantIdentity) -> JitterBufferStatistics? {
+        receivers[who]?.buffer.stats
+    }
+
+    /// What reassembly has seen for a participant.
+    public func videoStatistics(for who: ParticipantIdentity) -> VideoReceiveStatistics? {
+        guard let depacketiser = depacketisers[who] else { return nil }
+        return VideoReceiveStatistics(
+            framesProduced: depacketiser.framesProduced,
+            objectsLost: depacketiser.objectsLost,
+            objectsAwaitingKeyFrame: depacketiser.objectsAwaitingKeyFrame
+        )
+    }
+
+    /// How decryption is going. `nil` when the room is not encrypted.
+    public var decryptionStatistics: DecryptionStatistics? {
+        get async {
+            guard let unprotector else { return nil }
+            return DecryptionStatistics(
+                objectsDecrypted: await unprotector.objectsDecrypted,
+                objectsRejected: await unprotector.objectsRejected,
+                objectsAwaitingKey: await unprotector.objectsAwaitingKey
+            )
+        }
+    }
 
     /// A snapshot.
     public var currentState: RoomState { state }
@@ -72,6 +322,7 @@ public actor RoomSession {
 
     /// Start watching the room prefix.
     func begin() async {
+        watchControl()
         guard rosterTask == nil else { return }
         let stream: AsyncStream<AnnouncementEvent>
         do {
@@ -86,11 +337,220 @@ public actor RoomSession {
         }
     }
 
+    /// Move the room onto a new transport session after a reconnect.
+    ///
+    /// A room is not the connection it happens to be running over. The roster,
+    /// the layout, the encryption keys, the camera, and the encoders all survive
+    /// a dropped socket; subscriptions, announcement streams, and every writer do
+    /// not, because each of those was a stream on a connection that no longer
+    /// exists. This replaces precisely the second set.
+    ///
+    /// The roster is torn down and rebuilt from the new session's announcements
+    /// rather than kept. Keeping it looks better — no churn — and is wrong: a
+    /// prefix subscription reports who is publishing *now*, and nobody sends a
+    /// withdrawal for a participant who left while we were not connected. A
+    /// retained roster would keep that participant forever. The rebuild happens
+    /// while the session is still `reconnecting`, so an application showing a
+    /// reconnect treatment never renders the intermediate empty state.
+    func rebind(to session: any TransportSession) async {
+        connection = session
+
+        // Restored once participants re-announce. Captured before the roster is
+        // torn down, because tearing it down is what discards the layout.
+        layoutToRestore = planner.layout
+
+        // Everything on the receive side belonged to the dead session. Routed
+        // through the withdrawal path rather than reimplemented so that the
+        // per-participant teardown has one definition: an application watching
+        // events sees each participant leave, and every pump, sink, and catalog
+        // reader is released by the code that already knows how.
+        for participant in state.roster.participants {
+            await applyAnnouncement(.withdrawn(participant.slot.namespace))
+        }
+        rosterTask?.cancel()
+        rosterTask = nil
+        speechTask?.cancel()
+        speechTask = nil
+
+        // The log position goes with the roster, and for the same reason. It
+        // means "everything up to here is already applied to the state I am
+        // holding", and the line above threw that state away — so keeping the
+        // number would have this client dismiss the snapshot it needs as
+        // something it had already read, and come back to a room where nobody
+        // has any grants. Re-reading the log from the start of the current group
+        // is cheap and correct: that group opens with a complete state, and every
+        // entry after it assigns a value rather than adjusting one.
+        controlTask?.cancel()
+        controlTask = nil
+        controlSubscription = nil
+        controlRepair?.cancel()
+        controlRepair = nil
+        repairedAt = nil
+        log = RoomLog(policy: log.policy)
+        waiting.removeAll()
+
+        for task in replayTasks.values { task.cancel() }
+        replayTasks.removeAll()
+        replayDepacketisers.removeAll()
+
+        // Anything the withdrawals did not reach, because it was never keyed by
+        // a participant.
+        subscriptions.removeAll()
+        audioSubscriptions.removeAll()
+        for pump in audioPumps.values { pump.cancel() }
+        audioPumps.removeAll()
+
+        await rebindPublications(to: session)
+        await begin()
+    }
+
+    /// Re-announce and re-open every writer this room was publishing through.
+    private func rebindPublications(to session: any TransportSession) async {
+        if let broadcast {
+            let publishNamespace = broadcast.namespace
+            let configuration = broadcast.configuration
+
+            if let announcement = try? await session.announce(publishNamespace) {
+                var writers: [LayerID: any TrackWriter] = [:]
+                for (index, rung) in configuration.ladder.rungs.enumerated() {
+                    guard
+                        let name = try? TrackName(rung.id.value),
+                        let track = try? FullTrackName(
+                            namespace: publishNamespace, name: name
+                        )
+                    else { continue }
+                    let priority = UInt8(
+                        min(255, Int(configuration.basePriority) + index * 8)
+                    )
+                    guard
+                        let writer = try? await protectedWriter(for: track, priority: priority)
+                    else { continue }
+                    writers[rung.id] = writer
+                }
+                await broadcast.rebind(writers: writers, announcement: announcement)
+            }
+
+            // Dropped rather than finished: its writer is on the dead session, so
+            // there is nothing to flush and nowhere to flush it. A fresh one
+            // republishes the current catalog, which a viewer needs before it can
+            // build a decoder for the media about to arrive.
+            catalogPublisher = nil
+            try? await publishCatalog(under: publishNamespace)
+        }
+
+        if let authority {
+            // Reopened rather than kept, since its writer was a stream on the
+            // dead session — but carrying the sequence and group it had reached.
+            // Restarting either would make every reader dismiss what follows as
+            // something it had already applied.
+            self.authority = try? await RoomLogPublisher.opening(
+                room: room,
+                tenant: tenant,
+                on: session,
+                state: await authority.state,
+                cadence: await authority.cadence,
+                sequence: await authority.sequence,
+                group: await authority.group
+            )
+        }
+
+        if let audio {
+            let publishNamespace = audio.track.namespace
+            if let announcement = try? await session.announce(publishNamespace) {
+                audioAnnouncement = announcement
+            }
+            if let writer = try? await protectedWriter(
+                for: audio.track,
+                priority: audio.configuration.priority
+            ) {
+                await audio.rebind(writer: writer)
+            }
+            if broadcast == nil {
+                catalogPublisher = nil
+                try? await publishCatalog(under: publishNamespace)
+            }
+        }
+    }
+
+    /// The layout to put back as participants return after a reconnect.
+    ///
+    /// Held because the alternative is worse than it sounds: the roster is
+    /// rebuilt from announcements, which drops the planner's boxes with it, and
+    /// an application that does not happen to run a layout pass after
+    /// reconnecting would come back to a room with audio and no video. Cleared by
+    /// the next ``updateLayout(_:linkBitrate:)``, so an application that *does*
+    /// lay out again wins.
+    private var layoutToRestore: [ParticipantIdentity: RenderBox] = [:]
+    private var layoutRestore: Task<Void, Never>?
+
+    private func scheduleLayoutRestore() {
+        layoutRestore?.cancel()
+        layoutRestore = Task { [weak self] in
+            await self?.restoreLayout()
+        }
+    }
+
+    private func restoreLayout() async {
+        let boxes = layoutToRestore.filter { state.roster[$0.key] != nil }
+        guard !boxes.isEmpty else { return }
+        await applyLayout(boxes, linkBitrate: nil)
+    }
+
     func end() async {
         rosterTask?.cancel()
         rosterTask = nil
+        speechTask?.cancel()
+        speechTask = nil
+        controlTask?.cancel()
+        controlTask = nil
+        controlSubscription = nil
+        controlRepair?.cancel()
+        controlRepair = nil
+        await authority?.finish()
+        authority = nil
+        waiting.removeAll()
+        layoutRestore?.cancel()
+        layoutRestore = nil
+        layoutToRestore.removeAll()
         await broadcast?.stop()
         broadcast = nil
+        await audio?.stop()
+        audio = nil
+        await audioAnnouncement?.withdraw()
+        audioAnnouncement = nil
+        catalogRefresh?.cancel()
+        catalogRefresh = nil
+        await catalogPublisher?.finish()
+        catalogPublisher = nil
+        catalogs.removeAll()
+        for task in catalogTasks.values { task.cancel() }
+        catalogTasks.removeAll()
+        for pump in pumps.values { pump.cancel() }
+        pumps.removeAll()
+        for task in catchUps.values { task.cancel() }
+        catchUps.removeAll()
+        for task in replayTasks.values { task.cancel() }
+        replayTasks.removeAll()
+        replayDepacketisers.removeAll()
+        for sink in media.values { sink.finish() }
+        media.removeAll()
+        depacketisers.removeAll()
+        for pipes in videoTaps.values {
+            for pipe in pipes { await pipe.close() }
+        }
+        videoTaps.removeAll()
+        for pipes in audioTaps.values {
+            for pipe in pipes { pipe.tap.stop() }
+        }
+        audioTaps.removeAll()
+        subscribedLayers.removeAll()
+        for pump in audioPumps.values { pump.cancel() }
+        audioPumps.removeAll()
+        for subscription in audioSubscriptions.values { await subscription.cancel() }
+        audioSubscriptions.removeAll()
+        for sink in audioSinks.values { sink.continuation.finish() }
+        audioSinks.removeAll()
+        receivers.removeAll()
         for subscription in subscriptions.values {
             await subscription.cancel()
         }
@@ -129,6 +589,7 @@ public actor RoomSession {
         let announcement = try await connection.announce(publishNamespace)
 
         var writers: [LayerID: any TrackWriter] = [:]
+        var encoders: [LayerID: any FrameEncoder] = [:]
         for (index, rung) in configuration.ladder.rungs.enumerated() {
             let track: FullTrackName
             do {
@@ -140,7 +601,17 @@ public actor RoomSession {
                 throw MoqomError.invalidName(error)
             }
             let priority = UInt8(min(255, Int(configuration.basePriority) + index * 8))
-            writers[rung.id] = try await connection.publish(track, priority: priority)
+            writers[rung.id] = try await protectedWriter(for: track, priority: priority)
+            do {
+                encoders[rung.id] = try await configuration.encoderFactory(
+                    EncoderConfiguration(layer: rung, codec: configuration.codec)
+                )
+            } catch let error as MoqomError {
+                throw error
+            } catch {
+                // A factory an integrator supplied can throw anything.
+                throw MoqomError.unsupportedCodec(configuration.codec)
+            }
         }
 
         let live = Broadcast(
@@ -148,16 +619,165 @@ public actor RoomSession {
             configuration: configuration,
             source: source,
             announcement: announcement,
-            writers: writers
+            writers: writers,
+            encoders: encoders
         )
         broadcast = live
+
+        // Published before the first frame. A viewer that receives media for a
+        // track the catalog does not mention cannot build a decoder for it, and
+        // the failure looks like a codec problem rather than an ordering one.
+        try await publishCatalog(under: publishNamespace)
+
         await live.start()
+
+        // Republished once the encoders have produced parameter sets, which
+        // cannot happen until something has been encoded.
+        catalogRefresh?.cancel()
+        catalogRefresh = Task { [weak self] in
+            // Bounded rather than open-ended. If a rung has produced nothing
+            // after five seconds it is not going to, and a viewer is better
+            // served by a catalog missing one configuration than by a publisher
+            // that never stops polling its own encoders.
+            for _ in 0 ..< 20 {
+                try? await Task.sleep(for: .milliseconds(250))
+                if Task.isCancelled { return }
+                guard let self, await self.refreshCatalog() else { continue }
+                return
+            }
+        }
+
         return live
     }
 
+    /// The catalog this session is publishing.
+    public var publishedCatalog: Catalog? {
+        get async { await catalogPublisher?.published }
+    }
+
+    /// Bring the catalog up to date with what the encoders now know.
+    ///
+    /// - Returns: Whether the catalog is now complete, meaning every video rung
+    ///   has a decoder configuration.
+    @discardableResult
+    private func refreshCatalog() async -> Bool {
+        guard let publisher = catalogPublisher else { return true }
+
+        // An audio-only publisher has no broadcast and still needs a catalog,
+        // because the catalog is how a viewer finds out they have an audio track
+        // at all. Describing an empty ladder is the honest answer: they are
+        // publishing, and none of it is video.
+        let configurations = await broadcast?.decoderConfigurations ?? [:]
+        let configuration = broadcast?.configuration
+            ?? BroadcastConfiguration(ladder: LayerLadder(rungs: []))
+        let catalog = Catalog.describing(
+            configuration,
+            decoderConfigurations: configurations,
+            audio: audio?.configuration,
+            keyID: encryption?.sender.key.keyID
+        )
+        _ = try? await publisher.publish(catalog)
+        return configurations.count >= configuration.ladder.rungs.count
+    }
+
+    private func publishCatalog(under namespace: TrackNamespace) async throws(MoqomError) {
+        guard catalogPublisher == nil else {
+            await refreshCatalog()
+            return
+        }
+        let name: FullTrackName
+        do {
+            name = try FullTrackName(namespace: namespace, name: TrackName(Catalog.trackName))
+        } catch {
+            throw MoqomError.invalidName(error)
+        }
+
+        // Never encrypted. It is the description a receiver needs in order to
+        // decrypt anything else, and it says nothing that the announcement it
+        // travels beside does not already reveal.
+        let writer = try await connection.publish(name, priority: CatalogPublisher.priority)
+        let publisher = CatalogPublisher(writer: writer)
+        catalogPublisher = publisher
+        await refreshCatalog()
+    }
+
     public func stopBroadcast() async {
+        catalogRefresh?.cancel()
+        catalogRefresh = nil
         await broadcast?.stop()
         broadcast = nil
+        await catalogPublisher?.finish()
+        catalogPublisher = nil
+    }
+
+    /// Start publishing audio.
+    ///
+    /// Separate from ``startBroadcast(from:configuration:backstage:)`` because
+    /// the two are separate permissions and separate acts. Someone who joins to
+    /// talk should not have to start a camera, and a stream that keeps talking
+    /// after the video stops is normal rather than exceptional.
+    @discardableResult
+    public func startAudio(
+        from source: any AudioSource,
+        configuration: AudioPublicationConfiguration = AudioPublicationConfiguration(),
+        backstage: Bool = false
+    ) async throws(MoqomError) -> AudioPublication {
+        if let audio { return audio }
+
+        let publishNamespace: TrackNamespace
+        let name: FullTrackName
+        do {
+            publishNamespace = backstage
+                ? try MoqomNamespaces.backstageParticipant(
+                    tenant: tenant, room: room, identity: identity
+                )
+                : try MoqomNamespaces.participant(
+                    tenant: tenant, room: room, identity: identity
+                )
+            name = try FullTrackName(namespace: publishNamespace, name: TrackName("audio"))
+        } catch {
+            throw MoqomError.invalidName(error)
+        }
+
+        // Announced even when video already did: the announcement is per
+        // namespace and withdrawing it is refcounted by the transport, so an
+        // audio-only participant appears in the roster the same way.
+        let announcement = try await connection.announce(publishNamespace)
+        audioAnnouncement = announcement
+
+        let writer = try await protectedWriter(for: name, priority: configuration.priority)
+
+        let encoder: any AudioEncoder
+        do {
+            encoder = try await configuration.encoderFactory(configuration.encoder)
+        } catch let error as MoqomError {
+            throw error
+        } catch {
+            throw MoqomError.unsupportedAudioCodec(configuration.encoder.codec)
+        }
+
+        let publication = AudioPublication(
+            track: name,
+            configuration: configuration,
+            source: source,
+            encoder: encoder,
+            writer: writer
+        )
+        audio = publication
+        await publication.start()
+
+        // The catalog, not just a refresh of one. An audio-only participant has
+        // never started a broadcast, so nothing has created a publisher yet and
+        // a refresh would have nowhere to go.
+        try await publishCatalog(under: publishNamespace)
+        return publication
+    }
+
+    public func stopAudio() async {
+        await audio?.stop()
+        audio = nil
+        await audioAnnouncement?.withdraw()
+        audioAnnouncement = nil
     }
 
     func startNewGroup() async {
@@ -172,13 +792,44 @@ public actor RoomSession {
     /// planner returns an empty diff — so it does not need debouncing at the
     /// call site, and driving it from every layout is how a resize gets picked
     /// up promptly.
+    /// - Parameter linkBitrate: What the link can carry. Defaults to the SDK's
+    ///   own measurement, which is what an application should use — passing a
+    ///   number here overrides a live estimate with a guess, and is for tests
+    ///   and for integrators who genuinely know something we do not.
     @discardableResult
     public func updateLayout(
         _ boxes: [ParticipantIdentity: RenderBox],
-        linkBitrate: Int = .max
+        linkBitrate: Int? = nil
     ) async -> [SubscriptionChange] {
-        let changes = planner.plan(boxes: boxes, linkBitrate: linkBitrate)
+        // The application has stated a layout, which supersedes anything a
+        // reconnect was still trying to put back.
+        layoutToRestore.removeAll()
+        return await applyLayout(boxes, linkBitrate: linkBitrate)
+    }
+
+    @discardableResult
+    private func applyLayout(
+        _ boxes: [ParticipantIdentity: RenderBox],
+        linkBitrate: Int?
+    ) async -> [SubscriptionChange] {
+        let budget = linkBitrate ?? estimator.estimate
+
+        // Never this device. A tile showing yourself is a self view drawn from
+        // the capture session, and an application that reports a box for it —
+        // which is the natural thing to do, since it is a tile like any other —
+        // would otherwise pay to download its own upload, complete with the round
+        // trip and the compression artefacts. The audio path has always guarded
+        // this; the video path did not, and the symptom is a bandwidth bill
+        // rather than anything visible on screen.
+        let remote = boxes.filter { $0.key != identity }
+        let changes = planner.plan(boxes: remote, order: gallery.order, linkBitrate: budget)
         for change in changes {
+            // At `debug` rather than `info`: a room where the layout is animating
+            // produces one of these per participant per frame of the animation,
+            // and drowning a field report is as bad as having no log at all.
+            logger.debug(.subscribe, "subscription change", change.fields + [
+                LogField("budget_bps", .number(budget)),
+            ])
             await apply(change)
         }
         return changes
@@ -193,22 +844,185 @@ public actor RoomSession {
         planner.prewarm(target, for: box)
     }
 
+    // MARK: - Gallery
+
+    /// Who to draw, in what order, bounded by how many tiles the layout has.
+    ///
+    /// Kept here rather than left to the application because the two things it
+    /// needs are both here: who is speaking, which only the audio path knows, and
+    /// the subscription ranking, which has to agree with the layout or the relay
+    /// sheds the wrong tile.
+    public var galleryLayout: [Gallery.Slot] { gallery.slots }
+
+    /// Everyone in the room without a tile, strongest claim first. They keep
+    /// their audio.
+    public var galleryOverflow: [ParticipantIdentity] { gallery.overflow }
+
+    public var galleryPolicy: Gallery.Policy { gallery.policy }
+
+    /// Set the tile count and the shape of the layout.
+    ///
+    /// Lower it under thermal pressure. Sixteen tiles is reachable because
+    /// sixteen tiles are small enough for the bottom rung of the ladder, not
+    /// because a phone can decode sixteen streams of anything larger.
+    public func setGalleryPolicy(_ policy: Gallery.Policy) async {
+        gallery.policy = policy
+        await refreshGallery()
+    }
+
+    /// Guarantee a participant a tile, for this viewer only.
+    public func pin(_ target: ParticipantIdentity) async {
+        gallery.pin(target)
+        await refreshGallery()
+    }
+
+    public func unpin(_ target: ParticipantIdentity) async {
+        gallery.unpin(target)
+        await refreshGallery()
+    }
+
+    /// Whether this participant is talking right now.
+    ///
+    /// Worked out on this device from the voice-activity flag their packets
+    /// carry, which is why it still works when the media is end-to-end encrypted
+    /// and the relay cannot see any of it.
+    public func isSpeaking(_ target: ParticipantIdentity) -> Bool {
+        speakers.isSpeaking(target)
+    }
+
+    // MARK: - Picture in Picture
+
+    /// Who the Picture in Picture window draws.
+    ///
+    /// Setting this starts maintaining the window's occupancy; it does not
+    /// start the window, which is ``MoqomPictureInPicture``'s job and needs a
+    /// view hierarchy this actor does not have.
+    public func setPictureInPictureCast(_ cast: PictureInPictureCast) async {
+        if pictureInPicture == nil {
+            pictureInPicture = PictureInPictureStage(cast: cast, viewer: identity)
+        } else {
+            pictureInPicture?.cast = cast
+        }
+        await refreshPictureInPicture()
+    }
+
+    /// Stop maintaining the window's occupancy.
+    public func clearPictureInPictureCast() {
+        pictureInPicture = nil
+        pictureInPictureContinuation?.finish()
+        pictureInPictureContinuation = nil
+    }
+
+    /// The window's occupancy, as it changes.
+    ///
+    /// A stream of its own rather than a case on ``events`` for the controller
+    /// to watch, because an `AsyncStream` has one consumer: a controller
+    /// reading ``events`` would take events the application never sees, and the
+    /// symptom — a roster that updates only half the time — points nowhere near
+    /// Picture in Picture. Applications that want to draw their own thing still
+    /// get ``RoomEvent/pictureInPictureChanged(_:)`` on ``events``.
+    ///
+    /// Calling this a second time replaces the first stream. There is one
+    /// window.
+    public func pictureInPictureUpdates() -> AsyncStream<[Gallery.Slot]> {
+        pictureInPictureContinuation?.finish()
+        let (stream, continuation) = AsyncStream.makeStream(
+            of: [Gallery.Slot].self,
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        pictureInPictureContinuation = continuation
+        continuation.yield(pictureInPicture?.slots ?? [])
+        return stream
+    }
+
+    public var pictureInPictureCast: PictureInPictureCast? { pictureInPicture?.cast }
+
+    /// Who the window is drawing, in order.
+    public var pictureInPictureSlots: [Gallery.Slot] { pictureInPicture?.slots ?? [] }
+
+    private func refreshPictureInPicture(at now: MonotonicTime? = nil) async {
+        guard pictureInPicture != nil else { return }
+        let instant = now ?? .nanoseconds(DispatchTime.now().uptimeNanoseconds)
+        guard pictureInPicture?.update(state, speakers: speakers, at: instant) == true else {
+            return
+        }
+        let slots = pictureInPicture?.slots ?? []
+        pictureInPictureContinuation?.yield(slots)
+        eventContinuation.yield(.pictureInPictureChanged(slots))
+    }
+
+    /// Recompute the gallery, and re-rank subscriptions if it moved.
+    private func refreshGallery(at now: MonotonicTime? = nil) async {
+        let instant = now ?? .nanoseconds(DispatchTime.now().uptimeNanoseconds)
+
+        // Unconditionally, and before the early return below. The window's
+        // occupancy can move when the grid's does not — a speaker-following
+        // cast changes on speech that leaves a nine-up grid untouched — so
+        // making it a consequence of the grid changing would leave the window
+        // showing whoever was talking a minute ago.
+        await refreshPictureInPicture(at: instant)
+
+        guard gallery.update(state.roster, speakers: speakers, at: instant) else { return }
+
+        eventContinuation.yield(.galleryChanged(gallery.slots))
+
+        // Against the layout the application last stated, because the tiles are
+        // still the size they were: what changed is which participant is in which
+        // one, and therefore which subscription the relay should shed last.
+        await applyLayout(planner.layout, linkBitrate: nil)
+    }
+
+    private func scheduleSpeechExpiry() {
+        guard speechTask == nil, !speakers.speaking.isEmpty else { return }
+        speechTask = Task { [weak self] in
+            while true {
+                try? await Task.sleep(for: .milliseconds(150))
+                guard let self, !Task.isCancelled else { return }
+                guard await self.expireSpeech() else { return }
+            }
+        }
+    }
+
+    /// - Returns: Whether anybody is still speaking, and so whether to tick again.
+    private func expireSpeech() async -> Bool {
+        let now = MonotonicTime.nanoseconds(DispatchTime.now().uptimeNanoseconds)
+        if !speakers.refresh(at: now).isEmpty {
+            await refreshGallery(at: now)
+        }
+        guard !speakers.speaking.isEmpty else {
+            speechTask = nil
+            return false
+        }
+        return true
+    }
+
     /// Silence one participant for this viewer alone.
     ///
     /// Deliberately not `async throws` against the network: this is an
     /// unsubscribe and a local state change. Nobody else is affected and the
     /// server need not know.
-    public func localMute(_ target: ParticipantIdentity, _ kinds: MediaKind) {
+    public func localMute(_ target: ParticipantIdentity, _ kinds: MediaKind) async {
         guard var participant = state.roster[target] else { return }
         participant.mute.localToMe.formUnion(kinds)
         state.roster[target] = participant
+
+        // The unsubscribe that makes this a bandwidth saving rather than a
+        // client-side discard. It is the one thing here that touches the
+        // transport, and it asks nobody's permission.
+        if kinds.contains(.audio) {
+            await stopAudioSubscription(for: target)
+        }
         eventContinuation.yield(.muteChanged(target, participant.mute))
     }
 
-    public func localUnmute(_ target: ParticipantIdentity, _ kinds: MediaKind) {
+    public func localUnmute(_ target: ParticipantIdentity, _ kinds: MediaKind) async {
         guard var participant = state.roster[target] else { return }
         participant.mute.localToMe.subtract(kinds)
         state.roster[target] = participant
+
+        if kinds.contains(.audio), let catalog = await catalogs[target]?.current {
+            await followAudio(of: target, in: catalog)
+        }
         eventContinuation.yield(.muteChanged(target, participant.mute))
     }
 
@@ -228,7 +1042,43 @@ public actor RoomSession {
         if case let .failure(error) = authorize(action, by: actor, against: target) {
             throw error
         }
-        apply(action)
+        await apply(action)
+
+        // Published after the local effect and read back from state, so what the
+        // room is told is the value this client actually holds rather than a
+        // second derivation of it that could disagree.
+        if let change = published(action) { await announce(change) }
+    }
+
+    /// What a moderation action becomes on the control log, once applied.
+    ///
+    /// `nil` for the bans, which are control-plane records rather than room
+    /// state: what the room sees is the eviction that follows, and predicting it
+    /// here would show somebody as gone on a ban the control plane went on to
+    /// refuse.
+    private func published(_ action: ModerationAction) -> RoomChange? {
+        switch action {
+        case let .kick(who):
+            .evicted(who)
+        case let .forceMute(who, _, _), let .unmute(who, _):
+            state.roster[who].map {
+                .mute(
+                    who,
+                    forEveryone: $0.mute.forcedForEveryone,
+                    forAudience: $0.mute.forcedForAudience
+                )
+            }
+        case let .demote(who, _):
+            state.roster[who].map { .grants(who, $0.grants) }
+        case .spotlight:
+            .spotlight(state.stage.spotlighted)
+        case .lockStage:
+            .stage(StageSnapshot(state.stage))
+        case let .closeRoom(event):
+            .lifecycle(.ended(event))
+        case .banFromRoom, .banFromTenant, .banDevice:
+            nil
+        }
     }
 
     /// Attach, detach, start, or stop a watchdog.
@@ -263,19 +1113,560 @@ public actor RoomSession {
             state.watchdogs.setHealth(.failed, for: id)
         }
         eventContinuation.yield(.watchdogChanged(state.watchdogs))
+        await announce(.watchdogs(state.watchdogs.all))
+    }
+
+    // MARK: - Measurement
+
+    /// When this room was joined, for uptime.
+    private let joinedAt = MonotonicTime.nanoseconds(DispatchTime.now().uptimeNanoseconds)
+
+    /// The last quality reported for this device and for each participant.
+    ///
+    /// Held so that a change can be an event. Without it the only way an
+    /// application learns a cohost's connection has degraded is by polling, and
+    /// the indicator it draws would update at whatever rate it happened to
+    /// choose rather than when the thing changed.
+    private var reportedQuality: [ParticipantIdentity: ConnectionQuality] = [:]
+
+    /// Everything measurable about the room, right now.
+    ///
+    /// One snapshot rather than a dozen accessors, taken at one instant. The
+    /// instant matters: comparing an encoder's output rate against a link
+    /// estimate is only meaningful if both were read together, and that
+    /// comparison is most of what diagnosis consists of.
+    public var statistics: RoomStatistics {
+        get async { await sample() }
+    }
+
+    /// The same snapshot, repeatedly.
+    ///
+    /// For a diagnostics overlay, a periodic upload, or a support-ticket capture.
+    /// Emitting quality changes as ``RoomEvent/qualityChanged(_:_:)`` is a side
+    /// effect of sampling, so an application that consumes this stream also gets
+    /// the events, and one that wants only the events can consume this and
+    /// discard it.
+    ///
+    /// The stream ends when the room does. `interval` is clamped to something a
+    /// device can sustain: this walks the roster and hops to three actors per
+    /// sample, so a caller asking for a millisecond would be asking for the
+    /// measurement to become the load.
+    public func statistics(every interval: Duration) -> AsyncStream<RoomStatistics> {
+        let period = max(interval, .milliseconds(100))
+        return AsyncStream { continuation in
+            let task = Task { [weak self] in
+                while !Task.isCancelled {
+                    guard let self else { break }
+                    let snapshot = await self.sample()
+                    continuation.yield(snapshot)
+                    if snapshot.lifecycle.isEnded { break }
+                    try? await Task.sleep(for: period)
+                }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    /// Gather one snapshot, and emit any quality change it reveals.
+    private func sample() async -> RoomStatistics {
+        let link = linkStatistics
+        let publishing = PublishingStatistics(
+            video: await broadcast?.stats,
+            audio: await audio?.stats
+        )
+
+        var participants: [ParticipantIdentity: ParticipantStatistics] = [:]
+        for participant in state.roster.participants where participant.id != identity {
+            let who = participant.id
+            let video = videoStatistics(for: who)
+            let audio = receivers[who]?.buffer.stats
+            var stats = ParticipantStatistics(
+                identity: who,
+                presence: participant.presence,
+                isSpeaking: speakers.isSpeaking(who),
+                layer: subscribedLayers[who],
+                video: video,
+                audio: audio
+            )
+            stats.quality = quality(for: stats, link: link)
+            participants[who] = stats
+        }
+
+        // The local figure folds in encode drops, because a broadcaster whose
+        // uplink is failing sees nothing wrong in any participant tile — every
+        // one of those describes an inbound stream.
+        let local = localQuality(link: link, publishing: publishing)
+
+        let snapshot = RoomStatistics(
+            capturedAt: now(),
+            room: room,
+            identity: identity,
+            uptime: now() - joinedAt,
+            lifecycle: state.lifecycle,
+            participantCount: state.participantCount,
+            link: link,
+            publishing: publishing,
+            participants: participants,
+            decryption: await decryptionStatistics,
+            control: ControlStatistics(
+                sequence: log.applied,
+                isFounded: log.isFounded,
+                accepted: log.accepted,
+                duplicates: log.duplicates,
+                rejected: log.rejected,
+                needsSnapshot: log.needsSnapshot,
+                isTruncated: log.isTruncated,
+                isAuthority: authority != nil
+            ),
+            quality: local
+        )
+
+        report(local, for: identity)
+        for (who, stats) in participants {
+            report(stats.quality, for: who)
+        }
+        return snapshot
+    }
+
+    /// How one participant's inbound stream is arriving.
+    ///
+    /// Their own audio loss is preferred over the room-wide link figure when
+    /// there is any, because the link figure is an aggregate across every
+    /// subscription: one cohost on a failing connection would otherwise drag
+    /// every tile's indicator down with them, which points the viewer at their
+    /// own network instead of at the person actually in trouble.
+    private func quality(
+        for stats: ParticipantStatistics,
+        link: LinkStatistics
+    ) -> ConnectionQuality {
+        // Somebody who is not connected has no measurable stream, and reporting
+        // `bad` for them would conflate "gone" with "struggling".
+        guard stats.presence == .connected else { return .unknown }
+        if let audio = stats.audio, audio.packetsReceived > 0 {
+            return .from(link: link, loss: stats.audioLossRatio)
+        }
+        if let video = stats.video, video.framesProduced > 0 {
+            let expected = video.framesProduced + video.objectsLost
+            let loss = expected > 0 ? Double(video.objectsLost) / Double(expected) : 0
+            return .from(link: link, loss: loss)
+        }
+        return .unknown
+    }
+
+    /// How this device's own connection looks.
+    private func localQuality(
+        link: LinkStatistics,
+        publishing: PublishingStatistics
+    ) -> ConnectionQuality {
+        let downlink = ConnectionQuality.from(link: link)
+        guard publishing.isPublishing else { return downlink }
+
+        // Encode drops measured against the same thresholds as network loss: a
+        // frame the device threw away and a frame the network lost look
+        // identical to whoever was meant to see it.
+        let uplink = ConnectionQuality.from(link: link, loss: publishing.encodeDropRatio)
+        guard downlink != .unknown else { return uplink }
+        guard uplink != .unknown else { return downlink }
+        return min(downlink, uplink)
+    }
+
+    /// Emit a quality change, once, when it actually changes.
+    private func report(_ quality: ConnectionQuality, for who: ParticipantIdentity) {
+        guard reportedQuality[who] != quality else { return }
+        reportedQuality[who] = quality
+        logger.debug(
+            .statistics,
+            "connection quality changed",
+            [
+                LogField("participant", .participant(who)),
+                LogField("quality", .text(quality.label)),
+            ]
+        )
+        eventContinuation.yield(.qualityChanged(who, quality))
+    }
+
+    /// The monotonic clock, in one place.
+    private nonisolated func now() -> MonotonicTime {
+        .nanoseconds(DispatchTime.now().uptimeNanoseconds)
+    }
+
+    // MARK: - The control log
+
+    /// What the room's authority has told this client, in order.
+    private var log = RoomLog()
+
+    private var controlTask: Task<Void, Never>?
+    private var controlSubscription: (any SubscriptionHandle)?
+    private var controlRepair: Task<Void, Never>?
+
+    /// The log position the last repair was attempted from.
+    ///
+    /// Without this a client behind a relay that cannot answer fetches issues one
+    /// per arriving object forever, since the gap it is trying to close stays
+    /// open. Retrying only once the log has moved bounds it to one attempt per
+    /// gap.
+    private var repairedAt: UInt64?
+
+    /// Authority held over this room's log, when this session is the authority.
+    private var authority: RoomLogPublisher?
+
+    /// Control state for people whose announcement has not arrived, or who will
+    /// never send one.
+    ///
+    /// A promotion is what *causes* somebody to start publishing, so grants
+    /// routinely precede the announcement they apply to; and a moderator who
+    /// publishes nothing never announces at all. Dropping what arrives early
+    /// would mean a cohost whose permissions land a frame before they do appears
+    /// as a viewer until the next snapshot.
+    private var waiting: [ParticipantIdentity: ParticipantControl] = [:]
+
+    /// Where this client is in the room's log. `0` when it has read none of it.
+    ///
+    /// Reset by a reconnect, along with the roster and everything else derived
+    /// from a connection that no longer exists. The authority's numbering is not
+    /// reset, so this climbing past where it was is the sign that a returning
+    /// client has caught up rather than merely resubscribed.
+    public var logPosition: UInt64 { log.applied }
+
+    /// The authority this session holds over the room's log, if it has taken it.
+    ///
+    /// Worth reading rather than holding what ``assumeAuthority(cadence:)``
+    /// returned: a reconnect replaces the publisher, because its writer was a
+    /// stream on a connection that is gone.
+    public var roomAuthority: RoomLogPublisher? { authority }
+
+    /// Whether the log has a hole in it that this client cannot close alone.
+    public var isAwaitingSnapshot: Bool { log.needsSnapshot }
+
+    /// Subscribe to the room's control track and follow it.
+    ///
+    /// At `.latestGroup`, which is what makes this work: every group on that
+    /// track opens with a complete state, so subscribing delivers the room as it
+    /// is now rather than the next thing to change about it. A client that
+    /// waited for the next change would render an empty room until somebody was
+    /// promoted.
+    private func watchControl() {
+        guard controlTask == nil else { return }
+        guard
+            let name = try? TrackName(RoomUpdate.trackName),
+            let track = try? FullTrackName(namespace: namespace, name: name)
+        else { return }
+
+        controlTask = Task { [weak self] in
+            guard let self else { return }
+            guard
+                let subscription = try? await self.connection.subscribe(
+                    SubscribeRequest(
+                        track: track,
+                        priority: RoomLogPublisher.priority,
+                        start: .latestGroup
+                    )
+                )
+            else { return }
+            await self.holdControl(subscription)
+            for await object in subscription.objects {
+                await self.receiveControl(object)
+            }
+        }
+    }
+
+    private func holdControl(_ subscription: any SubscriptionHandle) {
+        controlSubscription = subscription
+    }
+
+    private func receiveControl(_ object: TrackObject) async {
+        guard let update = try? RoomUpdate.decode(object.payload) else {
+            logger.warning(
+                .control,
+                "undecodable control entry",
+                [LogField("payload", .redacted(bytes: object.payload.count))]
+            )
+            return
+        }
+        for body in log.accept(update) {
+            await apply(body)
+        }
+        if log.needsSnapshot {
+            // A reader that has never seen a snapshot also wants one, and that is
+            // not a fault — it is the first moment of every room. Only a hole in
+            // a log that had been whole is worth a warning, and that one is worth
+            // it: until it heals, this client's idea of who may do what is stale,
+            // which presents as a permissions bug rather than a network one.
+            let fields = [
+                LogField("applied", .number(Int(log.applied))),
+                LogField("received", .number(Int(update.sequence))),
+                LogField("holding", .number(log.holding)),
+            ]
+            if log.isFounded {
+                logger.warning(.control, "control gap", fields)
+            } else {
+                logger.debug(.control, "awaiting first snapshot", fields)
+            }
+            repairControl()
+        }
+    }
+
+    /// Fetch the group the control track is in the middle of.
+    ///
+    /// The whole repair, and it needs no mechanism of its own: that group opens
+    /// with a snapshot, so one fetch returns a complete state plus everything
+    /// published since. The objects it also re-delivers are ones this client has
+    /// already applied, and the sequence numbers make re-reading them free.
+    private func repairControl() {
+        guard controlRepair == nil, repairedAt != log.applied else { return }
+        guard let subscription = controlSubscription else { return }
+        repairedAt = log.applied
+        controlRepair = Task { [weak self] in
+            guard let self else { return }
+            defer { Task { await self.finishRepair() } }
+            guard
+                let fetch = try? await self.connection.fetch(
+                    FetchRequest.catchUp(on: subscription, groups: 1)
+                )
+            else { return }
+            for await record in fetch.records {
+                guard case let .object(object) = record else { continue }
+                await self.receiveControl(object)
+            }
+        }
+    }
+
+    private func finishRepair() {
+        controlRepair = nil
+    }
+
+    /// Take authority over this room's log and start publishing it.
+    ///
+    /// For the party that owns the room's state — a relay, a control plane, or a
+    /// self-hosted deployment's own service. A participant's token does not
+    /// authorise publishing under the room's own prefix, so a client calling this
+    /// against a real relay is refused; it is public because the log's shape is a
+    /// protocol contract, and because a test has to be able to be the authority.
+    @discardableResult
+    public func assumeAuthority(
+        cadence: RoomLogPublisher.Cadence = .default
+    ) async throws(MoqomError) -> RoomLogPublisher {
+        if let authority { return authority }
+        let publisher = try await RoomLogPublisher.opening(
+            room: room,
+            tenant: tenant,
+            on: connection,
+            state: controlState,
+            cadence: cadence
+        )
+
+        // Taking authority is an assertion about the room as it stands, so it
+        // makes one immediately. Without it the track stays empty until somebody
+        // is moderated, and a client that joins before then cannot tell an
+        // authority with nothing to say from a room that has no authority.
+        try await publisher.snapshot()
+        authority = publisher
+        return publisher
+    }
+
+    /// What this session would publish as a snapshot, drawn from live state.
+    private var controlState: RoomSnapshot {
+        RoomSnapshot(
+            participants: state.roster.participants.map {
+                ParticipantControl(
+                    identity: $0.id,
+                    grants: $0.grants,
+                    presence: $0.presence,
+                    mutedForEveryone: $0.mute.forcedForEveryone,
+                    mutedForAudience: $0.mute.forcedForAudience
+                )
+            },
+            stage: StageSnapshot(state.stage),
+            lifecycle: state.lifecycle,
+            watchdogs: state.watchdogs.all
+        )
+    }
+
+    /// Publish a change, if this session is the authority. Otherwise nothing:
+    /// a client that is not the authority has nowhere to put it, and pretending
+    /// otherwise would make every moderation call fail on a viewer's device.
+    private func announce(_ change: RoomChange) async {
+        guard let authority else { return }
+        _ = try? await authority.append(change)
+    }
+
+    private func apply(_ body: RoomUpdate.Body) async {
+        switch body {
+        case let .snapshot(snapshot):
+            await adopt(snapshot)
+        case let .change(change):
+            await adopt(change)
+        }
+    }
+
+    /// Replace everything the control track owns with a complete state.
+    ///
+    /// Participants the snapshot does not mention are reset rather than left as
+    /// they were. A snapshot is the authority's complete account, so an omission
+    /// is a statement — and the failure mode of the alternative is a grant that
+    /// outlives its revocation because the entry carrying the revocation was the
+    /// one that got lost.
+    private func adopt(_ snapshot: RoomSnapshot) async {
+        waiting = [:]
+        for control in snapshot.participants where state.roster[control.identity] == nil {
+            waiting[control.identity] = control
+        }
+        for participant in state.roster.participants {
+            adopt(snapshot[participant.id] ?? ParticipantControl(identity: participant.id))
+        }
+
+        state.stage = snapshot.stage.applied(to: state.stage)
+        mirrorSpotlight()
+        state.watchdogs = WatchdogSet(snapshot.watchdogs, limit: state.watchdogs.limit)
+
+        eventContinuation.yield(.stageChanged(state.stage))
+        eventContinuation.yield(.watchdogChanged(state.watchdogs))
+        await adopt(lifecycle: snapshot.lifecycle)
+        await refreshGallery()
+    }
+
+    private func adopt(_ change: RoomChange) async {
+        // Attributes for somebody the roster has never heard of. Kept rather than
+        // dropped, and applied the moment they announce. Room-level changes fall
+        // through, because a spotlight on a stranger is still a spotlight.
+        if let subject = change.subject, change.isAttribute, state.roster[subject] == nil {
+            var carrier = RoomSnapshot(
+                participants: [waiting[subject] ?? ParticipantControl(identity: subject)]
+            )
+            carrier.apply(change)
+            waiting[subject] = carrier[subject]
+            return
+        }
+
+        switch change {
+        case let .grants(who, grants):
+            applyGrants(grants, to: who)
+        case let .presence(who, presence):
+            await publishPresence(presence, for: who)
+        case let .mute(who, forEveryone, forAudience):
+            guard var participant = state.roster[who] else { return }
+            participant.mute.forcedForEveryone = forEveryone
+            participant.mute.forcedForAudience = forAudience
+            state.roster[who] = participant
+            eventContinuation.yield(.muteChanged(who, participant.mute))
+        case let .spotlight(who):
+            state.stage.spotlighted = who
+            mirrorSpotlight()
+            eventContinuation.yield(.spotlightChanged(who))
+            await refreshGallery()
+        case let .stage(stage):
+            state.stage = stage.applied(to: state.stage)
+            mirrorSpotlight()
+            eventContinuation.yield(.stageChanged(state.stage))
+            await refreshGallery()
+        case let .lifecycle(lifecycle):
+            await adopt(lifecycle: lifecycle)
+        case let .watchdogs(watchdogs):
+            state.watchdogs = WatchdogSet(watchdogs, limit: state.watchdogs.limit)
+            eventContinuation.yield(.watchdogChanged(state.watchdogs))
+        case let .evicted(who):
+            waiting.removeValue(forKey: who)
+            if who == identity {
+                // Being told, rather than watching the stream stop for no
+                // reason. The transport may well be about to close; this arrives
+                // first, which is the whole argument for carrying it as media.
+                deliverTerminal(
+                    .moderated(
+                        .operatorAction,
+                        display: "You were removed from this room."
+                    )
+                )
+                return
+            }
+            guard state.roster[who] != nil else { return }
+            state.roster.remove(who)
+            speakers.remove(who)
+            eventContinuation.yield(.participantLeft(who))
+            await refreshGallery()
+        }
+    }
+
+    private func adopt(lifecycle: RoomLifecycle) async {
+        guard !state.lifecycle.isEnded else { return }
+        if case let .ended(event) = lifecycle {
+            deliverTerminal(event)
+            return
+        }
+        state.lifecycle = lifecycle
+        eventContinuation.yield(.lifecycleChanged(lifecycle))
+    }
+
+    /// Apply attributes onto a roster member and report the change.
+    private func adopt(_ control: ParticipantControl) {
+        guard assign(control) else { return }
+        eventContinuation.yield(.grantsChanged(control.identity, control.grants))
+    }
+
+    /// Apply attributes onto a roster member without reporting anything.
+    ///
+    /// - Returns: Whether anything changed.
+    @discardableResult
+    private func assign(_ control: ParticipantControl) -> Bool {
+        guard var participant = state.roster[control.identity] else { return false }
+        let changed = participant.grants != control.grants
+            || participant.presence != control.presence
+            || participant.mute.forcedForEveryone != control.mutedForEveryone
+            || participant.mute.forcedForAudience != control.mutedForAudience
+        guard changed else { return false }
+
+        participant.grants = control.grants
+        participant.presence = control.presence
+        participant.mute.forcedForEveryone = control.mutedForEveryone
+        participant.mute.forcedForAudience = control.mutedForAudience
+        state.roster[control.identity] = participant
+        planner.setLadder(
+            participant.ladders[MediaKind.video.rawValue] ?? .defaultCamera(),
+            for: control.identity
+        )
+        return true
+    }
+
+    /// Keep ``Participant/isSpotlighted`` in step with the stage.
+    ///
+    /// Two fields hold one fact, so everything that changes the stage comes
+    /// through here — otherwise a spotlight moves the badge beside a name
+    /// without moving the tile, or the reverse.
+    private func mirrorSpotlight() {
+        for participant in state.roster.participants {
+            let wanted = participant.id == state.stage.spotlighted
+            guard participant.isSpotlighted != wanted else { continue }
+            state.roster[participant.id]?.isSpotlighted = wanted
+        }
     }
 
     // MARK: - Room state
 
-    func publishPresence(_ presence: Presence, for who: ParticipantIdentity) {
+    func publishPresence(_ presence: Presence, for who: ParticipantIdentity) async {
         guard var participant = state.roster[who] else { return }
+        guard participant.presence != presence else { return }
         participant.presence = presence
         state.roster[who] = participant
         eventContinuation.yield(.presenceChanged(who, presence))
+
+        // A cohost who drops keeps their tile and becomes the first candidate to
+        // lose it, which is the room persisting through a lift rather than
+        // reflowing around a gap.
+        await refreshGallery()
+        await announce(.presence(who, presence))
     }
 
     func deliverTerminal(_ event: TerminalEvent) {
         state.lifecycle = .ended(event)
+        logger.info(
+            .room,
+            "room ended",
+            [
+                LogField("room", .text(room.value)),
+                LogField("reason", .text(event.reason.identifier)),
+                LogField("uptime", .elapsed(now() - joinedAt)),
+            ]
+        )
         eventContinuation.yield(.terminated(event))
     }
 
@@ -300,29 +1691,598 @@ public actor RoomSession {
         eventContinuation.yield(.grantsChanged(who, grants))
     }
 
-    private func applyAnnouncement(_ event: AnnouncementEvent) {
+    private func applyAnnouncement(_ event: AnnouncementEvent) async {
         let before = Set(state.roster.participants.map(\.id))
         state.roster.apply(event, under: namespace)
         let after = Set(state.roster.participants.map(\.id))
 
         for joined in after.subtracting(before) {
             if let participant = state.roster[joined] {
+                // A default until their catalog arrives, not a decision. It
+                // exists so that layout can proceed in the milliseconds before
+                // the catalog lands, and it is replaced rather than merged.
                 planner.setLadder(.defaultCamera(), for: joined)
-                eventContinuation.yield(.participantJoined(participant))
+
+                // What the authority already said about them, which routinely
+                // arrives first: a promotion is what causes somebody to start
+                // publishing, so their grants can precede their announcement.
+                // Before the joined event, so an application reading the roster
+                // from it sees a cohost rather than a viewer that is about to
+                // change.
+                if let control = waiting.removeValue(forKey: joined) { assign(control) }
+                if state.stage.spotlighted == joined {
+                    state.roster[joined]?.isSpotlighted = true
+                }
+
+                eventContinuation.yield(.participantJoined(state.roster[joined] ?? participant))
+                watchCatalog(of: participant)
+
+                // Someone the outage took away has come back. Coalesced rather
+                // than applied per arrival, because a reconnect brings the whole
+                // room back at once and each plan would otherwise re-derive
+                // priorities against a roster that is still filling.
+                if layoutToRestore[joined] != nil { scheduleLayoutRestore() }
             }
         }
         for left in before.subtracting(after) {
             planner.remove(left)
             subscriptions.removeValue(forKey: left)
+            catalogTasks.removeValue(forKey: left)?.cancel()
+            catalogs.removeValue(forKey: left)
+            pumps.removeValue(forKey: left)?.cancel()
+            catchUps.removeValue(forKey: left)?.cancel()
+            media.removeValue(forKey: left)?.finish()
+            depacketisers.removeValue(forKey: left)
+            subscribedLayers.removeValue(forKey: left)
+            audioPumps.removeValue(forKey: left)?.cancel()
+            audioSubscriptions.removeValue(forKey: left)
+            audioSinks.removeValue(forKey: left)?.continuation.finish()
+            receivers.removeValue(forKey: left)
+
+            // Otherwise a rejoin inherits the speech history of the session that
+            // left, and jumps the queue for a tile on the strength of a sentence
+            // finished before the reconnect.
+            speakers.remove(left)
             eventContinuation.yield(.participantLeft(left))
+        }
+
+        if before != after { await refreshGallery() }
+    }
+
+    /// Subscribe to a participant's catalog track and follow it.
+    private func watchCatalog(of participant: Participant) {
+        // Never this device. Announcing is what puts a participant in the roster,
+        // and this device announces itself, so without this a publisher
+        // subscribes to the catalog it is publishing — paying a subscription and
+        // a round trip to be told what it just said. The same self-subscription
+        // the video path guards against in `applyLayout`, on a track small enough
+        // that nobody would notice it in a bandwidth graph.
+        guard participant.id != identity else { return }
+        guard catalogTasks[participant.id] == nil else { return }
+        guard
+            let name = try? TrackName(Catalog.trackName),
+            let track = try? FullTrackName(namespace: participant.slot.namespace, name: name)
+        else { return }
+
+        let who = participant.id
+        catalogTasks[who] = Task { [weak self] in
+            guard let self else { return }
+            guard
+                let subscription = try? await self.connection.subscribe(
+                    SubscribeRequest(
+                        track: track,
+                        priority: CatalogPublisher.priority,
+                        // The current catalog, not the next one. Waiting for
+                        // the next version means waiting until the publisher
+                        // happens to change something, which may be never.
+                        start: .latestGroup
+                    )
+                )
+            else { return }
+            for await object in subscription.objects {
+                await self.applyCatalog(object, from: who)
+            }
         }
     }
 
-    private func apply(_ action: ModerationAction) {
+    private func applyCatalog(_ object: TrackObject, from who: ParticipantIdentity) async {
+        let reader = catalogs[who] ?? CatalogReader()
+        catalogs[who] = reader
+        guard let catalog = await reader.apply(object) else { return }
+
+        // The ladder now comes from the publisher rather than from an
+        // assumption. This is the difference between subscribing to the rungs
+        // that exist and subscribing to the rungs we hoped for.
+        let ladder = catalog.videoLadder
+        if !ladder.isEmpty {
+            planner.setLadder(ladder, for: who)
+        }
+        configureDepacketiser(for: who, from: catalog)
+        await followAudio(of: who, in: catalog)
+        eventContinuation.yield(.catalogChanged(who, catalog))
+    }
+
+    // MARK: - Audio
+
+    /// Subscribe to a participant's audio, or stop, according to their catalog
+    /// and this viewer's mute.
+    private func followAudio(of who: ParticipantIdentity, in catalog: Catalog) async {
+        guard who != identity else { return }
+
+        guard
+            let track = catalog.audioTrack,
+            state.roster[who]?.mute.effective.contains(.audio) != true
+        else {
+            await stopAudioSubscription(for: who)
+            return
+        }
+
+        var receiver = receivers[who] ?? AudioReceiver()
+        receiver.setFormat(AudioFormat(track))
+        receivers[who] = receiver
+
+        guard audioSubscriptions[who] == nil else { return }
+        guard
+            let participant = state.roster[who],
+            let name = try? TrackName(track.name),
+            let full = try? FullTrackName(namespace: participant.slot.namespace, name: name),
+            let subscription = try? await connection.subscribe(
+                SubscribeRequest(track: full, priority: AudioPublicationConfiguration().priority)
+            )
+        else { return }
+
+        audioSubscriptions[who] = subscription
+        let sink = audioSinks[who] ?? AudioSink()
+        audioSinks[who] = sink
+
+        let objects = subscription.objects
+        audioPumps[who] = Task { [weak self] in
+            for await object in objects {
+                guard let self else { return }
+                await self.receiveAudio(object, from: who, into: sink)
+            }
+        }
+    }
+
+    private func receiveAudio(
+        _ object: TrackObject,
+        from who: ParticipantIdentity,
+        into sink: AudioSink
+    ) async {
+        estimator.record(object, at: .nanoseconds(DispatchTime.now().uptimeNanoseconds))
+
+        let plain: TrackObject
+        if let unprotector {
+            guard let decrypted = await unprotector.unprotect(object) else { return }
+            plain = decrypted
+        } else {
+            plain = object
+        }
+
+        let arrival = MonotonicTime.nanoseconds(DispatchTime.now().uptimeNanoseconds)
+
+        // After decryption, and on this device. Every other stack measures speech
+        // on the server, where it is unavailable the moment the media is
+        // encrypted; here it is a flag the publisher already computed, on a track
+        // this viewer is already subscribed to.
+        let voiced = !(plain.properties.isSilence ?? false)
+        if !speakers.heard(voiced: voiced, from: who, at: arrival).isEmpty {
+            await refreshGallery(at: arrival)
+            scheduleSpeechExpiry()
+        }
+
+        var receiver = receivers[who] ?? AudioReceiver()
+        receiver.accept(plain, at: arrival)
+
+        // Drained on arrival rather than on a timer. A real player pulls from
+        // its own audio callback at exactly the device's rate, which is the
+        // clock that matters; pulling here keeps the buffer from growing without
+        // bound when nobody is playing, and hands a caller that is playing the
+        // slots in order.
+        var tapped: [JitterBufferOutput] = []
+        while true {
+            let output = receiver.next()
+            if output == .buffering { break }
+            sink.continuation.yield(output)
+            if audioTaps[who]?.isEmpty == false { tapped.append(output) }
+        }
+        receivers[who] = receiver
+
+        for output in tapped {
+            await feedAudioTaps(output, from: who)
+        }
+    }
+
+    /// Hand one decoded slot to whoever is listening for their own reasons.
+    private func feedAudioTaps(_ output: JitterBufferOutput, from who: ParticipantIdentity) async {
+        guard var pipes = audioTaps[who], !pipes.isEmpty else { return }
+
+        pipes.removeAll { !$0.tap.isActive }
+        guard !pipes.isEmpty else {
+            audioTaps.removeValue(forKey: who)
+            return
+        }
+        audioTaps[who] = pipes
+
+        guard let track = await catalogs[who]?.current?.audioTrack else { return }
+        let format = AudioFormat(track)
+        let codec = track.audioCodec ?? .opus
+
+        for pipe in pipes {
+            guard
+                let failure = await pipe.offer(output, format: format, codec: codec)
+            else { continue }
+            logger.error(
+                .media,
+                "audio tap cannot decode",
+                [
+                    LogField("participant", .participant(who)),
+                    LogField("codec", .text(codec.rawValue)),
+                    LogField("reason", .text(String(describing: failure))),
+                ]
+            )
+        }
+    }
+
+    private func stopAudioSubscription(for who: ParticipantIdentity) async {
+        audioPumps.removeValue(forKey: who)?.cancel()
+        if let subscription = audioSubscriptions.removeValue(forKey: who) {
+            await subscription.cancel()
+        }
+        receivers[who]?.reset()
+        for pipe in audioTaps.removeValue(forKey: who) ?? [] {
+            pipe.tap.stop()
+        }
+    }
+
+    /// Hand the subscribed rung's parameter sets to reassembly.
+    ///
+    /// Called from both directions — a new subscription and a new catalog —
+    /// because either can arrive first. A publisher's first catalog has no
+    /// decoder configuration in it at all, since the encoders have produced
+    /// nothing yet, so the version that carries one is usually the second.
+    private func configureDepacketiser(for who: ParticipantIdentity, from catalog: Catalog?) {
+        guard
+            let catalog,
+            let layer = subscribedLayers[who],
+            let track = catalog.track(named: layer.value),
+            let hex = track.decoderConfiguration,
+            var depacketiser = depacketisers[who]
+        else { return }
+        depacketiser.setDecoderConfiguration(hexadecimal: hex)
+        depacketisers[who] = depacketiser
+    }
+
+    /// The codec a participant's subscribed rung is encoded with, from their
+    /// catalog. `nil` until the catalog arrives.
+    public func codec(of who: ParticipantIdentity) async -> VideoCodec? {
+        guard
+            let layer = subscribedLayers[who],
+            let catalog = await catalogs[who]?.current
+        else { return nil }
+        return catalog.track(named: layer.value)?.videoCodec
+    }
+
+    /// A participant's catalog, once it has arrived.
+    ///
+    /// For this device it is the catalog being published, which is known without
+    /// a subscription — asking the relay to send back a description this session
+    /// wrote would be a round trip to learn something it already knows.
+    public func catalog(of who: ParticipantIdentity) async -> Catalog? {
+        if who == identity { return await catalogPublisher?.current }
+        return await catalogs[who]?.current
+    }
+
+    // MARK: - Measuring the link
+
+    /// Read every object of a subscription: measure it, decrypt it, hand it on.
+    private func startPump(_ subscription: any SubscriptionHandle, for who: ParticipantIdentity) {
+        let sink = media[who] ?? MediaSink()
+        media[who] = sink
+
+        let objects = subscription.objects
+        pumps[who] = Task { [weak self] in
+            for await object in objects {
+                guard let self else { return }
+                await self.receive(object, from: who, into: sink)
+            }
+        }
+    }
+
+    /// Ask for the group the publisher is in the middle of.
+    ///
+    /// A subscription starts at the next group, so joining a broadcast means
+    /// waiting for the next keyframe — up to a whole group interval of nothing.
+    /// This closes that gap by fetching the group already in progress, which is
+    /// the difference between a tile that fills immediately and one that is
+    /// black for two seconds.
+    ///
+    /// Best-effort on purpose. A publisher or relay that keeps no history
+    /// refuses the fetch, and the subscription still delivers from the next
+    /// group: catch-up makes joining faster and is not what makes it work.
+    private func catchUp(
+        on subscription: any SubscriptionHandle,
+        for who: ParticipantIdentity
+    ) async {
+        guard catchUpGroups > 0 else { return }
+        guard let fetch = try? await connection.fetch(
+            FetchRequest.catchUp(on: subscription, groups: catchUpGroups)
+        ) else { return }
+
+        let sink = media[who] ?? MediaSink()
+        media[who] = sink
+
+        catchUps[who]?.cancel()
+        catchUps[who] = Task { [weak self] in
+            for await record in fetch.records {
+                guard let self else { return }
+                await self.receive(record, from: who, into: sink)
+            }
+        }
+    }
+
+    /// How many groups of history to ask for when subscribing. `0` disables it.
+    public private(set) var catchUpGroups: UInt64 = 1
+
+    /// Change how much history a new subscription asks for.
+    ///
+    /// One group is the default because one group is what buys a keyframe.
+    /// More is a seek rather than a join, and it competes with the live edge for
+    /// the same downlink — so raising this trades a faster first frame for a
+    /// worse first second.
+    public func setCatchUpGroups(_ groups: UInt64) {
+        catchUpGroups = groups
+    }
+
+    // MARK: - Replaying history
+
+    /// Ask for the last `groups` groups of a participant's video, delivered
+    /// separately from their live stream.
+    ///
+    /// This is the seek. ``frames(from:)`` is the live edge and only ever moves
+    /// forward — catch-up feeds into it precisely because the objects it fetches
+    /// are the ones immediately behind that edge — so replaying into it would
+    /// interleave the past with the present and hand a renderer frames that jump
+    /// backwards. What comes back here is its own stream, with its own
+    /// reassembly, and consuming it does not disturb what is on screen.
+    ///
+    /// Requires a live subscription to the participant, because a joining fetch
+    /// is resolved against one: the publisher counts back from where that
+    /// subscription is rather than from a group number this client would have to
+    /// guess. `nil` when there is no subscription, or when the range was refused.
+    ///
+    /// How far back this can reach is not ours to promise. A publisher retains a
+    /// couple of groups by default and a relay retains what its cache holds, so
+    /// asking for a hundred groups is not an error and will not get you a
+    /// hundred groups.
+    public func replay(
+        of who: ParticipantIdentity,
+        lastGroups groups: UInt64
+    ) async -> AsyncStream<DepacketisedFrame>? {
+        guard groups > 0, let subscription = subscriptions[who] else { return nil }
+        return await replay(
+            of: who,
+            range: .joining(subscription: subscription, groups: groups)
+        )
+    }
+
+    /// The same, from a group already seen rather than a distance back.
+    ///
+    /// For resuming: a client that knows which group it stopped at asks from
+    /// there, and gets everything up to the live edge without having to work out
+    /// how far away that is.
+    public func replay(
+        of who: ParticipantIdentity,
+        fromGroup group: UInt64
+    ) async -> AsyncStream<DepacketisedFrame>? {
+        guard let subscription = subscriptions[who] else { return nil }
+        return await replay(
+            of: who,
+            range: .joiningFrom(subscription: subscription, group: group)
+        )
+    }
+
+    /// Reassembly state for replays in flight, keyed per replay.
+    ///
+    /// Per replay rather than per participant because two replays of the same
+    /// participant are two independent walks through history, and sharing a
+    /// depacketiser between them would have each one's gaps and keyframes
+    /// interpreted against the other's position.
+    private var replayDepacketisers: [UUID: VideoDepacketiser] = [:]
+    private var replayTasks: [UUID: Task<Void, Never>] = [:]
+
+    private func replay(
+        of who: ParticipantIdentity,
+        range: FetchRequest.Range
+    ) async -> AsyncStream<DepacketisedFrame>? {
+        guard let fetch = try? await connection.fetch(FetchRequest(range: range)) else {
+            return nil
+        }
+
+        // Unbounded, unlike the live sinks. Dropping the oldest is right for a
+        // live stream, where the newest picture is the one wanted; a replay is
+        // read in order and dropping from the front would silently remove the
+        // keyframe everything after it depends on.
+        let (frames, continuation) = AsyncStream.makeStream(
+            of: DepacketisedFrame.self,
+            bufferingPolicy: .unbounded
+        )
+
+        var depacketiser = VideoDepacketiser()
+        if
+            let layer = subscribedLayers[who],
+            let catalog = await catalogs[who]?.current,
+            let hex = catalog.track(named: layer.value)?.decoderConfiguration
+        {
+            depacketiser.setDecoderConfiguration(hexadecimal: hex)
+        }
+
+        let id = UUID()
+        replayDepacketisers[id] = depacketiser
+        replayTasks[id] = Task { [weak self] in
+            for await record in fetch.records {
+                await self?.receiveReplay(record, id: id, into: continuation)
+            }
+            await self?.endReplay(id: id, continuation: continuation)
+        }
+        return frames
+    }
+
+    private func receiveReplay(
+        _ record: FetchedRecord,
+        id: UUID,
+        into continuation: AsyncStream<DepacketisedFrame>.Continuation
+    ) async {
+        guard var depacketiser = replayDepacketisers[id] else { return }
+        defer { replayDepacketisers[id] = depacketiser }
+
+        switch record {
+        case let .object(object):
+            // Metered like live media. History competes for the same downlink,
+            // and an estimator that only saw the live edge would read a replay
+            // as spare capacity.
+            estimator.record(object, at: .nanoseconds(DispatchTime.now().uptimeNanoseconds))
+
+            let plain: TrackObject
+            if let unprotector {
+                guard let decrypted = await unprotector.unprotect(object) else { return }
+                plain = decrypted
+            } else {
+                plain = object
+            }
+            if let frame = depacketiser.accept(plain) { continuation.yield(frame) }
+        case let .missing(through), let .unknown(through):
+            depacketiser.skip(through: through.object)
+        }
+    }
+
+    private func endReplay(
+        id: UUID,
+        continuation: AsyncStream<DepacketisedFrame>.Continuation
+    ) {
+        replayDepacketisers.removeValue(forKey: id)
+        replayTasks.removeValue(forKey: id)
+        // Finished rather than left open: a fetch ending is the normal outcome,
+        // and a caller iterating this needs the loop to terminate.
+        continuation.finish()
+    }
+
+    private func receive(
+        _ record: FetchedRecord,
+        from who: ParticipantIdentity,
+        into sink: MediaSink
+    ) async {
+        switch record {
+        case let .object(object):
+            // Through the same path as live media, deliberately: fetched objects
+            // are decrypted with the same keys, counted in the same statistics,
+            // and reassembled by the same depacketiser. A second path would be a
+            // second place for the pre-keyframe rule to be wrong.
+            await receive(object, from: who, into: sink)
+        case let .missing(through), let .unknown(through):
+            // A gap in history is final, so the depacketiser is told rather than
+            // left waiting for objects that were never published.
+            var depacketiser = depacketisers[who] ?? VideoDepacketiser()
+            depacketiser.skip(through: through.object)
+            depacketisers[who] = depacketiser
+        }
+    }
+
+    private var catchUps: [ParticipantIdentity: Task<Void, Never>] = [:]
+
+    private func receive(
+        _ object: TrackObject,
+        from who: ParticipantIdentity,
+        into sink: MediaSink
+    ) async {
+        // Measured before decryption, because what the link carried is the
+        // ciphertext, and because an object that fails to authenticate still
+        // consumed bandwidth.
+        estimator.record(object, at: .nanoseconds(DispatchTime.now().uptimeNanoseconds))
+
+        let plain: TrackObject
+        if let unprotector {
+            guard let decrypted = await unprotector.unprotect(object) else { return }
+            plain = decrypted
+        } else {
+            plain = object
+        }
+
+        sink.objectsContinuation.yield(plain)
+
+        var depacketiser = depacketisers[who] ?? VideoDepacketiser()
+        let frame = depacketiser.accept(plain)
+        depacketisers[who] = depacketiser
+        guard let frame else { return }
+
+        sink.framesContinuation.yield(frame)
+        await feedVideoTaps(frame, from: who)
+    }
+
+    /// Hand a reassembled frame to whoever is decoding it for their own reasons.
+    ///
+    /// After the renderer's copy has been yielded, deliberately. A tap is
+    /// somebody else's work and must never be in front of the picture.
+    private func feedVideoTaps(_ frame: DepacketisedFrame, from who: ParticipantIdentity) async {
+        guard var pipes = videoTaps[who], !pipes.isEmpty else { return }
+
+        for pipe in pipes where !pipe.tap.isActive { await pipe.close() }
+        pipes.removeAll { !$0.tap.isActive }
+        guard !pipes.isEmpty else {
+            videoTaps.removeValue(forKey: who)
+            return
+        }
+        videoTaps[who] = pipes
+
+        // Held until the catalog names it. Guessing would build a format
+        // description that fails somewhere inside VideoToolbox rather than
+        // declining the frame, and the difference matters when the answer
+        // arrives a few hundred milliseconds later anyway.
+        guard let codec = await codec(of: who) else { return }
+
+        for pipe in pipes {
+            guard let failure = await pipe.offer(frame, codec: codec) else { continue }
+            logger.error(
+                .media,
+                "video tap cannot decode",
+                [
+                    LogField("participant", .participant(who)),
+                    LogField("codec", .text(codec.rawValue)),
+                    LogField("reason", .text(String(describing: failure))),
+                ]
+            )
+        }
+    }
+
+    /// What the downlink looks like it can carry, in bits per second.
+    ///
+    /// Measured from arriving media rather than supplied by the application.
+    public var estimatedLinkBitrate: Int { estimator.estimate }
+
+    /// The full picture, for a debug overlay or a support ticket.
+    public var linkStatistics: LinkStatistics {
+        LinkStatistics(
+            estimate: estimator.estimate,
+            received: estimator.receivedBitrate,
+            state: estimator.state,
+            delayTrend: estimator.delayTrend,
+            objectsReceived: estimator.objectsReceived,
+            objectsLost: estimator.objectsLost
+        )
+    }
+
+    /// Forget the path. Call on a network change.
+    public func resetLinkEstimate() {
+        estimator.reset()
+    }
+
+    private func apply(_ action: ModerationAction) async {
         switch action {
         case let .kick(who):
             state.roster.remove(who)
+            speakers.remove(who)
             eventContinuation.yield(.participantLeft(who))
+            await refreshGallery()
         case let .forceMute(who, kinds, _):
             guard var participant = state.roster[who] else { return }
             participant.mute.forcedForEveryone.formUnion(kinds)
@@ -340,7 +2300,19 @@ public actor RoomSession {
             eventContinuation.yield(.grantsChanged(who, participant.grants))
         case let .spotlight(who):
             state.stage.spotlighted = who
+
+            // Mirrored onto the roster, because two fields holding one fact is
+            // how a spotlight ends up moving the badge next to a name without
+            // moving the tile. Everything that asks "is this participant
+            // spotlighted" asks ``Participant/isSpotlighted``.
+            for participant in state.roster.participants {
+                let wanted = participant.id == who
+                guard participant.isSpotlighted != wanted else { continue }
+                state.roster[participant.id]?.isSpotlighted = wanted
+            }
+
             eventContinuation.yield(.spotlightChanged(who))
+            await refreshGallery()
         case let .lockStage(locked):
             state.stage.isLocked = locked
             eventContinuation.yield(.stageChanged(state.stage))
@@ -356,6 +2328,21 @@ public actor RoomSession {
         }
     }
 
+    /// A writer that encrypts, when the room is encrypted.
+    ///
+    /// Wrapping the writer rather than encrypting inside the publish path is
+    /// what makes it impossible to bypass: there is no route from a frame to
+    /// the wire that goes around the wrapper, because upstream the wrapper is
+    /// the only writer there is.
+    private func protectedWriter(
+        for track: FullTrackName,
+        priority: UInt8
+    ) async throws(MoqomError) -> any TrackWriter {
+        let writer = try await connection.publish(track, priority: priority)
+        guard let encryption else { return writer }
+        return ProtectedTrackWriter(wrapping: writer, sender: encryption.sender)
+    }
+
     private func apply(_ change: SubscriptionChange) async {
         switch change {
         case let .subscribe(who, layer, priority):
@@ -363,13 +2350,38 @@ public actor RoomSession {
             if let existing = subscriptions[who] {
                 await existing.cancel()
             }
+            pumps.removeValue(forKey: who)?.cancel()
+            catchUps.removeValue(forKey: who)?.cancel()
             guard
                 let name = try? TrackName(layer.value),
                 let track = try? FullTrackName(namespace: participant.slot.namespace, name: name)
             else { return }
             let request = SubscribeRequest(track: track, priority: priority)
-            subscriptions[who] = try? await connection.subscribe(request)
+            guard let subscription = try? await connection.subscribe(request) else { return }
+            subscriptions[who] = subscription
+
+            // A rung change is a different bitstream with its own parameter
+            // sets and its own object numbering, so reassembly starts over
+            // rather than carrying state across the switch.
+            subscribedLayers[who] = layer
+            depacketisers[who] = VideoDepacketiser()
+            configureDepacketiser(for: who, from: await catalogs[who]?.current)
+
+            startPump(subscription, for: who)
+            await catchUp(on: subscription, for: who)
         case let .unsubscribeVideo(who):
+            pumps.removeValue(forKey: who)?.cancel()
+            catchUps.removeValue(forKey: who)?.cancel()
+            subscribedLayers.removeValue(forKey: who)
+            depacketisers.removeValue(forKey: who)
+
+            // The tap ends with the media. A tap left open on a track nobody is
+            // subscribed to holds a decoder that will never be fed, and a
+            // consumer blocked on it would wait for a frame that is not coming.
+            for pipe in videoTaps.removeValue(forKey: who) ?? [] {
+                await pipe.close()
+            }
+
             if let existing = subscriptions.removeValue(forKey: who) {
                 await existing.cancel()
             }
@@ -377,4 +2389,99 @@ public actor RoomSession {
             await subscriptions[who]?.updatePriority(priority)
         }
     }
+}
+
+/// One participant's media, after metering and decryption.
+///
+/// Two views of the same objects rather than one, because the two consumers are
+/// different: a renderer wants frames, and a recorder or a bridge wants the
+/// objects exactly as they arrived. Deriving one from the other in the
+/// application would mean depacketising twice or recording something that had
+/// already been reassembled.
+struct MediaSink: Sendable {
+    let objects: AsyncStream<TrackObject>
+    let objectsContinuation: AsyncStream<TrackObject>.Continuation
+    let frames: AsyncStream<DepacketisedFrame>
+    let framesContinuation: AsyncStream<DepacketisedFrame>.Continuation
+
+    init() {
+        // Newest, because a subscriber that has fallen behind on live media
+        // wants the current picture rather than the backlog.
+        (objects, objectsContinuation) = AsyncStream.makeStream(
+            of: TrackObject.self,
+            bufferingPolicy: .bufferingNewest(64)
+        )
+        (frames, framesContinuation) = AsyncStream.makeStream(
+            of: DepacketisedFrame.self,
+            bufferingPolicy: .bufferingNewest(64)
+        )
+    }
+
+    func finish() {
+        objectsContinuation.finish()
+        framesContinuation.finish()
+    }
+}
+
+/// One participant's audio, paced.
+struct AudioSink: Sendable {
+    let stream: AsyncStream<JitterBufferOutput>
+    let continuation: AsyncStream<JitterBufferOutput>.Continuation
+
+    init() {
+        // Unbounded, unlike the video sinks. Dropping the oldest slot would put
+        // the remaining ones out of order with what has already been heard,
+        // which is the one thing a jitter buffer exists to prevent — and audio
+        // at 24kbps cannot build a backlog worth bounding.
+        (stream, continuation) = AsyncStream.makeStream(
+            of: JitterBufferOutput.self,
+            bufferingPolicy: .unbounded
+        )
+    }
+}
+
+/// What the link is doing, for a debug overlay or a support ticket.
+public struct LinkStatistics: Hashable, Sendable {
+    /// What the controller believes the path can carry, in bits per second.
+    public let estimate: Int
+
+    /// What is actually arriving.
+    public let received: Int
+
+    public let state: BandwidthState
+
+    /// Milliseconds of delay the path is adding per second of media. Positive
+    /// means a queue is building.
+    public let delayTrend: Double
+
+    public let objectsReceived: Int
+
+    /// Inferred from gaps in object IDs within a group.
+    public let objectsLost: Int
+
+    public init(
+        estimate: Int,
+        received: Int,
+        state: BandwidthState,
+        delayTrend: Double,
+        objectsReceived: Int,
+        objectsLost: Int
+    ) {
+        self.estimate = estimate
+        self.received = received
+        self.state = state
+        self.delayTrend = delayTrend
+        self.objectsReceived = objectsReceived
+        self.objectsLost = objectsLost
+    }
+
+    /// Before anything has arrived.
+    public static let unknown = LinkStatistics(
+        estimate: 0,
+        received: 0,
+        state: .increasing,
+        delayTrend: 0,
+        objectsReceived: 0,
+        objectsLost: 0
+    )
 }

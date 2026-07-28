@@ -91,3 +91,11 @@ targets:
       base:
         SWIFT_VERSION: "6.0"
         TEST_TARGET_NAME: MoqomRoom
+        # A test bundle has no Info.plist of its own in this repository, so it
+        # needs the generated one. Without this the target cannot be signed and
+        # the failure names code signing rather than the missing plist.
+        GENERATE_INFOPLIST_FILE: YES
+        # Overridden because Signing.xcconfig sets one identifier for the whole
+        # project and two bundles cannot share it. Team and signing style are
+        # deliberately still left to the xcconfig.
+        PRODUCT_BUNDLE_IDENTIFIER: $(MOQOM_BUNDLE_PREFIX).room.uitests

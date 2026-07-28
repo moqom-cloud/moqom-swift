@@ -36,7 +36,7 @@ jobs:
 
       # The package builds for macOS, so the shared logic -- rooms, layer
       # selection, the session machine -- is tested on the host rather than in a
-      # simulator, which is faster and where all 103 tests live.
+      # simulator, which is faster and where all but the UI tests live.
       - name: Build and test the package
         run: |
           swift build

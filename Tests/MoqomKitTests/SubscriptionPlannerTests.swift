@@ -108,6 +108,46 @@ struct SubscriptionPlannerTests {
         }
     }
 
+    @Test("a uniform grid ranks by the gallery, because equal tiles cannot rank themselves")
+    func galleryOrderOutranksDrawnArea() {
+        // Sixteen tiles the same size means drawn area ties, and the tie-break is
+        // the identity string — so without an order the relay sheds whoever is
+        // last in the alphabet, regardless of who is talking.
+        var (people, planner) = grid(3)
+        let boxes = Dictionary(
+            uniqueKeysWithValues: people.map { ($0, RenderBox(width: 120, height: 68, scale: 2)) }
+        )
+
+        let changes = planner.plan(boxes: boxes, order: [people[2], people[0], people[1]])
+        var priorities: [ParticipantIdentity: UInt8] = [:]
+        for case let .subscribe(who, _, priority) in changes {
+            priorities[who] = priority
+        }
+
+        #expect(priorities[people[2]]! < priorities[people[0]]!)
+        #expect(priorities[people[0]]! < priorities[people[1]]!)
+    }
+
+    @Test("the gallery decides who loses video past the budget, and they keep audio")
+    func galleryOrderDecidesTheOverflow() {
+        var (people, planner) = grid(4)
+        planner.videoBudget = 2
+        let boxes = Dictionary(
+            uniqueKeysWithValues: people.map { ($0, RenderBox(width: 120, height: 68, scale: 2)) }
+        )
+
+        // Reverse of the alphabet, which is what an active speaker at the end of
+        // the roster looks like to the planner.
+        _ = planner.plan(boxes: boxes, order: people.reversed())
+
+        #expect(planner.selection(for: people[3])?.video != nil)
+        #expect(planner.selection(for: people[2])?.video != nil)
+        for person in [people[0], people[1]] {
+            #expect(planner.selection(for: person)?.video == nil)
+            #expect(planner.selection(for: person)?.audio == true)
+        }
+    }
+
     @Test("a re-layout that changes nothing emits nothing")
     func stableLayoutIsSilent() {
         var (people, planner) = grid(4)

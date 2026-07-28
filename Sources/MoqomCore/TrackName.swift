@@ -132,6 +132,34 @@ extension TrackNamespace: CustomStringConvertible {
     public var description: String { "(\(storage.joined(separator: ", ")))" }
 }
 
+extension TrackNamespace: Codable {
+    /// A JSON array of fields, validated on the way back in.
+    ///
+    /// Written by hand rather than synthesised because a synthesised
+    /// conformance decodes straight into storage, producing namespaces that
+    /// ``init(_:)`` would have refused — an empty field, or a tuple past the
+    /// draft's limits. Those fail later, on the wire, a long way from the bytes
+    /// that caused them.
+    public init(from decoder: any Decoder) throws {
+        let fields = try [String](from: decoder)
+        do {
+            try self.init(fields)
+        } catch {
+            throw DecodingError.dataCorrupted(
+                DecodingError.Context(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "not a valid namespace: \(error)",
+                    underlyingError: error
+                )
+            )
+        }
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        try fields.encode(to: encoder)
+    }
+}
+
 // No `ExpressibleByStringLiteral` or `ExpressibleByArrayLiteral` on the
 // validating types in this file, and the reason is a Swift overload-resolution
 // trap rather than taste. Given both a throwing `init(_:)` and a trapping

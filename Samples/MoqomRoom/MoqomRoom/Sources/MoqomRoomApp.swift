@@ -72,20 +72,22 @@ struct FailureScreen: View {
         ContentUnavailableView {
             Label("Could not join", systemImage: "exclamationmark.triangle")
         } description: {
-            Text(describe(error))
+            Text(error.displayString)
         } actions: {
             Button("Try again", action: onDismiss)
         }
     }
+}
 
+extension MoqomError {
     /// Rendered from the case, not from a message string.
     ///
-    /// The four terminal reasons want four different treatments and the typed
-    /// enum is what makes that a compile-time obligation — adding a case here
-    /// breaks the build rather than silently falling into a generic
-    /// "disconnected" message.
-    private func describe(_ error: MoqomError) -> String {
-        switch error {
+    /// The terminal reasons want different treatments and the typed enum is
+    /// what makes that a compile-time obligation — adding a case here breaks
+    /// the build rather than silently falling into a generic "disconnected"
+    /// message.
+    var displayString: String {
+        switch self {
         case let .invalidName(reason):
             "That name will not work: \(reason)."
         case .transport:
@@ -100,6 +102,14 @@ struct FailureScreen: View {
             "You do not have permission (\(capability))."
         case let .unsupportedCodec(codec):
             "This device cannot handle \(codec.rawValue)."
+        case let .unsupportedAudioCodec(codec):
+            "This device cannot handle \(codec.rawValue) audio."
+        case .protocolViolation:
+            // Deliberately not "try again". Reconnecting into the same
+            // violation is how one bug on the other end becomes a loop here.
+            "The relay is speaking a protocol this app does not understand."
+        case .encryptionFailed:
+            "Could not encrypt the stream, so nothing was sent."
         case let .platform(api, status):
             "\(api) failed with \(status)."
         }

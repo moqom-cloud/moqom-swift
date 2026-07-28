@@ -227,7 +227,14 @@ struct RoomSessionIntegrationTests {
         ])
         let broadcast = try await hostRoom.startBroadcast(
             from: source,
-            configuration: BroadcastConfiguration(ladder: ladder)
+            configuration: BroadcastConfiguration(
+                ladder: ladder,
+                // Synthetic frames carry no pixels, so a hardware encoder would
+                // correctly refuse every one of them. What is under test is the
+                // path from encoder output to published object, and that path
+                // does not care whether the bytes decode.
+                encoderFactory: { SyntheticEncoder(configuration: $0) }
+            )
         )
 
         for index in 0 ..< 5 {
@@ -276,7 +283,48 @@ struct RoomSessionIntegrationTests {
         #expect(timestamps == [98, 99])
     }
 
-    @Test("per-viewer mute never reaches the relay")
+    @Test("a publisher does not subscribe to its own catalog")
+    func catalogIsNotSelfSubscribed() async throws {
+        // Announcing is what puts somebody in the roster, and this device
+        // announces itself — so the roster contains the local participant and
+        // the obvious loop subscribes to their catalog too. That is a round trip
+        // to be told what this session just published, and it is invisible in a
+        // bandwidth graph because a catalog is a few hundred bytes, which is
+        // exactly why it needs a test rather than a review.
+        let relay = LoopbackRelay()
+        let host = try await session("alice", relay: relay)
+        let hostRoom = try await host.join(room: "room-42")
+
+        let source = FrameRelay(
+            format: CaptureFormat(size: PixelSize(width: 1280, height: 720), frameRate: 30)
+        )
+        _ = try await hostRoom.startBroadcast(from: source)
+        _ = await eventually { await hostRoom.roster.count == 1 }
+
+        // Long enough for a subscription to have been made if one were going to
+        // be. Asserting an absence needs a window, and this is the same one the
+        // backstage test uses.
+        try await Task.sleep(for: .milliseconds(50))
+
+        // The room's control track is a legitimate subscription and every session
+        // makes it; what must not appear is a subscription under this
+        // participant's own namespace.
+        let log = await relay.log
+        let ownNamespace = try MoqomNamespaces.participant(
+            tenant: "acme", room: "room-42", identity: identity("alice")
+        )
+        let selfSubscribed = log.contains {
+            guard case let .subscribed(track, _) = $0 else { return false }
+            return track.namespace == ownNamespace
+        }
+        #expect(!selfSubscribed, "subscribed to itself: \(log)")
+
+        // And the catalog is still readable, because it is published from here
+        // rather than fetched from the relay.
+        #expect(await hostRoom.catalog(of: identity("alice")) != nil)
+    }
+
+    @Test("per-viewer mute asks nobody and costs the publisher nothing")
     func localMuteIsPurelyLocal() async throws {
         // Because the relay forwards rather than mixes, one viewer silencing
         // one cohost is an unsubscribe. Sending a control message would turn a
@@ -293,12 +341,33 @@ struct RoomSessionIntegrationTests {
         _ = try await hostRoom.startBroadcast(from: source)
         _ = await eventually { await viewerRoom.roster.count == 1 }
 
+        // The roster filling is not the last thing joining does. Learning about
+        // a participant is what triggers the subscription to their catalog, and
+        // that reaches the relay a few hops later — so clearing the log on the
+        // roster alone leaves it inside the window under test, and the assertion
+        // below then fails for a reason that has nothing to do with mute.
+        //
+        // Waited for on the viewer rather than in the relay log, because the log
+        // does not record who asked: the host subscribes to its own catalog too,
+        // and matching that would let this proceed while the viewer's request is
+        // still in flight, which is the race this is here to close.
+        _ = await eventually { await viewerRoom.catalog(of: identity("alice")) != nil }
+
         await relay.clearLog()
         await viewerRoom.localMute(identity("alice"), .audio)
         try await Task.sleep(for: .milliseconds(20))
 
+        // Nothing but an unsubscribe. In particular no publish, no write, and
+        // no announcement: there is no message here that the publisher or any
+        // other viewer could observe, and nothing that could be refused.
         let log = await relay.log
-        #expect(log.isEmpty)
+        #expect(
+            log.allSatisfy {
+                if case .unsubscribed = $0 { return true }
+                return false
+            },
+            "local mute produced \(log)"
+        )
 
         let muted = await viewerRoom.roster[identity("alice")]?.mute
         #expect(muted?.localToMe == .audio)
@@ -338,6 +407,28 @@ struct RoomSessionIntegrationTests {
             return false
         }
         #expect(subscribed)
+    }
+
+    @Test("a box reported for your own tile does not subscribe you to yourself")
+    func selfLayoutIsIgnored() async throws {
+        // A self tile is a tile, so an application reports its size like any
+        // other. Acting on it would download this device's own upload — invisible
+        // on screen and doubled on the bill.
+        let relay = LoopbackRelay()
+        let host = try await session("alice", relay: relay)
+        let hostRoom = try await host.join(room: "room-42")
+
+        let source = FrameRelay(
+            format: CaptureFormat(size: PixelSize(width: 1280, height: 720), frameRate: 30)
+        )
+        _ = try await hostRoom.startBroadcast(from: source)
+        _ = await eventually { await hostRoom.roster.count == 1 }
+
+        let changes = await hostRoom.updateLayout([
+            identity("alice"): RenderBox(width: 320, height: 180, scale: 3),
+        ])
+
+        #expect(changes.isEmpty)
     }
 
     @Test("moderation is refused locally when the capability is absent")

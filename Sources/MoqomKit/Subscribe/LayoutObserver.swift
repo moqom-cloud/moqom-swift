@@ -37,6 +37,10 @@ import MoqomCore
         /// What the planner was last told, for diagnostics.
         public private(set) var lastReported: [ParticipantIdentity: RenderBox] = [:]
 
+        /// A layout that replaces the view hierarchy's, or `nil` when the
+        /// hierarchy is in charge.
+        public private(set) var takenOver: [ParticipantIdentity: RenderBox]?
+
         public init(room: RoomSession? = nil) {
             self.room = room
         }
@@ -69,6 +73,34 @@ import MoqomCore
             await deliver()
         }
 
+        /// Draw somewhere the view hierarchy cannot see, and report that
+        /// instead of what the hierarchy says.
+        ///
+        /// Picture in Picture is the case this exists for, and it is a
+        /// replacement rather than an addition for a reason that only shows up
+        /// on a bill. Backgrounding an app does not tear its views down: every
+        /// `GeometryReader` in the grid still holds the size it had when the
+        /// user swiped home, so a window that merely *added* four small boxes
+        /// would leave nine large ones in place and keep paying for full-size
+        /// video to draw thumbnails — with the screen off, where nothing looks
+        /// wrong until the data usage is read back a month later.
+        ///
+        /// The hierarchy keeps reporting underneath. Nothing is lost, so
+        /// ``restore()`` puts the grid back in one pass rather than waiting for
+        /// a layout that only happens once the app is visible again.
+        public func takeOver(_ boxes: [ParticipantIdentity: RenderBox]) {
+            guard takenOver != boxes else { return }
+            takenOver = boxes
+            scheduleFlush()
+        }
+
+        /// Hand the layout back to the view hierarchy.
+        public func restore() {
+            guard takenOver != nil else { return }
+            takenOver = nil
+            scheduleFlush()
+        }
+
         private func scheduleFlush() {
             guard flush == nil else { return }
             flush = Task { [weak self] in
@@ -83,7 +115,7 @@ import MoqomCore
 
         private func deliver() async {
             guard let room else { return }
-            let snapshot = boxes
+            let snapshot = takenOver ?? boxes
             lastReported = snapshot
             _ = await room.updateLayout(snapshot, linkBitrate: linkBitrate)
         }

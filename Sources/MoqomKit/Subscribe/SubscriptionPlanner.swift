@@ -12,6 +12,14 @@
 // layout. Assigning it from the render box means the speaker outranks the
 // thumbnails automatically, rather than through a heuristic somebody has to
 // keep in sync with the UI.
+//
+// Drawn area is the right ranking for a speaker view and no ranking at all for a
+// uniform grid, where every tile is the same size and the comparison falls
+// through to the identity string. Sixteen equal tiles ranked alphabetically
+// means the relay sheds whoever is last in the alphabet, so a ``Gallery`` order
+// can be supplied instead: it already knows who is speaking and who is pinned,
+// and taking the ranking from the same place the layout took it from is what
+// stops the two from disagreeing.
 
 import Foundation
 import MoqomCore
@@ -21,6 +29,38 @@ public enum SubscriptionChange: Hashable, Sendable {
     case subscribe(ParticipantIdentity, LayerID, priority: UInt8)
     case unsubscribeVideo(ParticipantIdentity)
     case reprioritise(ParticipantIdentity, priority: UInt8)
+
+    /// Who the change is about.
+    public var target: ParticipantIdentity {
+        switch self {
+        case let .subscribe(who, _, _), let .unsubscribeVideo(who), let .reprioritise(who, _):
+            who
+        }
+    }
+
+    /// The change as log fields.
+    public var fields: [LogField] {
+        switch self {
+        case let .subscribe(who, layer, priority):
+            [
+                LogField("action", .text("subscribe")),
+                LogField("participant", .participant(who)),
+                LogField("layer", .text(layer.value)),
+                LogField("priority", .number(Int(priority))),
+            ]
+        case let .unsubscribeVideo(who):
+            [
+                LogField("action", .text("unsubscribe")),
+                LogField("participant", .participant(who)),
+            ]
+        case let .reprioritise(who, priority):
+            [
+                LogField("action", .text("reprioritise")),
+                LogField("participant", .participant(who)),
+                LogField("priority", .number(Int(priority))),
+            ]
+        }
+    }
 }
 
 /// Holds one selector per participant and produces batched diffs.
@@ -34,6 +74,10 @@ public struct SubscriptionPlanner: Sendable {
     /// The host count is bounded by what a client can decode, not by what the
     /// relay will carry — so when a stage exceeds this, the SDK degrades the
     /// overflow to audio rather than refusing to render the room.
+    ///
+    /// Set it to ``Gallery/Policy/capacity`` when a gallery is driving the
+    /// layout. Holding the two independently is legal and means the planner
+    /// silently drops video for tiles the gallery is still drawing.
     public var videoBudget: Int
 
     public init(videoBudget: Int = 9) {
@@ -62,20 +106,37 @@ public struct SubscriptionPlanner: Sendable {
     /// `allowance` is per-track: the congestion controller's estimate is for
     /// the link, and dividing it across tracks is the planner's job because
     /// only the planner knows how many there are and how big each one is drawn.
+    ///
+    /// `order` is a ``Gallery/order``, and breaks ties in drawn area rather than
+    /// replacing it. That distinction matters: in a speaker view the areas differ
+    /// and are the better signal, and in a uniform grid they are all equal and
+    /// carry none at all. Participants the order does not mention rank after
+    /// everyone it does.
     public mutating func plan(
         boxes newBoxes: [ParticipantIdentity: RenderBox],
+        order: [ParticipantIdentity] = [],
         linkBitrate: Int = .max
     ) -> [SubscriptionChange] {
         boxes = newBoxes
 
-        // Rank by drawn area. Ties broken by identity so a redraw with two
-        // equal tiles does not reshuffle priorities and churn the relay.
+        var position: [ParticipantIdentity: Int] = [:]
+        for (index, identity) in order.enumerated() { position[identity] = index }
+
+        // Area first, so a speaker view still ranks the speaker above the
+        // thumbnails; the gallery only decides what area cannot. Identity last,
+        // so a redraw with two tiles the gallery does not distinguish either does
+        // not reshuffle priorities and churn the relay.
         let ranked = newBoxes
             .filter { $0.value.visibility == .visible }
             .sorted { lhs, rhs in
                 let lhsArea = lhs.value.pixelSize.pixelCount
                 let rhsArea = rhs.value.pixelSize.pixelCount
                 if lhsArea != rhsArea { return lhsArea > rhsArea }
+
+                let left = position[lhs.key] ?? Int.max
+                let right = position[rhs.key] ?? Int.max
+                if left != right { return left < right }
+
                 return lhs.key.description < rhs.key.description
             }
 
@@ -127,6 +188,14 @@ public struct SubscriptionPlanner: Sendable {
     public func selection(for identity: ParticipantIdentity) -> LayerSelection? {
         selectors[identity]?.current
     }
+
+    /// The last layout planned against.
+    ///
+    /// Readable so that a reconnect can put it back: the subscriptions are gone
+    /// with the session but the tiles are still the size they were, and asking
+    /// the application to restate a layout it never changed would mean a room
+    /// that comes back without video.
+    public var layout: [ParticipantIdentity: RenderBox] { boxes }
 
     /// Map layout rank onto draft-19 subscriber priority, where lower is more
     /// urgent. Spread out rather than sequential so a later insertion between

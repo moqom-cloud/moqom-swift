@@ -34,19 +34,29 @@ let package = Package(
     products: [
         .library(name: "MoqomKit", targets: ["MoqomKit"]),
         .library(name: "MoqomLoopback", targets: ["MoqomLoopback"]),
+        // Exposed rather than kept internal because a relay implementer, a
+        // fuzzer, or anyone diffing our bytes against another stack needs the
+        // codec without the SDK on top of it.
+        .library(name: "MoqomWire", targets: ["MoqomWire"]),
     ],
     targets: [
         .target(name: "MoqomCore", swiftSettings: strict),
-        .target(name: "MoqomKit", dependencies: ["MoqomCore"], swiftSettings: strict),
+        .target(name: "MoqomWire", dependencies: ["MoqomCore"], swiftSettings: strict),
+        .target(
+            name: "MoqomKit",
+            dependencies: ["MoqomCore", "MoqomWire"],
+            swiftSettings: strict
+        ),
         .target(
             name: "MoqomLoopback",
             dependencies: ["MoqomCore", "MoqomKit"],
             swiftSettings: strict
         ),
         .testTarget(name: "MoqomCoreTests", dependencies: ["MoqomCore"], swiftSettings: strict),
+        .testTarget(name: "MoqomWireTests", dependencies: ["MoqomWire"], swiftSettings: strict),
         .testTarget(
             name: "MoqomKitTests",
-            dependencies: ["MoqomKit", "MoqomLoopback"],
+            dependencies: ["MoqomKit", "MoqomLoopback", "MoqomWire"],
             swiftSettings: strict
         ),
     ]

@@ -28,6 +28,8 @@ public enum RelayInteraction: Hashable, Sendable {
     case reprioritised(FullTrackName, priority: UInt8)
     case published(FullTrackName)
     case wrote(FullTrackName, group: UInt64, object: UInt64)
+    case fetched(FullTrackName, from: Location, to: FetchEnd)
+    case cancelledFetch(FullTrackName)
     case closed(code: UInt64)
 }
 
@@ -43,7 +45,50 @@ public actor LoopbackRelay {
     private var subscribers: [FullTrackName: [UUID: AsyncStream<TrackObject>.Continuation]] = [:]
     private var interactions: [RelayInteraction] = []
 
+    /// Everything published, kept whole.
+    ///
+    /// The interaction log records that a write happened; this records what was
+    /// written. Both are needed, because a publish path can produce the right
+    /// number of objects in the right groups and still put nothing useful in
+    /// them — which is exactly the bug the descriptor placeholder was.
+    private var delivered: [FullTrackName: [TrackObject]] = [:]
+
+    /// The current group of each track, for joiners that ask to start there.
+    private var latestGroup: [FullTrackName: [TrackObject]] = [:]
+    private var latestGroupNumber: [FullTrackName: UInt64] = [:]
+
+    /// Sessions opened on this fabric, per identity, so a test can take one away.
+    private var sessions: [ParticipantIdentity: [LoopbackSession]] = [:]
+
+    /// Whether new connections are answered.
+    ///
+    /// The switch that makes a reconnect worth testing: a retry loop against a
+    /// relay that never comes back only proves the loop runs, and the behaviour
+    /// that matters is what happens when it does come back.
+    public private(set) var isAcceptingConnections = true
+
     public init() {}
+
+    public func setAcceptingConnections(_ accepting: Bool) {
+        isAcceptingConnections = accepting
+    }
+
+    func attach(_ session: LoopbackSession, for who: ParticipantIdentity) {
+        sessions[who, default: []].append(session)
+    }
+
+    /// Take a participant's connection away, as the network would.
+    ///
+    /// Every session that identity has opened, because a reconnect leaves the
+    /// earlier ones behind and dropping an already-dead one does nothing.
+    public func drop(
+        _ who: ParticipantIdentity,
+        failure: TransportFailure = .idleTimeout
+    ) {
+        for session in sessions.removeValue(forKey: who) ?? [] {
+            session.drop(failure)
+        }
+    }
 
     /// Everything that has happened, in order.
     public var log: [RelayInteraction] { interactions }
@@ -55,6 +100,25 @@ public actor LoopbackRelay {
 
     public func clearLog() {
         interactions.removeAll()
+        delivered.removeAll()
+        latestGroup.removeAll()
+        latestGroupNumber.removeAll()
+    }
+
+    /// Objects published on a track.
+    public func objects(on track: FullTrackName) -> [TrackObject] {
+        delivered[track] ?? []
+    }
+
+    /// Objects published on any track with this name, whoever published it.
+    ///
+    /// Convenient for a test that cares about one rung and not about which
+    /// participant's namespace it hangs under.
+    public func objects(onTrackNamed name: String) -> [TrackObject] {
+        delivered
+            .filter { $0.key.name.value == name }
+            .sorted { $0.key.description < $1.key.description }
+            .flatMap(\.value)
     }
 
     /// Namespaces currently announced under a prefix.
@@ -112,11 +176,20 @@ public actor LoopbackRelay {
     func subscribe(
         to track: FullTrackName,
         priority: UInt8,
+        start: SubscribeRequest.Start,
         continuation: AsyncStream<TrackObject>.Continuation
     ) -> UUID {
         interactions.append(.subscribed(track, priority: priority))
         let id = UUID()
         subscribers[track, default: [:]][id] = continuation
+
+        // A real relay caches the current group so a joiner does not have to
+        // wait for the publisher to open the next one. That behaviour is the
+        // whole reason the catalog can be a track: a viewer subscribes and has
+        // the description immediately, rather than when it next changes.
+        if start == .latestGroup, let latest = latestGroup[track] {
+            for object in latest { continuation.yield(object) }
+        }
         return id
     }
 
@@ -124,6 +197,74 @@ public actor LoopbackRelay {
         interactions.append(.unsubscribed(track))
         subscribers[track]?.removeValue(forKey: id)?.finish()
         if subscribers[track]?.isEmpty == true { subscribers.removeValue(forKey: track) }
+    }
+
+    /// Where a subscription is now, for resolving a joining fetch.
+    ///
+    /// Nil for a track nothing has been published on, which is the case a
+    /// joining fetch cannot be answered in: there is no position to count back
+    /// from. The real relay answers INVALID_RANGE.
+    func position(of track: FullTrackName) -> Location? {
+        guard let last = delivered[track]?.last else { return nil }
+        return Location(group: last.group, object: last.object)
+    }
+
+    /// Serve a fetch from what has been published, gaps included.
+    ///
+    /// The gaps are the interesting part, and the reason this is not a filter
+    /// over `delivered`: a fetch's answer has to distinguish "there was never an
+    /// object here" from "the range stops here", and a subscriber that cannot
+    /// tell them apart waits for something that is never coming.
+    func fetch(
+        _ track: FullTrackName,
+        from start: Location,
+        through end: FetchEnd,
+        order: GroupOrder
+    ) -> [FetchedRecord] {
+        interactions.append(.fetched(track, from: start, to: end))
+
+        let limit = end.wire
+        let matching = (delivered[track] ?? []).filter { object in
+            let location = Location(group: object.group, object: object.object)
+            guard location >= start else { return false }
+            switch end {
+            case let .endOfGroup(group): return object.group <= group
+            case .through: return location < limit
+            }
+        }
+
+        let ordered: [TrackObject]
+        switch order {
+        case .ascending:
+            ordered = matching.sorted {
+                Location(group: $0.group, object: $0.object)
+                    < Location(group: $1.group, object: $1.object)
+            }
+        case .descending:
+            // Groups descend, objects within a group still ascend.
+            ordered = matching.sorted {
+                $0.group == $1.group ? $0.object < $1.object : $0.group > $1.group
+            }
+        }
+
+        // A hole in the object numbering within a group means the object does
+        // not exist, and saying so is what lets a receiver stop waiting. The
+        // rule is `FetchGaps` rather than local, so this and the real session's
+        // responder cannot drift apart.
+        let markers = FetchGaps.markers(
+            before: ordered.map { Location(group: $0.group, object: $0.object) },
+            order: order
+        )
+        var records: [FetchedRecord] = []
+        for (index, object) in ordered.enumerated() {
+            if let marker = markers[index] { records.append(.missing(through: marker)) }
+            records.append(.object(object))
+        }
+        return records
+    }
+
+    func cancelFetch(on track: FullTrackName) {
+        interactions.append(.cancelledFetch(track))
     }
 
     func reprioritise(_ track: FullTrackName, priority: UInt8) {
@@ -136,6 +277,13 @@ public actor LoopbackRelay {
 
     func deliver(_ object: TrackObject, to track: FullTrackName) {
         interactions.append(.wrote(track, group: object.group, object: object.object))
+        delivered[track, default: []].append(object)
+
+        if latestGroupNumber[track] != object.group {
+            latestGroupNumber[track] = object.group
+            latestGroup[track] = []
+        }
+        latestGroup[track, default: []].append(object)
         guard let targets = subscribers[track] else { return }
         for continuation in targets.values {
             continuation.yield(object)

@@ -3,19 +3,15 @@
 // A note on where this boundary sits, because the obvious place is not the
 // right one. A "transport" protocol would naturally be QUIC-shaped — open a
 // unidirectional stream, open a bidirectional stream, send a datagram, accept
-// an inbound stream, reset. That seam exists and matters, but it belongs
-// *below* this one, inside `moqom-client`, because the wire codec is written
-// once in Rust and reused by every platform. Reimplementing draft-19 framing in
-// Swift would give us a second decoder to keep in agreement with the first, and
-// the README is explicit that the interop risk we are most exposed to is two
-// implementations misreading the draft the same way.
+// an inbound stream, reset. That seam exists and matters, and it is one layer
+// down: `QUICCarrier`, which `MoqtSession` is written against.
 //
-// So `Transport` here is expressed in MOQT *operations*: announce, subscribe,
-// subscribe to a namespace prefix, write objects. Those are exactly the calls a
-// UniFFI binding over `moqom-client` will expose, and exactly what an in-memory
-// loopback can satisfy honestly. Everything above this line — rooms, rosters,
-// layer selection, mute, moderation — is Swift, is testable today, and is where
-// the SDK's design decisions actually live.
+// This one is expressed in MOQT *operations* instead: announce, subscribe,
+// subscribe to a namespace prefix, fetch, write objects. The reason to put a
+// seam here rather than only at QUIC is that an in-memory relay can satisfy
+// these honestly, which is what lets the room model, layer selection, mute, and
+// moderation be tested end to end with no socket involved. `MoqomLoopback` is
+// that implementation and `MoqtSession` is the real one.
 
 import Foundation
 import MoqomCore
@@ -92,6 +88,14 @@ public protocol TransportSession: Sendable, AnyObject {
     /// What the peer agreed to at SETUP.
     var negotiated: NegotiatedParameters { get async }
 
+    /// The session ending without anyone having asked it to.
+    ///
+    /// Yields at most once and then finishes; a session closed through
+    /// ``close(code:reason:)`` finishes it without yielding. ``MoqomSession``
+    /// reconnects on whatever arrives here, so the two cases have to stay
+    /// distinguishable — the alternative is a redial on every clean exit.
+    var interruptions: AsyncStream<TransportFailure> { get }
+
     /// Announce a namespace, making its publisher visible to prefix
     /// subscribers. Releasing the handle withdraws the announcement.
     func announce(_ namespace: TrackNamespace) async throws(MoqomError) -> any AnnouncementHandle
@@ -110,6 +114,14 @@ public protocol TransportSession: Sendable, AnyObject {
     func subscribe(
         _ request: SubscribeRequest
     ) async throws(MoqomError) -> any SubscriptionHandle
+
+    /// Ask for objects that have already been published.
+    ///
+    /// The counterpart to `subscribe`, and the only way to get anything the
+    /// publisher sent before we arrived. A subscription starts at the live edge
+    /// by construction; without this, joining a stream mid-group means waiting
+    /// for the next keyframe before anything can be decoded.
+    func fetch(_ request: FetchRequest) async throws(MoqomError) -> any FetchHandle
 
     /// Begin publishing one track.
     func publish(
@@ -172,10 +184,36 @@ public struct SubscribeRequest: Hashable, Sendable {
     /// late, it is worthless.
     public let deliveryTimeout: Duration?
 
-    public init(track: FullTrackName, priority: UInt8 = 128, deliveryTimeout: Duration? = nil) {
+    /// Where in the track to begin.
+    public let start: Start
+
+    public enum Start: Hashable, Sendable {
+        /// The next group the publisher opens.
+        ///
+        /// Right for live video: the current group is already partly gone, and
+        /// the objects still in it reference a keyframe that will not be
+        /// resent.
+        case nextGroup
+
+        /// The most recent complete group, replayed from its start.
+        ///
+        /// Right for anything where the current value is the point rather than
+        /// the live edge — the catalog above all, where a viewer that waited
+        /// for the next version would wait until the publisher happened to
+        /// change something.
+        case latestGroup
+    }
+
+    public init(
+        track: FullTrackName,
+        priority: UInt8 = 128,
+        deliveryTimeout: Duration? = nil,
+        start: Start = .nextGroup
+    ) {
         self.track = track
         self.priority = priority
         self.deliveryTimeout = deliveryTimeout
+        self.start = start
     }
 }
 
@@ -194,6 +232,128 @@ public protocol SubscriptionHandle: Sendable, AnyObject {
     func updatePriority(_ priority: UInt8) async
 
     func cancel() async
+}
+
+/// What history to ask for.
+public struct FetchRequest: Hashable, Sendable {
+    /// The track, and the range within it.
+    public let range: Range
+
+    /// Draft-19 subscriber priority. Lower is more urgent.
+    ///
+    /// A fetch defaults to *less* urgent than a subscription, which is the
+    /// opposite of what "the user is waiting for this" suggests. It is right
+    /// anyway: catch-up competes with live media on the same link, and winning
+    /// that competition means stalling the live edge to deliver the past.
+    public let priority: UInt8
+
+    /// Whether to walk groups forwards or backwards.
+    ///
+    /// Descending is for a seek backwards through history — the most recent
+    /// group first, so something is on screen before the whole range arrives.
+    public let order: GroupOrder
+
+    public enum Range: Hashable, Sendable {
+        /// An explicit span of a named track.
+        case standalone(track: FullTrackName, from: Location, to: FetchEnd)
+
+        /// The last `groups` groups before wherever a subscription is now.
+        ///
+        /// The catch-up case, and the reason to prefer it over a standalone
+        /// fetch: the publisher resolves the range against the subscription's
+        /// own position, so there is no window in which the live edge moves
+        /// between working out what to ask for and asking for it.
+        case joining(subscription: any SubscriptionHandle, groups: UInt64)
+
+        /// From an absolute group up to wherever a subscription is now.
+        ///
+        /// The seek form. ``joining(subscription:groups:)`` asks for a distance
+        /// back from the live edge, which is what a joiner wants because it does
+        /// not know where the edge is; this asks from a group the caller has
+        /// already seen, which is what resuming from a known position wants. Only
+        /// the end is resolved against the edge.
+        case joiningFrom(subscription: any SubscriptionHandle, group: UInt64)
+
+        public static func == (lhs: Range, rhs: Range) -> Bool {
+            switch (lhs, rhs) {
+            case let (.standalone(a, b, c), .standalone(x, y, z)):
+                a == x && b == y && c == z
+            case let (.joining(a, b), .joining(x, y)):
+                a === x && b == y
+            case let (.joiningFrom(a, b), .joiningFrom(x, y)):
+                a === x && b == y
+            default:
+                false
+            }
+        }
+
+        public func hash(into hasher: inout Hasher) {
+            switch self {
+            case let .standalone(track, from, to):
+                hasher.combine(0)
+                hasher.combine(track)
+                hasher.combine(from)
+                hasher.combine(to)
+            case let .joining(subscription, groups):
+                hasher.combine(1)
+                hasher.combine(ObjectIdentifier(subscription))
+                hasher.combine(groups)
+            case let .joiningFrom(subscription, group):
+                hasher.combine(2)
+                hasher.combine(ObjectIdentifier(subscription))
+                hasher.combine(group)
+            }
+        }
+    }
+
+    public init(range: Range, priority: UInt8 = 200, order: GroupOrder = .ascending) {
+        self.range = range
+        self.priority = priority
+        self.order = order
+    }
+
+    /// Catch up on the group a subscription is in the middle of.
+    ///
+    /// One group, because that is what buys a keyframe. Asking for more is a
+    /// seek, not a join.
+    public static func catchUp(
+        on subscription: any SubscriptionHandle,
+        groups: UInt64 = 1
+    ) -> FetchRequest {
+        FetchRequest(range: .joining(subscription: subscription, groups: groups))
+    }
+}
+
+/// A fetch in progress.
+public protocol FetchHandle: Sendable, AnyObject {
+    /// The range the publisher agreed to serve, which is the requested range
+    /// clamped to what exists. `nil` until FETCH_OK arrives.
+    var served: FetchEnd? { get async }
+
+    /// Objects and gaps, in the requested group order.
+    ///
+    /// The stream ends when the range does. Unlike a subscription's, this
+    /// terminating is the normal outcome rather than a failure.
+    var records: AsyncStream<FetchedRecord> { get }
+
+    func cancel() async
+}
+
+/// What a fetch delivers.
+///
+/// Gaps are in the stream rather than filtered out of it, because a receiver
+/// needs them: an object that is missing from history is never arriving, and a
+/// decoder that waited for it would wait forever. Distinguishing "not there"
+/// from "cannot say" matters for the same reason — the second is worth retrying
+/// against another relay and the first is not.
+public enum FetchedRecord: Hashable, Sendable {
+    case object(TrackObject)
+
+    /// Nothing exists from after the previous record through this location.
+    case missing(through: Location)
+
+    /// Nothing is *known* from after the previous record through this location.
+    case unknown(through: Location)
 }
 
 /// Writes objects to a track.
@@ -229,17 +389,72 @@ public struct TrackObject: Hashable, Sendable {
     /// Whether this object begins a decodable point.
     public let isKeyFrame: Bool
 
+    /// Metadata the relay may read and the payload's encryption authenticates.
+    public let properties: ObjectProperties
+
     public init(
         group: UInt64,
         object: UInt64,
         priority: UInt8 = 128,
         payload: Data,
-        isKeyFrame: Bool = false
+        isKeyFrame: Bool = false,
+        properties: ObjectProperties = ObjectProperties()
     ) {
         self.group = group
         self.object = object
         self.priority = priority
         self.payload = payload
         self.isKeyFrame = isKeyFrame
+        self.properties = properties
+    }
+}
+
+/// What travels alongside an object's bytes.
+///
+/// These go on the wire as MOQT object properties rather than inside the
+/// payload, and the reason is end-to-end encryption. A relay has to schedule,
+/// deduplicate, and drop objects it cannot read; a receiver has to know when a
+/// frame should be presented before it can decrypt anything. Both need this
+/// visible. Putting it in the payload would either break the relay or force it
+/// to hold the key.
+///
+/// Being visible is not the same as being unprotected: SFrame authenticates
+/// these as additional data, so a relay can read them and cannot alter them.
+public struct ObjectProperties: Hashable, Sendable {
+    /// When the frame was captured, on the publisher's clock.
+    ///
+    /// Presentation timing, not arrival timing. A receiver that paced from
+    /// arrival would reproduce every jitter the network added.
+    public var captureTime: FrameTimestamp?
+
+    /// `0` for the base layer, higher for frames nothing depends on.
+    ///
+    /// The relay drops the highest layer first under congestion, which lowers
+    /// the frame rate rather than corrupting the picture — and it can do that
+    /// without parsing a bitstream it may not be able to read.
+    public var temporalLayer: Int?
+
+    /// Whether an audio packet is the encoder's idea of silence.
+    ///
+    /// On the object rather than inside the payload because the receiver has to
+    /// act on it before decoding: a packet that never arrived needs
+    /// concealment, and one the publisher marked as silence needs quiet.
+    /// Deriving it from the payload would mean decoding to find out, and
+    /// deriving it from a missing sequence number is exactly the confusion this
+    /// exists to prevent.
+    public var isSilence: Bool?
+
+    public init(
+        captureTime: FrameTimestamp? = nil,
+        temporalLayer: Int? = nil,
+        isSilence: Bool? = nil
+    ) {
+        self.captureTime = captureTime
+        self.temporalLayer = temporalLayer
+        self.isSilence = isSilence
+    }
+
+    public var isEmpty: Bool {
+        captureTime == nil && temporalLayer == nil && isSilence == nil
     }
 }

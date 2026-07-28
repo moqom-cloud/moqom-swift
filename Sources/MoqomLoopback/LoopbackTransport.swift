@@ -15,7 +15,11 @@ import MoqomKit
 public struct LoopbackTransport: Transport {
     public let relay: LoopbackRelay
 
-    /// Fail the next connection attempt, to exercise the reconnect path.
+    /// Fail every connection attempt, to exercise the reconnect path.
+    ///
+    /// For a relay that goes away and comes back — which is the case reconnection
+    /// actually has to handle — use ``LoopbackRelay/setAcceptingConnections(_:)``
+    /// instead. This is the permanent version.
     public let failure: TransportFailure?
 
     public init(relay: LoopbackRelay = LoopbackRelay(), failure: TransportFailure? = nil) {
@@ -28,8 +32,11 @@ public struct LoopbackTransport: Transport {
         credentials: DeviceCredentials
     ) async throws(MoqomError) -> any TransportSession {
         if let failure { throw MoqomError.transport(failure) }
+        guard await relay.isAcceptingConnections else {
+            throw MoqomError.transport(.unreachable)
+        }
         await relay.record(.connected(credentials.identity))
-        return LoopbackSession(
+        let session = LoopbackSession(
             relay: relay,
             negotiated: NegotiatedParameters(
                 alpn: endpoint.alpn.first ?? "moqt-19",
@@ -37,6 +44,8 @@ public struct LoopbackTransport: Transport {
                 maximumDatagramSize: 1200
             )
         )
+        await relay.attach(session, for: credentials.identity)
+        return session
     }
 }
 
@@ -45,13 +54,34 @@ public final class LoopbackSession: TransportSession {
     private let relay: LoopbackRelay
     private let parameters: NegotiatedParameters
 
+    private let interruptionStream: AsyncStream<TransportFailure>
+    private let interruptionContinuation: AsyncStream<TransportFailure>.Continuation
+    private let interrupted = OnceFlag()
+
     init(relay: LoopbackRelay, negotiated: NegotiatedParameters) {
         self.relay = relay
         parameters = negotiated
+        (interruptionStream, interruptionContinuation) = AsyncStream.makeStream(
+            of: TransportFailure.self,
+            bufferingPolicy: .bufferingNewest(1)
+        )
     }
 
     public var negotiated: NegotiatedParameters {
         get async { parameters }
+    }
+
+    public var interruptions: AsyncStream<TransportFailure> { interruptionStream }
+
+    /// Drop this session as if the network had gone away.
+    ///
+    /// The loopback's equivalent of ``MemoryCarrier/drop(_:)``, and the reason
+    /// the room layer's reconnection is testable without a socket: everything
+    /// above the transport sees exactly what a real drop produces.
+    public func drop(_ failure: TransportFailure = .idleTimeout) {
+        guard interrupted.claim() else { return }
+        interruptionContinuation.yield(failure)
+        interruptionContinuation.finish()
     }
 
     public func announce(
@@ -86,6 +116,7 @@ public final class LoopbackSession: TransportSession {
         let id = await relay.subscribe(
             to: request.track,
             priority: request.priority,
+            start: request.start,
             continuation: continuation
         )
         return LoopbackSubscription(
@@ -94,6 +125,42 @@ public final class LoopbackSession: TransportSession {
             objects: stream,
             relay: relay
         )
+    }
+
+    public func fetch(_ request: FetchRequest) async throws(MoqomError) -> any FetchHandle {
+        let track: FullTrackName
+        let start: Location
+        let end: FetchEnd
+
+        switch request.range {
+        case let .standalone(named, from, to):
+            track = named
+            start = from
+            end = to
+        case let .joining(subscription, groups):
+            // Resolved against where the track actually is, which is the whole
+            // reason to prefer a joining fetch: the live edge cannot move
+            // between working out what to ask for and asking.
+            track = subscription.track
+            guard let position = await relay.position(of: track) else {
+                throw MoqomError.rejected(.unavailable)
+            }
+            start = Location.group(position.group >= groups ? position.group - groups : 0)
+            end = .through(position)
+        case let .joiningFrom(subscription, group):
+            track = subscription.track
+            guard let position = await relay.position(of: track) else {
+                throw MoqomError.rejected(.unavailable)
+            }
+            guard group <= position.group else {
+                throw MoqomError.rejected(.unavailable)
+            }
+            start = Location.group(group)
+            end = .through(position)
+        }
+
+        let records = await relay.fetch(track, from: start, through: end, order: request.order)
+        return LoopbackFetch(track: track, served: end, records: records, relay: relay)
     }
 
     public func publish(
@@ -105,7 +172,24 @@ public final class LoopbackSession: TransportSession {
     }
 
     public func close(code: UInt64, reason _: String) async {
+        // Finished without yielding, so a deliberate close is never mistaken for
+        // a drop and never provokes a reconnect.
+        if interrupted.claim() { interruptionContinuation.finish() }
         await relay.close(code: code)
+    }
+}
+
+/// A one-shot latch.
+private final class OnceFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var claimed = false
+
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if claimed { return false }
+        claimed = true
+        return true
     }
 }
 
@@ -148,6 +232,48 @@ private final class LoopbackSubscription: SubscriptionHandle {
 
     func cancel() async {
         await relay.unsubscribe(id, from: track)
+    }
+}
+
+/// A fetch that has already been answered.
+///
+/// Everything is resolved before the handle exists, because there is no network
+/// to be waiting on. The records still arrive through an `AsyncStream` rather
+/// than as an array, so that a caller written against this and a caller written
+/// against `MoqtSession` are the same caller — including the part where the
+/// stream ending is how a fetch says it is done.
+private final class LoopbackFetch: FetchHandle {
+    let records: AsyncStream<FetchedRecord>
+
+    private let track: FullTrackName
+    private let end: FetchEnd
+    private let relay: LoopbackRelay
+
+    init(
+        track: FullTrackName,
+        served: FetchEnd,
+        records: [FetchedRecord],
+        relay: LoopbackRelay
+    ) {
+        self.track = track
+        end = served
+        self.relay = relay
+
+        let (stream, continuation) = AsyncStream.makeStream(
+            of: FetchedRecord.self,
+            bufferingPolicy: .unbounded
+        )
+        for record in records { continuation.yield(record) }
+        continuation.finish()
+        self.records = stream
+    }
+
+    var served: FetchEnd? {
+        get async { end }
+    }
+
+    func cancel() async {
+        await relay.cancelFetch(on: track)
     }
 }
 

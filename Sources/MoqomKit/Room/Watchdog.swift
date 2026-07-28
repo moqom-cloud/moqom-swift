@@ -46,6 +46,36 @@ public enum WatchdogKind: Hashable, Sendable {
         case let .custom(name): name
         }
     }
+
+    /// Read back from an identifier.
+    ///
+    /// A custom kind named `recording` becomes ``recording``, which is
+    /// deliberate rather than lossy: ``WatchdogSet/isRecording`` drives the
+    /// disclosure indicator off this case, and a tenant who could name their way
+    /// around it would have a recorder that users are never told about.
+    public init(identifier: String) {
+        switch identifier {
+        case "recording": self = .recording
+        case "safety": self = .safety
+        case "analytics": self = .analytics
+        case "compliance": self = .compliance
+        default: self = .custom(identifier)
+        }
+    }
+}
+
+extension WatchdogKind: Codable {
+    /// A bare string, because this appears in a disclosure that a third party
+    /// may have to read — a compliance auditor, or an operator diagnosing why a
+    /// customer's recorder is not attached. `{"custom":{"_0":"acme"}}` is what
+    /// the synthesised conformance would produce.
+    public init(from decoder: any Decoder) throws {
+        self.init(identifier: try String(from: decoder))
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        try identifier.encode(to: encoder)
+    }
 }
 
 /// Who runs it.
@@ -64,6 +94,44 @@ public enum WatchdogOperator: Hashable, Sendable {
     case thirdParty(String)
 }
 
+extension WatchdogOperator: Codable {
+    private enum Key: String, CodingKey {
+        case operator_ = "operator"
+        case name
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: Key.self)
+        switch try container.decode(String.self, forKey: .operator_) {
+        case "platform":
+            self = .platform
+        case "tenant":
+            self = .tenant
+        case "thirdParty":
+            self = .thirdParty(try container.decode(String.self, forKey: .name))
+        case let other:
+            throw DecodingError.dataCorruptedError(
+                forKey: .operator_,
+                in: container,
+                debugDescription: "unknown operator \(other)"
+            )
+        }
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: Key.self)
+        switch self {
+        case .platform:
+            try container.encode("platform", forKey: .operator_)
+        case .tenant:
+            try container.encode("tenant", forKey: .operator_)
+        case let .thirdParty(name):
+            try container.encode("thirdParty", forKey: .operator_)
+            try container.encode(name, forKey: .name)
+        }
+    }
+}
+
 /// Operational state, which is not the same shape as a participant's presence.
 ///
 /// A participant is connected, reconnecting, or away — a social state. A
@@ -77,7 +145,7 @@ public enum WatchdogHealth: String, Hashable, Sendable, Codable {
 }
 
 /// A subscriber that observes the room without appearing in it.
-public struct Watchdog: Hashable, Sendable, Identifiable {
+public struct Watchdog: Hashable, Sendable, Identifiable, Codable {
     public let id: WatchdogID
 
     public let kind: WatchdogKind
@@ -186,6 +254,21 @@ public struct WatchdogSet: Hashable, Sendable {
     public init(limit: Int = 8) {
         storage = [:]
         self.limit = limit
+    }
+
+    /// Build from a disclosure the room's authority published.
+    ///
+    /// The limit stretches to fit rather than truncating, and the reason is that
+    /// ``limit`` bounds *attaching* — a cost surprise and a denial of service
+    /// against a publisher — while this is the list a user has a right to see. A
+    /// recorder dropped on the floor by a client-side cap is a recorder nobody
+    /// was told about, which is the one failure here that matters.
+    public init(_ watchdogs: some Collection<Watchdog>, limit: Int = 8) {
+        storage = Dictionary(
+            watchdogs.map { ($0.id, $0) },
+            uniquingKeysWith: { _, later in later }
+        )
+        self.limit = max(limit, storage.count)
     }
 
     public var all: [Watchdog] { storage.values.sorted { $0.attachedAt < $1.attachedAt } }

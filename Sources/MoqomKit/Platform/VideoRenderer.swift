@@ -38,10 +38,24 @@ import MoqomCore
     public final class SampleBufferAssembler {
         private var format: CMFormatDescription?
         private var parameterSets: [Data] = []
-        private let codec: VideoCodec
+        private var codec: VideoCodec
 
         public init(codec: VideoCodec = .hevc) {
             self.codec = codec
+        }
+
+        /// Switch codecs.
+        ///
+        /// Settable because a viewer learns the codec from the publisher's
+        /// catalog, which arrives after the renderer has been built — the view
+        /// exists as soon as the participant does. Discards the format
+        /// description rather than converting it: an HEVC description is not a
+        /// starting point for an H.264 one.
+        public func setCodec(_ codec: VideoCodec) {
+            guard codec != self.codec else { return }
+            self.codec = codec
+            format = nil
+            parameterSets = []
         }
 
         /// Install the parameter sets from the catalog.
@@ -216,6 +230,22 @@ import MoqomCore
             layer.videoGravity = .resizeAspectFill
         }
 
+        /// Adopt the codec the publisher's catalog names.
+        public func setCodec(_ codec: VideoCodec) {
+            assembler.setCodec(codec)
+        }
+
+        /// Draw a reassembled frame, flushing first when objects were lost.
+        ///
+        /// The gap handling is why this overload exists rather than leaving
+        /// callers to unwrap the frame themselves: enqueueing across a hole
+        /// feeds the decoder references that never arrived, and the artefacts
+        /// last until the next keyframe.
+        public func enqueue(_ frame: DepacketisedFrame) throws(MoqomError) {
+            if frame.followsGap { flush() }
+            try enqueue(frame.frame)
+        }
+
         /// Show a frame.
         ///
         /// Drops rather than throws when the layer has failed, because the
@@ -236,6 +266,67 @@ import MoqomCore
                 renderer.isReadyForMoreMediaData,
                 let sample = try assembler.sampleBuffer(for: frame)
             else { return }
+
+            renderer.enqueue(sample)
+        }
+
+        /// Show a captured frame without encoding it.
+        ///
+        /// This is the local preview, and it deliberately does not go through
+        /// the encoder. Previewing the encoded stream would show the publisher
+        /// their own latency and their own compression artefacts, and would
+        /// keep the camera visible on screen only for as long as the
+        /// publication survived.
+        ///
+        /// Silently ignores a frame with no pixels, because the synthetic
+        /// surface exists precisely for paths that have no GPU.
+        public func enqueue(_ frame: VideoFrame) {
+            guard case let .pixelBuffer(buffer) = frame.surface else { return }
+
+            let renderer = layer.sampleBufferRenderer
+            if renderer.status == .failed { renderer.flush() }
+            guard renderer.isReadyForMoreMediaData else { return }
+
+            var format: CMFormatDescription?
+            guard
+                CMVideoFormatDescriptionCreateForImageBuffer(
+                    allocator: kCFAllocatorDefault,
+                    imageBuffer: buffer,
+                    formatDescriptionOut: &format
+                ) == noErr,
+                let format
+            else { return }
+
+            var timing = CMSampleTimingInfo(
+                duration: .invalid,
+                presentationTimeStamp: frame.timestamp.cmTime,
+                decodeTimeStamp: .invalid
+            )
+            var sample: CMSampleBuffer?
+            guard
+                CMSampleBufferCreateReadyWithImageBuffer(
+                    allocator: kCFAllocatorDefault,
+                    imageBuffer: buffer,
+                    formatDescription: format,
+                    sampleTiming: &timing,
+                    sampleBufferOut: &sample
+                ) == noErr,
+                let sample
+            else { return }
+
+            if
+                let attachments = CMSampleBufferGetSampleAttachmentsArray(
+                    sample,
+                    createIfNecessary: true
+                ) as? [CFMutableDictionary],
+                let first = attachments.first
+            {
+                CFDictionarySetValue(
+                    first,
+                    Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+                    Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
+                )
+            }
 
             renderer.enqueue(sample)
         }

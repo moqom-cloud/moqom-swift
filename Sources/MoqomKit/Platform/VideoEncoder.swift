@@ -25,73 +25,6 @@ import MoqomCore
     import CoreVideo
     import VideoToolbox
 
-    /// One encoded frame on its way to a track.
-    public struct EncodedFrame: Sendable {
-        public let timestamp: FrameTimestamp
-        public let isKeyFrame: Bool
-
-        /// `0` for the base layer, `1` for frames nothing depends on.
-        ///
-        /// Derived from `kCMSampleAttachmentKey_IsDependedOnByOthers` rather
-        /// than counted by the SDK, because the encoder is the only thing that
-        /// knows the reference structure it actually produced — it may ignore a
-        /// requested base layer fraction on hardware that cannot do it.
-        public let temporalLayer: Int
-
-        /// Length-prefixed NAL units, as VideoToolbox emits them.
-        public let data: Data
-
-        /// Parameter sets, present on keyframes.
-        ///
-        /// Carried out of band on the catalog rather than inline in every
-        /// keyframe: a viewer joining mid-stream needs them before the first
-        /// object, and a subscriber that starts at an arbitrary group would
-        /// otherwise have to wait for the next IDR to learn how to configure a
-        /// decoder.
-        public let parameterSets: [Data]
-
-        public init(
-            timestamp: FrameTimestamp,
-            isKeyFrame: Bool,
-            temporalLayer: Int,
-            data: Data,
-            parameterSets: [Data]
-        ) {
-            self.timestamp = timestamp
-            self.isKeyFrame = isKeyFrame
-            self.temporalLayer = temporalLayer
-            self.data = data
-            self.parameterSets = parameterSets
-        }
-    }
-
-    /// How to encode one rung.
-    public struct EncoderConfiguration: Sendable {
-        public var layer: VideoLayer
-        public var codec: VideoCodec
-
-        /// Split the rung into two temporal layers.
-        ///
-        /// Costs a little efficiency and buys the relay something to shed that
-        /// degrades gracefully.
-        public var usesTemporalLayers: Bool
-
-        /// How long a joiner may wait for a decodable point.
-        public var keyFrameInterval: Duration
-
-        public init(
-            layer: VideoLayer,
-            codec: VideoCodec = .hevc,
-            usesTemporalLayers: Bool = true,
-            keyFrameInterval: Duration = .seconds(2)
-        ) {
-            self.layer = layer
-            self.codec = codec
-            self.usesTemporalLayers = usesTemporalLayers
-            self.keyFrameInterval = keyFrameInterval
-        }
-    }
-
     /// A hardware compression session for one rung of the ladder.
     ///
     /// One session per rung rather than one session downscaled per frame: the
@@ -103,8 +36,18 @@ import MoqomCore
     /// > Important: This type is written against VideoToolbox and compiles on
     /// > every Apple platform, but nothing in the package's test suite runs it.
     /// > It needs a GPU and, in practice, a device.
-    public actor VideoEncoder {
-        public let configuration: EncoderConfiguration
+    public actor VideoEncoder: FrameEncoder {
+        public nonisolated let configuration: EncoderConfiguration
+
+        /// Whether the session got the low-latency rate controller.
+        ///
+        /// False means this encoder is targeting its bitrate over a window and
+        /// may buffer to hit it, which is a latency floor the transport cannot
+        /// undo. The simulator is the case that makes this worth exposing
+        /// rather than fataling: it has an encoder for both codecs and no
+        /// low-latency one for either, so refusing outright would mean the SDK
+        /// cannot encode anything without a device.
+        public nonisolated let usesLowLatencyRateControl: Bool
 
         private let box: SessionBox
         private nonisolated var session: VTCompressionSession { box.session }
@@ -121,28 +64,26 @@ import MoqomCore
 
             // Requested on the specification rather than as a property, because
             // it selects a different rate control implementation and cannot be
-            // switched on after the session exists.
-            let specification: [CFString: Any] = [
-                kVTVideoEncoderSpecification_EnableLowLatencyRateControl: kCFBooleanTrue as Any,
-            ]
-
+            // switched on after the session exists. Which is also why the
+            // fallback has to be a second create rather than a property set.
             var created: VTCompressionSession?
-            let status = VTCompressionSessionCreate(
-                allocator: kCFAllocatorDefault,
-                width: Int32(configuration.layer.size.width),
-                height: Int32(configuration.layer.size.height),
-                codecType: Self.codecType(configuration.codec),
-                encoderSpecification: specification as CFDictionary,
-                imageBufferAttributes: nil,
-                compressedDataAllocator: nil,
-                outputCallback: nil,
-                refcon: nil,
-                compressionSessionOut: &created
-            )
+            var status = Self.create(&created, for: configuration, lowLatency: true)
+            let lowLatency = status == noErr
+
+            // `kVTCouldNotFindVideoEncoderErr` here means "no low-latency
+            // encoder for this codec", not "no encoder": the plain session
+            // still builds. Any other failure is a real one and is not retried,
+            // because a second create would only turn a diagnosable status into
+            // a confusing one.
+            if status == kVTCouldNotFindVideoEncoderErr {
+                status = Self.create(&created, for: configuration, lowLatency: false)
+            }
+
             guard status == noErr, let created else {
                 continuation.finish()
                 throw MoqomError.platform(api: "VTCompressionSessionCreate", status: status)
             }
+            usesLowLatencyRateControl = lowLatency
             box = SessionBox(session: created)
 
             try Self.configure(created, with: configuration)
@@ -171,7 +112,7 @@ import MoqomCore
         ///
         /// Returns once VideoToolbox has accepted the frame, which is not when
         /// it has been encoded — output arrives on ``encodedFrames()``.
-        public func encode(_ frame: VideoFrame, forcingKeyFrame: Bool = false) throws {
+        public func encode(_ frame: VideoFrame, forcingKeyFrame: Bool = false) async throws {
             guard !isClosed else {
                 throw MoqomError.invalidState(expected: "encoding", actual: "closed")
             }
@@ -225,6 +166,28 @@ import MoqomCore
             isClosed = true
             VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
             continuation.finish()
+        }
+
+        private static func create(
+            _ session: inout VTCompressionSession?,
+            for configuration: EncoderConfiguration,
+            lowLatency: Bool
+        ) -> OSStatus {
+            let specification: [CFString: Any] = lowLatency
+                ? [kVTVideoEncoderSpecification_EnableLowLatencyRateControl: kCFBooleanTrue as Any]
+                : [:]
+            return VTCompressionSessionCreate(
+                allocator: kCFAllocatorDefault,
+                width: Int32(configuration.layer.size.width),
+                height: Int32(configuration.layer.size.height),
+                codecType: codecType(configuration.codec),
+                encoderSpecification: specification.isEmpty ? nil : specification as CFDictionary,
+                imageBufferAttributes: nil,
+                compressedDataAllocator: nil,
+                outputCallback: nil,
+                refcon: nil,
+                compressionSessionOut: &session
+            )
         }
 
         private static func codecType(_ codec: VideoCodec) -> CMVideoCodecType {

@@ -37,6 +37,24 @@ public enum MoqomError: Error, Sendable {
     /// The device has no encoder or decoder for what was asked.
     case unsupportedCodec(VideoCodec)
 
+    /// The device has no audio encoder or decoder for what was asked.
+    case unsupportedAudioCodec(AudioCodec)
+
+    /// End-to-end encryption was configured and could not be applied.
+    ///
+    /// Always fatal to the write that caused it. Publishing plaintext because
+    /// encryption failed would give a caller who asked for E2EE a stream that
+    /// silently is not one, which is worse than dropping the frame.
+    case encryptionFailed(SFrameError)
+
+    /// The peer sent something the protocol does not allow.
+    ///
+    /// Distinct from ``transport(_:)`` because the correct response differs: a
+    /// dropped connection is worth retrying and a peer that cannot frame a
+    /// message is not. Reconnecting into the same violation is how a client
+    /// turns one bug into a loop.
+    case protocolViolation(String)
+
     /// A platform framework returned a failure the SDK cannot interpret.
     ///
     /// The `OSStatus` is preserved verbatim because VideoToolbox status codes
@@ -99,8 +117,14 @@ extension MoqomError: CustomStringConvertible {
             "terminated: \(event.reason)"
         case let .notPermitted(capability):
             "not permitted: requires \(capability)"
+        case let .protocolViolation(why):
+            "protocol violation: \(why)"
         case let .unsupportedCodec(codec):
             "unsupported codec: \(codec.rawValue)"
+        case let .unsupportedAudioCodec(codec):
+            "unsupported audio codec: \(codec.rawValue)"
+        case let .encryptionFailed(reason):
+            "encryption failed: \(reason)"
         case let .platform(api, status):
             "\(api) failed with status \(status)"
         }

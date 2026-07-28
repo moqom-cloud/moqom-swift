@@ -25,6 +25,65 @@ public enum RoomLifecycle: Hashable, Sendable {
     case actingHost(ParticipantIdentity)
 
     case ended(TerminalEvent)
+
+    /// Whether the room is over.
+    ///
+    /// Terminal in both directions: nothing reopens a room, so a late entry
+    /// arriving after the end is history rather than news. A client that let one
+    /// move it back to `live` would resurrect a stream that has already told the
+    /// user why it stopped.
+    public var isEnded: Bool {
+        if case .ended = self { return true }
+        return false
+    }
+}
+
+extension RoomLifecycle: Codable {
+    private enum Key: String, CodingKey {
+        case lifecycle
+        case startsAt
+        case actingHost
+        case event
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: Key.self)
+        switch try container.decode(String.self, forKey: .lifecycle) {
+        case "scheduled":
+            self = .scheduled(startsAt: try container.decode(Date.self, forKey: .startsAt))
+        case "live":
+            self = .live
+        case "actingHost":
+            self = .actingHost(
+                try container.decode(ParticipantIdentity.self, forKey: .actingHost)
+            )
+        case "ended":
+            self = .ended(try container.decode(TerminalEvent.self, forKey: .event))
+        case let other:
+            throw DecodingError.dataCorruptedError(
+                forKey: .lifecycle,
+                in: container,
+                debugDescription: "unknown lifecycle \(other)"
+            )
+        }
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: Key.self)
+        switch self {
+        case let .scheduled(startsAt):
+            try container.encode("scheduled", forKey: .lifecycle)
+            try container.encode(startsAt, forKey: .startsAt)
+        case .live:
+            try container.encode("live", forKey: .lifecycle)
+        case let .actingHost(identity):
+            try container.encode("actingHost", forKey: .lifecycle)
+            try container.encode(identity, forKey: .actingHost)
+        case let .ended(event):
+            try container.encode("ended", forKey: .lifecycle)
+            try container.encode(event, forKey: .event)
+        }
+    }
 }
 
 /// Everything a client knows about a room right now.
@@ -98,6 +157,13 @@ public enum RoomEvent: Sendable {
     case grantsChanged(ParticipantIdentity, Grants)
     case spotlightChanged(ParticipantIdentity?)
 
+    /// A participant published or changed their catalog.
+    ///
+    /// Where a viewer learns what a publisher actually offers. Until this
+    /// arrives the SDK is guessing at a default ladder, and a guess that is
+    /// wrong means subscribing to tracks that do not exist.
+    case catalogChanged(ParticipantIdentity, Catalog)
+
     /// A watchdog attached, detached, or changed health. Separate from the
     /// participant cases so a client that renders the roster from these events
     /// physically cannot add a recorder to it.
@@ -105,6 +171,36 @@ public enum RoomEvent: Sendable {
 
     case stageChanged(StageState)
     case lifecycleChanged(RoomLifecycle)
+
+    /// Who to draw, in what order, and which of them are talking.
+    ///
+    /// Carries the whole layout rather than a delta, because the interesting
+    /// property is what did *not* change: an occupant keeps its position for as
+    /// long as it holds a tile, so somebody starting to speak arrives here as a
+    /// ring to redraw and not as a grid to rearrange.
+    case galleryChanged([Gallery.Slot])
+
+    /// Who the Picture in Picture window should draw, in order.
+    ///
+    /// Separate from ``galleryChanged`` because the two move independently: a
+    /// cast that follows the speaker changes on speech that a nine-up grid
+    /// absorbs without rearranging, and a window bounded at four tiles reaches
+    /// its overflow long before the grid reaches its own. Only emitted once
+    /// something has asked for a window.
+    case pictureInPictureChanged([Gallery.Slot])
+
+    /// Somebody's connection changed how it looks, this device included.
+    ///
+    /// One case for both, because the identity says which: an application draws
+    /// the same indicator on a remote tile and on its own self view, and giving
+    /// it two cases would only make it write the drawing code twice. Emitted on
+    /// change and not on measurement, so a stable connection produces nothing.
+    ///
+    /// Only arrives while something is sampling ``RoomSession/statistics``, since
+    /// quality is derived from a snapshot rather than tracked continuously —
+    /// there is no measurement without a measurer, and a timer nobody read from
+    /// would be battery spent on a number nobody wanted.
+    case qualityChanged(ParticipantIdentity, ConnectionQuality)
 
     /// The stream is over. Arrives as media, before the transport winds down.
     case terminated(TerminalEvent)

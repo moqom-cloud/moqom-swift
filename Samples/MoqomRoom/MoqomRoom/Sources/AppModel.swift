@@ -54,7 +54,14 @@ final class AppModel {
                     token: Data(),
                     proofSigner: { challenge in challenge }
                 ),
-                tenant: "demo"
+                tenant: "demo",
+                // The sample opts in, because the sample is what an integrator
+                // reads to find out that this exists. `.hashed` even here: a
+                // demo's log is the one most likely to end up in a screenshot.
+                logger: MoqomLogger(
+                    sink: SystemLogSink(subsystem: "cloud.moqom.sample", privacy: .hashed),
+                    minimum: .debug
+                )
             )
             try await session.connect(to: RelayEndpoint(host: "relay.moqom.invalid"))
             let room = try await session.join(room: RoomID(roomName))

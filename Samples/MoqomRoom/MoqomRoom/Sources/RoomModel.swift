@@ -25,7 +25,140 @@ final class RoomModel {
     private(set) var stage = StageState()
     private(set) var lifecycle: RoomLifecycle = .live
     private(set) var isBroadcasting = false
+    private(set) var isPublishingAudio = false
     private(set) var lastError: MoqomError?
+
+    /// Where published audio comes from.
+    ///
+    /// A tone by default so the sample runs in a simulator with no input device
+    /// and asks for no permission it does not need. The microphone is the option
+    /// that matters on a device, and it is the only way to check the thing that
+    /// cannot be checked anywhere else: whether the room's own output is being
+    /// cancelled before it goes back up the uplink.
+    var audioInput: AudioInput = .tone
+
+    /// What the microphone is hearing. ``AudioMeter/quiet`` unless capturing.
+    ///
+    /// This is the instrument for the speakerphone test. Put a cohost's voice on
+    /// the speaker, say nothing, and watch the level: at the noise floor means
+    /// the canceller has its reference, and tracking the far end means it does
+    /// not and everybody in the room is about to hear themselves.
+    private(set) var meter = AudioMeter.quiet
+
+    /// Whether the system agreed to cancel echo. Asking is not getting.
+    private(set) var isCancellingEcho = false
+
+    /// Turn the processing off without taking the graph down.
+    ///
+    /// The measurement instrument. Cancellation is invisible when it works, so
+    /// the only way to know it is working is to remove it and watch the level
+    /// rise by however much it was subtracting.
+    var isBypassingVoiceProcessing: Bool {
+        get { AudioGraph.shared.isBypassingVoiceProcessing }
+        set { AudioGraph.shared.isBypassingVoiceProcessing = newValue }
+    }
+
+    enum AudioInput: String, CaseIterable, Identifiable, Sendable {
+        case tone = "Tone"
+        case microphone = "Microphone"
+
+        var id: String { rawValue }
+    }
+
+    /// What each participant says they are publishing.
+    private(set) var catalogs: [ParticipantIdentity: Catalog] = [:]
+
+    /// Who the Picture in Picture window draws when the app is backgrounded.
+    ///
+    /// A separate question from ``boxes``, and deliberately so: the window is a
+    /// few hundred points over somebody else's app, so the interesting default
+    /// is not "the gallery, smaller" but "the one or two people worth watching
+    /// at that size".
+    var cast: CastChoice = .speaker {
+        didSet {
+            guard cast != oldValue else { return }
+            Task { await room.setPictureInPictureCast(cast.cast) }
+        }
+    }
+
+    /// Live, once the window is up. Drives nothing; shown so the state is legible.
+    var isInPictureInPicture: Bool {
+        #if os(iOS)
+            pictureInPicture?.isActive ?? false
+        #else
+            false
+        #endif
+    }
+
+    #if os(iOS)
+        /// Owns the AVKit controller and the borrowed layers.
+        ///
+        /// Held here rather than in a view because the window outlives the view
+        /// that started it — that is the entire feature.
+        private(set) var pictureInPicture: MoqomPictureInPicture?
+    #endif
+
+    /// Which of the two layouts the room is in.
+    ///
+    /// Both are the same SDK machinery with a different bound: the gallery caps
+    /// occupancy at what the device can decode, and the audio room caps it at how
+    /// many seats the design draws, which is a bigger number because an avatar is
+    /// not a decoder.
+    var mode: Mode = .gallery {
+        didSet {
+            guard mode != oldValue else { return }
+            Task { await applyMode() }
+        }
+    }
+
+    /// How many tiles the gallery draws.
+    ///
+    /// A control in the sample because it is the number a real client should be
+    /// lowering under thermal pressure, and having it on screen makes the
+    /// consequence — which participants keep video and which keep only audio —
+    /// something you can watch happen.
+    var boxes = 9 {
+        didSet {
+            guard boxes != oldValue else { return }
+            Task { await applyMode() }
+        }
+    }
+
+    /// Who to draw, in what order, from the SDK.
+    ///
+    /// Excludes this device: the self tile is drawn from the capture preview, not
+    /// from a subscription to our own upload.
+    private(set) var slots: [Gallery.Slot] = []
+
+    /// In the room, without a tile. They are still audible.
+    private(set) var overflow: [ParticipantIdentity] = []
+
+    enum Mode: String, CaseIterable, Identifiable, Sendable {
+        case gallery = "Gallery"
+        case audioRoom = "Audio room"
+
+        var id: String { rawValue }
+
+        var seatAspect: Double { self == .gallery ? 16.0 / 9.0 : 1 }
+    }
+
+    /// Everything the SDK measures, resampled a few times a second.
+    ///
+    /// Nothing in the app supplies any of this. It is what makes the difference
+    /// between a quality selector that guesses and one that knows.
+    private(set) var statistics: RoomStatistics?
+
+    /// What the SDK measures the downlink to be carrying.
+    var link: LinkStatistics { statistics?.link ?? .unknown }
+
+    /// How this device's connection looks, and how everyone else's does.
+    ///
+    /// Two values because they answer different questions. A viewer whose own
+    /// link is failing should be told to check their network; a viewer watching
+    /// one cohost on a train should be told which cohost.
+    var quality: ConnectionQuality { statistics?.quality ?? .unknown }
+
+    private(set) var qualities: [ParticipantIdentity: ConnectionQuality] = [:]
 
     /// What this device may do, as granted by its token.
     ///
@@ -40,13 +173,37 @@ final class RoomModel {
     private let session: MoqomSession
     private let room: RoomSession
     private var pump: Task<Void, Never>?
-    private var capture: FrameRelay?
+    private var sampler: Task<Void, Never>?
+    private var capture: PatternSource?
+    private var microphone: AudioRelay?
+    private var toneTask: Task<Void, Never>?
+    private var mic: MicrophoneSource?
+    private var meterTask: Task<Void, Never>?
+
+    /// One player per participant, because the relay forwards rather than mixes
+    /// and mixing here would throw away per-participant volume and mute.
+    ///
+    /// They all share one audio graph, which is a different question and has the
+    /// opposite answer: the device has one speaker, and the echo canceller in
+    /// front of the microphone can only subtract audio it was given. Players on
+    /// separate graphs would each be echo somebody else hears.
+    private var players: [ParticipantIdentity: AudioPlayer] = [:]
+    private var playback: [ParticipantIdentity: Task<Void, Never>] = [:]
 
     init(session: MoqomSession, room: RoomSession, identity: ParticipantIdentity) {
         self.session = session
         self.room = room
         self.identity = identity
         layout.bind(to: room)
+        #if os(iOS)
+            pictureInPicture = MoqomPictureInPicture(room: room, layout: layout)
+            pictureInPicture?.onFailure = { [weak self] error in
+                // Almost always the missing background mode, and worth
+                // surfacing rather than swallowing: the failure is silent
+                // otherwise, and looks like the feature simply not working.
+                self?.lastError = .invalidState("Picture in Picture: \(error.localizedDescription)")
+            }
+        #endif
         start()
     }
 
@@ -63,7 +220,23 @@ final class RoomModel {
                 await self?.apply(event)
             }
         }
-        Task { await refresh() }
+
+        // Four times a second, which is faster than a person reads a number and
+        // slow enough to be free. The stream ends itself when the room does.
+        sampler = Task { [weak self, room] in
+            for await snapshot in await room.statistics(every: .milliseconds(250)) {
+                self?.observe(snapshot)
+            }
+        }
+        Task {
+            await applyMode()
+            await room.setPictureInPictureCast(cast.cast)
+            await refresh()
+        }
+    }
+
+    private func observe(_ snapshot: RoomStatistics) {
+        statistics = snapshot
     }
 
     private func apply(_ event: RoomEvent) async {
@@ -74,7 +247,27 @@ final class RoomModel {
             stage = updated
         case .lifecycleChanged(let updated):
             lifecycle = updated
-        case .participantJoined, .participantLeft, .presenceChanged,
+        case .catalogChanged(let who, let catalog):
+            catalogs[who] = catalog
+            if catalog.audioTrack != nil { await startPlayback(for: who) }
+        case .galleryChanged(let updated):
+            // Carries speaking state as well as occupancy, so this one event
+            // drives both the rings and the layout — and because a tile holds its
+            // position while it is held, the common case is a ring changing and
+            // nothing moving.
+            slots = updated
+            overflow = await room.galleryOverflow
+        case .participantLeft(let who):
+            catalogs.removeValue(forKey: who)
+            await stopPlayback(for: who)
+            await refresh()
+        case .qualityChanged(let who, let quality):
+            // Applied straight rather than through `refresh()`: the indicator is
+            // the only thing that changed, and rebuilding the roster to draw one
+            // badge would reshuffle a grid because somebody's train went into a
+            // tunnel.
+            qualities[who] = quality
+        case .participantJoined, .presenceChanged,
              .muteChanged, .grantsChanged, .spotlightChanged:
             await refresh()
         case .terminated:
@@ -84,6 +277,104 @@ final class RoomModel {
 
     private func refresh() async {
         participants = await room.roster.participants
+        slots = await room.galleryLayout
+        overflow = await room.galleryOverflow
+    }
+
+    private func applyMode() async {
+        switch mode {
+        case .gallery:
+            await room.setGalleryPolicy(.grid(boxes: boxes))
+        case .audioRoom:
+            await room.setGalleryPolicy(.audioRoom(seats: max(boxes, 12)))
+        }
+        applyAudioPurpose()
+    }
+
+    /// Configure the system for what this device is actually doing.
+    ///
+    /// The distinction that matters is publishing versus not. A viewer who has
+    /// not gone on stage should hold no microphone at all: no orange indicator for
+    /// an app that is only listening, no input device taken from other apps, and —
+    /// the one that decides whether an audio room is usable — audio that keeps
+    /// playing when the screen locks.
+    ///
+    /// Called on the transitions rather than on every mute, because the category
+    /// is fixed when the engine starts and changing it restarts the engine. A
+    /// speaker toggling their microphone stays on a recording session; leaving the
+    /// stage entirely is what moves them off it.
+    private func applyAudioPurpose(publishing: Bool? = nil) {
+        let purpose: AudioGraph.Purpose
+        if publishing ?? (isPublishingAudio || isBroadcasting) {
+            purpose = mode == .audioRoom ? .voiceCall : .videoCall
+        } else {
+            purpose = .listening
+        }
+
+        guard AudioGraph.shared.configuration.purpose != purpose else { return }
+        do {
+            try AudioGraph.shared.reconfigure(
+                AudioGraph.Configuration(purpose: purpose)
+            )
+        } catch {
+            // A device that will not reconfigure its session is a reason to keep
+            // listening on whatever it has, not to leave the room.
+            lastError = error
+        }
+    }
+
+    /// Guarantee a participant a tile, for this viewer only.
+    ///
+    /// Immediate rather than subject to the dwell that keeps speech from
+    /// rearranging the grid: this is somebody having tapped a button.
+    func togglePin(_ target: ParticipantIdentity) async {
+        if slots.first(where: { $0.identity == target })?.claim == .pinned {
+            await room.unpin(target)
+        } else {
+            await room.pin(target)
+        }
+    }
+
+    func isSpeaking(_ target: ParticipantIdentity) -> Bool {
+        slots.first { $0.identity == target }?.isSpeaking ?? false
+    }
+
+    /// The participant behind a tile, for the views that need the whole record.
+    func participant(_ target: ParticipantIdentity) -> Participant? {
+        participants.first { $0.slot.identity == target }
+    }
+
+    /// The best rung a participant is offering, for the tile's quality badge.
+    ///
+    /// From their catalog rather than from an assumption, which is the whole
+    /// reason the catalog exists: this label is correct for a publisher whose
+    /// ladder we have never seen before.
+    func quality(of who: ParticipantIdentity) -> String? {
+        guard let best = catalogs[who]?.videoLadder.highest else { return nil }
+        return "\(best.size.height)p"
+    }
+
+    /// Decodable frames for one participant.
+    ///
+    /// The SDK reassembles: it drops what precedes the first keyframe, notices
+    /// gaps, and attaches the parameter sets the catalog carried. All this
+    /// view has to do is draw.
+    func frames(of who: ParticipantIdentity) async -> AsyncStream<DepacketisedFrame>? {
+        await room.frames(from: who)
+    }
+
+    /// What codec a participant's current rung is in, once their catalog says.
+    func codec(of who: ParticipantIdentity) async -> VideoCodec? {
+        await room.codec(of: who)
+    }
+
+    /// This device's own capture, for the self tile.
+    ///
+    /// Straight off the source rather than round-tripped through the relay:
+    /// previewing the encoded stream would show the publisher their own
+    /// latency and their own compression artefacts.
+    func localPreview() -> AsyncStream<VideoFrame>? {
+        capture?.preview()
     }
 
     // MARK: - Broadcasting
@@ -91,23 +382,176 @@ final class RoomModel {
     func startBroadcast() async {
         guard !isBroadcasting else { return }
 
-        // A `FrameRelay` rather than a camera or a scene, so the sample runs in
-        // a simulator with nothing attached. `SceneEffects` is where a real
-        // build swaps in `SceneCapture` and gets the RealityKit path.
-        let relay = FrameRelay(
-            format: CaptureFormat(size: PixelSize(width: 1280, height: 720), frameRate: 30)
+        // A rendered pattern rather than a camera or a scene, so the sample
+        // runs in a simulator with nothing attached — and unlike an empty
+        // relay, it produces pixels that actually encode. `CameraSource` and
+        // `SceneCapture` are the two one-line swaps a real build makes here.
+        let size = PixelSize(width: 1280, height: 720)
+        let source = PatternSource(
+            format: CaptureFormat(size: size, frameRate: 30),
+            label: identity.username.value
         )
-        capture = relay
+        capture = source
 
         do {
-            let broadcast = try await room.startBroadcast(from: relay)
+            // The ladder is capped at what is being captured. The default goes
+            // to 1080p, and a 1080p rung fed 720p frames publishes an upscale:
+            // the catalog says 1080p, the viewer subscribes for it, and the
+            // extra bitrate buys nothing.
+            let broadcast = try await room.startBroadcast(
+                from: source,
+                configuration: BroadcastConfiguration(ladder: .defaultCamera(topSize: size))
+            )
             await broadcast.start()
             isBroadcasting = true
+            applyAudioPurpose()
             await refresh()
         } catch {
             lastError = error
+            source.stop()
             capture = nil
         }
+    }
+
+    /// Publish audio, from whichever input is selected.
+    func startAudio() async {
+        guard !isPublishingAudio else { return }
+
+        // Before the capture rather than after it. `AudioGraph.microphone()`
+        // refuses on a listening graph, and should: a playback session has no
+        // input to tap, and returning a relay that would stay silent forever is
+        // the worse of the two behaviours.
+        applyAudioPurpose(publishing: true)
+
+        switch audioInput {
+        case .tone: await startTone()
+        case .microphone: await startMicrophone()
+        }
+
+        applyAudioPurpose()
+    }
+
+    /// Publish the real microphone, through the shared audio graph.
+    ///
+    /// Which is the whole point of doing it here: the graph this capture runs on
+    /// is the same one every `AudioPlayer` in `startPlayback` mixes into, so the
+    /// canceller's reference contains the cohosts. Nothing in this method says
+    /// so, and that is the intent — the correct arrangement is the default, and
+    /// an integrator gets it without knowing it was a decision.
+    private func startMicrophone() async {
+        let source: MicrophoneSource
+        do {
+            source = try MicrophoneSource()
+            try source.start()
+        } catch {
+            lastError = error
+            return
+        }
+
+        do {
+            let publication = try await room.startAudio(from: source)
+            await publication.start()
+            isPublishingAudio = true
+        } catch {
+            lastError = error
+            source.stop()
+            return
+        }
+
+        mic = source
+        isCancellingEcho = source.isCancellingEcho
+
+        // Ten times a second, which is faster than anybody reads a number and
+        // slow enough to be free. A meter driven off every 20ms packet would
+        // redraw the interface fifty times a second to say the same thing.
+        meterTask = Task { [weak self] in
+            while !Task.isCancelled {
+                self?.meter = source.meter
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+        }
+    }
+
+    private func startTone() async {
+        let relay = AudioRelay()
+        microphone = relay
+
+        do {
+            let publication = try await room.startAudio(from: relay)
+            await publication.start()
+            isPublishingAudio = true
+        } catch {
+            lastError = error
+            microphone = nil
+            return
+        }
+
+        toneTask = Task { [weak self] in
+            let format = AudioFormat.voice
+            var phase = 0.0
+            var timestamp: UInt64 = 0
+            let step = 2 * Double.pi * 440 / Double(format.sampleRate)
+            while !Task.isCancelled {
+                var samples = [Float](repeating: 0, count: format.samplesPerFrame)
+                for index in samples.indices {
+                    samples[index] = Float(sin(phase)) * 0.2
+                    phase += step
+                }
+                relay.submit(
+                    AudioFrame(
+                        timestamp: FrameTimestamp(nanoseconds: timestamp),
+                        format: format,
+                        samples: samples
+                    )
+                )
+                timestamp += 20_000_000
+                try? await Task.sleep(for: .milliseconds(20))
+            }
+            _ = self
+        }
+    }
+
+    /// Hear a cohost.
+    ///
+    /// Started from their catalog rather than from a button, because a viewer
+    /// who joined a room expects to hear it. Stopping is `toggleLocalMute`,
+    /// which unsubscribes rather than turning the volume down.
+    private func startPlayback(for who: ParticipantIdentity) async {
+        guard who != identity, playback[who] == nil else { return }
+        guard let outputs = await room.audio(from: who) else { return }
+
+        let player: AudioPlayer
+        do {
+            player = try AudioPlayer()
+        } catch {
+            // Not surfaced as an alert. A device with no output is a reason to
+            // stay in the room silently, not a reason to leave it.
+            return
+        }
+        players[who] = player
+        playback[who] = Task { try? await player.play(outputs) }
+    }
+
+    private func stopPlayback(for who: ParticipantIdentity) async {
+        playback.removeValue(forKey: who)?.cancel()
+        if let player = players.removeValue(forKey: who) {
+            await player.stop()
+        }
+    }
+
+    func stopAudio() async {
+        toneTask?.cancel()
+        toneTask = nil
+        meterTask?.cancel()
+        meterTask = nil
+        await room.stopAudio()
+        mic?.stop()
+        mic = nil
+        microphone = nil
+        isPublishingAudio = false
+        isCancellingEcho = false
+        meter = .quiet
+        applyAudioPurpose()
     }
 
     func stopBroadcast() async {
@@ -115,6 +559,7 @@ final class RoomModel {
         await room.stopBroadcast()
         capture = nil
         isBroadcasting = false
+        applyAudioPurpose()
         await refresh()
     }
 
@@ -131,8 +576,13 @@ final class RoomModel {
         }
         if participant.mute.localToMe.contains(.audio) {
             await room.localUnmute(target, .audio)
+            if catalogs[target]?.audioTrack != nil { await startPlayback(for: target) }
         } else {
             await room.localMute(target, .audio)
+
+            // The unsubscribe ends the stream, which ends `play`, but the
+            // engine stays up holding an output device it no longer needs.
+            await stopPlayback(for: target)
         }
         await refresh()
     }
@@ -169,8 +619,13 @@ final class RoomModel {
     func dismissError() { lastError = nil }
 
     func leave() async {
+        toneTask?.cancel()
+        toneTask = nil
         pump?.cancel()
         pump = nil
+        sampler?.cancel()
+        sampler = nil
+        for who in playback.keys { await stopPlayback(for: who) }
         await session.close()
     }
 }

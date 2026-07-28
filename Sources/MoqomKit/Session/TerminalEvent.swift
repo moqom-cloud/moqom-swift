@@ -33,6 +33,58 @@ public enum TerminalReason: Hashable, Sendable {
     case tokenExpired
 }
 
+extension TerminalReason {
+    /// A stable short name, used on the wire and in logs.
+    ///
+    /// One list rather than one per direction: the moderation code stays out of
+    /// it so that this is safe to log, since a policy code beside a username is
+    /// a record of an enforcement decision and belongs wherever the tenant keeps
+    /// those, not in a client's diagnostics.
+    public var identifier: String {
+        switch self {
+        case .moderated: "moderated"
+        case .hostEnded: "hostEnded"
+        case .networkFailure: "networkFailure"
+        case .tokenExpired: "tokenExpired"
+        }
+    }
+}
+
+extension TerminalReason: Codable {
+    private enum Key: String, CodingKey {
+        case reason
+        case code
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: Key.self)
+        switch try container.decode(String.self, forKey: .reason) {
+        case "moderated":
+            self = .moderated(code: try container.decode(ModerationCode.self, forKey: .code))
+        case "hostEnded":
+            self = .hostEnded
+        case "networkFailure":
+            self = .networkFailure
+        case "tokenExpired":
+            self = .tokenExpired
+        case let other:
+            throw DecodingError.dataCorruptedError(
+                forKey: .reason,
+                in: container,
+                debugDescription: "unknown terminal reason \(other)"
+            )
+        }
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: Key.self)
+        try container.encode(identifier, forKey: .reason)
+        if case let .moderated(code) = self {
+            try container.encode(code, forKey: .code)
+        }
+    }
+}
+
 /// Why moderation acted, as a code the SDK and the app can both switch on.
 public enum ModerationCode: String, Hashable, Sendable, Codable {
     case adultContent
@@ -46,7 +98,7 @@ public enum ModerationCode: String, Hashable, Sendable, Codable {
 }
 
 /// The terminal object, as it arrives on the lifecycle track.
-public struct TerminalEvent: Hashable, Sendable {
+public struct TerminalEvent: Hashable, Sendable, Codable {
     /// What happened.
     public let reason: TerminalReason
 

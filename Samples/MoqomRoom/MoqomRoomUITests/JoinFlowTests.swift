@@ -63,6 +63,70 @@ final class JoinFlowTests: XCTestCase {
         XCTAssertTrue(app.buttons["Record session"].exists)
     }
 
+    func testGoingLiveAndPublishingAudio() {
+        let app = launch()
+
+        let username = app.textFields["Username"]
+        XCTAssertTrue(username.waitForExistence(timeout: 10))
+        username.tap()
+        username.typeText("elliott")
+        app.buttons["Join"].tap()
+        XCTAssertTrue(app.navigationBars["demo"].waitForExistence(timeout: 15))
+
+        // Going live is what puts this device in its own roster, so the empty
+        // state disappearing is the signal that publish actually reached the
+        // relay rather than the button merely flipping its label.
+        app.buttons["Go live"].tap()
+        if app.alerts.firstMatch.waitForExistence(timeout: 5) {
+            XCTFail("go live failed: \(app.alerts.firstMatch.staticTexts.allElementsBoundByIndex.map(\.label))")
+        }
+        XCTAssertTrue(app.buttons["Stop"].waitForExistence(timeout: 10))
+        XCTAssertFalse(app.staticTexts["Nobody on stage"].exists)
+
+        // Audio is a separate act from video, and the SDK treats it as one:
+        // there is no path where starting a camera starts a microphone.
+        app.buttons["Audio"].tap()
+        XCTAssertTrue(app.buttons["Mute"].waitForExistence(timeout: 10))
+
+        // The tile is the only place a whole-pipeline failure shows up: the
+        // roster, the buttons, and the catalog can all be right while nothing
+        // ever draws. Attached rather than asserted on, because pixel
+        // comparison in CI is a source of flakes rather than of confidence.
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "live"
+        shot.lifetime = .keepAlways
+        add(shot)
+
+        app.buttons["Stop"].tap()
+        XCTAssertTrue(app.buttons["Go live"].waitForExistence(timeout: 10))
+    }
+
+    func testSwitchingToTheAudioRoomLayout() {
+        let app = launch()
+
+        let username = app.textFields["Username"]
+        XCTAssertTrue(username.waitForExistence(timeout: 10))
+        username.tap()
+        username.typeText("elliott")
+        app.buttons["Join"].tap()
+        XCTAssertTrue(app.navigationBars["demo"].waitForExistence(timeout: 15))
+
+        // The audio room is a different session category as well as a different
+        // layout — a listener holds no microphone — so the switch reconfigures the
+        // audio graph underneath. Worth one shallow test: if that throws, the
+        // model surfaces an alert and this catches it.
+        app.buttons["Room"].tap()
+        let audioRoom = app.buttons["Audio room"]
+        XCTAssertTrue(audioRoom.waitForExistence(timeout: 5))
+        audioRoom.tap()
+
+        XCTAssertFalse(
+            app.alerts.firstMatch.waitForExistence(timeout: 3),
+            "switching layout raised: \(app.alerts.firstMatch.staticTexts.allElementsBoundByIndex.map(\.label))"
+        )
+        XCTAssertTrue(app.navigationBars["demo"].exists)
+    }
+
     func testJoinIsRefusedUntilThereIsAName() {
         let app = launch()
 
