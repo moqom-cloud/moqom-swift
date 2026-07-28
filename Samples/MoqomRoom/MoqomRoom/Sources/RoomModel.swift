@@ -12,6 +12,7 @@
 // `Watchdog`, so a view that wanted them in one array would have to build the
 // union deliberately rather than forget to exclude one.
 
+import AVFoundation
 import Foundation
 import MoqomCore
 import MoqomKit
@@ -64,6 +65,47 @@ final class RoomModel {
 
         var id: String { rawValue }
     }
+
+    /// Where published video comes from.
+    ///
+    /// A rendered pattern by default, for the same reason the audio default is a
+    /// tone: the sample has to run in a simulator with nothing attached and ask
+    /// for no permission it does not need. The camera is the option that makes
+    /// switching and mirroring mean anything, and neither can be judged from a
+    /// pattern — a test card looks the same either way round.
+    ///
+    /// Only read when a broadcast starts. Changing it mid-broadcast would mean
+    /// swapping the ``FrameSource`` the publication is bound to, which is a stop
+    /// and a restart; switching between the two *cameras* is the thing that does
+    /// not need one, and that is ``flipCamera()``.
+    var videoInput: VideoInput = .pattern
+
+    enum VideoInput: String, CaseIterable, Identifiable, Sendable {
+        case pattern = "Test pattern"
+        case camera = "Camera"
+
+        var id: String { rawValue }
+    }
+
+    /// Which camera is open, when broadcasting from one.
+    private(set) var cameraPosition: CameraPosition = .front
+
+    /// Whether the self-preview is drawn flipped.
+    ///
+    /// Follows the camera rather than being a preference, because it is not
+    /// really one: a front-camera preview that is not mirrored feels broken to
+    /// the person in it, and a back-camera preview that is mirrored feels broken
+    /// to everyone. Only what is *published* is a matter of taste, and this
+    /// sample publishes the truth.
+    var isPreviewMirrored: Bool { videoInput == .camera && cameraPosition.wantsMirroredPreview }
+
+    /// Whether this device has muted its own microphone.
+    var isMicrophoneMuted: Bool { selfMuted.contains(.audio) }
+
+    /// Whether this device has muted its own camera.
+    var isCameraMuted: Bool { selfMuted.contains(.video) }
+
+    private(set) var selfMuted: MediaKind = []
 
     /// What each participant says they are publishing.
     private(set) var catalogs: [ParticipantIdentity: Catalog] = [:]
@@ -179,6 +221,14 @@ final class RoomModel {
     private var pump: Task<Void, Never>?
     private var sampler: Task<Void, Never>?
     private var capture: PatternSource?
+    private var camera: CameraSource?
+
+    /// Kept so a camera switch can ask for a keyframe. Nothing else here needs
+    /// it — the room owns the publication's lifetime.
+    private var broadcast: Broadcast?
+
+    /// The self-view, when broadcasting from a camera. See ``localPreview()``.
+    private var previewTap: MediaTap<VideoFrame>?
     private var microphone: AudioRelay?
     private var toneTask: Task<Void, Never>?
     private var mic: MicrophoneSource?
@@ -291,6 +341,10 @@ final class RoomModel {
         participants = await room.roster.participants
         slots = await room.galleryLayout
         overflow = await room.galleryOverflow
+
+        // Read back rather than assumed from the last call, because a moderator
+        // can change what is muted without this device asking.
+        selfMuted = await room.selfMuted
     }
 
     private func applyMode() async {
@@ -385,8 +439,20 @@ final class RoomModel {
     /// Straight off the source rather than round-tripped through the relay:
     /// previewing the encoded stream would show the publisher their own
     /// latency and their own compression artefacts.
+    ///
+    /// The camera goes through a tap rather than a second `frames()` call,
+    /// because a ``FrameSource`` has one consumer and the publication is
+    /// already it — iterating twice would silently give each side half the
+    /// frames. A tap is what the SDK provides for exactly this, and it copies
+    /// nothing: the preview draws the same surface the encoder is reading.
+    ///
+    /// Notice that the preview keeps running while the camera is muted, and
+    /// that is deliberate. The person who muted needs to see what they will be
+    /// sending when they come back, which is why every video app shows you
+    /// yourself even with the camera off to everyone else.
     func localPreview() -> AsyncStream<VideoFrame>? {
-        capture?.preview()
+        if let capture { return capture.preview() }
+        return previewTap?.elements
     }
 
     // MARK: - Broadcasting
@@ -394,27 +460,63 @@ final class RoomModel {
     func startBroadcast() async {
         guard !isBroadcasting else { return }
 
-        // A rendered pattern rather than a camera or a scene, so the sample
-        // runs in a simulator with nothing attached — and unlike an empty
-        // relay, it produces pixels that actually encode. `CameraSource` and
-        // `SceneCapture` are the two one-line swaps a real build makes here.
+        // A rendered pattern by default rather than a camera or a scene, so the
+        // sample runs in a simulator with nothing attached — and unlike an
+        // empty relay, it produces pixels that actually encode. `SceneCapture`
+        // is the third option a real build reaches for.
         let size = PixelSize(width: 1280, height: 720)
-        let source = PatternSource(
-            format: CaptureFormat(size: size, frameRate: 30),
-            label: identity.username.value
-        )
-        capture = source
+        let format = CaptureFormat(size: size, frameRate: 30)
+
+        let source: any FrameSource
+        switch videoInput {
+        case .pattern:
+            let pattern = PatternSource(format: format, label: identity.username.value)
+            capture = pattern
+            source = pattern
+        case .camera:
+            do {
+                // The SDK deliberately does not prompt — it says so on
+                // `CameraSource.start()` — because the prompt belongs where the
+                // app can explain itself rather than at the moment a broadcast
+                // starts. This is that place.
+                guard await Self.cameraIsAuthorised() else {
+                    throw MoqomError.platform(api: "AVCaptureDevice.requestAccess", status: -1)
+                }
+                let device = try CameraSource(format: format, position: cameraPosition)
+                device.start()
+                camera = device
+                source = device
+            } catch {
+                // Falling back rather than failing the broadcast. A simulator
+                // has no camera and the interesting half of the sample — the
+                // room, the gallery, the mute controls — should not be
+                // unreachable because of it.
+                lastError = error as? MoqomError
+                videoInput = .pattern
+                let pattern = PatternSource(format: format, label: identity.username.value)
+                capture = pattern
+                source = pattern
+            }
+        }
 
         do {
             // The ladder is capped at what is being captured. The default goes
             // to 1080p, and a 1080p rung fed 720p frames publishes an upscale:
             // the catalog says 1080p, the viewer subscribes for it, and the
             // extra bitrate buys nothing.
-            let broadcast = try await room.startBroadcast(
+            let publication = try await room.startBroadcast(
                 from: source,
                 configuration: BroadcastConfiguration(ladder: .defaultCamera(topSize: size))
             )
-            await broadcast.start()
+            await publication.start()
+            broadcast = publication
+            if camera != nil {
+                // Shallow, because a preview that buffers is a preview that
+                // lags: the only frame worth drawing is the newest one.
+                previewTap = await publication.tapFrames(
+                    policy: TapPolicy(cadence: .everyFrame, depth: 2)
+                )
+            }
             isBroadcasting = true
             applyAudioPurpose()
             #if os(iOS)
@@ -425,7 +527,52 @@ final class RoomModel {
             lastError = error
             source.stop()
             capture = nil
+            camera = nil
+            broadcast = nil
         }
+    }
+
+    /// Ask once, and answer from the recorded decision after that.
+    private static func cameraIsAuthorised() async -> Bool {
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized: true
+        case .notDetermined: await AVCaptureDevice.requestAccess(for: .video)
+        default: false
+        }
+    }
+
+    // MARK: - Camera and mute
+
+    /// Swap front camera for back, or back for front.
+    ///
+    /// The publication is untouched: the same ``CameraSource`` keeps feeding the
+    /// same encoders, so nobody watching sees the participant leave and come
+    /// back. What they do see is a new scene, hence the keyframe — without it
+    /// the encoder would predict the far side of the room from the near side of
+    /// someone's face and take a second to admit it was wrong.
+    func flipCamera() async {
+        guard let camera else { return }
+        let wanted = cameraPosition.flipped
+        do {
+            try camera.setPosition(wanted)
+            cameraPosition = wanted
+            await broadcast?.startNewGroup()
+        } catch {
+            lastError = error as? MoqomError
+        }
+    }
+
+    func setMicrophoneMuted(_ muted: Bool) async {
+        await setSelfMuted(muted ? selfMuted.union(.audio) : selfMuted.subtracting(.audio))
+    }
+
+    func setCameraMuted(_ muted: Bool) async {
+        await setSelfMuted(muted ? selfMuted.union(.video) : selfMuted.subtracting(.video))
+    }
+
+    private func setSelfMuted(_ kinds: MediaKind) async {
+        await room.setSelfMuted(kinds)
+        selfMuted = await room.selfMuted
     }
 
     /// Publish audio, from whichever input is selected.
@@ -573,6 +720,10 @@ final class RoomModel {
         guard isBroadcasting else { return }
         await room.stopBroadcast()
         capture = nil
+        camera = nil
+        broadcast = nil
+        previewTap?.stop()
+        previewTap = nil
         isBroadcasting = false
         applyAudioPurpose()
         await refresh()

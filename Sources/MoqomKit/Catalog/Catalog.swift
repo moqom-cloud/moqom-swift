@@ -144,12 +144,59 @@ public struct Catalog: Hashable, Sendable, Codable {
 
     public let tracks: [CatalogTrack]
 
+    /// What the publisher has muted on themselves.
+    ///
+    /// Here rather than on the room's control track because that track is
+    /// written by the authority — a participant's token cannot publish under
+    /// the room prefix, and it should not be able to, since the same channel
+    /// carries moderator decisions. The catalog is the one document a
+    /// participant authors about themselves, everyone already subscribes to it,
+    /// and it is already versioned and grouped so a late joiner reads the
+    /// current value without asking.
+    ///
+    /// Deliberately not the same thing as the track being absent. A muted track
+    /// is still offered and still subscribed to; what stops is the bytes. That
+    /// distinction is what makes unmuting instant — the subscription is still
+    /// open, so there is nothing to renegotiate — and it is also what lets a
+    /// viewer draw "camera off" rather than a frozen last frame, because the
+    /// difference between muted and merely stalled is stated rather than
+    /// inferred from a timeout.
+    ///
+    /// A publisher saying this about themselves is a claim, not an enforcement.
+    /// A modified client can say `.audio` and keep sending; the mute that
+    /// cannot be lied about is ``MuteState/forcedForEveryone``, which the relay
+    /// applies. This is the one a participant chooses, and it is trusted for
+    /// the same reason a participant is trusted to stop talking.
+    public let muted: MediaKind
+
     public static let currentVersion = 1
 
-    public init(version: Int = Catalog.currentVersion, keyID: UInt64? = nil, tracks: [CatalogTrack]) {
+    public init(
+        version: Int = Catalog.currentVersion,
+        keyID: UInt64? = nil,
+        muted: MediaKind = [],
+        tracks: [CatalogTrack]
+    ) {
         self.version = version
         self.keyID = keyID
+        self.muted = muted
         self.tracks = tracks
+    }
+
+    // Hand-written so that `muted` may be absent. A catalog published by a
+    // build from before this field existed is not malformed, it is a publisher
+    // who has muted nothing, and refusing to decode it would take the whole
+    // participant off the stage over a missing key.
+    private enum CodingKeys: String, CodingKey {
+        case version, keyID, muted, tracks
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        version = try container.decode(Int.self, forKey: .version)
+        keyID = try container.decodeIfPresent(UInt64.self, forKey: .keyID)
+        muted = try container.decodeIfPresent(MediaKind.self, forKey: .muted) ?? []
+        tracks = try container.decode([CatalogTrack].self, forKey: .tracks)
     }
 
     /// The video rungs, cheapest first.

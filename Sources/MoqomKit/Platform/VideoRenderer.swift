@@ -222,12 +222,45 @@ import MoqomCore
 
         private let assembler: SampleBufferAssembler
 
+        /// Draw the picture flipped left to right.
+        ///
+        /// For the local preview of a front camera, and for nothing else. A
+        /// selfie preview that is not mirrored feels wrong in a way people
+        /// cannot always name — every mirror they have ever used works this way
+        /// — while a *remote* participant drawn mirrored is simply wrong, since
+        /// what arrived is the real scene and the text in it reads correctly.
+        ///
+        /// A transform on the layer, so it costs nothing: no pass over the
+        /// pixels, no second surface, and no work at all per frame. Doing this
+        /// with a GPU pass is the expensive way to reach the same picture, and
+        /// doing it at the capture connection reaches a different one — that
+        /// mirrors what is *published*, which is
+        /// ``CameraSource/publishesMirrored`` and is usually not wanted.
+        public var isMirrored = false {
+            didSet {
+                guard isMirrored != oldValue else { return }
+                apply(mirroring: isMirrored)
+            }
+        }
+
         public init(codec: VideoCodec = .hevc) {
             assembler = SampleBufferAssembler(codec: codec)
             // The publisher's clock, not ours. Rate control belongs upstream:
             // a viewer that resamples to its own clock reintroduces the buffer
             // the whole stack exists to avoid.
             layer.videoGravity = .resizeAspectFill
+        }
+
+        private func apply(mirroring: Bool) {
+            // Without disabling actions this animates, and a preview that
+            // swings through edge-on when the user taps the flip button reads
+            // as a glitch rather than as a transition.
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.transform = mirroring
+                ? CATransform3DMakeScale(-1, 1, 1)
+                : CATransform3DIdentity
+            CATransaction.commit()
         }
 
         /// Adopt the codec the publisher's catalog names.

@@ -57,6 +57,14 @@ public actor RoomSession {
     /// Keyed by participant and held as arrays because two taps on one person
     /// is a real case — a safety classifier on keyframes and a transcriber on
     /// everything are different cadences and should not have to agree.
+    /// What this device has muted on itself. See ``setSelfMuted(_:)``.
+    ///
+    /// The source of truth, rather than the roster entry, because that entry is
+    /// this device's own announcement arriving back and can be absent or be
+    /// rebuilt — on a reconnect, on a rejoin — while the user's choice about
+    /// their own microphone has not changed and must not be quietly discarded.
+    private var ownMute: MediaKind = []
+
     private var videoTaps: [ParticipantIdentity: [ReceiveVideoPipe]] = [:]
     private var audioTaps: [ParticipantIdentity: [ReceiveAudioPipe]] = [:]
 
@@ -674,7 +682,8 @@ public actor RoomSession {
             configuration,
             decoderConfigurations: configurations,
             audio: audio?.configuration,
-            keyID: encryption?.sender.key.keyID
+            keyID: encryption?.sender.key.keyID,
+            muted: ownMute
         )
         _ = try? await publisher.publish(catalog)
         return configurations.count >= configuration.ladder.rungs.count
@@ -1024,6 +1033,88 @@ public actor RoomSession {
             await followAudio(of: target, in: catalog)
         }
         eventContinuation.yield(.muteChanged(target, participant.mute))
+    }
+
+    // MARK: - Muting yourself
+
+    /// What this device has muted on itself.
+    public var selfMuted: MediaKind { ownMute }
+
+    /// Stop sending your own microphone or camera.
+    ///
+    /// ```swift
+    /// await room.setSelfMuted(.audio)          // microphone off
+    /// await room.setSelfMuted([])              // both back on
+    /// await room.setSelfMuted([.audio, .video]) // and off again
+    /// ```
+    ///
+    /// Three things happen, and all three are needed for the feature to be what
+    /// a user believes it is.
+    ///
+    /// The bytes stop, at the encoder. Nothing muted is compressed and nothing
+    /// is written, so this is a saving on the uplink rather than a filter
+    /// applied at the far end — and, more to the point, it is a claim a packet
+    /// capture can check.
+    ///
+    /// The publication stays up. The announcement stands, the tracks stay
+    /// offered, and every subscriber keeps their subscription, so unmuting
+    /// resumes on the next captured frame instead of renegotiating. That is why
+    /// this is not ``stopBroadcast()`` with a nicer name: stopping takes the
+    /// participant off the stage, and coming back from it is a rejoin.
+    ///
+    /// The room is told, on the catalog. Without that a viewer sees objects
+    /// stop and cannot tell a muted microphone from a dead uplink, which are
+    /// the same silence and want opposite interfaces — one draws a mute badge,
+    /// the other draws a reconnecting spinner.
+    ///
+    /// Absolute rather than additive, deliberately. A toggle expressed as
+    /// "add .audio" and "remove .audio" drifts out of step with the button that
+    /// drives it as soon as anything else can mute — and something else always
+    /// can, because a moderator can. Passing the whole set means the SDK's idea
+    /// of what is muted and the interface's cannot disagree.
+    ///
+    /// > Note: This is what *this participant chose*. A moderator's mute is
+    /// > ``MuteState/forcedForEveryone`` and is enforced at the relay; nothing
+    /// > here can lift it, and unmuting yourself while force-muted changes this
+    /// > flag and no behaviour.
+    public func setSelfMuted(_ kinds: MediaKind) async {
+        guard ownMute != kinds else { return }
+        ownMute = kinds
+
+        // Held here rather than only on the roster entry, because the roster
+        // entry for this device is built from our own announcement coming back
+        // round and may not exist yet. Muting before that lands is entirely
+        // ordinary — it is what a "join muted" control does — and reading the
+        // roster for it would make that case do nothing at all, silently.
+        if var participant = state.roster[identity] {
+            participant.mute.selfMuted = kinds
+            state.roster[identity] = participant
+        }
+
+        await broadcast?.setMuted(kinds.contains(.video))
+        await audio?.setMuted(kinds.contains(.audio))
+
+        // After the media, so that a catalog claiming silence is never
+        // published while packets are still in flight behind it.
+        _ = await refreshCatalog()
+
+        logger.info(.media, "self mute changed", [
+            LogField("audio", .flag(kinds.contains(.audio))),
+            LogField("video", .flag(kinds.contains(.video))),
+        ])
+        if let participant = state.roster[identity] {
+            eventContinuation.yield(.muteChanged(identity, participant.mute))
+        }
+    }
+
+    /// Mute these kinds in addition to whatever is already muted.
+    public func muteSelf(_ kinds: MediaKind) async {
+        await setSelfMuted(selfMuted.union(kinds))
+    }
+
+    /// Unmute these kinds, leaving anything else muted alone.
+    public func unmuteSelf(_ kinds: MediaKind) async {
+        await setSelfMuted(selfMuted.subtracting(kinds))
     }
 
     // MARK: - Moderation
@@ -1697,7 +1788,17 @@ public actor RoomSession {
         let after = Set(state.roster.participants.map(\.id))
 
         for joined in after.subtracting(before) {
-            if let participant = state.roster[joined] {
+            if var participant = state.roster[joined] {
+                // Our own entry arrives the same way everyone else's does, by
+                // our announcement coming back round, and it arrives with an
+                // empty mute. Restating what the user already chose keeps a
+                // mute set before the roster caught up — or before a
+                // reconnect — from appearing to have been undone.
+                if joined == identity, participant.mute.selfMuted != ownMute {
+                    participant.mute.selfMuted = ownMute
+                    state.roster[joined] = participant
+                }
+
                 // A default until their catalog arrives, not a decision. It
                 // exists so that layout can proceed in the milliseconds before
                 // the catalog lands, and it is replaced rather than merged.
@@ -1798,8 +1899,30 @@ public actor RoomSession {
             planner.setLadder(ladder, for: who)
         }
         configureDepacketiser(for: who, from: catalog)
+
+        // Before `followAudio`, which reads the effective mute to decide
+        // whether to stay subscribed. Applied in the other order, a participant
+        // muting themselves would be acted on one catalog late.
+        adoptSelfMute(catalog.muted, of: who)
+
         await followAudio(of: who, in: catalog)
         eventContinuation.yield(.catalogChanged(who, catalog))
+    }
+
+    /// Take a participant's own mute from the catalog they published.
+    ///
+    /// Trusted because it is theirs to state. The mute that does not rely on
+    /// the publisher cooperating arrives on the control track from the
+    /// authority and lands in ``MuteState/forcedForEveryone``; this one is the
+    /// participant reporting a choice, in the same way they are trusted to
+    /// report which rungs they are offering.
+    private func adoptSelfMute(_ muted: MediaKind, of who: ParticipantIdentity) {
+        guard var participant = state.roster[who], participant.mute.selfMuted != muted else {
+            return
+        }
+        participant.mute.selfMuted = muted
+        state.roster[who] = participant
+        eventContinuation.yield(.muteChanged(who, participant.mute))
     }
 
     // MARK: - Audio

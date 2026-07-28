@@ -36,9 +36,55 @@ per-viewer mute is an unsubscribe that never reaches the relay, and moderation
 is refused when the grants do not allow it.
 
 Nothing decodes, because nothing is encoded — the broadcast publishes synthetic
-frames carrying only their shape. Swapping `FrameRelay` for `CameraSource` or
-`SceneCapture` in `RoomModel.startBroadcast()` is the change that makes it
-real, and requires a device.
+frames carrying only their shape. **Input → Video → Camera** swaps the test
+pattern for a real `CameraSource` and is the change that makes it real; it needs
+a device, since a simulator has no camera and the app falls back to the pattern.
+`SceneCapture` is the third option, and the swap is in
+`RoomModel.startBroadcast()`.
+
+## Camera, microphone, and mute
+
+Four controls, and the interesting thing about them is which ones stay live
+while the publication does.
+
+**Mute** and **Camera off** stop the bytes without taking anything down. They
+call `RoomSession.setSelfMuted(_:)`, which suppresses the encoders and says so
+on the catalog. The publication stays up, the tracks stay offered, and every
+subscriber keeps their subscription — so coming back is the next captured frame
+rather than a resubscribe. **End audio** is the other thing, deliberately kept
+as a separate button: it ends the publication, closes the track, and makes
+everyone unsubscribe.
+
+That distinction is the whole reason self-mute rides the catalog rather than
+being implemented as stop-and-restart. A viewer whose objects simply stopped
+cannot tell a muted microphone from a dead uplink, and the two want opposite
+interfaces — one draws a mute badge, the other a reconnecting spinner. The
+catalog is the one document a participant authors about themselves, so it is
+where a claim about their own microphone belongs; the room's control track is
+written by the authority and carries moderator mutes, which are a different
+feature that happens to share a word.
+
+**Flip** switches front camera for back without interrupting anything. The same
+`CameraSource` keeps feeding the same encoders, so nobody sees the participant
+leave the stage; what they get is a keyframe, because the new camera is a new
+scene and predicting it from the old one looks like a second of smeared video.
+
+**Mirroring** is two questions that share a word, and the sample answers them
+differently. The self-preview of a front camera is mirrored, because a preview
+that is not feels broken to the person in it. What is published is not, because
+that copy is the real scene and mirroring it puts every letter on a T-shirt or
+a whiteboard backwards — and the person on camera is the one who cannot tell.
+The preview half is `VideoRenderer.isMirrored`, a transform on the layer that
+costs nothing per frame; the other half is `CameraSource.publishesMirrored`,
+which is off and which the sample leaves off.
+
+Two things worth noticing on a device. The self-preview keeps running while the
+camera is muted, which is what every video app does and for a good reason: the
+person who muted needs to see what they will be sending when they come back. And
+muting does not put the hardware indicator out, because the capture device is
+still open — the SDK is explicit that this stops the bytes rather than releasing
+the camera, and an app that wants the stronger claim has to stop the device and
+pay the reacquisition latency.
 
 ## The two layouts
 
@@ -123,7 +169,10 @@ that can break silently, which is the cast reaching `RoomSession`.
 | `RoomScreen.swift` | `SeatTile` — an audio room's entire interface is the speaking ring |
 | `RoomScreen.swift` | `WatchdogBanner` — why a recorder is not in the grid |
 | `SceneEffects.swift` | Where a beauty filter or scene effect attaches |
+| `RoomModel.swift` | `flipCamera` — switching input without restarting the publication |
+| `RoomModel.swift` | `localPreview` — why the camera self-view is a tap and not a second `frames()` |
 | `RemoteVideoView.swift` | `AVSampleBufferDisplayLayer` per tile, and lending it to the small window |
+| `RemoteVideoView.swift` | `isMirrored` — mirroring the preview and not the published frames |
 | `PictureInPicture.swift` | Handing SwiftUI's `UIView` to the SDK as the source |
 | `RoomModel.swift` | `startLiveActivity` — one call, and the card tracks the room |
 | `MoqomRoomWidgets/` | The Lock Screen card and Dynamic Island, out of process |
@@ -178,12 +227,13 @@ Then heat, since this runs alongside hardware video encode.
 
 ## Verification status
 
-The app runs. `MoqomRoomUITests` drives it on a simulator in CI with six tests:
+The app runs. `MoqomRoomUITests` drives it on a simulator in CI with eight tests:
 joining puts you in the room over the loopback relay, going live adds a tile
-under your username, switching to the audio-room layout reconfigures the audio
-session, choosing a Picture in Picture cast reaches `RoomSession`, and leaving
-comes back to the join screen. That is the only place the SwiftUI layer executes
-— the package's 496 tests drive `RoomSession` directly and never render.
+under your username, muting the microphone and camera leaves both publications
+running, switching to the audio-room layout reconfigures the audio session,
+choosing a Picture in Picture cast reaches `RoomSession`, and leaving comes back
+to the join screen. That is the only place the SwiftUI layer executes — the
+package's 505 tests drive `RoomSession` directly and never render.
 
 What a green simulator run does **not** cover is everything a simulator does not
 have: the camera, the VideoToolbox encoder, the Metal scene capture, and the
@@ -191,13 +241,23 @@ RealityKit tap. Those compile and have never executed. `Broadcast` also
 publishes a per-frame descriptor rather than encoded bytes, so a tile appearing
 means the roster works, not that video moves.
 
-Nor does it cover the two features above actually appearing. The Picture in
-Picture window and the Live Activity card have been built and wired but not seen
-on hardware: both need a real device, and the pieces most likely to be wrong are
-the ones only a device exercises — whether the system accepts the source view
-and opens the window unprompted, whether reparenting a layer that is mid-decode
-survives the transition, and whether the throttle actually stays inside
-ActivityKit's budget over an hour rather than over a unit test.
+Camera switching and mirroring are in that untested set, and they are the two
+things above that a simulator cannot say anything about. Muting is covered — the
+suppression, the catalog round trip, and the keyframe on resume all run in the
+package tests — but flipping cameras has never been executed, and the parts most
+likely to be wrong are the ones only hardware reaches: whether the session
+reconfiguration is quick enough not to stall the encoder, whether the two
+cameras agree on a format, and whether the preview transform survives the
+switch. Rotation is not handled at all: `CameraSource` never sets the capture
+connection's rotation angle, so a portrait phone publishes a sideways picture.
+
+Nor does a green run cover Picture in Picture or the Live Activity card actually
+appearing. Both have been built and wired but not seen on hardware, and the
+pieces most likely to be wrong are again the ones only a device exercises —
+whether the system accepts the source view and opens the window unprompted,
+whether reparenting a layer that is mid-decode survives the transition, and
+whether the throttle actually stays inside ActivityKit's budget over an hour
+rather than over a unit test.
 
 Requires an Xcode with an iOS 26 SDK; the deployment floor is 26.
 

@@ -424,22 +424,71 @@ struct BroadcastControls: View {
                     }
                 } label: {
                     Label(
-                        room.isPublishingAudio ? "Mute" : "Audio",
-                        systemImage: room.isPublishingAudio ? "mic.fill" : "mic"
+                        room.isPublishingAudio ? "End audio" : "Audio",
+                        systemImage: room.isPublishingAudio ? "waveform.slash" : "waveform"
                     )
                 }
                 .buttonStyle(.bordered)
+
+                // Distinct from the button beside it, and the difference is the
+                // point. That one ends the publication: the track closes, the
+                // catalog loses it, and every subscriber unsubscribes. This one
+                // stops the bytes and leaves all of that standing, so coming
+                // back is the next packet rather than a renegotiation.
+                Button {
+                    Task { await room.setMicrophoneMuted(!room.isMicrophoneMuted) }
+                } label: {
+                    Label(
+                        room.isMicrophoneMuted ? "Unmute" : "Mute",
+                        systemImage: room.isMicrophoneMuted ? "mic.slash.fill" : "mic.fill"
+                    )
+                }
+                .buttonStyle(.bordered)
+                .tint(room.isMicrophoneMuted ? .red : nil)
+                .disabled(!room.isPublishingAudio)
+
+                Button {
+                    Task { await room.setCameraMuted(!room.isCameraMuted) }
+                } label: {
+                    Label(
+                        room.isCameraMuted ? "Camera on" : "Camera off",
+                        systemImage: room.isCameraMuted ? "video.slash.fill" : "video.fill"
+                    )
+                }
+                .buttonStyle(.bordered)
+                .tint(room.isCameraMuted ? .red : nil)
+                .disabled(!room.isBroadcasting)
+
+                // Live, unlike the input pickers below. Switching cameras does
+                // not replace the `FrameSource` the publication is bound to, so
+                // there is nothing to tear down and nobody watching sees the
+                // participant leave the stage.
+                Button {
+                    Task { await room.flipCamera() }
+                } label: {
+                    Label("Flip", systemImage: "arrow.triangle.2.circlepath.camera")
+                }
+                .buttonStyle(.bordered)
+                .disabled(!room.isBroadcasting || room.videoInput != .camera)
 
                 // Fixed while publishing. Swapping the source under a live
                 // publication would mean tearing down the capture the encoder is
                 // reading from, and the sample is not the place to demonstrate
                 // that being survivable.
                 Menu {
-                    Picker("Input", selection: $room.audioInput) {
+                    Picker("Audio", selection: $room.audioInput) {
                         ForEach(RoomModel.AudioInput.allCases) { input in
                             Text(input.rawValue).tag(input)
                         }
                     }
+                    .disabled(room.isPublishingAudio)
+
+                    Picker("Video", selection: $room.videoInput) {
+                        ForEach(RoomModel.VideoInput.allCases) { input in
+                            Text(input.rawValue).tag(input)
+                        }
+                    }
+                    .disabled(room.isBroadcasting)
 
                     // Here so cancellation can be measured rather than believed.
                     // Toggling it while the far end plays gives the level
@@ -448,10 +497,9 @@ struct BroadcastControls: View {
                     Toggle("Bypass voice processing", isOn: $room.isBypassingVoiceProcessing)
                         .disabled(!room.isPublishingAudio || room.audioInput != .microphone)
                 } label: {
-                    Label("Input", systemImage: "waveform")
+                    Label("Input", systemImage: "slider.horizontal.3")
                 }
                 .buttonStyle(.bordered)
-                .disabled(room.isPublishingAudio)
 
                 SceneEffectsMenu()
                     .disabled(!room.isBroadcasting)

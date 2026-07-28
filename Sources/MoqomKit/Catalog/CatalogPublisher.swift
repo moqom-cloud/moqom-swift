@@ -140,7 +140,8 @@ public extension Catalog {
         _ configuration: BroadcastConfiguration,
         decoderConfigurations: [LayerID: Data] = [:],
         audio: AudioPublicationConfiguration? = nil,
-        keyID: UInt64? = nil
+        keyID: UInt64? = nil,
+        muted: MediaKind = []
     ) -> Catalog {
         var tracks: [CatalogTrack] = configuration.ladder.rungs.enumerated().map { index, rung in
             CatalogTrack(
@@ -170,7 +171,7 @@ public extension Catalog {
             )
         }
 
-        return Catalog(keyID: keyID, tracks: tracks)
+        return Catalog(keyID: keyID, muted: muted, tracks: tracks)
     }
 }
 

@@ -21,15 +21,32 @@ struct RemoteVideoView: View {
     let room: RoomModel
 
     var body: some View {
-        VideoLayerView(identity: participant.slot.identity, isSelf: isSelf, room: room)
-            .background(.black)
-            .overlay {
-                if participant.presence != .connected {
-                    Image(systemName: "person.crop.circle.badge.clock")
-                        .font(.largeTitle)
-                        .foregroundStyle(.secondary)
-                }
+        // Read here rather than inside the representable so that observation
+        // actually sees it. A property read in `updateUIView` is not a body
+        // read, and the flip button would leave the preview facing the wrong
+        // way until something else happened to redraw the tile.
+        VideoLayerView(
+            identity: participant.slot.identity,
+            isSelf: isSelf,
+            isMirrored: isSelf && room.isPreviewMirrored,
+            room: room
+        )
+        .background(.black)
+        .overlay {
+            if participant.presence != .connected {
+                Image(systemName: "person.crop.circle.badge.clock")
+                    .font(.largeTitle)
+                    .foregroundStyle(.secondary)
+            } else if participant.mute.effective.contains(.video) {
+                // The reason a mute is published rather than inferred from the
+                // objects stopping. Without the catalog saying so, this tile
+                // would show a frozen last frame and no way to tell it from a
+                // stalled uplink.
+                Image(systemName: "video.slash.fill")
+                    .font(.largeTitle)
+                    .foregroundStyle(.secondary)
             }
+        }
     }
 }
 
@@ -103,6 +120,7 @@ final class VideoTile {
     private struct VideoLayerView: UIViewRepresentable {
         let identity: ParticipantIdentity
         let isSelf: Bool
+        let isMirrored: Bool
         let room: RoomModel
 
         func makeUIView(context: Context) -> SampleBufferView {
@@ -115,6 +133,7 @@ final class VideoTile {
         }
 
         private func start(_ coordinator: Coordinator) {
+            coordinator.tile.renderer.isMirrored = isMirrored
             if isSelf {
                 coordinator.tile.attachPreview(in: room)
             } else {
@@ -174,6 +193,7 @@ final class VideoTile {
     private struct VideoLayerView: NSViewRepresentable {
         let identity: ParticipantIdentity
         let isSelf: Bool
+        let isMirrored: Bool
         let room: RoomModel
 
         func makeNSView(context: Context) -> SampleBufferView {
@@ -186,6 +206,7 @@ final class VideoTile {
         }
 
         private func start(_ coordinator: Coordinator) {
+            coordinator.tile.renderer.isMirrored = isMirrored
             if isSelf {
                 coordinator.tile.attachPreview(in: room)
             } else {

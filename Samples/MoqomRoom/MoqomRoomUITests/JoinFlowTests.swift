@@ -85,8 +85,13 @@ final class JoinFlowTests: XCTestCase {
 
         // Audio is a separate act from video, and the SDK treats it as one:
         // there is no path where starting a camera starts a microphone.
+        //
+        // "End audio" rather than "Mute": ending the publication and muting it
+        // are two different buttons here because they are two different things
+        // on the wire, and asserting on the wrong one would pass while the
+        // publication never started.
         app.buttons["Audio"].tap()
-        XCTAssertTrue(app.buttons["Mute"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.buttons["End audio"].waitForExistence(timeout: 10))
 
         // The tile is the only place a whole-pipeline failure shows up: the
         // roster, the buttons, and the catalog can all be right while nothing
@@ -99,6 +104,80 @@ final class JoinFlowTests: XCTestCase {
 
         app.buttons["Stop"].tap()
         XCTAssertTrue(app.buttons["Go live"].waitForExistence(timeout: 10))
+    }
+
+    func testMutingTheMicrophoneAndCameraWithoutEndingEither() {
+        let app = launch()
+
+        let username = app.textFields["Username"]
+        XCTAssertTrue(username.waitForExistence(timeout: 10))
+        username.tap()
+        username.typeText("elliott")
+        app.buttons["Join"].tap()
+        XCTAssertTrue(app.navigationBars["demo"].waitForExistence(timeout: 15))
+
+        // Muting is only meaningful against a running publication, and the
+        // buttons say so by being disabled until there is one. That is worth
+        // asserting: a mute control that is live before anything is publishing
+        // is a control that silently does nothing.
+        XCTAssertFalse(app.buttons["Camera off"].isEnabled)
+        XCTAssertFalse(app.buttons["Mute"].isEnabled)
+
+        app.buttons["Go live"].tap()
+        XCTAssertTrue(app.buttons["Stop"].waitForExistence(timeout: 10))
+        app.buttons["Audio"].tap()
+        XCTAssertTrue(app.buttons["End audio"].waitForExistence(timeout: 10))
+
+        app.buttons["Mute"].tap()
+        XCTAssertTrue(app.buttons["Unmute"].waitForExistence(timeout: 5))
+
+        app.buttons["Camera off"].tap()
+        XCTAssertTrue(app.buttons["Camera on"].waitForExistence(timeout: 5))
+
+        // The whole point of the feature: muted, but still broadcasting and
+        // still on stage. A mute implemented as stop-and-restart would have
+        // flipped these back and emptied the grid.
+        XCTAssertTrue(app.buttons["Stop"].exists, "muting the camera ended the broadcast")
+        XCTAssertTrue(app.buttons["End audio"].exists, "muting the mic ended the publication")
+        XCTAssertFalse(app.staticTexts["Nobody on stage"].exists, "muting took us off stage")
+
+        XCTAssertFalse(
+            app.alerts.firstMatch.waitForExistence(timeout: 3),
+            "muting raised: \(app.alerts.firstMatch.staticTexts.allElementsBoundByIndex.map(\.label))"
+        )
+
+        app.buttons["Unmute"].tap()
+        XCTAssertTrue(app.buttons["Mute"].waitForExistence(timeout: 5))
+        app.buttons["Camera on"].tap()
+        XCTAssertTrue(app.buttons["Camera off"].waitForExistence(timeout: 5))
+    }
+
+    func testFlippingIsOfferedOnlyForARealCamera() {
+        let app = launch()
+
+        let username = app.textFields["Username"]
+        XCTAssertTrue(username.waitForExistence(timeout: 10))
+        username.tap()
+        username.typeText("elliott")
+        app.buttons["Join"].tap()
+        XCTAssertTrue(app.navigationBars["demo"].waitForExistence(timeout: 15))
+
+        app.buttons["Go live"].tap()
+        XCTAssertTrue(app.buttons["Stop"].waitForExistence(timeout: 10))
+
+        // The sample broadcasts a test pattern by default so it runs in a
+        // simulator, and a test pattern has no front and back. Asserting the
+        // control is disabled rather than absent, because a flip button that
+        // does nothing is worse than one that says it cannot.
+        XCTAssertTrue(app.buttons["Flip"].exists)
+        XCTAssertFalse(app.buttons["Flip"].isEnabled)
+
+        // The picker that would change that is locked while live, for the same
+        // reason: swapping the source under a running publication means tearing
+        // down the capture the encoder is reading from.
+        app.buttons["Input"].tap()
+        let video = app.buttons["Camera"]
+        XCTAssertTrue(video.waitForExistence(timeout: 5), "no video input picker in the menu")
     }
 
     func testSwitchingToTheAudioRoomLayout() {

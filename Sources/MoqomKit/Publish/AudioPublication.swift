@@ -60,8 +60,19 @@ public struct AudioPublicationStatistics: Hashable, Sendable {
     public var silentPackets: Int = 0
     public var currentGroup: UInt64 = 0
 
+    /// Samples captured while muted, and therefore never encoded.
+    ///
+    /// Distinct from ``silentPackets``, which counts packets that were sent and
+    /// happened to contain no speech. This counts audio that was never sent at
+    /// all, and the two answer different questions: one is what the room sounds
+    /// like, the other is whether the microphone switch is doing anything.
+    public var framesMuted: Int = 0
+
     /// Whether the last packet carried speech, for a talking indicator.
     public var isSpeaking: Bool = false
+
+    /// Whether ``AudioPublication/setMuted(_:)`` is holding samples back.
+    public var isMuted: Bool = false
 }
 
 /// A running audio publication.
@@ -75,6 +86,9 @@ public actor AudioPublication {
     private var capture: Task<Void, Never>?
     private var drain: Task<Void, Never>?
     private var statistics = AudioPublicationStatistics()
+
+    /// Whether ``setMuted(_:)`` is currently holding samples back.
+    public private(set) var isMuted = false
 
     /// Position within the current group.
     private var packetInGroup = 0
@@ -164,6 +178,35 @@ public actor AudioPublication {
         }
     }
 
+    /// Stop publishing packets, without taking the publication down.
+    ///
+    /// The samples still reach ``tapSamples(policy:)`` — local processing is
+    /// not what the user switched off — but nothing is encoded and nothing is
+    /// written, so no bytes leave the device.
+    ///
+    /// Not the same as publishing silence, and the difference is more than
+    /// bandwidth. A muted participant who keeps sending comfort noise is
+    /// indistinguishable on the wire from one in a quiet room, so a viewer
+    /// cannot draw the mute indicator without being told separately, and any
+    /// claim about the microphone rests on the encoder having actually produced
+    /// silence. Sending nothing is the claim that can be checked.
+    ///
+    /// The microphone is left open, because the shared audio graph is also what
+    /// cancels the room's echo for everybody else and tearing it down on mute
+    /// would make unmuting reconverge from nothing. Stop the ``AudioGraph`` if
+    /// the hardware indicator is the point.
+    public func setMuted(_ muted: Bool) async {
+        guard muted != isMuted else { return }
+        isMuted = muted
+        statistics.isMuted = muted
+
+        // Otherwise the last packet before the mute decides the indicator, and
+        // a participant who muted mid-word keeps a lit speaking ring until they
+        // come back. Everyone else learns the same thing by the objects
+        // stopping; this is the local view of it.
+        if muted { statistics.isSpeaking = false }
+    }
+
     public func stop() async {
         capture?.cancel()
         capture = nil
@@ -183,6 +226,14 @@ public actor AudioPublication {
         if !taps.isEmpty {
             taps.removeAll { !$0.tap.isActive }
             for pipe in taps { pipe.offer(frame, at: frame.timestamp) }
+        }
+
+        // After the taps, so a transcriber keeps working while the user is
+        // muted, and before the encoder, so nothing is compressed that cannot
+        // be sent. Not counted as a drop: see ``AudioPublicationStatistics``.
+        guard !isMuted else {
+            statistics.framesMuted += 1
+            return
         }
 
         do {

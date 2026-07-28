@@ -75,6 +75,15 @@ public struct BroadcastStatistics: Hashable, Sendable {
     /// frame rate as a bug in their capture.
     public var framesDropped: Int
 
+    /// Frames the camera produced while the publication was muted.
+    ///
+    /// Separate from ``framesDropped`` because they mean opposite things to
+    /// whoever is reading them. A rising drop count is pressure and may be a
+    /// problem; a rising muted count is the user's own choice being honoured,
+    /// and it is the number that distinguishes "muted" from "the capture
+    /// stopped", which look identical from the objects published.
+    public var framesMuted: Int
+
     public var objectsPublished: Int
     public var currentGroup: UInt64
 
@@ -83,20 +92,28 @@ public struct BroadcastStatistics: Hashable, Sendable {
     /// watching.
     public var activeLayers: Set<LayerID>
 
+    /// Whether the publication is holding frames back. See
+    /// ``Broadcast/setMuted(_:)``.
+    public var isMuted: Bool
+
     public init(
         framesSubmitted: Int = 0,
         framesEncoded: Int = 0,
         framesDropped: Int = 0,
+        framesMuted: Int = 0,
         objectsPublished: Int = 0,
         currentGroup: UInt64 = 0,
-        activeLayers: Set<LayerID> = []
+        activeLayers: Set<LayerID> = [],
+        isMuted: Bool = false
     ) {
         self.framesSubmitted = framesSubmitted
         self.framesEncoded = framesEncoded
         self.framesDropped = framesDropped
+        self.framesMuted = framesMuted
         self.objectsPublished = objectsPublished
         self.currentGroup = currentGroup
         self.activeLayers = activeLayers
+        self.isMuted = isMuted
     }
 }
 
@@ -124,6 +141,12 @@ public actor Broadcast {
     private var sequencing: [LayerID: TrackSequencer] = [:]
     private var statistics = BroadcastStatistics()
     private var pump: Task<Void, Never>?
+
+    /// Whether ``setMuted(_:)`` is currently holding frames back.
+    public private(set) var isMuted = false
+
+    /// Set while unmuting, and cleared by the frame that carries the keyframe.
+    private var resumesWithKeyFrame = false
 
     /// Consumers watching the frames on their way to the encoders.
     private var taps: [CapturePipe<VideoFrame>] = []
@@ -252,6 +275,37 @@ public actor Broadcast {
         statistics.activeLayers = demanded.union(pinned)
     }
 
+    /// Stop encoding, without taking the publication down.
+    ///
+    /// The distinction from ``stop()`` is the whole point. Stopping withdraws
+    /// the announcement, closes the tracks, and takes the participant out of
+    /// everyone's roster; muting leaves all of that standing and simply stops
+    /// producing objects. Subscribers keep their subscriptions, the layer
+    /// selector keeps its rung, and unmuting is a frame away rather than a
+    /// resubscribe and a wait for the next keyframe.
+    ///
+    /// The camera is left running. That is a deliberate limit and worth being
+    /// plain about: this stops the bytes reaching the relay, it does not put
+    /// the hardware indicator out. An application that wants the stronger claim
+    /// — the one the user reads off the green dot — should stop the capture
+    /// device as well, and pay the reacquisition latency when it comes back.
+    public func setMuted(_ muted: Bool) async {
+        guard muted != isMuted else { return }
+        isMuted = muted
+        statistics.isMuted = muted
+        guard !muted else { return }
+
+
+        // Coming back is not simply the opposite of going away. Subscribers
+        // have a hole where the muted frames would have been, so the group they
+        // are mid-way through cannot be continued into: a viewer joining the
+        // continuation would be missing its keyframe, and one already watching
+        // would be handed frames referencing pictures that were never sent.
+        // Same reasoning as a reconnect, and the same remedy.
+        await startNewGroup()
+        resumesWithKeyFrame = true
+    }
+
     public func stop() async {
         pump?.cancel()
         pump = nil
@@ -283,15 +337,34 @@ public actor Broadcast {
         // Before the encoders, and synchronously. A tap that ran after encoding
         // would deliver frames reordered and late; a tap that awaited anything
         // would put a consumer's latency in front of the uplink.
+        //
+        // Before the mute check too, and that is a decision rather than an
+        // accident of ordering: a tap is the local processing path — a safety
+        // classifier, a transcriber, a beauty filter's own analysis — and those
+        // are exactly the things that should keep seeing the camera while it is
+        // not being sent anywhere. A consumer that wants to stop when the user
+        // mutes can stop; one that needed the frames cannot get them back.
         if !taps.isEmpty {
             taps.removeAll { !$0.tap.isActive }
             for pipe in taps { pipe.offer(frame, at: frame.timestamp) }
         }
 
+        // Counted as submitted above and then dropped here, so the statistics
+        // show a source still producing into a publication that is not sending.
+        // Reporting them as never submitted would make a muted broadcast look
+        // like a dead camera.
+        guard !isMuted else {
+            statistics.framesMuted += 1
+            return
+        }
+
+        let forcesKeyFrame = frame.forcesKeyFrame || resumesWithKeyFrame
+        resumesWithKeyFrame = false
+
         for layer in configuration.ladder.rungs where isActive(layer.id) {
             guard let encoder = encoders[layer.id] else { continue }
             do {
-                try await encoder.encode(frame, forcingKeyFrame: frame.forcesKeyFrame)
+                try await encoder.encode(frame, forcingKeyFrame: forcesKeyFrame)
             } catch {
                 // A rejected frame is a dropped frame, not a failed broadcast.
                 // Encoders reject under back pressure and recover on the next
