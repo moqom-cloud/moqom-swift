@@ -34,6 +34,55 @@ struct SubscriptionPlannerTests {
         #expect(Set(layers) == ["video/360p"])
     }
 
+    @Test("a ladder arriving mid-subscription does not lose the subscription")
+    func restatingALadderKeepsTheSubscription() {
+        // The bug this pins is a bandwidth leak with no symptom. A ladder is
+        // restated constantly — a default when somebody joins, the real one
+        // when their catalog lands, and again on every grants update — and a
+        // selector rebuilt from scratch has no memory of what it subscribed
+        // to. The planner reads that as "nothing is live", so when the tile
+        // goes away it emits no unsubscribe, and the track keeps arriving for
+        // something nobody is drawing.
+        var planner = SubscriptionPlanner()
+        let who = identity("mallory")
+        planner.setLadder(.defaultCamera(), for: who)
+
+        let box = RenderBox(width: 320, height: 180, scale: 2)
+        #expect(!planner.plan(boxes: [who: box]).isEmpty)
+
+        // What a catalog does when it replaces the assumed ladder with the one
+        // the publisher is actually offering.
+        planner.setLadder(
+            .defaultCamera(topSize: PixelSize(width: 1280, height: 720)),
+            for: who
+        )
+
+        let changes = planner.plan(boxes: [:])
+        #expect(changes.contains { change in
+            if case let .unsubscribeVideo(target) = change { return target == who }
+            return false
+        }, "the tile went away and nothing told the relay")
+    }
+
+    @Test("restating the same ladder plans nothing at all")
+    func restatingAnIdenticalLadderIsFree() {
+        // Grants updates restate whatever ladder is already in force, and they
+        // can arrive several times a second in a room being moderated. None of
+        // them is a reason to re-derive a selection that cannot have changed.
+        var planner = SubscriptionPlanner()
+        let who = identity("niaj")
+        planner.setLadder(.defaultCamera(), for: who)
+
+        let box = RenderBox(width: 320, height: 180, scale: 2)
+        _ = planner.plan(boxes: [who: box])
+        let before = planner.selection(for: who)
+
+        planner.setLadder(.defaultCamera(), for: who)
+
+        #expect(planner.selection(for: who) == before)
+        #expect(planner.plan(boxes: [who: box]).isEmpty)
+    }
+
     @Test("switching grid to speaker is one batch, not a burst of individual requests")
     func speakerSwitchIsBatched() {
         var (people, planner) = grid(9)

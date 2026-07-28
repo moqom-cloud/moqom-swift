@@ -48,6 +48,10 @@ targets:
         product: MoqomKit
       - package: MoqomKit
         product: MoqomLoopback
+      # Embeds the extension in the app. A Live Activity whose extension is not
+      # inside the bundle fails at `Activity.request` with an error that names
+      # the attributes type rather than the missing extension.
+      - target: MoqomRoomWidgets
     info:
       path: MoqomRoom/Info.plist
       properties:
@@ -67,6 +71,17 @@ targets:
         # the app would otherwise be terminated on the first capture attempt.
         NSCameraUsageDescription: Publish your camera to the room.
         NSMicrophoneUsageDescription: Publish your microphone to the room.
+        # Required for Picture in Picture, and not optional in the way the name
+        # suggests: without it the system refuses to start the window, and the
+        # refusal arrives as a delegate error rather than as a build failure.
+        # It is the same key that keeps room audio running when backgrounded.
+        UIBackgroundModes:
+          - audio
+        # Lets the app start a Live Activity at all.
+        NSSupportsLiveActivities: true
+        # Not set: NSSupportsLiveActivitiesFrequentUpdates. The throttle in
+        # `BroadcastActivityThrottle` is built to live inside the ordinary
+        # budget, and asking for the larger one would hide whether it does.
     settings:
       base:
         SWIFT_VERSION: "6.0"
@@ -76,6 +91,33 @@ targets:
         # Not repeated here: PRODUCT_BUNDLE_IDENTIFIER, DEVELOPMENT_TEAM, and
         # CODE_SIGN_STYLE. A target-level setting beats an xcconfig, so naming
         # any of them would silently defeat Local.xcconfig.
+
+  # Draws the Lock Screen card and the Dynamic Island. Out of process, which is
+  # why it links MoqomKit for `MoqomBroadcastAttributes` rather than sharing
+  # anything with the app at runtime.
+  MoqomRoomWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: MoqomRoomWidgets
+    dependencies:
+      - package: MoqomKit
+        product: MoqomKit
+    info:
+      path: MoqomRoomWidgets/Info.plist
+      properties:
+        CFBundleDisplayName: MOQOM
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        SWIFT_VERSION: "6.0"
+        SWIFT_STRICT_CONCURRENCY: complete
+        TARGETED_DEVICE_FAMILY: "1,2"
+        GENERATE_INFOPLIST_FILE: NO
+        # As with the UI test bundle: one identifier per bundle, and the
+        # extension's must be prefixed by the app's or it will not embed.
+        PRODUCT_BUNDLE_IDENTIFIER: $(MOQOM_BUNDLE_PREFIX).room.widgets
 
   # The only place the SwiftUI layer is executed. MoqomKit's 103 tests drive
   # RoomSession directly and never render, so the @Observable bridge and the

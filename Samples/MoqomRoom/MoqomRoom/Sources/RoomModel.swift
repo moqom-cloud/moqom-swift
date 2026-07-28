@@ -96,6 +96,10 @@ final class RoomModel {
         /// Held here rather than in a view because the window outlives the view
         /// that started it — that is the entire feature.
         private(set) var pictureInPicture: MoqomPictureInPicture?
+
+        /// The Lock Screen card, while broadcasting.
+        private var card: BroadcastLiveActivity?
+        private var cardTask: Task<Void, Never>?
     #endif
 
     /// Which of the two layouts the room is in.
@@ -201,7 +205,10 @@ final class RoomModel {
                 // Almost always the missing background mode, and worth
                 // surfacing rather than swallowing: the failure is silent
                 // otherwise, and looks like the feature simply not working.
-                self?.lastError = .invalidState("Picture in Picture: \(error.localizedDescription)")
+                self?.lastError = .invalidState(
+                    expected: "picture in picture available",
+                    actual: error.localizedDescription
+                )
             }
         #endif
         start()
@@ -267,6 +274,11 @@ final class RoomModel {
             // badge would reshuffle a grid because somebody's train went into a
             // tunnel.
             qualities[who] = quality
+        case .pictureInPictureChanged:
+            // Nothing to do here. The window's occupancy reaches the controller
+            // on its own stream; this arrives so an app that wants to draw a
+            // "2 in the small window" hint has somewhere to notice it.
+            break
         case .participantJoined, .presenceChanged,
              .muteChanged, .grantsChanged, .spotlightChanged:
             await refresh()
@@ -405,6 +417,9 @@ final class RoomModel {
             await broadcast.start()
             isBroadcasting = true
             applyAudioPurpose()
+            #if os(iOS)
+                startLiveActivity()
+            #endif
             await refresh()
         } catch {
             lastError = error
@@ -625,7 +640,59 @@ final class RoomModel {
         pump = nil
         sampler?.cancel()
         sampler = nil
+        #if os(iOS)
+            pictureInPicture?.stop()
+            endLiveActivity()
+        #endif
         for who in playback.keys { await stopPlayback(for: who) }
         await session.close()
     }
+
+    // MARK: - Live Activity
+
+    #if os(iOS)
+        /// Put the broadcast on the Lock Screen, and keep it current.
+        ///
+        /// Started from ``startBroadcast()`` rather than from joining, because a
+        /// card that says "live" for a viewer is a lie, and the system charges
+        /// the same budget either way.
+        private func startLiveActivity() {
+            guard BroadcastLiveActivity.isPermitted, card == nil else { return }
+
+            let card = BroadcastLiveActivity(logger: .silent)
+            do {
+                try card.start(
+                    MoqomBroadcastAttributes(
+                        title: "Room \(roomName)",
+                        host: identity.username.value,
+                        room: room.room
+                    ),
+                    state: BroadcastActivityState(
+                        phase: .live,
+                        startedAt: .now,
+                        participants: participants.count,
+                        quality: quality
+                    )
+                )
+            } catch {
+                lastError = error as? MoqomError
+                return
+            }
+
+            self.card = card
+
+            // One call, and the card tracks the room from here: participant
+            // count, who is talking, connection quality, and the mute and
+            // camera state of this device. The throttle inside it is what keeps
+            // that from spending the system's update budget in the first minute.
+            cardTask = card.follow(room)
+        }
+
+        private func endLiveActivity() {
+            cardTask?.cancel()
+            cardTask = nil
+            card?.end(card?.showing.map { var last = $0; last.phase = .ended; return last })
+            card = nil
+        }
+    #endif
 }

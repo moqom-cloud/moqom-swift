@@ -7,7 +7,7 @@ audio room, go live, mute a cohost for yourself only.
 
 ```sh
 brew install xcodegen
-cd samples/ios
+cd Samples/MoqomRoom
 cp Local.xcconfig.example Local.xcconfig   # only needed for a device
 xcodegen generate
 open MoqomRoom.xcodeproj
@@ -63,6 +63,56 @@ publishing moves to `AudioGraph.Purpose.listening`, which is a playback session 
 no microphone held, no orange indicator, and audio that survives the screen
 locking, which is what the `audio` background mode in `Info.plist` is for.
 
+## Leaving the app
+
+Two features that only exist once the app is no longer the thing on screen, and
+which are in the sample because both are easy to get subtly wrong in ways that
+do not fail loudly.
+
+**Picture in Picture.** Background the app while in a room and the video follows
+you into the floating window. **Room → In small window** chooses who is in it:
+everyone, the host, the cohosts and guests, or whoever is talking. That is
+`PictureInPictureCast`, and it is a rule rather than a list, so it keeps
+following the room as people join and leave.
+
+Two things in the wiring are load-bearing. The window borrows the
+`AVSampleBufferDisplayLayer` each tile is already drawing into — hence
+`register(_:for:)` in `RemoteVideoView` — instead of building its own, because a
+second layer would mean a second hardware decode of a subscription that already
+exists. And the source view is the video area rather than the screen, because
+the system measures that view to decide whether to open the window at all; point
+it at something zero-sized and the feature silently never triggers.
+
+The reason it is not a composited grid: compositing participants into one buffer
+needs a GPU pass per frame, and an app that submits GPU work in the background is
+terminated. It appears to work in the simulator, where that is not enforced.
+
+**Live Activities.** Going live puts a card on the Lock Screen and in the Dynamic
+Island, drawn by `MoqomRoomWidgets` — an extension, because the card is rendered
+out of process while the app is suspended. `BroadcastLiveActivity.follow(room)`
+is the whole integration; it tracks participant count, active speaker, connection
+quality, recording, and this device's mute and camera state.
+
+The interesting part is what it does *not* send. ActivityKit budgets updates, and
+a nine-person room reassigns the active speaker several times a second, so a card
+that forwarded each change would exhaust its allowance in the first minute and
+then freeze for the rest of the broadcast. Three things prevent that: the elapsed
+time is `Text(timerInterval:)` counting from a date the card already holds, so it
+costs nothing; updates that would not change a pixel are dropped by
+`differsVisibly(from:)`, meaning a viewer count going 1,004 → 1,005 under a card
+reading "1K" is free; and everything else waits out a minimum interval except the
+transitions where delay would be a lie — recording starting, the stream ending, a
+mute the user just pressed.
+
+Both need the *Audio, AirPlay, and Picture in Picture* background mode, which
+`project.yml` sets. Without it the system refuses to start the window and reports
+it through `onFailure` rather than failing the build — the sample raises that as
+an alert so the refusal is visible rather than mysterious.
+
+Neither can be driven from a UI test: the window belongs to the system, and the
+simulator will not background the app on request. The UI test covers the part
+that can break silently, which is the cast reaching `RoomSession`.
+
 ## Where things are
 
 | File | What to read it for |
@@ -73,7 +123,10 @@ locking, which is what the `audio` background mode in `Info.plist` is for.
 | `RoomScreen.swift` | `SeatTile` — an audio room's entire interface is the speaking ring |
 | `RoomScreen.swift` | `WatchdogBanner` — why a recorder is not in the grid |
 | `SceneEffects.swift` | Where a beauty filter or scene effect attaches |
-| `RemoteVideoView.swift` | `AVSampleBufferDisplayLayer` per tile |
+| `RemoteVideoView.swift` | `AVSampleBufferDisplayLayer` per tile, and lending it to the small window |
+| `PictureInPicture.swift` | Handing SwiftUI's `UIView` to the SDK as the source |
+| `RoomModel.swift` | `startLiveActivity` — one call, and the card tracks the room |
+| `MoqomRoomWidgets/` | The Lock Screen card and Dynamic Island, out of process |
 
 ## Measuring echo cancellation on a device
 
@@ -125,17 +178,26 @@ Then heat, since this runs alongside hardware video encode.
 
 ## Verification status
 
-The app runs. `MoqomRoomUITests` drives it on a simulator in CI: joining puts
-you in the room over the loopback relay, going live adds a tile under your
-username, switching to the audio-room layout reconfigures the audio session, and
-leaving comes back to the join screen. That is the only place the SwiftUI layer
-executes — the package's 380 tests drive `RoomSession` directly and never render.
+The app runs. `MoqomRoomUITests` drives it on a simulator in CI with six tests:
+joining puts you in the room over the loopback relay, going live adds a tile
+under your username, switching to the audio-room layout reconfigures the audio
+session, choosing a Picture in Picture cast reaches `RoomSession`, and leaving
+comes back to the join screen. That is the only place the SwiftUI layer executes
+— the package's 496 tests drive `RoomSession` directly and never render.
 
 What a green simulator run does **not** cover is everything a simulator does not
 have: the camera, the VideoToolbox encoder, the Metal scene capture, and the
 RealityKit tap. Those compile and have never executed. `Broadcast` also
 publishes a per-frame descriptor rather than encoded bytes, so a tile appearing
 means the roster works, not that video moves.
+
+Nor does it cover the two features above actually appearing. The Picture in
+Picture window and the Live Activity card have been built and wired but not seen
+on hardware: both need a real device, and the pieces most likely to be wrong are
+the ones only a device exercises — whether the system accepts the source view
+and opens the window unprompted, whether reparenting a layer that is mid-decode
+survives the transition, and whether the throttle actually stays inside
+ActivityKit's budget over an hour rather than over a unit test.
 
 Requires an Xcode with an iOS 26 SDK; the deployment floor is 26.
 

@@ -85,8 +85,26 @@ public struct SubscriptionPlanner: Sendable {
     }
 
     /// Register or replace the ladder a participant is offering.
+    ///
+    /// Callers restate a ladder far more often than it changes — a default goes
+    /// in when somebody joins, the catalog replaces it, and every grants update
+    /// restates whatever is current — so an unchanged ladder is left completely
+    /// alone, and a changed one inherits the selection already in force.
+    ///
+    /// Both halves matter for the same reason. A fresh ``LayerSelector`` has no
+    /// ``LayerSelector/current``, and the planner reads that to mean no
+    /// subscription is live, so it emits no unsubscribe when the participant
+    /// later loses their box. The track then keeps arriving for a tile nobody
+    /// is drawing: no error, no log, just bandwidth.
     public mutating func setLadder(_ ladder: LayerLadder, for identity: ParticipantIdentity) {
-        selectors[identity] = LayerSelector(ladder: ladder)
+        if let existing = selectors[identity] {
+            guard existing.ladder != ladder else { return }
+            var replacement = LayerSelector(ladder: ladder)
+            replacement.adopt(existing.current)
+            selectors[identity] = replacement
+        } else {
+            selectors[identity] = LayerSelector(ladder: ladder)
+        }
     }
 
     public mutating func remove(_ identity: ParticipantIdentity) {

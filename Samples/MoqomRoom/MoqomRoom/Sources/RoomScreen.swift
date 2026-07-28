@@ -86,6 +86,10 @@ struct RoomScreen: View {
             }
         }
         .frame(maxHeight: .infinity)
+        // On the video area rather than on the screen, because the system
+        // measures this view to decide whether to open the window when the app
+        // is backgrounded, and animates the window out of its frame.
+        .moqomPictureInPictureSource(room)
         .navigationTitle(room.roomName)
         .safeAreaInset(edge: .bottom) {
             BroadcastControls(room: room)
@@ -105,6 +109,15 @@ struct RoomScreen: View {
                     Picker("Tiles", selection: $room.boxes) {
                         ForEach([4, 9, 16], id: \.self) { count in
                             Text("\(count)").tag(count)
+                        }
+                    }
+
+                    // Who stays on screen once the app is not. A rule rather
+                    // than a list, so it keeps following the room as people
+                    // join, leave and take the stage.
+                    Picker("In small window", selection: $room.cast) {
+                        ForEach(CastChoice.allCases) { choice in
+                            Text(choice.rawValue).tag(choice)
                         }
                     }
 

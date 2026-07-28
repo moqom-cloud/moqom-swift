@@ -127,6 +127,34 @@ final class JoinFlowTests: XCTestCase {
         XCTAssertTrue(app.navigationBars["demo"].exists)
     }
 
+    func testChoosingWhoStaysInTheSmallWindow() {
+        let app = launch()
+
+        let username = app.textFields["Username"]
+        XCTAssertTrue(username.waitForExistence(timeout: 10))
+        username.tap()
+        username.typeText("elliott")
+        app.buttons["Join"].tap()
+        XCTAssertTrue(app.navigationBars["demo"].waitForExistence(timeout: 15))
+
+        // Picture in Picture itself cannot be driven from a UI test — the
+        // window belongs to the system and the simulator will not background
+        // the app on demand — so what is worth testing is the part that can
+        // break silently: choosing a cast reaches `RoomSession` and the room
+        // recomputes occupancy without throwing. A cast that referenced a
+        // participant who is not there surfaces here as an alert.
+        app.buttons["Room"].tap()
+        let cast = app.buttons["Cohosts and guests"]
+        XCTAssertTrue(cast.waitForExistence(timeout: 5), "the cast picker is not in the menu")
+        cast.tap()
+
+        XCTAssertFalse(
+            app.alerts.firstMatch.waitForExistence(timeout: 3),
+            "choosing a cast raised: \(app.alerts.firstMatch.staticTexts.allElementsBoundByIndex.map(\.label))"
+        )
+        XCTAssertTrue(app.navigationBars["demo"].exists)
+    }
+
     func testJoinIsRefusedUntilThereIsAName() {
         let app = launch()
 

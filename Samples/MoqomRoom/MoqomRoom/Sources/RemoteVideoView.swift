@@ -119,18 +119,32 @@ final class VideoTile {
                 coordinator.tile.attachPreview(in: room)
             } else {
                 coordinator.tile.attach(to: identity, in: room)
+                // Lend the window this tile's layer, so entering Picture in
+                // Picture reuses the decode already running here instead of
+                // starting a second one for the same track.
+                coordinator.identity = identity
+                room.pictureInPicture?.register(coordinator.tile.renderer, for: identity)
             }
         }
 
         static func dismantleUIView(_: SampleBufferView, coordinator: Coordinator) {
             coordinator.tile.detach()
+            if let identity = coordinator.identity {
+                coordinator.room?.pictureInPicture?.unregister(identity)
+            }
         }
 
-        func makeCoordinator() -> Coordinator { Coordinator() }
+        func makeCoordinator() -> Coordinator {
+            let coordinator = Coordinator()
+            coordinator.room = room
+            return coordinator
+        }
 
         @MainActor
         final class Coordinator {
             let tile = VideoTile()
+            var identity: ParticipantIdentity?
+            weak var room: RoomModel?
         }
     }
 
@@ -148,6 +162,11 @@ final class VideoTile {
 
         override func layoutSubviews() {
             super.layoutSubviews()
+            // Only while we still hold it. The Picture in Picture window moves
+            // this layer into its own hierarchy and lays it out there, so a
+            // grid pass that happened to run meanwhile would otherwise resize
+            // the layer out from under the window.
+            guard renderer.layer.superlayer === layer else { return }
             renderer.layer.frame = bounds
         }
     }
@@ -201,6 +220,7 @@ final class VideoTile {
 
         override func layout() {
             super.layout()
+            guard renderer.layer.superlayer === layer else { return }
             renderer.layer.frame = bounds
         }
     }

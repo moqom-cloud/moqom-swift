@@ -217,6 +217,19 @@ public struct LayerSelector: Sendable {
         self.policy = policy ?? (ladder.kind == .screenShare ? .screenShare : .default)
     }
 
+    /// Carry the decision already in force onto a selector for a new ladder.
+    ///
+    /// A ladder can be replaced while a subscription is live — the catalog
+    /// lands after the default, grants arrive, a publisher restates what it is
+    /// offering — and ``current`` is a fact about the wire rather than about
+    /// the ladder: it is what the relay was last asked for, and it stays true
+    /// across the swap. Dropping it makes the selector believe it holds no
+    /// subscription, so the next layout that hides this participant produces no
+    /// unsubscribe and the track keeps arriving for a tile nobody is drawing.
+    public mutating func adopt(_ selection: LayerSelection?) {
+        current = selection
+    }
+
     /// Request a layer before the layout that needs it.
     ///
     /// Cleared by the next ``update(box:allowance:)`` that would meet or exceed
