@@ -244,7 +244,11 @@ public struct Roster: Hashable, Sendable {
             if storage[slot.identity] == nil {
                 storage[slot.identity] = Participant(slot: slot)
             }
-        case let .withdrawn(namespace):
+        case let .withdrawn(namespace, _):
+            // The reason is not consulted here on purpose. This is the plain
+            // set-of-participants view, and whether the seat is worth holding is
+            // a policy question that ``RoomSession`` answers with ``SeatPolicy``
+            // before it ever calls this.
             guard let slot = ParticipantSlot(announced: namespace, under: prefix) else { return }
             storage.removeValue(forKey: slot.identity)
         }

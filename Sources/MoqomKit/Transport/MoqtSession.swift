@@ -597,7 +597,12 @@ public actor MoqtSession: TransportSession {
         guard announced.remove(namespace) != nil else { return }
         for watcher in namespaceWatchers where namespace.starts(with: watcher.prefix) {
             guard let suffix = Self.split(namespace, under: watcher.prefix) else { continue }
-            try? await send(NamespaceDone(suffix: suffix), on: watcher.stream)
+
+            // `stopped`, unconditionally, because reaching here means somebody
+            // called ``AnnouncementHandle/withdraw()``. A session that merely
+            // ends never runs this: the streams close and the peer reports its
+            // own `vanished` instead.
+            try? await send(NamespaceDone(suffix: suffix, reason: .stopped), on: watcher.stream)
         }
     }
 
@@ -669,7 +674,7 @@ public actor MoqtSession: TransportSession {
                         guard let message = try? NamespaceDone.read(from: &body),
                               let full = Self.join(prefix: prefix, suffix: message.suffix)
                         else { break }
-                        continuation.yield(.withdrawn(full))
+                        continuation.yield(.withdrawn(full, message.reason))
                     default:
                         break
                     }

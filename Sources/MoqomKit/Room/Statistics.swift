@@ -235,6 +235,37 @@ public struct ParticipantStatistics: Hashable, Sendable, Identifiable {
     /// their own tile and nobody else's.
     public var quality: ConnectionQuality
 
+    /// How long since anything of theirs arrived, or `nil` if nothing ever has.
+    ///
+    /// The failure no transport timeout can see. A publisher whose camera has
+    /// frozen, whose encoder has wedged, or who has been dropped by the relay
+    /// without their connection noticing still has a healthy QUIC session:
+    /// ACKs flow, nothing times out, and their tile is a still image. The only
+    /// evidence is that the objects stopped, which is what this measures.
+    ///
+    /// It is also much faster than the alternatives. Media arrives tens of
+    /// times a second, so a gap is obvious within a frame or two — where a
+    /// connection-level timeout has to wait out its whole idle period before
+    /// concluding anything, and an application heartbeat could do no better
+    /// than the interval it was configured with.
+    ///
+    /// Growing on its own is normal for somebody who is not sending: a
+    /// participant with their camera and microphone muted is silent by
+    /// definition. Read it against ``Participant/mute`` before treating it as a
+    /// fault, and see ``isStalled(after:)``.
+    public var silentFor: Duration?
+
+    /// Whether their media has been absent long enough to be worth showing.
+    ///
+    /// - Parameter after: how much silence counts. A couple of hundred
+    ///   milliseconds is a hiccup at any frame rate; the default is
+    ///   deliberately several frames' worth, so a single late group does not
+    ///   flicker an indicator on and off.
+    public func isStalled(after threshold: Duration = .seconds(2)) -> Bool {
+        guard let silentFor else { return false }
+        return silentFor > threshold
+    }
+
     public init(
         identity: ParticipantIdentity,
         presence: Presence = .connected,
@@ -242,7 +273,8 @@ public struct ParticipantStatistics: Hashable, Sendable, Identifiable {
         layer: LayerID? = nil,
         video: VideoReceiveStatistics? = nil,
         audio: JitterBufferStatistics? = nil,
-        quality: ConnectionQuality = .unknown
+        quality: ConnectionQuality = .unknown,
+        silentFor: Duration? = nil
     ) {
         self.identity = identity
         self.presence = presence
@@ -251,6 +283,7 @@ public struct ParticipantStatistics: Hashable, Sendable, Identifiable {
         self.video = video
         self.audio = audio
         self.quality = quality
+        self.silentFor = silentFor
     }
 
     /// Audio packets lost or discarded as a fraction of those expected.

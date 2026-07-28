@@ -39,18 +39,39 @@
         private let lossStream: AsyncStream<TransportFailure>
         private let reporter: LossReporter
 
+        /// What this end advertises as its idle timeout.
+        ///
+        /// Matches the relay's `Liveness::DEFAULT`, and matching it is
+        /// cosmetic: the effective timeout is the lower of the two ends'
+        /// (RFC 9000 §10.1), so the relay's short value governs whatever a
+        /// client asks for. Agreeing with it anyway means the number a reader
+        /// finds here is the number in force, rather than one that is quietly
+        /// overridden on every connection.
+        ///
+        /// This end sends no keep-alive of its own and does not need to. The
+        /// relay PINGs quiet connections, a PING is ack-eliciting, and the ACK
+        /// this end sends back is a packet the relay receives — so one side
+        /// pinging resets the idle timer at both. A second keep-alive here
+        /// would be duplicate traffic on a phone's radio for no added
+        /// liveness.
+        public static let defaultIdleTimeout: Duration = .seconds(10)
+
         /// Dial a relay.
         ///
         /// - Parameter alpn: offered in preference order. Version negotiation
         ///   in draft-19 *is* ALPN — it was removed from SETUP entirely — so
         ///   this list is the version list, and a mismatch fails the handshake
         ///   rather than the session.
+        /// - Parameter idleTimeout: what this end advertises. The value that
+        ///   actually applies is the lower of the two ends' (RFC 9000 §10.1),
+        ///   and the relay sets a short one, so this is a ceiling rather than a
+        ///   choice — see ``NetworkQUICCarrier/defaultIdleTimeout``.
         public static func connect(
             host: String,
             port: UInt16,
             alpn: [String],
             trust: RelayTrust = .system,
-            idleTimeout: Duration = .seconds(30)
+            idleTimeout: Duration = NetworkQUICCarrier.defaultIdleTimeout
         ) async throws(MoqomError) -> NetworkQUICCarrier {
             guard let port = NWEndpoint.Port(rawValue: port) else {
                 throw MoqomError.transport(.unreachable)
@@ -459,7 +480,7 @@
         ///   development relay, or a self-hosted deployment behind a private CA.
         static func network(
             trust: RelayTrust = .system,
-            idleTimeout: Duration = .seconds(30)
+            idleTimeout: Duration = NetworkQUICCarrier.defaultIdleTimeout
         ) -> MoqtTransport {
             MoqtTransport { endpoint, _ in
                 try await NetworkQUICCarrier.connect(

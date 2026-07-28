@@ -87,8 +87,13 @@ public final class LoopbackSession: TransportSession {
     public func announce(
         _ namespace: TrackNamespace
     ) async throws(MoqomError) -> any AnnouncementHandle {
-        await relay.announce(namespace)
-        return LoopbackAnnouncement(namespace: namespace, relay: relay)
+        // Announced *by this session*, so that dropping the session withdraws
+        // it. Ownership rather than a bare namespace, because two sessions for
+        // the same person -- an old one and its replacement mid-reconnect --
+        // must not withdraw each other's.
+        let owner = ObjectIdentifier(self)
+        await relay.announce(namespace, by: owner)
+        return LoopbackAnnouncement(namespace: namespace, relay: relay, owner: owner)
     }
 
     public func announcements(
@@ -196,14 +201,16 @@ private final class OnceFlag: @unchecked Sendable {
 private final class LoopbackAnnouncement: AnnouncementHandle {
     let namespace: TrackNamespace
     private let relay: LoopbackRelay
+    private let owner: ObjectIdentifier
 
-    init(namespace: TrackNamespace, relay: LoopbackRelay) {
+    init(namespace: TrackNamespace, relay: LoopbackRelay, owner: ObjectIdentifier) {
         self.namespace = namespace
         self.relay = relay
+        self.owner = owner
     }
 
     func withdraw() async {
-        await relay.withdraw(namespace)
+        await relay.withdraw(namespace, by: owner)
     }
 }
 

@@ -41,6 +41,16 @@ public actor LoopbackRelay {
     }
 
     private var announcements: Set<TrackNamespace> = []
+
+    /// Which session announced what.
+    ///
+    /// Needed because a session ending withdraws everything it announced, which
+    /// is the real relay's behaviour and the only way a client ever finds out
+    /// that somebody's connection died. Without this the loopback would keep a
+    /// dead participant announced forever, and every test of a vanished peer
+    /// would pass while the room quietly showed a ghost.
+    private var announced: [ObjectIdentifier: Set<TrackNamespace>] = [:]
+
     private var watchers: [UUID: Watcher] = [:]
     private var subscribers: [FullTrackName: [UUID: AsyncStream<TrackObject>.Continuation]] = [:]
     private var interactions: [RelayInteraction] = []
@@ -81,12 +91,28 @@ public actor LoopbackRelay {
     ///
     /// Every session that identity has opened, because a reconnect leaves the
     /// earlier ones behind and dropping an already-dead one does nothing.
+    ///
+    /// Withdrawing what the dead sessions announced is not tidying up, it is the
+    /// behaviour being modelled. A real relay withdraws everything a session
+    /// announced when that session ends, cleanly or otherwise, and that
+    /// withdrawal is the *only* way other clients learn a participant is gone —
+    /// nobody dying sends their own notice. Leaving the announcements in place
+    /// would make every peer's roster permanently wrong and every test of it
+    /// vacuous.
+    ///
+    /// The withdrawals say ``WithdrawalReason/vanished``, which is what makes
+    /// this distinguishable from the participant closing their own announcement.
+    /// Without that, dying and leaving are the same event here and no test could
+    /// tell whether the roster held the right seat for the right reason.
     public func drop(
         _ who: ParticipantIdentity,
         failure: TransportFailure = .idleTimeout
     ) {
         for session in sessions.removeValue(forKey: who) ?? [] {
             session.drop(failure)
+            for namespace in announced.removeValue(forKey: ObjectIdentifier(session)) ?? [] {
+                withdraw(namespace, reason: .vanished)
+            }
         }
     }
 
@@ -136,19 +162,25 @@ public actor LoopbackRelay {
         interactions.append(interaction)
     }
 
-    func announce(_ namespace: TrackNamespace) {
+    func announce(_ namespace: TrackNamespace, by owner: ObjectIdentifier? = nil) {
         interactions.append(.announced(namespace))
+        if let owner { announced[owner, default: []].insert(namespace) }
         guard announcements.insert(namespace).inserted else { return }
         for watcher in watchers.values where namespace.starts(with: watcher.prefix) {
             watcher.continuation.yield(.announced(namespace))
         }
     }
 
-    func withdraw(_ namespace: TrackNamespace) {
+    func withdraw(
+        _ namespace: TrackNamespace,
+        by owner: ObjectIdentifier? = nil,
+        reason: WithdrawalReason = .stopped
+    ) {
         interactions.append(.withdrew(namespace))
+        if let owner { announced[owner]?.remove(namespace) }
         guard announcements.remove(namespace) != nil else { return }
         for watcher in watchers.values where namespace.starts(with: watcher.prefix) {
-            watcher.continuation.yield(.withdrawn(namespace))
+            watcher.continuation.yield(.withdrawn(namespace, reason))
         }
     }
 

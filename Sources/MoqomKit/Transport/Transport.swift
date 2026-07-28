@@ -165,7 +165,21 @@ public protocol AnnouncementHandle: Sendable, AnyObject {
 /// A namespace appearing under or leaving a watched prefix.
 public enum AnnouncementEvent: Hashable, Sendable {
     case announced(TrackNamespace)
-    case withdrawn(TrackNamespace)
+
+    /// A namespace is no longer served, and why, if the relay said.
+    ///
+    /// The reason is what makes this actionable rather than merely informative:
+    /// see ``MoqomCore/WithdrawalReason``. `nil` from a relay that predates the
+    /// extension, and treated the same as ``MoqomCore/WithdrawalReason/vanished``.
+    case withdrawn(TrackNamespace, WithdrawalReason?)
+
+    /// The namespace either way, for the common case of resolving who this is
+    /// about before deciding what the event means.
+    public var namespace: TrackNamespace {
+        switch self {
+        case let .announced(namespace), let .withdrawn(namespace, _): namespace
+        }
+    }
 }
 
 /// What to subscribe to, and how urgently.

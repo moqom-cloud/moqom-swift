@@ -167,7 +167,9 @@ struct RoomStateTests {
         roster.apply(.announced(namespace), under: prefix)
         #expect(roster.count == 1)
 
-        roster.apply(.withdrawn(namespace), under: prefix)
+        // Either reason, because this view does not weigh them: holding a seat
+        // open is ``SeatPolicy``'s job, decided before the roster is touched.
+        roster.apply(.withdrawn(namespace, .vanished), under: prefix)
         #expect(roster.count == 0)
     }
 

@@ -84,10 +84,14 @@ struct MoqtSessionTests {
 
         #expect(await eventually { await collected.items == [.announced(namespace)] })
 
+        // `stopped`, because this withdrawal was asked for. The reason is part of
+        // the assertion rather than ignored: it is what a receiver acts on, and a
+        // session that reported the wrong one would look identical here without
+        // it while making every roster hold seats for people who had left.
         await handle.withdraw()
         #expect(
             await eventually {
-                await collected.items == [.announced(namespace), .withdrawn(namespace)]
+                await collected.items == [.announced(namespace), .withdrawn(namespace, .stopped)]
             }
         )
 

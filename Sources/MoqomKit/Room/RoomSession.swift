@@ -109,14 +109,36 @@ public actor RoomSession {
     private let eventStream: AsyncStream<RoomEvent>
     private let eventContinuation: AsyncStream<RoomEvent>.Continuation
 
+    /// How long a vanished participant keeps their seat.
+    private let seatPolicy: SeatPolicy
+
+    /// When each participant's media last arrived.
+    ///
+    /// The one liveness signal that costs nothing to collect, because every
+    /// object already passes through here on its way to a decoder. Recorded per
+    /// participant rather than per track: a publisher whose video has frozen
+    /// while their audio continues is a stalled camera, not a stalled peer, and
+    /// the tile is what a viewer is looking at either way.
+    private var lastObject: [ParticipantIdentity: MonotonicTime] = [:]
+
+    /// Seats being held open, and the timer that will give up on each.
+    ///
+    /// Membership here is what distinguishes "gone" from "gone for now", and it
+    /// is why a withdrawal is not a departure: everyone in this dictionary is
+    /// still in the roster, still holds a tile, and is one re-announcement away
+    /// from carrying on as though nothing happened.
+    private var held: [ParticipantIdentity: Task<Void, Never>] = [:]
+
     init(
         tenant: TenantID,
         room: RoomID,
         namespace: TrackNamespace,
         identity: ParticipantIdentity,
         connection: any TransportSession,
-        logger: MoqomLogger = .silent
+        logger: MoqomLogger = .silent,
+        seatPolicy: SeatPolicy = .default
     ) {
+        self.seatPolicy = seatPolicy
         self.tenant = tenant
         self.room = room
         self.namespace = namespace
@@ -368,12 +390,19 @@ public actor RoomSession {
         layoutToRestore = planner.layout
 
         // Everything on the receive side belonged to the dead session. Routed
-        // through the withdrawal path rather than reimplemented so that the
+        // through the departure path rather than reimplemented so that the
         // per-participant teardown has one definition: an application watching
         // events sees each participant leave, and every pump, sink, and catalog
         // reader is released by the code that already knows how.
+        //
+        // Departure and not ``vanish``, which is what a withdrawal would reach.
+        // Holding seats is right when one participant's session ends and this
+        // one can still see the room; it is wrong here, where the reasoning in
+        // the comment above applies -- this client cannot tell who is still
+        // there, so a held seat is a guess rather than a wait, and the guess is
+        // wrong for anybody who left during the outage.
         for participant in state.roster.participants {
-            await applyAnnouncement(.withdrawn(participant.slot.namespace))
+            await depart(participant.id, reason: .connectionLost)
         }
         rosterTask?.cancel()
         rosterTask = nil
@@ -505,6 +534,12 @@ public actor RoomSession {
     }
 
     func end() async {
+        // Nobody is waiting for anybody once the room is over, and a held seat
+        // is a live task with a `weak self` that would otherwise sit out its
+        // grace period before discovering there is nothing left to report to.
+        for timer in held.values { timer.cancel() }
+        held.removeAll()
+
         rosterTask?.cancel()
         rosterTask = nil
         speechTask?.cancel()
@@ -1267,6 +1302,7 @@ public actor RoomSession {
             audio: await audio?.stats
         )
 
+        let sampledAt = now()
         var participants: [ParticipantIdentity: ParticipantStatistics] = [:]
         for participant in state.roster.participants where participant.id != identity {
             let who = participant.id
@@ -1278,7 +1314,8 @@ public actor RoomSession {
                 isSpeaking: speakers.isSpeaking(who),
                 layer: subscribedLayers[who],
                 video: video,
-                audio: audio
+                audio: audio,
+                silentFor: lastObject[who].map { sampledAt - $0 }
             )
             stats.quality = quality(for: stats, link: link)
             participants[who] = stats
@@ -1670,11 +1707,7 @@ public actor RoomSession {
                 )
                 return
             }
-            guard state.roster[who] != nil else { return }
-            state.roster.remove(who)
-            speakers.remove(who)
-            eventContinuation.yield(.participantLeft(who))
-            await refreshGallery()
+            await depart(who, reason: .evicted)
         }
     }
 
@@ -1745,6 +1778,14 @@ public actor RoomSession {
         // reflowing around a gap.
         await refreshGallery()
         await announce(.presence(who, presence))
+
+        // Said outright, so there is nothing to wait for. This also covers the
+        // order the other way round from ``vanish``: somebody whose seat is
+        // already being held, who then turns out to have left deliberately,
+        // should go now rather than serve out a window meant for an accident.
+        if presence == .left, who != identity {
+            await depart(who, reason: .left)
+        }
     }
 
     func deliverTerminal(_ event: TerminalEvent) {
@@ -1782,9 +1823,35 @@ public actor RoomSession {
         eventContinuation.yield(.grantsChanged(who, grants))
     }
 
+    /// A namespace appeared or went away under the room prefix.
+    ///
+    /// The asymmetry here is the whole point. An announcement is proof somebody
+    /// is there and is acted on at once; a withdrawal is only proof their
+    /// session ended, which is a different and much weaker claim, so it starts
+    /// a clock instead. See ``SeatPolicy``.
     private func applyAnnouncement(_ event: AnnouncementEvent) async {
+        guard let slot = ParticipantSlot(announced: event.namespace, under: namespace) else {
+            // A namespace this client does not model. The relay is entitled to
+            // announce those and it is not an error to ignore them.
+            return
+        }
+
+        switch event {
+        case .announced:
+            if held[slot.identity] != nil {
+                await restore(slot.identity)
+            } else {
+                await admit(slot)
+            }
+        case let .withdrawn(_, reason):
+            await vanish(slot.identity, reason: reason)
+        }
+    }
+
+    /// Somebody who was never here before.
+    private func admit(_ slot: ParticipantSlot) async {
         let before = Set(state.roster.participants.map(\.id))
-        state.roster.apply(event, under: namespace)
+        state.roster.apply(.announced(slot.namespace), under: namespace)
         let after = Set(state.roster.participants.map(\.id))
 
         for joined in after.subtracting(before) {
@@ -1825,29 +1892,134 @@ public actor RoomSession {
                 if layoutToRestore[joined] != nil { scheduleLayoutRestore() }
             }
         }
-        for left in before.subtracting(after) {
-            planner.remove(left)
-            subscriptions.removeValue(forKey: left)
-            catalogTasks.removeValue(forKey: left)?.cancel()
-            catalogs.removeValue(forKey: left)
-            pumps.removeValue(forKey: left)?.cancel()
-            catchUps.removeValue(forKey: left)?.cancel()
-            media.removeValue(forKey: left)?.finish()
-            depacketisers.removeValue(forKey: left)
-            subscribedLayers.removeValue(forKey: left)
-            audioPumps.removeValue(forKey: left)?.cancel()
-            audioSubscriptions.removeValue(forKey: left)
-            audioSinks.removeValue(forKey: left)?.continuation.finish()
-            receivers.removeValue(forKey: left)
+        if before != after { await refreshGallery() }
+    }
 
-            // Otherwise a rejoin inherits the speech history of the session that
-            // left, and jumps the queue for a tile on the strength of a sentence
-            // finished before the reconnect.
-            speakers.remove(left)
-            eventContinuation.yield(.participantLeft(left))
+    /// Their session ended. Hold the seat and start the clock.
+    private func vanish(_ who: ParticipantIdentity, reason: WithdrawalReason?) async {
+        guard let participant = state.roster[who], held[who] == nil else { return }
+
+        // They said they were going, one way or the other: on the control track
+        // before leaving, or by closing the announcement, which the relay
+        // reports as ``WithdrawalReason/stopped``. Either is a statement of
+        // intent, and waiting for somebody who announced their departure is
+        // waiting for nobody. A relay too old to say gets the patient reading.
+        if participant.presence == .left || !reason.mayReturn {
+            await depart(who, reason: .left)
+            return
         }
 
-        if before != after { await refreshGallery() }
+        let grace = seatPolicy.grace(for: participant.role)
+        guard grace > .zero else {
+            await depart(who, reason: .timedOut)
+            return
+        }
+
+        // The media plumbing goes now, even though the seat stays. Their tracks
+        // are gone with the namespace, so every pump is about to fail on a
+        // subscription to something nobody is publishing; keeping them would
+        // buy nothing and burn a task each. What is kept is the roster entry
+        // and the tile, which is what anyone watching actually notices.
+        teardownMedia(for: who)
+
+        state.roster[who]?.presence = .reconnecting
+        eventContinuation.yield(.presenceChanged(who, .reconnecting))
+        logger.info(
+            .room,
+            "participant vanished, holding their seat",
+            [
+                LogField("participant", .participant(who)),
+                LogField("role", .text(participant.role.rawValue)),
+                LogField("grace", .elapsed(grace)),
+            ]
+        )
+
+        held[who] = Task { [weak self] in
+            try? await Task.sleep(for: grace)
+            guard !Task.isCancelled else { return }
+            await self?.depart(who, reason: .timedOut)
+        }
+
+        await refreshGallery()
+    }
+
+    /// They came back inside the window.
+    private func restore(_ who: ParticipantIdentity) async {
+        held.removeValue(forKey: who)?.cancel()
+        guard state.roster[who] != nil else { return }
+
+        state.roster[who]?.presence = .connected
+        eventContinuation.yield(.presenceChanged(who, .connected))
+        logger.info(
+            .room,
+            "participant returned",
+            [LogField("participant", .participant(who))]
+        )
+
+        // Rebuilding what `vanish` tore down. Not a join: they never left the
+        // roster, so nothing above has to re-add them, and emitting
+        // `participantJoined` would tell an application to build a tile it
+        // already has.
+        planner.setLadder(
+            state.roster[who]?.ladders[MediaKind.video.rawValue] ?? .defaultCamera(),
+            for: who
+        )
+        if let participant = state.roster[who] { watchCatalog(of: participant) }
+        if layoutToRestore[who] != nil { scheduleLayoutRestore() }
+
+        await refreshGallery()
+    }
+
+    /// Out of the roster, for good.
+    private func depart(_ who: ParticipantIdentity, reason: DepartureReason) async {
+        held.removeValue(forKey: who)?.cancel()
+        guard state.roster[who] != nil else { return }
+
+        teardownMedia(for: who)
+        state.roster.remove(who)
+
+        // Otherwise a rejoin inherits the speech history of the session that
+        // left, and jumps the queue for a tile on the strength of a sentence
+        // finished before the reconnect.
+        speakers.remove(who)
+        waiting.removeValue(forKey: who)
+
+        logger.info(
+            .room,
+            "participant left",
+            [
+                LogField("participant", .participant(who)),
+                LogField("reason", .text(reason.rawValue)),
+            ]
+        )
+        eventContinuation.yield(.participantLeft(who, reason))
+        await refreshGallery()
+    }
+
+    /// Drop everything subscribed, pumped, or decoded on somebody's behalf.
+    ///
+    /// Shared by the seat-holding path and the departure path because the two
+    /// want exactly the same teardown and differ only in whether the roster
+    /// entry survives it.
+    private func teardownMedia(for who: ParticipantIdentity) {
+        // Otherwise somebody who vanishes and returns is reported as having been
+        // silent for the whole outage, when what actually happened is that this
+        // client was not subscribed to them for any of it.
+        lastObject.removeValue(forKey: who)
+
+        planner.remove(who)
+        subscriptions.removeValue(forKey: who)
+        catalogTasks.removeValue(forKey: who)?.cancel()
+        catalogs.removeValue(forKey: who)
+        pumps.removeValue(forKey: who)?.cancel()
+        catchUps.removeValue(forKey: who)?.cancel()
+        media.removeValue(forKey: who)?.finish()
+        depacketisers.removeValue(forKey: who)
+        subscribedLayers.removeValue(forKey: who)
+        audioPumps.removeValue(forKey: who)?.cancel()
+        audioSubscriptions.removeValue(forKey: who)
+        audioSinks.removeValue(forKey: who)?.continuation.finish()
+        receivers.removeValue(forKey: who)
     }
 
     /// Subscribe to a participant's catalog track and follow it.
@@ -1973,6 +2145,7 @@ public actor RoomSession {
         into sink: AudioSink
     ) async {
         estimator.record(object, at: .nanoseconds(DispatchTime.now().uptimeNanoseconds))
+        lastObject[who] = now()
 
         let plain: TrackObject
         if let unprotector {
@@ -2323,6 +2496,13 @@ public actor RoomSession {
         // consumed bandwidth.
         estimator.record(object, at: .nanoseconds(DispatchTime.now().uptimeNanoseconds))
 
+        // Before the decryption guard below, for the same reason: an object
+        // that arrived and failed to open is still proof the publisher is
+        // sending. Recording it after would report a peer with the wrong keys
+        // as a peer who had gone quiet, which is a misleading way to describe a
+        // key mismatch.
+        lastObject[who] = now()
+
         let plain: TrackObject
         if let unprotector {
             guard let decrypted = await unprotector.unprotect(object) else { return }
@@ -2402,10 +2582,7 @@ public actor RoomSession {
     private func apply(_ action: ModerationAction) async {
         switch action {
         case let .kick(who):
-            state.roster.remove(who)
-            speakers.remove(who)
-            eventContinuation.yield(.participantLeft(who))
-            await refreshGallery()
+            await depart(who, reason: .evicted)
         case let .forceMute(who, kinds, _):
             guard var participant = state.roster[who] else { return }
             participant.mute.forcedForEveryone.formUnion(kinds)

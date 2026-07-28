@@ -12,12 +12,12 @@
 //
 // # Why this is skipped by default
 //
-// It needs a relay binary, which lives in the monorepo rather than here, so the
-// path comes from `MOQOM_RELAY_BIN`:
+// It needs a relay binary, which lives in `moqom-engine` rather than here, so
+// the path comes from `MOQOM_RELAY_BIN`:
 //
 // ```
-// (cd ../moqom/rs && cargo build --bin moqom-relay)
-// MOQOM_RELAY_BIN=$PWD/../moqom/rs/target/debug/moqom-relay swift test
+// (cd ../moqom-engine && cargo build --bin moqom-relay)
+// MOQOM_RELAY_BIN=$PWD/../moqom-engine/target/debug/moqom-relay swift test
 // ```
 //
 // Skipping rather than failing when it is absent is the right trade for a client
@@ -94,16 +94,64 @@ struct RelayInteropTests {
 
         // Withdrawal is a stream close rather than a message, so this also
         // checks that the relay notices one and translates it.
+        //
+        // And the reason, which is the part only this test can check. The
+        // trailing varint carrying it is written by the Rust relay and read
+        // here, so the two codecs have to agree on a field draft-19 does not
+        // describe; a loopback test asserts Swift against Swift and would pass
+        // whatever the relay actually sent.
         await announcement.withdraw()
         #expect(
             await eventually(timeout: .seconds(10)) {
-                await seen.items.contains(.withdrawn(mine))
+                await seen.items.contains(.withdrawn(mine, .stopped))
             },
             "the relay did not report the withdrawal"
         )
 
         reader.cancel()
         await publisher.close(code: 0, reason: "done")
+        await watcher.close(code: 0, reason: "done")
+    }
+
+    /// The same message, the other reason, across the same two codecs.
+    ///
+    /// Everything a viewer does with a withdrawal turns on this distinction, and
+    /// it is the pair that gives it meaning: the test above establishes that the
+    /// relay can say `stopped`, and this one that it does not simply always say
+    /// so. Nothing else about the two endings differs on the wire.
+    @Test("a publisher whose session dies is reported as vanished, not stopped")
+    func vanishingCrossesTheRelay() async throws {
+        let relay = try RelayProcess.start()
+        let publisher = try await relay.connect(credentials: credentials("alice"))
+        let watcher = try await relay.connect(credentials: credentials("bob"))
+
+        let room = try MoqomNamespaces.room(tenant: "acme", room: "room-42")
+        let events = try await watcher.announcements(matching: room)
+        let seen = Collector<AnnouncementEvent>()
+        let reader = Task { for await event in events { await seen.append(event) } }
+
+        let mine = try namespace("alice")
+        let announcement = try await publisher.announce(mine)
+        #expect(
+            await eventually(timeout: .seconds(10)) {
+                await seen.items.contains(.announced(mine))
+            },
+            "the relay did not report the announcement"
+        )
+
+        // The connection goes while the announcement is still standing. Not
+        // withdrawing it first is the whole scenario: the relay has to infer the
+        // withdrawal from the transport, which is what a dead battery looks like.
+        await publisher.close(code: 0, reason: "vanished")
+        #expect(
+            await eventually(timeout: .seconds(10)) {
+                await seen.items.contains(.withdrawn(mine, .vanished))
+            },
+            "the relay did not report the withdrawal as a vanish"
+        )
+
+        _ = announcement
+        reader.cancel()
         await watcher.close(code: 0, reason: "done")
     }
 

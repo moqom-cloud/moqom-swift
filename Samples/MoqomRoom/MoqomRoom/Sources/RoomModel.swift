@@ -314,7 +314,7 @@ final class RoomModel {
             // nothing moving.
             slots = updated
             overflow = await room.galleryOverflow
-        case .participantLeft(let who):
+        case .participantLeft(let who, _):
             catalogs.removeValue(forKey: who)
             await stopPlayback(for: who)
             await refresh()

@@ -151,7 +151,12 @@ public actor MoqomSession {
     /// participant on stage arrives through namespace announcement, including
     /// ones who join later, with no roster protocol to keep in agreement with
     /// who is actually publishing.
-    public func join(room: RoomID) async throws(MoqomError) -> RoomSession {
+    /// - Parameter seatPolicy: how long a participant whose session vanishes
+    ///   keeps their place in the roster. See ``SeatPolicy``.
+    public func join(
+        room: RoomID,
+        seatPolicy: SeatPolicy = .default
+    ) async throws(MoqomError) -> RoomSession {
         if let existing = rooms[room] { return existing }
         guard let connection else {
             throw MoqomError.invalidState(expected: "connected", actual: machine.state.description)
@@ -168,7 +173,8 @@ public actor MoqomSession {
             namespace: namespace,
             identity: identity,
             connection: connection,
-            logger: logger
+            logger: logger,
+            seatPolicy: seatPolicy
         )
         rooms[room] = session
         await session.begin()

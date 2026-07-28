@@ -266,16 +266,48 @@ public struct NamespaceDone: ControlMessage {
 
     public var suffix: TrackNamespace
 
-    public init(suffix: TrackNamespace) { self.suffix = suffix }
+    /// Why it went away, if the sender said.
+    ///
+    /// A MOQOM extension, and deliberately shaped so that it is not a new
+    /// dialect. It rides *after* the suffix in the same body, which works in
+    /// both directions because control messages are length-framed and every
+    /// decoder reads the fields it knows and then stops:
+    ///
+    /// - A draft-19 receiver reads the suffix, never looks at the trailing
+    ///   varint, and behaves exactly as it did before.
+    /// - This receiver, given a draft-19 sender, finds no trailing bytes and
+    ///   gets `nil`.
+    ///
+    /// A new message type would not have this property: draft-19 §10 requires
+    /// closing the session over an unknown message type, so inventing one would
+    /// make every conformant peer hang up rather than ignore us.
+    ///
+    /// `nil` therefore means "did not say", which is why
+    /// ``MoqomCore/WithdrawalReason/mayReturn`` is also defined on the optional.
+    public var reason: WithdrawalReason?
 
-    public var encodedLength: Int { suffix.encodedLength }
+    public init(suffix: TrackNamespace, reason: WithdrawalReason? = nil) {
+        self.suffix = suffix
+        self.reason = reason
+    }
+
+    public var encodedLength: Int {
+        suffix.encodedLength + (reason.map { WireSize.varInt($0.code) } ?? 0)
+    }
 
     public func write(to writer: inout WireWriter) {
         suffix.write(to: &writer)
+        if let reason { writer.varInt(reason.code) }
     }
 
     public static func read(from reader: inout WireReader) throws(WireError) -> NamespaceDone {
-        NamespaceDone(suffix: try TrackNamespace.read(from: &reader))
+        let suffix = try TrackNamespace.read(from: &reader)
+
+        // Absent rather than truncated when there is nothing left. This is the
+        // entire compatibility story: a draft-19 sender stops after the suffix,
+        // and that has to read as "did not say" rather than as a short message.
+        let reason = reader.isEmpty ? nil : WithdrawalReason(code: try reader.varInt())
+        return NamespaceDone(suffix: suffix, reason: reason)
     }
 }
 

@@ -151,7 +151,13 @@ public struct RoomState: Sendable {
 /// they get it at media latency through the same fan-out tree as the video.
 public enum RoomEvent: Sendable {
     case participantJoined(Participant)
-    case participantLeft(ParticipantIdentity)
+    /// Somebody is out of the roster for good.
+    ///
+    /// Not sent when a session merely vanishes. A withdrawal holds the seat and
+    /// reports ``presenceChanged(_:_:)`` with ``Presence/reconnecting`` first;
+    /// this follows only if ``SeatPolicy`` runs out, and says so via
+    /// ``DepartureReason/timedOut``.
+    case participantLeft(ParticipantIdentity, DepartureReason)
     case presenceChanged(ParticipantIdentity, Presence)
     case muteChanged(ParticipantIdentity, MuteState)
     case grantsChanged(ParticipantIdentity, Grants)

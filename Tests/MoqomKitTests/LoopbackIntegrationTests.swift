@@ -191,7 +191,12 @@ struct RoomSessionIntegrationTests {
         let host = try await session("alice", relay: relay)
         let viewer = try await session("bob", relay: relay)
         let hostRoom = try await host.join(room: "room-42")
-        let viewerRoom = try await viewer.join(room: "room-42")
+
+        // A withdrawal holds the seat by default, on the grounds that a session
+        // ending is not the same as a person leaving -- see `SeatPolicy`. This
+        // test is about the withdrawal reaching the roster at all, so it opts
+        // out of the wait rather than sleeping through one.
+        let viewerRoom = try await viewer.join(room: "room-42", seatPolicy: .immediate)
 
         let source = FrameRelay(
             format: CaptureFormat(size: PixelSize(width: 1280, height: 720), frameRate: 30)

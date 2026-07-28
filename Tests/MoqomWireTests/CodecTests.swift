@@ -282,6 +282,39 @@ struct ControlMessageTests {
         try roundTrip(SubscribeNamespace(requestID: 2, prefix: namespace))
         try roundTrip(NamespaceAnnounced(suffix: try TrackNamespace(["elliott", "phone"])))
         try roundTrip(NamespaceDone(suffix: try TrackNamespace(["elliott", "phone"])))
+        try roundTrip(
+            NamespaceDone(suffix: try TrackNamespace(["elliott", "phone"]), reason: .stopped)
+        )
+        try roundTrip(
+            NamespaceDone(suffix: try TrackNamespace(["elliott", "phone"]), reason: .other(41))
+        )
+    }
+
+    /// The withdrawal reason is a MOQOM addition to a draft-19 message, and the
+    /// only thing making that safe is that it is skippable in both directions.
+    /// Both halves are checked against bytes rather than against our own output,
+    /// because a symmetrical mistake round-trips perfectly and interoperates with
+    /// nobody.
+    @Test("a withdrawal reason is optional in both directions")
+    func withdrawalReasonIsOptional() throws {
+        let suffix = try TrackNamespace(["elliott", "phone"])
+        let bare = encoded { NamespaceDone(suffix: suffix).write(to: &$0) }
+
+        // What a draft-19 sender produces: the suffix and nothing after it. Read
+        // as "did not say", which is distinct from any reason and must not be a
+        // truncation error.
+        var reader = WireReader(bare)
+        #expect(try NamespaceDone.read(from: &reader).reason == nil)
+
+        // What we produce: the same bytes, plus one varint. The prefix has to be
+        // byte-identical or a draft-19 receiver would misread the suffix itself
+        // rather than harmlessly ignore the tail.
+        let withReason = encoded {
+            NamespaceDone(suffix: suffix, reason: .vanished).write(to: &$0)
+        }
+        #expect(withReason.prefix(bare.count) == bare)
+        #expect(withReason.count == bare.count + 1)
+        #expect(withReason.last == 1)
     }
 
     @Test("subscribe and its response round-trip")
