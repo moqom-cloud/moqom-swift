@@ -15,6 +15,7 @@
 // a much smaller and much more obvious thing to be unsure about.
 
 import Foundation
+import MoqomCore
 import MoqomWire
 
 /// A QUIC connection, as MOQT uses one.

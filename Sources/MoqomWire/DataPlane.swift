@@ -9,6 +9,7 @@
 // unconstructible rather than rejected at the socket.
 
 import Foundation
+import MoqomCore
 
 /// Object delivery status, per draft-19 §11.
 public enum ObjectStatus: UInt64, Sendable {

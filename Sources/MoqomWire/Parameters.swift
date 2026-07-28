@@ -14,6 +14,7 @@
 //      which is why ``Parameter`` refuses to hold a mismatched pair.
 
 import Foundation
+import MoqomCore
 
 /// Largest permitted byte value: `2^16 - 1`.
 public let maximumParameterValueLength = (1 << 16) - 1

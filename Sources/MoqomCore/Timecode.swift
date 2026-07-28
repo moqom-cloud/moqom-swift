@@ -75,6 +75,42 @@ public enum TimeTrust: String, Hashable, Sendable, Codable, CaseIterable {
     case fallback
 }
 
+public extension TimeTrust {
+    /// The numeric form, for the binary record codec.
+    ///
+    /// The `String` raw value stays what it is because it is what appears in a
+    /// log line and in the admin API's JSON, where a `2` would be unreadable.
+    /// But a track carrying one of these per tick cannot spend thirteen bytes on
+    /// `"synchronised"`, so the wire uses a number.
+    ///
+    /// **These values are fixed and shared.** They match `Trust` in
+    /// `go/internal/timecode` and in `rs/moqom-relay/src/clock.rs`, where the
+    /// same three states are already numbered this way. Fallback is zero on
+    /// purpose, in all three: a field nobody set must read as "we do not know"
+    /// rather than as a claim of accuracy.
+    var wireCode: UInt8 {
+        switch self {
+        case .fallback: 0
+        case .synchronised: 1
+        case .authoritative: 2
+        }
+    }
+
+    /// Read a trust level from the wire.
+    ///
+    /// An unrecognised code is ``TimeTrust/fallback`` rather than an error. A
+    /// future peer that learns a fourth kind of clock should leave older readers
+    /// treating its timestamps as unverifiable — which is what fallback means —
+    /// instead of making them drop the object entirely.
+    init(wireCode: UInt8) {
+        switch wireCode {
+        case 1: self = .synchronised
+        case 2: self = .authoritative
+        default: self = .fallback
+        }
+    }
+}
+
 /// An instant on the trusted timeline, with the width of what is actually known.
 ///
 /// ```swift

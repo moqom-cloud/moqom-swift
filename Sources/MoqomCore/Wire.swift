@@ -1,20 +1,23 @@
-// The bottom of the MOQT codec: variable-length integers and bounded reads.
+// Variable-length integers and bounded reads: the bottom of every codec here.
 //
-// This target is a port of `rs/moqom-proto`, not a second design. That
-// distinction is the whole reason it is allowed to exist. The SDK's `Transport`
-// seam was originally drawn at MOQT *operations* precisely so that draft-19
-// framing would be written once in Rust and bound into Swift, and the risk
-// being avoided was two implementations quietly disagreeing about the draft.
-// Nothing about that risk has changed. What changed is that binding to the Rust
-// crate requires a C ABI that does not exist yet, so the choice was not
-// "port or bind" but "port or have no transport at all".
+// Lives in `MoqomCore` rather than in `MoqomWire`, where it started, because it
+// has two dependents that must not be tied together. `MoqomWire` is a
+// transcription of draft-19 and is explicitly deletable — when the Rust crate
+// grows a C ABI, that whole target goes away and the round-trip tests say
+// whether deleting it changed any bytes. ``DataRecord`` is the opposite: a
+// format MOQOM defines for its own tracks, which nothing upstream will ever
+// supply. Leaving the varints in the deletable target would have quietly made
+// it undeletable.
 //
-// The mitigation is to keep this a transcription rather than an interpretation:
-// every type here corresponds to one in `moqom-proto`, field order is copied
-// from its `encode`, and the constants are copied rather than re-derived from
-// the draft. Where the Rust makes an invalid state unrepresentable, so does
-// this. When the C ABI lands, this target is deletable, and the round-trip
-// tests are what will say whether deleting it changed any bytes.
+// What is here is only the byte layer. Anything that encodes a draft-19 concept
+// stays in `MoqomWire`.
+//
+// # Two endiannesses, deliberately
+//
+// ``WireWriter/uint16(_:)`` is big-endian, because every fixed-width field in
+// MOQT is and this half of the file serves that. The record codec in
+// ``DataRecord`` is little-endian, for a reason written out there: it exists to
+// be read without copying, and a big-endian float array cannot be.
 
 import Foundation
 

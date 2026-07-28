@@ -7,6 +7,7 @@
 // boundaries are the ones the encoder chose.
 
 import Foundation
+import MoqomCore
 import Testing
 
 @testable import MoqomCore
