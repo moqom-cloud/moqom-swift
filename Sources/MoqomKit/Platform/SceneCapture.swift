@@ -52,26 +52,56 @@ import MoqomCore
         private let device: any MTLDevice
         private let textureCache: CVMetalTextureCache
         private let relay: FrameRelay
+        private let logger: MoqomLogger
         private let lock = NSLock()
 
         /// Guarded by ``lock``, because ``adoptPool(_:)`` may be called from the
         /// broadcast actor while the render thread is drawing from it.
         private var pool: CVPixelBufferPool
 
+        /// What ``pool`` vends, and whether the caller chose it. Guarded by ``lock``.
+        ///
+        /// Tracked because the pool's format has to agree with the format of the
+        /// texture being copied in, which is not known until the renderer draws.
+        private var poolFormat: OSType
+        private var poolWasAdopted = false
+
+        /// The mismatched size most recently complained about, guarded by ``lock``.
+        ///
+        /// Remembered so the warning is one line per size rather than one per frame,
+        /// while a genuine change — a rotation resizes the drawable — still reports.
+        private var reportedMismatch: PixelSize?
+
+        /// The texture format most recently refused, guarded by ``lock``.
+        private var reportedFormat: MTLPixelFormat?
+
         /// - Parameters:
         ///   - format: What the renderer will produce. Must match the texture
         ///     handed to ``submit(texture:at:on:)``; a mismatch is a scaling
-        ///     blit the SDK will not do silently.
+        ///     blit the SDK will not do, and every frame is dropped and reported
+        ///     through `logger`. A renderer whose drawable is sized by a view's
+        ///     layout does not know this until it has drawn once, so take the size
+        ///     from the first texture rather than from what you intend to publish.
         ///   - device: Must be the same device the renderer draws with.
         ///     Cross-device textures cannot be blitted.
-        public init(format: CaptureFormat, device: (any MTLDevice)? = nil, depth: Int = 3) throws {
+        ///   - logger: Where a rejected frame is reported. Worth passing: a size
+        ///     mismatch is invisible from the outside, since the scene keeps
+        ///     rendering and only the stream is empty.
+        public init(
+            format: CaptureFormat,
+            device: (any MTLDevice)? = nil,
+            depth: Int = 3,
+            logger: MoqomLogger = .silent
+        ) throws {
             guard let resolved = device ?? MTLCreateSystemDefaultDevice() else {
                 throw MoqomError.platform(api: "MTLCreateSystemDefaultDevice", status: -1)
             }
             captureFormat = format
             self.device = resolved
+            self.logger = logger
             relay = FrameRelay(format: format, depth: depth)
-            pool = try Self.makePool(size: format.size)
+            poolFormat = kCVPixelFormatType_32BGRA
+            pool = try Self.makePool(size: format.size, format: poolFormat)
 
             var cache: CVMetalTextureCache?
             let status = CVMetalTextureCacheCreate(
@@ -93,7 +123,11 @@ import MoqomCore
         /// already in flight came from the old pool and will keep the old pool
         /// alive until they drain.
         public func adoptPool(_ replacement: CVPixelBufferPool) {
-            lock.withLock { pool = replacement }
+            lock.withLock {
+                pool = replacement
+                poolFormat = Self.format(of: replacement) ?? kCVPixelFormatType_32BGRA
+                poolWasAdopted = true
+            }
         }
 
         /// Hand over the scene's colour texture.
@@ -112,12 +146,31 @@ import MoqomCore
             // A same-size blit is a copy; a different size is a scale, which is
             // a render pass and not something to do behind the caller's back on
             // their command buffer. Configure the format to match the renderer.
+            //
+            // Reported, because dropping silently here is indistinguishable from a
+            // renderer that never draws: the scene stays on screen and only the
+            // stream is empty, which sends anyone debugging it to the render loop
+            // instead of to the one line of configuration that is actually wrong.
             guard
                 texture.width == captureFormat.size.width,
                 texture.height == captureFormat.size.height
-            else { return }
+            else {
+                reportMismatch(
+                    PixelSize(width: texture.width, height: texture.height)
+                )
+                return
+            }
 
-            let currentPool = lock.withLock { pool }
+            // A blit is a byte copy, so the buffer it lands in has to have the same
+            // layout as the texture it comes from. Copying a half-float texture into
+            // a BGRA8 buffer is not a conversion, it is 8 bytes per pixel read as 4,
+            // and the frame that comes out the other side is uniform magenta.
+            guard let layout = Layout(texture.pixelFormat) else {
+                reportUnsupported(texture.pixelFormat)
+                return
+            }
+
+            guard let currentPool = pool(for: layout) else { return }
 
             var buffer: CVPixelBuffer?
             guard
@@ -127,7 +180,7 @@ import MoqomCore
                     &buffer
                 ) == kCVReturnSuccess,
                 let buffer,
-                let destination = metalTexture(for: buffer),
+                let destination = metalTexture(for: buffer, as: layout.viewFormat),
                 let blit = commandBuffer.makeBlitCommandEncoder()
             else {
                 // A pool that cannot vend is a pool whose buffers are all still
@@ -138,6 +191,8 @@ import MoqomCore
 
             blit.copy(from: texture, to: destination)
             blit.endEncoding()
+
+            layout.tag(buffer)
 
             // Built here rather than inside the handler. `addCompletedHandler`
             // takes a `@Sendable` closure and `CVPixelBuffer` is not Sendable,
@@ -176,14 +231,189 @@ import MoqomCore
 
         public func stop() { relay.stop() }
 
-        private func metalTexture(for buffer: CVPixelBuffer) -> (any MTLTexture)? {
+        /// Complain once per texture size that does not match the configuration.
+        ///
+        /// Called from the render thread on a frame that is being dropped, so it does
+        /// as little as possible: a compare under the lock, and a log only when the
+        /// answer changed.
+        private func reportMismatch(_ actual: PixelSize) {
+            let shouldReport = lock.withLock { () -> Bool in
+                guard reportedMismatch != actual else { return false }
+                reportedMismatch = actual
+                return true
+            }
+            guard shouldReport else { return }
+
+            logger.warning(
+                .publish,
+                "scene capture is dropping every frame: the renderer's texture is not the "
+                    + "configured size, and scaling it is not something the SDK will do on "
+                    + "your command buffer",
+                [
+                    LogField("texture_width", .number(actual.width)),
+                    LogField("texture_height", .number(actual.height)),
+                    LogField("configured_width", .number(captureFormat.size.width)),
+                    LogField("configured_height", .number(captureFormat.size.height)),
+                ]
+            )
+        }
+
+        /// What a renderer's texture format means for the buffer it is copied into.
+        ///
+        /// Only the formats a renderer actually draws with are here. A texture in
+        /// anything else is refused rather than reinterpreted, because every wrong
+        /// answer available — swapping channels, reading half the bytes — produces a
+        /// frame that looks like a broken codec rather than a broken configuration.
+        private struct Layout {
+            let bufferFormat: OSType
+            let viewFormat: MTLPixelFormat
+
+            /// Whether the values are linear light rather than display-encoded.
+            let isLinear: Bool
+
+            init?(_ format: MTLPixelFormat) {
+                switch format {
+                case .bgra8Unorm, .bgra8Unorm_srgb:
+                    self.init(
+                        bufferFormat: kCVPixelFormatType_32BGRA,
+                        viewFormat: .bgra8Unorm,
+                        isLinear: false
+                    )
+                // RealityKit's post-process pipeline hands over linear half-float, and
+                // 64RGBAHalf is the only CoreVideo format that can hold it losslessly.
+                case .rgba16Float:
+                    self.init(
+                        bufferFormat: kCVPixelFormatType_64RGBAHalf,
+                        viewFormat: .rgba16Float,
+                        isLinear: true
+                    )
+                default:
+                    return nil
+                }
+            }
+
+            private init(bufferFormat: OSType, viewFormat: MTLPixelFormat, isLinear: Bool) {
+                self.bufferFormat = bufferFormat
+                self.viewFormat = viewFormat
+                self.isLinear = isLinear
+            }
+
+            /// Say what the pixels mean, so the conversion to YUV is right.
+            ///
+            /// Untagged linear values get read as though they were gamma-encoded, which
+            /// is not garbage but is visibly wrong — washed out and too bright — and
+            /// looks enough like a bad reconstruction to be blamed on the encoder.
+            func tag(_ buffer: CVPixelBuffer) {
+                guard isLinear else { return }
+                CVBufferSetAttachment(
+                    buffer,
+                    kCVImageBufferTransferFunctionKey,
+                    kCVImageBufferTransferFunction_Linear,
+                    .shouldPropagate
+                )
+                CVBufferSetAttachment(
+                    buffer,
+                    kCVImageBufferColorPrimariesKey,
+                    kCVImageBufferColorPrimaries_ITU_R_709_2,
+                    .shouldPropagate
+                )
+                CVBufferSetAttachment(
+                    buffer,
+                    kCVImageBufferYCbCrMatrixKey,
+                    kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+                    .shouldPropagate
+                )
+            }
+        }
+
+        /// The pool for a layout, rebuilding it if the renderer's format is not what
+        /// the current one vends.
+        ///
+        /// The format is not known at init — the renderer has not drawn yet — so the
+        /// first frame is where it gets settled.
+        private func pool(for layout: Layout) -> CVPixelBufferPool? {
+            lock.lock()
+            if poolFormat == layout.bufferFormat {
+                defer { lock.unlock() }
+                return pool
+            }
+            let wasAdopted = poolWasAdopted
+            lock.unlock()
+
+            guard
+                let replacement = try? Self.makePool(
+                    size: captureFormat.size,
+                    format: layout.bufferFormat
+                )
+            else { return nil }
+
+            lock.withLock {
+                pool = replacement
+                poolFormat = layout.bufferFormat
+                poolWasAdopted = false
+            }
+
+            // Worth saying out loud: an adopted pool is the encoder's, and abandoning it
+            // reintroduces exactly the per-frame conversion ``adoptPool(_:)`` exists to
+            // avoid. The caller cannot fix it from here — the renderer's format is the
+            // renderer's — but they should know why the copy came back.
+            if wasAdopted {
+                logger.warning(
+                    .publish,
+                    "the encoder's pixel buffer pool cannot hold this renderer's texture "
+                        + "format, so scene capture is using its own and the frames will be "
+                        + "converted on the way into the encoder",
+                    [LogField("buffer_format", .text(Self.name(of: layout.bufferFormat)))]
+                )
+            }
+            return replacement
+        }
+
+        /// Complain once per texture format that cannot be copied without conversion.
+        private func reportUnsupported(_ format: MTLPixelFormat) {
+            let shouldReport = lock.withLock { () -> Bool in
+                guard reportedFormat != format else { return false }
+                reportedFormat = format
+                return true
+            }
+            guard shouldReport else { return }
+
+            logger.warning(
+                .publish,
+                "scene capture is dropping every frame: the renderer's texture format is "
+                    + "not one that can be copied into a pixel buffer, and reinterpreting it "
+                    + "would publish garbage",
+                [LogField("texture_format", .number(Int(format.rawValue)))]
+            )
+        }
+
+        private static func format(of pool: CVPixelBufferPool) -> OSType? {
+            guard
+                let attributes = CVPixelBufferPoolGetPixelBufferAttributes(pool)
+                    as NSDictionary?,
+                let format = attributes[kCVPixelBufferPixelFormatTypeKey as String] as? NSNumber
+            else { return nil }
+            return OSType(truncating: format)
+        }
+
+        private static func name(of format: OSType) -> String {
+            String(
+                bytes: [24, 16, 8, 0].map { UInt8((format >> $0) & 0xFF) },
+                encoding: .ascii
+            ) ?? "\(format)"
+        }
+
+        private func metalTexture(
+            for buffer: CVPixelBuffer,
+            as viewFormat: MTLPixelFormat
+        ) -> (any MTLTexture)? {
             var wrapped: CVMetalTexture?
             let status = CVMetalTextureCacheCreateTextureFromImage(
                 kCFAllocatorDefault,
                 textureCache,
                 buffer,
                 nil,
-                .bgra8Unorm,
+                viewFormat,
                 CVPixelBufferGetWidth(buffer),
                 CVPixelBufferGetHeight(buffer),
                 0,
@@ -193,17 +423,19 @@ import MoqomCore
             return CVMetalTextureGetTexture(wrapped)
         }
 
-        /// BGRA rather than a biplanar YUV format.
+        /// An RGB format rather than a biplanar YUV one.
         ///
-        /// The tradeoff is deliberate: BGRA makes the blit a straight copy and
-        /// leaves the colour conversion to VideoToolbox, which does it on the
-        /// video hardware. A `420v` pool would save that conversion but needs a
-        /// compute shader here to do the same work, and doing it in the render
-        /// pass is only a win once the shader is also doing something else —
-        /// which, once scene effects exist, it will be.
-        private static func makePool(size: PixelSize) throws -> CVPixelBufferPool {
+        /// The tradeoff is deliberate: matching the renderer's own layout makes the
+        /// blit a straight copy and leaves the colour conversion to VideoToolbox,
+        /// which does it on the video hardware. A `420v` pool would save that
+        /// conversion but needs a compute shader here to do the same work, and doing
+        /// it in the render pass is only a win once the shader is also doing
+        /// something else — which, once scene effects exist, it will be.
+        private static func makePool(size: PixelSize, format: OSType) throws
+            -> CVPixelBufferPool
+        {
             let attributes: [CFString: Any] = [
-                kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferPixelFormatTypeKey: format,
                 kCVPixelBufferWidthKey: size.width,
                 kCVPixelBufferHeightKey: size.height,
                 kCVPixelBufferMetalCompatibilityKey: true,

@@ -1,0 +1,21 @@
+// Signing for the benchmark app.
+//
+// Deliberately a copy of the one in MoqomRoom rather than a shared include: the
+// two samples generate independently, and an xcconfig that reached up out of its
+// own directory would break whichever one was opened from elsewhere.
+//
+// The Team ID itself is not here. Point this at your own by creating
+// Local.xcconfig — or symlink the one you already made for MoqomRoom:
+//
+//   ln -s ../MoqomRoom/Local.xcconfig Local.xcconfig
+//   xcodegen generate
+
+MOQOM_BUNDLE_PREFIX = cloud.moqom
+
+PRODUCT_BUNDLE_IDENTIFIER = $(MOQOM_BUNDLE_PREFIX).codecbench
+
+CODE_SIGN_STYLE = Automatic
+
+DEVELOPMENT_TEAM =
+
+#include? "Local.xcconfig"

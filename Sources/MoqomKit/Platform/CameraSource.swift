@@ -61,6 +61,7 @@ import MoqomCore
         private let lock = NSLock()
         private var current: CameraPosition
         private var mirrored = false
+        private var rotation: Double = 0
         private var input: AVCaptureDeviceInput
 
         /// Which camera is open.
@@ -89,6 +90,25 @@ import MoqomCore
             set {
                 lock.withLock { mirrored = newValue }
                 queue.async { [weak self] in self?.applyMirroring() }
+            }
+        }
+
+        /// How far to rotate the delivered frames, in degrees counter-clockwise.
+        ///
+        /// A phone held upright still captures landscape: the sensor's long axis is
+        /// across the device, so a portrait publication needs a quarter turn. Doing it
+        /// here, at the connection, is the only place it is free — the capture pipeline
+        /// applies it before the buffer is ever handed over, whereas rotating afterwards
+        /// means touching every pixel of every frame on the CPU.
+        ///
+        /// Note this changes the size of the delivered frames, swapping width and height
+        /// for an odd multiple of 90. It does not change ``captureFormat``, which is what
+        /// the source was *asked* for.
+        public var rotationDegrees: Double {
+            get { lock.withLock { rotation } }
+            set {
+                lock.withLock { rotation = newValue }
+                queue.async { [weak self] in self?.applyRotation() }
             }
         }
 
@@ -126,6 +146,7 @@ import MoqomCore
             output.setSampleBufferDelegate(self, queue: queue)
             session.addOutput(output)
             applyMirroring()
+            applyRotation()
         }
 
         /// Open the device and begin delivering frames.
@@ -200,6 +221,7 @@ import MoqomCore
 
                 session.commitConfiguration()
                 self?.applyMirroring()
+                self?.applyRotation()
             }
         }
 
@@ -230,6 +252,15 @@ import MoqomCore
             // published, not what is previewed.
             connection.automaticallyAdjustsVideoMirroring = false
             connection.isVideoMirrored = wanted
+        }
+
+        /// Always called on the capture queue, for the same reason as ``applyMirroring``.
+        private func applyRotation() {
+            guard let connection = output.connection(with: .video) else { return }
+            let wanted = lock.withLock { rotation }
+            guard wanted != 0 else { return }
+            guard connection.isVideoRotationAngleSupported(wanted) else { return }
+            connection.videoRotationAngle = wanted
         }
 
         public func stop() {

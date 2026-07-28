@@ -1,0 +1,78 @@
+# A benchmark app, not a demo.
+#
+# It exists because the MLVC decision cannot be made from published numbers. The
+# paper reports throughput on an M3 Pro laptop; MOQOM ships to phones, which have
+# a smaller Neural Engine, no fan, and a camera already drawing from the same
+# budget. Only a device answers that.
+#
+#   brew install xcodegen
+#   cd Samples/CodecBench && xcodegen generate && open CodecBench.xcodeproj
+#
+# Signing is shared with MoqomRoom rather than duplicated: the same Local.xcconfig
+# holds the Team ID for both, so setting it once is enough.
+
+name: CodecBench
+
+options:
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+
+configFiles:
+  Debug: Signing.xcconfig
+  Release: Signing.xcconfig
+
+packages:
+  MoqomKit:
+    path: ../..
+
+targets:
+  CodecBench:
+    type: application
+    platform: iOS
+    sources:
+      - path: CodecBench/Sources
+      # Models are bundled when present and absent otherwise, which is the point
+      # of the optional flag: a clone with no exported model still builds, and
+      # the app reports the model as missing at run time instead of failing to
+      # compile. Anything matching is copied in as a resource.
+      - path: CodecBench/Models
+        optional: true
+        buildPhase: resources
+    dependencies:
+      - package: MoqomKit
+        product: MoqomKit
+    info:
+      path: CodecBench/Info.plist
+      properties:
+        CFBundleDisplayName: Codec bench
+        UIUserInterfaceStyle: Dark
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        # The camera is load, not input: frames are captured and dropped so that
+        # the ISP and the capture pipeline are drawing power while the codec runs.
+        # A codec measured on an idle phone has been measured in a state no
+        # broadcast is ever in.
+        NSCameraUsageDescription: Runs the camera as realistic load during a benchmark.
+        # Lets a run continue when the screen locks. A twenty-minute thermal run
+        # that stops because the display slept has measured nothing.
+        UIBackgroundModes:
+          - audio
+        # Exposes the results directory over the Files app and to `devicectl`, so
+        # a run's JSON can be pulled off without Xcode, and a freshly exported
+        # model can be pushed in without a rebuild.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+    settings:
+      base:
+        SWIFT_VERSION: "6.0"
+        SWIFT_STRICT_CONCURRENCY: complete
+        TARGETED_DEVICE_FAMILY: "1,2"
+        GENERATE_INFOPLIST_FILE: NO
+        PRODUCT_BUNDLE_IDENTIFIER: $(MOQOM_BUNDLE_PREFIX).codecbench
+        # Release settings even in Debug for the measured code. A debug build of
+        # the harness would report the optimiser's absence as codec latency,
+        # which is the one number this app exists to get right.
+        SWIFT_OPTIMIZATION_LEVEL: "-O"
+        GCC_OPTIMIZATION_LEVEL: s
