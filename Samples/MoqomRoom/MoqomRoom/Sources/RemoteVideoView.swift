@@ -65,6 +65,9 @@ final class VideoTile {
 
     private var pump: Task<Void, Never>?
 
+    /// This tile's own tap on the capture path, held so it can be stopped.
+    private var preview: MediaTap<VideoFrame>?
+
     /// Draw what this device is capturing.
     ///
     /// A different path from the remote one and deliberately so: nothing is
@@ -73,13 +76,18 @@ final class VideoTile {
     func attachPreview(in room: RoomModel) {
         guard pump == nil else { return }
         pump = Task { [weak self] in
-            var preview: AsyncStream<VideoFrame>?
-            while preview == nil, !Task.isCancelled {
-                preview = room.localPreview()
-                if preview == nil { try? await Task.sleep(for: .milliseconds(100)) }
+            var tap: MediaTap<VideoFrame>?
+            while tap == nil, !Task.isCancelled {
+                tap = await room.localPreview()
+                if tap == nil { try? await Task.sleep(for: .milliseconds(100)) }
             }
-            guard let preview, let self else { return }
-            for await frame in preview {
+            guard let tap, let self else {
+                // Cancelled while waiting, so nobody will ever read this one.
+                tap?.stop()
+                return
+            }
+            preview = tap
+            for await frame in tap.elements {
                 renderer.enqueue(frame)
             }
         }
@@ -102,7 +110,19 @@ final class VideoTile {
             if let codec = await room.codec(of: identity) {
                 renderer.setCodec(codec)
             }
+
+            // Measured here rather than after `enqueue`, because this is the last moment
+            // the frame is the receiver's responsibility: what follows is the display
+            // layer holding it until its presentation time, which is a queue depth the
+            // application chose and not a cost the network imposed.
+            let stamp = room.trustedStamp
+            let meter = room.latency
+            let cadence = room.cadence
             for await frame in frames {
+                if let stamp {
+                    meter.record(capturedAt: frame.frame.timestamp, receivedAt: stamp())
+                }
+                cadence.record()
                 try? renderer.enqueue(frame)
             }
         }
@@ -111,9 +131,16 @@ final class VideoTile {
     func detach() {
         pump?.cancel()
         pump = nil
+        // Before the pump is gone rather than after: a tap nobody is reading still takes a
+        // frame from the capture pool every time one arrives, and holds it.
+        preview?.stop()
+        preview = nil
     }
 
-    deinit { pump?.cancel() }
+    deinit {
+        pump?.cancel()
+        preview?.stop()
+    }
 }
 
 #if os(iOS) || os(visionOS)

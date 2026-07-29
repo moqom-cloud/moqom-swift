@@ -246,6 +246,36 @@ import MoqomCore
             Task { await activity.end(closing, dismissalPolicy: dismissal) }
         }
 
+        /// Take down every card this app has, including ones it no longer holds.
+        ///
+        /// ``end(_:lingering:)`` can only end the activity this instance started, and that
+        /// is not the card most likely to be stuck. A Live Activity outlives the process
+        /// that requested it — that is the feature — so a force quit, a crash, or a
+        /// termination in the background leaves a card saying "live" with nothing left
+        /// alive to update or end it, and the system will keep showing it for eight hours.
+        /// Nothing in the new process holds a reference to it, so nothing can clean it up
+        /// through the instance API.
+        ///
+        /// Worth calling before starting a card as well as from a control the user can
+        /// reach: without it, a relaunch after a crash adds a second entry to Notification
+        /// Centre rather than replacing the stale one.
+        ///
+        /// - Parameter lingering: How long the ended cards stay visible. Zero by default,
+        ///   unlike ``end(_:lingering:)``: these are cards whose broadcast is already over,
+        ///   and holding a final state to be read would be inventing a moment that has
+        ///   passed.
+        public static func endAll(lingering: Duration = .zero) async {
+            let dismissal: ActivityUIDismissalPolicy = lingering == .zero
+                ? .immediate
+                : .after(.now + lingering.timeInterval)
+
+            // Snapshotted rather than iterated live: ending an activity mutates the
+            // collection this is walking.
+            for activity in Array(Activity<MoqomBroadcastAttributes>.activities) {
+                await activity.end(nil, dismissalPolicy: dismissal)
+            }
+        }
+
         /// Keep the card in step with a room, until the room ends.
         ///
         /// Driven from the statistics stream rather than from room events

@@ -80,6 +80,33 @@ final class RoomModel {
     /// not need one, and that is ``flipCamera()``.
     var videoInput: VideoInput = .pattern
 
+    /// Publish exactly this rung and nothing else, when set.
+    ///
+    /// A ladder is right for a call and wrong for a measurement. Three rungs is three
+    /// encode sessions sharing one hardware encoder, and a viewer that is free to move
+    /// between them whenever the estimate wobbles — so a latency or bitrate figure taken
+    /// across the run describes no single rung. Pinning one makes both ends agree on what
+    /// is being measured.
+    var pinnedRung: VideoLayer?
+
+    /// A clock the other device also has, for measuring the gap between them.
+    ///
+    /// When set, published frames are stamped on it and received frames are measured
+    /// against it. Absent, neither happens and the room behaves as it always did.
+    var trustedStamp: (@Sendable () -> Timecode)?
+
+    /// What the far side's frames cost to arrive.
+    let latency = LatencyMeter()
+
+    /// Whether they arrive evenly, which needs no clock agreement and so is measured even
+    /// when the latency figures are unavailable.
+    let cadence = CadenceMeter()
+
+    /// The same, on the frames this device is capturing, so the two can be compared.
+    let captureCadence = CadenceMeter()
+
+    private var captureCadenceTask: Task<Void, Never>?
+
     enum VideoInput: String, CaseIterable, Identifiable, Sendable {
         case pattern = "Test pattern"
         case camera = "Camera"
@@ -109,6 +136,12 @@ final class RoomModel {
 
     /// What each participant says they are publishing.
     private(set) var catalogs: [ParticipantIdentity: Catalog] = [:]
+
+    /// Who brought the viewers.
+    ///
+    /// A figure to display and never a tick to animate: the authority quantises the counts
+    /// and publishes them on a timer, so this changes every few seconds at most.
+    private(set) var audiences = Audiences()
 
     /// Who the Picture in Picture window draws when the app is backgrounded.
     ///
@@ -227,8 +260,6 @@ final class RoomModel {
     /// it — the room owns the publication's lifetime.
     private var broadcast: Broadcast?
 
-    /// The self-view, when broadcasting from a camera. See ``localPreview()``.
-    private var previewTap: MediaTap<VideoFrame>?
     private var microphone: AudioRelay?
     private var toneTask: Task<Void, Never>?
     private var mic: MicrophoneSource?
@@ -318,6 +349,8 @@ final class RoomModel {
             catalogs.removeValue(forKey: who)
             await stopPlayback(for: who)
             await refresh()
+        case .audiencesChanged(let updated):
+            audiences = updated
         case .qualityChanged(let who, let quality):
             // Applied straight rather than through `refresh()`: the indicator is
             // the only thing that changed, and rebuilding the roster to draw one
@@ -450,9 +483,39 @@ final class RoomModel {
     /// that is deliberate. The person who muted needs to see what they will be
     /// sending when they come back, which is why every video app shows you
     /// yourself even with the camera off to everyone else.
-    func localPreview() -> AsyncStream<VideoFrame>? {
-        if let capture { return capture.preview() }
-        return previewTap?.elements
+    /// Time the frames going into the encoder, on their own tap.
+    private func watchCaptureCadence(of publication: Broadcast) {
+        captureCadenceTask?.cancel()
+        captureCadenceTask = Task { [captureCadence] in
+            let tap = await publication.tapFrames(
+                policy: TapPolicy(cadence: .everyFrame, depth: 2)
+            )
+            for await _ in tap.elements { captureCadence.record() }
+        }
+    }
+
+    /// A tap per caller, and never a shared stream.
+    ///
+    /// This used to hand every caller one stream, which is the mistake ``FrameSource`` warns
+    /// about: an `AsyncStream` has a single consumer, so a second view iterating it does not
+    /// get a copy of the frames — between them they get one each, and in practice the newer
+    /// iterator gets nothing at all.
+    ///
+    /// It broke at a layout change rather than at a join, which is what made it look like a
+    /// network fault. A solo broadcaster draws one full-size self view; the moment somebody
+    /// else appears, that view is replaced by a thumbnail beside the gallery, SwiftUI builds a
+    /// new one, and the new one asked for the stream the old one already owned. The camera
+    /// never stopped and the encoder never faltered — there was simply nobody left who could
+    /// read the frames.
+    ///
+    /// The caller owns what it gets and must stop it. A tap left running holds a place in the
+    /// publication's delivery list and a pixel buffer from the pool the capture path draws
+    /// from.
+    func localPreview() async -> MediaTap<VideoFrame>? {
+        // Off the publication rather than off the source, so the pattern and the camera take
+        // the same path. `Broadcast.stop()` stops every tap it handed out, which is what ends
+        // each view's pump when the broadcast does.
+        await broadcast?.tapFrames(policy: TapPolicy(cadence: .everyFrame, depth: 2))
     }
 
     // MARK: - Broadcasting
@@ -504,23 +567,25 @@ final class RoomModel {
             // to 1080p, and a 1080p rung fed 720p frames publishes an upscale:
             // the catalog says 1080p, the viewer subscribes for it, and the
             // extra bitrate buys nothing.
+            let ladder = pinnedRung.map { LayerLadder(rungs: [$0]) }
+                ?? .defaultCamera(topSize: size)
+            let published = trustedStamp.map { TimedSource(source, stamp: $0) } ?? source
             let publication = try await room.startBroadcast(
-                from: source,
-                configuration: BroadcastConfiguration(ladder: .defaultCamera(topSize: size))
+                from: published,
+                configuration: BroadcastConfiguration(ladder: ladder)
             )
             await publication.start()
             broadcast = publication
-            if camera != nil {
-                // Shallow, because a preview that buffers is a preview that
-                // lags: the only frame worth drawing is the newest one.
-                previewTap = await publication.tapFrames(
-                    policy: TapPolicy(cadence: .everyFrame, depth: 2)
-                )
-            }
             isBroadcasting = true
+
+            // The same measurement as the receiving end, on the frames going in. It is the
+            // only way to tell an uneven picture apart from an uneven network: if capture is
+            // already lumpy the far end can do nothing but reproduce it, and if capture is
+            // even then everything between here and there owns the difference.
+            if pinnedRung != nil { watchCaptureCadence(of: publication) }
             applyAudioPurpose()
             #if os(iOS)
-                startLiveActivity()
+                await startLiveActivity()
             #endif
             await refresh()
         } catch {
@@ -722,10 +787,17 @@ final class RoomModel {
         capture = nil
         camera = nil
         broadcast = nil
-        previewTap?.stop()
-        previewTap = nil
+        captureCadenceTask?.cancel()
+        captureCadenceTask = nil
         isBroadcasting = false
         applyAudioPurpose()
+        #if os(iOS)
+            // The card exists to say this device is live, so it comes down with the
+            // publication and not with the room. Left to `leave()`, stopping a broadcast and
+            // staying in the room leaves a Lock Screen card claiming a broadcast that ended,
+            // for as long as the system will show one.
+            endLiveActivity()
+        #endif
         await refresh()
     }
 
@@ -807,8 +879,14 @@ final class RoomModel {
         /// Started from ``startBroadcast()`` rather than from joining, because a
         /// card that says "live" for a viewer is a lie, and the system charges
         /// the same budget either way.
-        private func startLiveActivity() {
+        private func startLiveActivity() async {
             guard BroadcastLiveActivity.isPermitted, card == nil else { return }
+
+            // Anything still showing belongs to a process that is gone, since a card this
+            // one started would be held in `card` above. Cleared rather than left, or a
+            // relaunch after a crash puts a second entry in Notification Centre beside a
+            // stale one that will never update again.
+            await BroadcastLiveActivity.endAll()
 
             let card = BroadcastLiveActivity(logger: .silent)
             do {
@@ -844,6 +922,18 @@ final class RoomModel {
             cardTask = nil
             card?.end(card?.showing.map { var last = $0; last.phase = .ended; return last })
             card = nil
+        }
+
+        /// Clear the Lock Screen card, including one this launch never started.
+        ///
+        /// Exposed as a control because the card that needs clearing is usually not one the
+        /// app is holding: a Live Activity survives the process that requested it, so a
+        /// force quit during a broadcast leaves a card behind that nothing here has a
+        /// reference to and the system will show for hours. Ending only ``card`` would leave
+        /// exactly the case a person is looking at when they reach for this.
+        func clearBroadcastCard() async {
+            endLiveActivity()
+            await BroadcastLiveActivity.endAll()
         }
     #endif
 }

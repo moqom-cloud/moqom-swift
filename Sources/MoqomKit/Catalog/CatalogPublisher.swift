@@ -46,7 +46,33 @@ public actor CatalogPublisher {
     @discardableResult
     public func publish(_ catalog: Catalog) async throws(MoqomError) -> Bool {
         if let current, current == catalog { return false }
+        try await send(catalog)
+        return true
+    }
 
+    /// Send the current catalog again, unchanged.
+    ///
+    /// The escape from what ``publish(_:)`` assumes. Suppressing an identical version is right
+    /// when a subscriber that missed it can ask for it later, and that is exactly what a
+    /// relay forwarding without a cache cannot offer: the group is delivered to whoever is
+    /// subscribed at the instant it is written, and to nobody afterwards. A catalog published
+    /// once at go-live is therefore invisible to everyone who joins later, and no amount of
+    /// asking will surface it — the description a viewer needs before it can decode anything
+    /// is the one piece of state that behaves as if it were live media.
+    ///
+    /// So this exists to say the same thing again, on purpose, for an audience that has
+    /// changed rather than a catalog that has. In a new group, because that is where a
+    /// subscriber is allowed to begin.
+    ///
+    /// - Returns: Whether there was anything to restate.
+    @discardableResult
+    public func restate() async throws(MoqomError) -> Bool {
+        guard let current else { return false }
+        try await send(current)
+        return true
+    }
+
+    private func send(_ catalog: Catalog) async throws(MoqomError) {
         let payload: Data
         do {
             payload = try catalog.encoded()
@@ -69,7 +95,6 @@ public actor CatalogPublisher {
         )
         group += 1
         current = catalog
-        return true
     }
 
     public func finish() async {

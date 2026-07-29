@@ -122,6 +122,17 @@ struct RoomScreen: View {
                     }
 
                     Divider()
+                    // Always enabled, unlike the controls above it. The card worth clearing
+                    // is usually one this launch did not start — a Live Activity outlives
+                    // the process that asked for it — so the app cannot tell whether there
+                    // is anything to clear, and disabling it on what this launch knows about
+                    // would grey out exactly the case somebody is reaching for.
+                    #if os(iOS)
+                        Button("End Lock Screen card", systemImage: "rectangle.badge.xmark") {
+                            Task { await room.clearBroadcastCard() }
+                        }
+                    #endif
+
                     Button("Record session", systemImage: "record.circle") {
                         Task { await room.attachRecorder() }
                     }
@@ -511,6 +522,16 @@ struct BroadcastControls: View {
 
             LinkReadout(link: room.link, quality: room.quality)
 
+            if room.trustedStamp != nil {
+                LatencyReadout(meter: room.latency)
+            }
+
+            // Not behind the trusted clock, unlike the latency: cadence is measured on this
+            // device's own monotonic clock and stays valid when no clock has been agreed.
+            if !room.participants.filter({ $0.slot.identity != room.identity }).isEmpty {
+                CadenceReadout(meter: room.cadence)
+            }
+
             if let statistics = room.statistics, !statistics.struggling.isEmpty {
                 StrugglingReadout(struggling: statistics.struggling)
             }
@@ -596,6 +617,91 @@ struct LinkReadout: View {
         case .increasing: "arrow.up.right.circle"
         case .holding: "equal.circle"
         case .decreasing: "arrow.down.right.circle"
+        }
+    }
+}
+
+/// Glass to glass, on the phone rather than in a log.
+///
+/// The one figure a two-device run exists to produce, and the one the SDK cannot report on
+/// its own: the publisher's counters and the receiver's counters are each half of it, and the
+/// gap between them is where the network is. It only means anything because both devices
+/// stamp frames on a clock disciplined against the same service, so the error bar on that
+/// clock is shown beside the result and not tucked into a log line — a median of 60ms taken
+/// on a clock that could be 40ms out is not a latency measurement.
+///
+/// Polled rather than observed, because the meter is written from the frame pump on every
+/// frame and publishing that into SwiftUI would invalidate this view thirty times a second to
+/// move a digit.
+struct LatencyReadout: View {
+    let meter: LatencyMeter
+
+    @State private var reading: LatencyMeter.Reading?
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "timer")
+            if let reading, reading.worst > 0 {
+                Text(String(format: "%.0f ms", reading.median))
+                Text(String(format: "· p95 %.0f", reading.p95))
+                Text(String(format: "· ±%.0f clock", reading.uncertainty))
+                    .foregroundStyle(reading.uncertainty > reading.median ? .orange : .secondary)
+                if reading.impossible > 0 {
+                    // Not a slow link: a pair of clocks that have not agreed yet. Said
+                    // plainly, because the latencies alongside it are understated by
+                    // however far apart they are.
+                    Text("· clocks disagree")
+                        .foregroundStyle(.orange)
+                }
+            } else {
+                Text("waiting for the other device")
+            }
+        }
+        .font(.caption2.monospacedDigit())
+        .foregroundStyle(.secondary)
+        .task {
+            // A second is faster than anyone reads and slow enough to cost nothing.
+            while !Task.isCancelled {
+                reading = meter.reading()
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
+    }
+}
+
+/// Frame rate, evenness, and stalls, on the phone that is watching.
+///
+/// Beside the latency rather than instead of it, because a viewer complaining about choppy
+/// video is not describing latency and no latency figure will confirm or refute them. The
+/// spread is what to read: an even stream has a p95 gap close to its median, and one that
+/// stutters has a p95 several times it while both may average the same frame rate.
+struct CadenceReadout: View {
+    let meter: CadenceMeter
+
+    @State private var reading: CadenceMeter.Reading?
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "waveform.path.ecg")
+            if let reading {
+                Text(String(format: "%.0f fps", reading.rate))
+                Text(String(format: "· %.0f/%.0f ms gap", reading.median, reading.p95))
+                    .foregroundStyle(reading.unevenness > 2 ? .orange : .secondary)
+                if reading.freezes > 0 {
+                    Text(String(format: "· %d stalls %.0f%%", reading.freezes, reading.frozen * 100))
+                        .foregroundStyle(.orange)
+                }
+            } else {
+                Text("no frames yet")
+            }
+        }
+        .font(.caption2.monospacedDigit())
+        .foregroundStyle(.secondary)
+        .task {
+            while !Task.isCancelled {
+                reading = meter.reading()
+                try? await Task.sleep(for: .seconds(1))
+            }
         }
     }
 }

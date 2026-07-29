@@ -56,6 +56,14 @@
         /// liveness.
         public static let defaultIdleTimeout: Duration = .seconds(10)
 
+        /// How long to wait for a handshake before calling the relay unreachable.
+        ///
+        /// Long enough to cross a slow path and complete a QUIC handshake with a retry,
+        /// short enough that a client which cannot connect says so while somebody is still
+        /// looking at it. The failure is not final — a session is expected to re-steer and
+        /// dial again — so the cost of being wrong here is one more attempt.
+        public static let defaultHandshakeTimeout: Duration = .seconds(8)
+
         /// Dial a relay.
         ///
         /// - Parameter alpn: offered in preference order. Version negotiation
@@ -71,7 +79,8 @@
             port: UInt16,
             alpn: [String],
             trust: RelayTrust = .system,
-            idleTimeout: Duration = NetworkQUICCarrier.defaultIdleTimeout
+            idleTimeout: Duration = NetworkQUICCarrier.defaultIdleTimeout,
+            handshakeTimeout: Duration = NetworkQUICCarrier.defaultHandshakeTimeout
         ) async throws(MoqomError) -> NetworkQUICCarrier {
             guard let port = NWEndpoint.Port(rawValue: port) else {
                 throw MoqomError.transport(.unreachable)
@@ -92,7 +101,9 @@
             )
             let reporter = LossReporter(continuation: lossIn)
 
-            try await Self.waitUntilReady(connection, reporting: reporter)
+            try await Self.waitUntilReady(
+                connection, reporting: reporter, within: handshakeTimeout
+            )
 
             let datagrams = try? await connection.datagrams
             return NetworkQUICCarrier(
@@ -158,33 +169,72 @@
         /// only difference is whether the continuation has already been used.
         private static func waitUntilReady(
             _ connection: NetworkConnection<QUIC>,
-            reporting reporter: LossReporter
+            reporting reporter: LossReporter,
+            within timeout: Duration
         ) async throws(MoqomError) {
             do {
-                try await withCheckedThrowingContinuation { continuation in
+                try await withCheckedThrowingContinuation {
+                    (continuation: CheckedContinuation<Void, any Error>) in
                     let resumed = OnceBox()
+                    let stall = StallReason()
+
+                    // A deadline, because not every failure to connect is
+                    // reported as one. A connection whose packets are dropped
+                    // with no answer — a filtered port, a relay that is not
+                    // there, or an iOS app that has not been granted local
+                    // network access — sits in `.preparing` indefinitely and
+                    // no state update ever arrives to end it. Without this the
+                    // caller waits forever on a question that has an answer.
+                    //
+                    // It resumes the same continuation rather than racing a
+                    // second task. This API has no `cancel()`, so abandoning
+                    // the handshake would leave a continuation that is never
+                    // resumed, which leaks the caller's task rather than
+                    // failing it.
+                    let deadline = Task {
+                        try? await Task.sleep(for: timeout)
+                        guard !Task.isCancelled, resumed.claim() else { return }
+                        continuation.resume(
+                            throwing: stall.last ?? NWError.posix(.ETIMEDOUT)
+                        )
+                    }
+
                     connection.onStateUpdate { _, state in
                         switch state {
                         case .ready:
-                            if resumed.claim() { continuation.resume() }
+                            if resumed.claim() {
+                                deadline.cancel()
+                                continuation.resume()
+                            }
                         case let .failed(error):
                             if resumed.claim() {
+                                deadline.cancel()
                                 continuation.resume(throwing: error)
                             } else {
                                 reporter.report(Self.loss(for: error))
                             }
                         case .cancelled:
                             if resumed.claim() {
+                                deadline.cancel()
                                 continuation.resume(throwing: NWError.posix(.ECANCELED))
                             } else {
                                 reporter.report(.closed)
                             }
-                        case .setup, .preparing, .waiting:
-                            // `.waiting` after readiness is a path change, and
-                            // Network.framework recovers from those itself while
-                            // keeping the connection ID and therefore the
-                            // session. Reporting it would tear down a session
-                            // that is about to work again.
+                        case let .waiting(error):
+                            // Kept rather than acted on. Before readiness this
+                            // is the only description of what is going wrong —
+                            // Network.framework retries and reports why each
+                            // time — so holding the most recent one means the
+                            // deadline above can fail with the actual reason
+                            // instead of a bare timeout.
+                            //
+                            // Still not reported as a loss: after readiness a
+                            // `.waiting` is a path change that the framework
+                            // recovers from on its own, keeping the connection
+                            // ID and therefore the session, and tearing that
+                            // down would end a session that is about to work.
+                            stall.record(error)
+                        case .setup, .preparing:
                             break
                         @unknown default:
                             break
@@ -395,6 +445,23 @@
             let continuation = self.continuation
             self.continuation = nil
             return continuation
+        }
+    }
+
+    /// The most recent reason a connection was waiting rather than progressing.
+    ///
+    /// A class with a lock for the same reason as ``LossReporter``: it is written from
+    /// `onStateUpdate`, a synchronous callback on Network.framework's queue.
+    private final class StallReason: @unchecked Sendable {
+        private let lock = NSLock()
+        private var error: NWError?
+
+        func record(_ error: NWError) {
+            lock.withLock { self.error = error }
+        }
+
+        var last: NWError? {
+            lock.withLock { error }
         }
     }
 

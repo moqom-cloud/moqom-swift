@@ -176,6 +176,9 @@ that can break silently, which is the cast reaching `RoomSession`.
 | `PictureInPicture.swift` | Handing SwiftUI's `UIView` to the SDK as the source |
 | `RoomModel.swift` | `startLiveActivity` — one call, and the card tracks the room |
 | `MoqomRoomWidgets/` | The Lock Screen card and Dynamic Island, out of process |
+| `RelayConfiguration.swift` | Choosing between the loopback and a relay without a code change |
+| `RelayPairing.swift` | Why a four digit code is a lookup and never a trust decision |
+| `Measurement.swift` | Stamping frames on a clock both devices share, and what that costs |
 
 ## Measuring echo cancellation on a device
 
@@ -224,6 +227,59 @@ predict; the residual suppressor is what covers that, and it has limits. Then
 route changes: put on AirPods mid-test and the input format changes underneath the
 graph, which is meant to reinstall itself and reset its estimate of the room.
 Then heat, since this runs alongside hardware video encode.
+
+## Measuring latency between two devices
+
+The app runs on an in-process loopback by default, which is the right default and
+measures nothing about a network: a loopback hands frames between two objects, so
+latency, jitter, loss and congestion response are all absent. Two phones pointed
+at the same relay is the only arrangement where the numbers mean anything.
+
+**The relay.** Start `moqom-relay` on the Mac with a certificate that persists
+across restarts, because the phones pin it and a relay that regenerates one on
+every launch invalidates the pin:
+
+```sh
+MOQOM_RELAY_ADDR=0.0.0.0:4443 \
+MOQOM_RELAY_CERT=/tmp/relay-tls/cert.pem \
+MOQOM_RELAY_KEY=/tmp/relay-tls/key.pem \
+    ./target/release/moqom-relay
+```
+
+Bind `0.0.0.0` rather than `[::]`, or phones dialling an IPv4 address are not
+answered and the failure looks like a relay that is down.
+
+**Pairing.** The phones need the relay's address and the SHA-256 of that
+certificate. Rather than typing 44 characters of base64 into each one, advertise
+both over Bonjour and look them up by a short code:
+
+```sh
+Scripts/pair-relay.sh 4242
+```
+
+The code is a lookup and not a credential — the phone still pins the exact
+certificate the advertisement named. That is only safe because it assumes a
+trusted LAN, where anyone able to forge the advertisement could equally well be
+the relay, which is why it lives in this sample and not in MoqomKit.
+
+**On each phone.** Enter the code as the **Pairing code**, turn on **Measure this
+run**, and Join — the host, port and hash fill themselves in, so the interface
+still shows where the media is going. Allow local network access when asked;
+until that prompt is answered iOS blackholes the traffic and the connection hangs
+rather than failing. Use a different username on each phone and the same room on
+both.
+
+**Read.** Measured runs publish one pinned 720p HEVC rung from the camera instead
+of a ladder, because a viewer free to move between three rungs makes any figure
+taken across the run describe no single one of them. Both phones stamp frames on
+a clock disciplined against NTP, so the readout at the bottom of the room shows
+the median and 95th percentile of capture-to-arrival, and beside them the clock's
+own error bar. That last figure is the one to check first: it turns orange when it
+exceeds the median, which means the two clocks have not agreed closely enough for
+the subtraction between them to be a latency at all.
+
+Not currently measurable this way: MLVC. It produces no bitstream on device
+because the rANS entropy coder is not wired in, so there is nothing to send.
 
 ## Verification status
 

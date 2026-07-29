@@ -26,19 +26,258 @@ final class AppModel {
     var username: String = ""
     var roomName: String = "demo"
 
-    /// Pointed at the loopback relay, because there is no relay to point at
-    /// yet. When `moqom-transport` lands this becomes a QUIC transport and
-    /// nothing else in the sample changes, which is the whole point of the seam.
-    private let transport: any Transport = LoopbackTransport()
+    /// Where the relay is, and therefore whether this is a real broadcast.
+    ///
+    /// Configured rather than compiled in: given a host the sample dials it over QUIC, and
+    /// given none it runs on the in-memory loopback exactly as it always has. That the
+    /// switch is one line here is the point of the seam.
+    ///
+    /// Editable, because the interface is where a two-device run actually gets set up. A
+    /// launch argument needs a Mac tethered to the phone, and the moment the screen locks or
+    /// the app is reopened by hand the argument is gone and the build is silently back on the
+    /// loopback — which looks exactly like a relay that works.
+    var relay = RelayConfiguration.current()
+
+    let launch = LaunchOptions.current()
+
+    /// A four digit code standing in for the relay's address and certificate hash.
+    ///
+    /// Resolved over Bonjour at join, then discarded in favour of what it resolved to, so the
+    /// settings below always show what is actually being dialled. A code that stayed as the
+    /// configuration would leave the interface unable to say where the media went.
+    var pairingCode: String
+
+    /// Why the last pairing attempt found nothing, if it found nothing.
+    ///
+    /// Kept beside the field rather than raised as a failure screen. Nothing has been dialled
+    /// yet, the settings typed by hand are still there to fall back on, and "no relay is
+    /// advertising 4242" is a different sentence from "the relay refused".
+    private(set) var pairingProblem: String?
+
+    /// Publish one pinned rung on a disciplined clock, and measure what arrives.
+    ///
+    /// A mode rather than a build: the same app is the thing being measured, and a separate
+    /// benchmark target would measure a different program. Off by default, because the clock
+    /// discipline talks to an NTP server and the pinned rung is the wrong shape for a call.
+    var measure: Bool
+
+    init() {
+        measure = launch.benchmark
+        pairingCode = launch.pairingCode ?? ""
+    }
+
+    /// Guarded because SwiftUI may run a `task` more than once for the same view, and
+    /// joining twice reports the second attempt as a failure on a session that is fine.
+    private var joinedOnLaunch = false
+
+    /// Prints the link's state while a measured run is going.
+    private var reporter: Task<Void, Never>?
 
     var canJoin: Bool {
         if case .joining = phase { return !username.trimmed.isEmpty }
         return false
     }
 
+    /// The relay's host as a text field sees it, where blank means the loopback.
+    ///
+    /// A field rather than a switch and a field, because "no relay" and "a relay whose
+    /// address I have cleared" are the same intention and should not be two controls.
+    var relayHost: String {
+        get { relay.host ?? "" }
+        set { relay.host = newValue.trimmed.isEmpty ? nil : newValue.trimmed }
+    }
+
+    /// The one certificate hash a development relay needs pinned.
+    ///
+    /// One rather than the list the configuration carries: a deployment behind a real
+    /// certificate pins nothing, and a relay on the desk has exactly one. Somewhere between
+    /// those is a case for a list, and it is not a case anyone types in by thumb.
+    var relayCertificateHash: String {
+        get { relay.certificateHashes.first ?? "" }
+        set {
+            relay.certificateHashes = newValue.trimmed.isEmpty ? [] : [newValue.trimmed]
+        }
+    }
+
+    /// Join on the settings a script supplied, if it supplied any.
+    ///
+    /// Prints rather than only logging, so `devicectl process launch --console` makes the
+    /// outcome legible from the Mac. Whether a phone can reach a relay at all is the first
+    /// question of a two-device run and the console is where it gets answered.
+    func joinOnLaunch() async {
+        guard launch.autojoin, !joinedOnLaunch else { return }
+        joinedOnLaunch = true
+
+        username = launch.username ?? "device"
+        roomName = launch.room ?? roomName
+        print("JOINING relay=\(relay.summary) room=\(roomName) as=\(username)")
+
+        await join()
+
+        switch phase {
+        case let .inRoom(room):
+            print("JOINED relay=\(relay.summary) room=\(roomName)")
+            guard launch.benchmark else { return }
+            await room.startBroadcast()
+            guard room.isBroadcasting else {
+                print(
+                    "GO LIVE FAILED "
+                        + (room.lastError.map(String.init(describing:)) ?? "no reason given")
+                )
+                return
+            }
+            print("LIVE rung=video/720p codec=hevc source=camera")
+        case let .failed(error): print("JOIN FAILED \(error)")
+        default: print("JOIN ended in an unexpected state")
+        }
+    }
+
+    /// Set the room up to be measured, without starting anything.
+    ///
+    /// Separate from going live because the button is the honest way to do this by hand: both
+    /// phones are already in the room and pointed at each other before either starts sending,
+    /// so the first frames measured are not the ones from before the far side was listening.
+    ///
+    /// One rung and one codec, because the point of a two-device run is a number, and a
+    /// ladder gives a viewer three tracks to choose between while it is being taken.
+    private func prepareMeasurement(in room: RoomModel) async {
+        // Before anything is published, because frames stamped on an undisciplined clock
+        // are frames the far side cannot measure. A failure here is not fatal — the run
+        // still streams — but it is said out loud, since the alternative is a latency
+        // figure quietly built on the device's own idea of the time.
+        if let clock = try? Self.trustedClock() {
+            // Synchronised repeatedly rather than once. Each exchange keeps the sample
+            // with the shortest round trip and the clock keeps the most informative
+            // anchor, so more attempts can only narrow the interval — and the interval is
+            // the floor on what any latency measured against it can claim. A single
+            // exchange over Wi-Fi to a public server lands around ±40ms, which is the same
+            // order as the latency being measured and would swamp it.
+            var synchronised = false
+            for _ in 0 ..< 4 {
+                synchronised = await clock.synchronise() || synchronised
+            }
+            let now = await clock.now()
+            print(
+                synchronised
+                    ? "CLOCK synchronised uncertainty=\(now.uncertainty)"
+                    : "CLOCK NOT synchronised — latency across devices will be meaningless"
+            )
+            if synchronised { room.trustedStamp = clock.stamp }
+        } else {
+            print("CLOCK unavailable — latency across devices will be meaningless")
+        }
+
+        room.videoInput = .camera
+        room.pinnedRung = VideoLayer(
+            id: "video/720p",
+            size: PixelSize(width: 1280, height: 720),
+            frameRate: 30,
+            // One temporal layer for the same reason as one spatial rung: hierarchical
+            // P-frames are nearly free to produce, but they let a receiver drop the top
+            // sub-layer under pressure, and a run that silently becomes 15fps halfway
+            // through still reports itself as 30.
+            bitrate: 1_800_000,
+            temporalLayers: 1
+        )
+
+        report(on: room)
+    }
+
+    /// Print what the link is doing, on a cadence a console can be read at.
+    ///
+    /// The publisher's own counters and the receiver's latencies together, because either
+    /// alone invites the wrong conclusion: frames that never arrive look like low latency,
+    /// and latency measured without the drop count looks like a link that is coping.
+    private func report(on room: RoomModel) {
+        reporter?.cancel()
+        reporter = Task { [weak room] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(5))
+                guard let room else { return }
+                let stats = room.statistics
+                print(
+                    "LINK \(room.latency.report())"
+                        + " received=\(stats?.link.received ?? 0)bps"
+                        + " lost=\(stats?.link.objectsLost ?? 0)"
+                        + " quality=\(room.quality)"
+                )
+
+                // Alongside the latency rather than folded into it. A stream can be fast and
+                // uneven or slow and smooth, and the two complaints have different causes.
+                print("PLAY \(room.cadence.report())")
+                print("GRAB \(room.captureCadence.report())")
+
+                // What the publisher did with the frames it captured, which is where an
+                // uneven arrival pattern is explained when the network turns out to be
+                // healthy: a source delivering unevenly, or an encoder shedding frames it
+                // could not keep up with, produces exactly the same picture at the far end as
+                // a link that is losing them.
+                if let video = stats?.publishing.video {
+                    print(
+                        "SEND submitted=\(video.framesSubmitted)"
+                            + " encoded=\(video.framesEncoded)"
+                            + " dropped=\(video.framesDropped)"
+                            + " muted=\(video.framesMuted)"
+                            + " objects=\(video.objectsPublished)"
+                    )
+                }
+
+                // Per publisher as well as per link, because the two failures they
+                // distinguish look identical from the link alone. A viewer subscribed to a
+                // rung nobody publishes has a healthy connection carrying nothing, and a
+                // viewer that never subscribed at all has the same. The rung, the box that
+                // chose it, and whether anything has ever arrived are the three facts that
+                // tell those apart.
+                for who in room.participants.map(\.slot.identity)
+                    where who != room.identity
+                {
+                    let mine = stats?.participants[who]
+                    let box = room.layout.lastReported[who]
+                    print(
+                        "  VIEW \(who.username.value)"
+                            + " rung=\(mine?.layer?.value ?? "none")"
+                            + " box=\(box.map { "\($0.pixelSize.width)x\($0.pixelSize.height)" } ?? "unreported")"
+                            + " frames=\(mine?.video?.framesProduced ?? 0)"
+                            // Separated from a network failure on purpose: objects arriving
+                            // and being thrown away for want of a keyframe is also a black
+                            // tile, and the remedy is the publisher's, not the link's.
+                            + " nokey=\(mine?.video?.objectsAwaitingKeyFrame ?? 0)"
+                            + " offers=\(room.catalogs[who]?.videoLadder.rungs.map(\.id.value).joined(separator: ",") ?? "no catalog")"
+                            + " silent=\(mine?.silentFor.map { "\($0)" } ?? "never arrived")"
+                    )
+                }
+            }
+        }
+    }
+
+    /// A clock disciplined against the same service the other device uses.
+    private static func trustedClock() throws -> TrustedClock {
+        TrustedClock(
+            authority: NTPAuthority(exchange: try UDPExchange.cloudflare())
+        )
+    }
+
     func join() async {
         guard canJoin else { return }
         phase = .connecting
+        pairingProblem = nil
+
+        // Before the transport is built, since what it resolves to decides both where to dial
+        // and which certificate to pin. A code that resolves to nothing stops here rather
+        // than quietly dialling whatever was in the fields, which is how a run ends up
+        // measuring the loopback and reporting it as a network.
+        if !pairingCode.trimmed.isEmpty {
+            guard let paired = await RelayPairing.find(code: pairingCode) else {
+                pairingProblem =
+                    "Nothing is advertising \(pairingCode.trimmed) on this network."
+                phase = .joining
+                return
+            }
+            relay = paired
+            pairingCode = ""
+        }
+
+        relay.save()
 
         do {
             let identity = try ParticipantIdentity(
@@ -48,7 +287,7 @@ final class AppModel {
                 device: DeviceID(thumbprint: "sample-device-key")
             )
             let session = MoqomSession(
-                transport: transport,
+                transport: relay.transport(),
                 credentials: DeviceCredentials(
                     identity: identity,
                     token: Data(),
@@ -63,9 +302,11 @@ final class AppModel {
                     minimum: .debug
                 )
             )
-            try await session.connect(to: RelayEndpoint(host: "relay.moqom.invalid"))
+            try await session.connect(to: relay.endpoint)
             let room = try await session.join(room: RoomID(roomName))
-            phase = .inRoom(RoomModel(session: session, room: room, identity: identity))
+            let model = RoomModel(session: session, room: room, identity: identity)
+            if measure { await prepareMeasurement(in: model) }
+            phase = .inRoom(model)
         } catch let error as MoqomError {
             phase = .failed(error)
         } catch let error as NameError {
@@ -76,6 +317,7 @@ final class AppModel {
     }
 
     func leave() async {
+        reporter?.cancel()
         if case let .inRoom(model) = phase {
             await model.leave()
         }

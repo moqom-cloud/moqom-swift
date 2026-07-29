@@ -46,6 +46,7 @@ public actor RoomSession {
     private var unprotector: MediaUnprotector?
     private var catalogPublisher: CatalogPublisher?
     private var catalogRefresh: Task<Void, Never>?
+    private var catalogRestatement: Task<Void, Never>?
     private var catalogs: [ParticipantIdentity: CatalogReader] = [:]
     private var catalogTasks: [ParticipantIdentity: Task<Void, Never>] = [:]
     private var pumps: [ParticipantIdentity: Task<Void, Never>] = [:]
@@ -724,6 +725,43 @@ public actor RoomSession {
         return configurations.count >= configuration.ladder.rungs.count
     }
 
+    /// Say the catalog again, a few times, over the couple of seconds after somebody arrives.
+    ///
+    /// Once is not enough, and the reason is a race that cannot be won from this side. A
+    /// newcomer's announcement and their subscription to this device's catalog are separate
+    /// messages travelling separately; the announcement is what wakes this code, and by
+    /// construction it can arrive before the relay has finished setting up the upstream pull
+    /// that the subscription requires. A catalog written in that window is written to nobody
+    /// and the tile stays black for the rest of the call.
+    ///
+    /// Repeating it turns a race into a delay: whichever attempt is the first to land after
+    /// the pull exists is the one that gets through, and the others cost a few hundred bytes
+    /// each. Spread rather than evenly spaced, because the common case is that the first
+    /// attempt already works and the later ones are insurance against a slow relay.
+    ///
+    /// The honest fix is retention — a publisher that can answer a subscription for its latest
+    /// group from a held copy, which is what `start: .latestGroup` promises the subscriber and
+    /// what nothing currently keeps. This is the version that works against a relay that
+    /// forwards without caching.
+    private func restateCatalog() {
+        catalogRestatement?.cancel()
+        catalogRestatement = Task { [weak self] in
+            for delay in [Duration.zero, .milliseconds(250), .milliseconds(1000), .seconds(3)] {
+                if delay > .zero {
+                    do { try await Task.sleep(for: delay) } catch { return }
+                }
+                guard let self, !Task.isCancelled else { return }
+
+                // Refreshed first in case something has genuinely changed since the last
+                // version — a rung that has produced its parameter sets, a mute — and then
+                // restated, because a refresh that finds nothing new sends nothing at all and
+                // sending is the entire point here.
+                await refreshCatalog()
+                try? await catalogPublisher?.restate()
+            }
+        }
+    }
+
     private func publishCatalog(under namespace: TrackNamespace) async throws(MoqomError) {
         guard catalogPublisher == nil else {
             await refreshCatalog()
@@ -748,6 +786,8 @@ public actor RoomSession {
     public func stopBroadcast() async {
         catalogRefresh?.cancel()
         catalogRefresh = nil
+        catalogRestatement?.cancel()
+        catalogRestatement = nil
         await broadcast?.stop()
         broadcast = nil
         await catalogPublisher?.finish()
@@ -1915,6 +1955,25 @@ public actor RoomSession {
                 // room back at once and each plan would otherwise re-derive
                 // priorities against a roster that is still filling.
                 if layoutToRestore[joined] != nil { scheduleLayoutRestore() }
+
+                // Say again what we are offering, because somebody arrived who has not heard
+                // it. Their subscription asks for the latest group, which is the right
+                // request, but a group only exists where something retained it: the catalog
+                // is written once at go-live, and a relay that pulls upstream on demand was
+                // not subscribed at the time. Nothing is holding a copy, so a subscription
+                // opened afterwards begins at a live edge that stays silent until this
+                // publisher happens to change something — a mute, a camera flip — which in a
+                // call that has settled is never.
+                //
+                // It is why this failed by who arrived second rather than by anything about
+                // the network: whoever subscribed before the other's catalog was written saw
+                // video, and whoever subscribed after saw a black tile beside a roster entry
+                // proving the participant was there. Two phones, one direction working, no
+                // loss and no errors on either.
+                //
+                // Cheap enough to do unconditionally — a few hundred bytes against a joining
+                // participant's first video keyframe.
+                if joined != identity { restateCatalog() }
             }
         }
         if before != after { await refreshGallery() }
@@ -2094,6 +2153,19 @@ public actor RoomSession {
         let ladder = catalog.videoLadder
         if !ladder.isEmpty {
             planner.setLadder(ladder, for: who)
+
+            // And then act on it, which is the half that was missing. Replacing the ladder
+            // changes what every box means without changing any box, so nothing else here
+            // will ever reconsider: the layout has already been reported, and the next pass
+            // comes when something moves on screen, which in a two-person room is never.
+            //
+            // Until then the selection in force is the one made against the default ladder,
+            // whose top rung is 1080p. A publisher offering less than that — anyone pinned
+            // to a single rung, anyone whose camera caps lower — is subscribed at a rung
+            // they do not publish, and the relay has nothing to send. The result is a tile
+            // that stays black on a healthy connection, with the catalog on screen beside it
+            // naming a resolution that is never requested.
+            await applyLayout(planner.layout, linkBitrate: nil)
         }
         configureDepacketiser(for: who, from: catalog)
 
@@ -2682,7 +2754,22 @@ public actor RoomSession {
                 let track = try? FullTrackName(namespace: participant.slot.namespace, name: name)
             else { return }
             let request = SubscribeRequest(track: track, priority: priority)
-            guard let subscription = try? await connection.subscribe(request) else { return }
+            let subscription: any SubscriptionHandle
+            do {
+                subscription = try await connection.subscribe(request)
+            } catch {
+                // Said out loud rather than swallowed. A refused subscription leaves a tile
+                // black on a connection that is working perfectly, and the most common cause
+                // is asking for a rung the publisher does not offer — which is a disagreement
+                // between two ladders, not a network fault, and impossible to distinguish
+                // from one without this line.
+                logger.warning(.subscribe, "subscription refused", [
+                    LogField("participant", .participant(who)),
+                    LogField("layer", .text(layer.value)),
+                    LogField("error", .text(String(describing: error))),
+                ])
+                return
+            }
             subscriptions[who] = subscription
 
             // A rung change is a different bitstream with its own parameter

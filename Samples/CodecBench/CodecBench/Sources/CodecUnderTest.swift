@@ -704,13 +704,21 @@ actor CoreMLCodec: CodecUnderTest {
     /// produced — and charging it to the encoder would flatter hardware HEVC, which
     /// takes NV12 directly.
     ///
-    /// BT.601, scaled to the unit range the export declares through `pixel_range`.
+    /// Scaled to the unit range the export declares through `pixel_range`.
     ///
-    /// The range is read from the buffer rather than assumed. The synthetic scene renders
-    /// into a full-range pool, while a camera and a decoded clip both hand back video
-    /// range, where luma occupies 16...235 — decoding video-range luma with a full-range
-    /// formula lifts the blacks and flattens the contrast, which then shows up as a lower
-    /// PSNR and looks like the codec's fault.
+    /// Both the range and the matrix are read from the buffer rather than assumed, because
+    /// the sources here disagree on both and neither mistake looks like a mistake.
+    ///
+    /// The synthetic scene renders into a full-range pool, while a camera and a decoded clip
+    /// hand back video range, where luma occupies 16...235 — decoding video-range luma with
+    /// a full-range formula lifts the blacks and flattens the contrast, which shows up as a
+    /// lower PSNR and reads as the codec's fault.
+    ///
+    /// The matrix matters just as much and is easier to miss, because the error is invisible
+    /// on exactly the content you would test with. Anything HD-sized that VideoToolbox
+    /// produces is tagged BT.709, and reading 709 chroma with BT.601 coefficients shifts
+    /// hue in proportion to saturation: nothing at all on neutral grey, nothing much on a
+    /// face, and a magenta cast over a bright, coloured scene like a composited AR one.
     private static func fill(
         _ array: MLMultiArray,
         shape: [Int],
@@ -725,6 +733,7 @@ actor CoreMLCodec: CodecUnderTest {
         let lumaOffset: Float = isVideoRange ? 16 : 0
         let lumaScale: Float = isVideoRange ? 255.0 / 219.0 : 1
         let chromaScale: Float = isVideoRange ? 255.0 / 224.0 : 1
+        let matrix = ColorMatrix(of: buffer)
 
         guard CVPixelBufferLockBaseAddress(buffer, .readOnly) == kCVReturnSuccess else { return }
         defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
@@ -751,9 +760,9 @@ actor CoreMLCodec: CodecUnderTest {
                     let u = (Float(chromaRow[(x / 2) * 2]) - 128) * chromaScale
                     let v = (Float(chromaRow[(x / 2) * 2 + 1]) - 128) * chromaScale
 
-                    let red = (luminance + 1.402 * v) / 255
-                    let green = (luminance - 0.344_136 * u - 0.714_136 * v) / 255
-                    let blue = (luminance + 1.772 * u) / 255
+                    let red = (luminance + matrix.red * v) / 255
+                    let green = (luminance - matrix.greenU * u - matrix.greenV * v) / 255
+                    let blue = (luminance + matrix.blue * u) / 255
 
                     let offset = y * rowStride + x * columnStride
                     base[offset] = Float16(min(max(red, 0), 1))
@@ -761,6 +770,52 @@ actor CoreMLCodec: CodecUnderTest {
                     base[offset + 2 * channelStride] = Float16(min(max(blue, 0), 1))
                 }
             }
+        }
+    }
+
+    /// The YCbCr-to-RGB coefficients a particular buffer's chroma was encoded with.
+    ///
+    /// Derived from the luma weights rather than written out, so each entry is one pair of
+    /// constants from the specification instead of four that have to agree.
+    private struct ColorMatrix {
+        let red: Float
+        let greenU: Float
+        let greenV: Float
+        let blue: Float
+
+        /// Read the buffer's own tag, falling back on what its size implies.
+        ///
+        /// An untagged buffer is not unusual — a pool vends buffers with no attachments at
+        /// all — and SD content is 601 while HD is 709, which is the same guess every
+        /// framework makes in the same position.
+        init(of buffer: CVPixelBuffer) {
+            let tag = CVBufferGetAttachment(buffer, kCVImageBufferYCbCrMatrixKey, nil)?
+                .takeUnretainedValue() as? NSString
+
+            switch tag {
+            case kCVImageBufferYCbCrMatrix_ITU_R_601_4,
+                 kCVImageBufferYCbCrMatrix_SMPTE_240M_1995:
+                self.init(kr: 0.299, kb: 0.114)
+            case kCVImageBufferYCbCrMatrix_ITU_R_709_2:
+                self.init(kr: 0.2126, kb: 0.0722)
+            case kCVImageBufferYCbCrMatrix_ITU_R_2020:
+                self.init(kr: 0.2627, kb: 0.0593)
+            default:
+                let isHighDefinition = CVPixelBufferGetWidth(buffer) >= 1280
+                    || CVPixelBufferGetHeight(buffer) >= 720
+                self.init(
+                    kr: isHighDefinition ? 0.2126 : 0.299,
+                    kb: isHighDefinition ? 0.0722 : 0.114
+                )
+            }
+        }
+
+        private init(kr: Float, kb: Float) {
+            let kg = 1 - kr - kb
+            red = 2 * (1 - kr)
+            blue = 2 * (1 - kb)
+            greenU = 2 * (1 - kb) * kb / kg
+            greenV = 2 * (1 - kr) * kr / kg
         }
     }
 

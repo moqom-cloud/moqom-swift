@@ -20,8 +20,14 @@
 	<string>1.0</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_moqom-relay._udp</string>
+	</array>
 	<key>NSCameraUsageDescription</key>
 	<string>Publish your camera to the room.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Connect to a relay running on your own network, for development.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Publish your microphone to the room.</string>
 	<key>NSSupportsLiveActivities</key>
