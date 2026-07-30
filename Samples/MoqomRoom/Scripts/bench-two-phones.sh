@@ -214,12 +214,18 @@ EOF
 # failure that takes a quarter of an hour to appear. Ten seconds of streaming is plenty to judge
 # smoothness and is the difference between five iterations an hour and thirty.
 if [ -n "${MOQOM_SECONDS:-}" ]; then
+    # Patient for the same reason the launch loop is: the thing being waited for is often a person
+    # walking over to a phone that locked itself. A bounded run whose bound starts before the run
+    # does measures nothing and reports it as a result.
     waited=0
-    while [ "$waited" -lt 60 ]; do
+    while [ "$waited" -lt 300 ]; do
         if grep -q '^LIVE' "$VIEWER_LOG" 2>/dev/null; then break; fi
         sleep 1
         waited=$((waited + 1))
     done
+    if ! grep -q '^LIVE' "$VIEWER_LOG" 2>/dev/null; then
+        echo "the late joiner never went live — see $VIEWER_LOG" >&2
+    fi
     sleep "$MOQOM_SECONDS"
 
     # The console launches are background jobs holding a pipe this script's caller is reading, so

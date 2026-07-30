@@ -29,10 +29,25 @@ import MoqomKit
 /// are the ones the camera produced, in the order it produced them, and the only difference
 /// is which clock read them.
 ///
-/// The stamp is applied on delivery rather than on capture, so it includes however long the
-/// capture pipeline held the frame. That is the right place for it: a viewer waits for that
-/// too, and a measurement that started at the sensor's own timestamp would quietly exclude
-/// the first few milliseconds of the path it claims to measure.
+/// The clock is read once and applied as an offset, rather than read per frame. Reading it per
+/// frame looks more direct and is measurably worse: the reading happens wherever the frame
+/// reached in an asynchronous pipeline, so it carries that stage's scheduling noise — a few
+/// milliseconds usually, ten now and then — and *that becomes the frame's capture time*. The
+/// spacing between frames, which the camera had produced to within a fraction of a millisecond,
+/// is then wrong by that noise on every frame. A viewer presenting on those timestamps holds one
+/// frame for two refreshes and skips the next about once a second: invisible on a face, and on a
+/// ceiling fan a blade that stalls and jumps.
+///
+/// An offset keeps both properties. The sensor's spacing survives untouched, and the timestamps
+/// still land on the shared timeline, because the offset between the capture clock and that
+/// timeline is a constant — two readings of the same host clock, one of them corrected for the
+/// network's idea of the time.
+///
+/// It does cost one thing the per-frame reading gave away for free: however long the capture
+/// pipeline held the frame before delivery is no longer inside the measurement, because the
+/// offset is anchored on the first frame's delivery and every frame after it is measured from
+/// the sensor. The latency reported is therefore sensor-to-arrival with the first frame's
+/// pipeline delay folded in as a constant, which is the honest description of it.
 struct TimedSource: FrameSource {
     private let wrapped: any FrameSource
     private let stamp: @Sendable () -> Timecode
@@ -49,16 +64,52 @@ struct TimedSource: FrameSource {
         let stamp = stamp
         return AsyncStream { continuation in
             let pump = Task {
+                // Anchored on the first frames that carry a usable capture time. A source with no
+                // clock of its own — a synthetic pattern, say — stamps every frame zero, and for
+                // those the reading per frame is all there is.
+                var offset: Int64?
+                var settling = 0
+
                 for await frame in upstream {
+                    let captured = Int64(bitPattern: frame.timestamp.nanoseconds)
+                    let now = stamp().nanoseconds
+
+                    if captured > 0 {
+                        let candidate = now - captured
+                        switch offset {
+                        case .none:
+                            offset = candidate
+
+                        // Taken as the smallest of the first second's worth rather than the first
+                        // outright, because the difference between the two clocks is the same every
+                        // frame and the delay in observing it is not: whatever the pipeline added
+                        // on the frame that happened to be first would otherwise be charged to
+                        // every frame in the run.
+                        case let .some(current) where settling < 60:
+                            offset = min(current, candidate)
+
+                        // Re-anchored on a gross discrepancy and only then. A quarter of a second
+                        // is far more than scheduling ever accounts for and far less than a clock
+                        // moving: an NTP correction landing after the first frames, a source whose
+                        // timeline restarted. Latching once and never looking again turns any of
+                        // those into a run that is wrong from end to end, which is what this
+                        // measured before the check existed — three and a half seconds of
+                        // unreadable video and a latency figure eleven hours out.
+                        case let .some(current):
+                            if abs(candidate - current) > 250_000_000 { offset = candidate }
+                        }
+                        settling += 1
+                    }
+
+                    let shared = offset.map { captured + $0 } ?? now
+
                     continuation.yield(
                         VideoFrame(
                             // Clamped only against a clock that claims to predate the
                             // epoch, which nothing here produces; the timestamp is
                             // unsigned and a negative reading would wrap to an enormous
                             // one rather than fail.
-                            timestamp: FrameTimestamp(
-                                nanoseconds: UInt64(max(0, stamp().nanoseconds))
-                            ),
+                            timestamp: FrameTimestamp(nanoseconds: UInt64(max(0, shared))),
                             size: frame.size,
                             surface: frame.surface
                         )
