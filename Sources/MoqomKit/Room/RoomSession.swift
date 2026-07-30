@@ -47,6 +47,10 @@ public actor RoomSession {
     private var catalogPublisher: CatalogPublisher?
     private var catalogRefresh: Task<Void, Never>?
     private var catalogRestatement: Task<Void, Never>?
+
+    /// Retries of a broadcast's writers after a reconnect, and the announcement they share.
+    private var publicationRepair: Task<Void, Never>?
+    private var reopenedAnnouncement: (any AnnouncementHandle)?
     private var catalogs: [ParticipantIdentity: CatalogReader] = [:]
     private var catalogTasks: [ParticipantIdentity: Task<Void, Never>] = [:]
     private var pumps: [ParticipantIdentity: Task<Void, Never>] = [:]
@@ -446,34 +450,23 @@ public actor RoomSession {
     private func rebindPublications(to session: any TransportSession) async {
         if let broadcast {
             let publishNamespace = broadcast.namespace
-            let configuration = broadcast.configuration
-
-            if let announcement = try? await session.announce(publishNamespace) {
-                var writers: [LayerID: any TrackWriter] = [:]
-                for (index, rung) in configuration.ladder.rungs.enumerated() {
-                    guard
-                        let name = try? TrackName(rung.id.value),
-                        let track = try? FullTrackName(
-                            namespace: publishNamespace, name: name
-                        )
-                    else { continue }
-                    let priority = UInt8(
-                        min(255, Int(configuration.basePriority) + index * 8)
-                    )
-                    guard
-                        let writer = try? await protectedWriter(for: track, priority: priority)
-                    else { continue }
-                    writers[rung.id] = writer
-                }
-                await broadcast.rebind(writers: writers, announcement: announcement)
-            }
+            await restore(broadcast, on: session)
 
             // Dropped rather than finished: its writer is on the dead session, so
             // there is nothing to flush and nowhere to flush it. A fresh one
             // republishes the current catalog, which a viewer needs before it can
             // build a decoder for the media about to arrive.
             catalogPublisher = nil
-            try? await publishCatalog(under: publishNamespace)
+            do {
+                try await publishCatalog(under: publishNamespace)
+            } catch {
+                // Loudly, because a broadcast whose catalog never came back is a black tile on
+                // every viewer for the rest of the call, with media flowing behind it that
+                // nobody can build a decoder for.
+                logger.error(.publish, "catalog lost across a reconnect", [
+                    LogField("error", .text(String(describing: error))),
+                ])
+            }
         }
 
         if let authority {
@@ -510,6 +503,113 @@ public actor RoomSession {
         }
     }
 
+    /// Put a broadcast back on a live session, and keep trying until it is whole.
+    ///
+    /// The reason this is not a single attempt: reopening a track can fail for the same
+    /// transient reasons the reconnect itself happened, and a rung skipped on the way through
+    /// is a rung with no writer for the rest of the call. Every frame the encoder produces for
+    /// it is then discarded inside ``Broadcast``, which is invisible from the outside — the
+    /// camera runs, the counters climb, and nothing arrives at the far end. On a publication
+    /// pinned to one rung, as a measurement run is, a single skipped reopen is the whole
+    /// broadcast, silently.
+    ///
+    /// So the attempt repeats with a widening delay, and says so when it cannot succeed. The
+    /// first attempt is awaited because the common case succeeds immediately and the caller is
+    /// mid-resume; the retries are not, because the rest of the room — roster, control track,
+    /// subscriptions — should not wait on one track's stream.
+    private func restore(_ broadcast: Broadcast, on session: any TransportSession) async {
+        publicationRepair?.cancel()
+        publicationRepair = nil
+
+        if await reopen(broadcast, on: session) { return }
+
+        publicationRepair = Task { [weak self] in
+            // Widening, and bounded. If a track cannot be opened after half a minute of trying
+            // then the session is not what is broken, and a task retrying forever would hide
+            // that as effectively as the original silence did.
+            for delay in [Duration.milliseconds(250), .milliseconds(500), .seconds(1),
+                          .seconds(2), .seconds(4), .seconds(8), .seconds(15)] {
+                do { try await Task.sleep(for: delay) } catch { return }
+                guard let self, !Task.isCancelled else { return }
+                if await reopen(broadcast, on: session) { return }
+            }
+            await self?.reportPublicationLost()
+        }
+    }
+
+    /// Reopen the announcement and one writer per rung.
+    ///
+    /// - Returns: Whether every rung the ladder describes now has a writer.
+    private func reopen(_ broadcast: Broadcast, on session: any TransportSession) async -> Bool {
+        let namespace = broadcast.namespace
+        let configuration = broadcast.configuration
+
+        // Held across attempts rather than retaken on each one, because announcing twice puts
+        // the same participant in the roster twice.
+        if reopenedAnnouncement == nil {
+            do {
+                reopenedAnnouncement = try await session.announce(namespace)
+            } catch {
+                logger.warning(.publish, "could not re-announce after reconnect", [
+                    LogField("error", .text(String(describing: error))),
+                ])
+                return false
+            }
+        }
+        guard let announcement = reopenedAnnouncement else { return false }
+
+        var writers: [LayerID: any TrackWriter] = [:]
+        var missing: [LayerID] = []
+        for (index, rung) in configuration.ladder.rungs.enumerated() {
+            guard
+                let name = try? TrackName(rung.id.value),
+                let track = try? FullTrackName(namespace: namespace, name: name)
+            else {
+                // A name that will not parse will not parse on the next attempt either, so
+                // this one is reported rather than retried.
+                logger.error(.publish, "a rung has an unusable track name", [
+                    LogField("layer", .text(rung.id.value)),
+                ])
+                continue
+            }
+            let priority = UInt8(min(255, Int(configuration.basePriority) + index * 8))
+            do {
+                writers[rung.id] = try await protectedWriter(for: track, priority: priority)
+            } catch {
+                missing.append(rung.id)
+                logger.warning(.publish, "could not reopen a rung after reconnect", [
+                    LogField("layer", .text(rung.id.value)),
+                    LogField("error", .text(String(describing: error))),
+                ])
+            }
+        }
+
+        // What came back goes in now, rather than waiting for the rung that did not. A viewer
+        // on a recovered rung should not be held dark by an unrelated one.
+        if !writers.isEmpty {
+            await broadcast.rebind(writers: writers, announcement: announcement)
+        }
+
+        if missing.isEmpty {
+            reopenedAnnouncement = nil
+            return true
+        }
+        return false
+    }
+
+    /// Say that a publication could not be put back.
+    ///
+    /// The end of the road for a broadcast this session cannot repair. Reported rather than
+    /// thrown, because there is nobody to throw to — the reconnect succeeded and the room is
+    /// otherwise healthy — and reported at all because the alternative is what happened
+    /// before: a camera running for half an hour into a track that no longer existed.
+    private func reportPublicationLost() {
+        logger.error(.publish, "broadcast could not be restored after reconnect", [
+            LogField("room", .text(room.value)),
+        ])
+        eventContinuation.yield(.broadcastInterrupted)
+    }
+
     /// The layout to put back as participants return after a reconnect.
     ///
     /// Held because the alternative is worse than it sounds: the roster is
@@ -529,8 +629,22 @@ public actor RoomSession {
     }
 
     private func restoreLayout() async {
-        let boxes = layoutToRestore.filter { state.roster[$0.key] != nil }
-        guard !boxes.isEmpty else { return }
+        let returning = layoutToRestore.filter { state.roster[$0.key] != nil }
+        guard !returning.isEmpty else { return }
+
+        // Merged over what is already being drawn rather than stated on its own,
+        // because ``SubscriptionPlanner/plan(boxes:order:linkBitrate:)`` takes the
+        // whole layout: restoring one returning participant by itself would assert
+        // a layout in which nobody else has a box, and unsubscribe every tile that
+        // was working. After a reconnect the live layout is empty — everything was
+        // torn down together — so the merge changes nothing on that path.
+        var boxes = planner.layout
+        boxes.merge(returning) { _, restored in restored }
+
+        // Applied, so they are no longer pending. Anyone still absent keeps their
+        // entry and is restored by the arrival that brings them back.
+        for identity in returning.keys { layoutToRestore.removeValue(forKey: identity) }
+
         await applyLayout(boxes, linkBitrate: nil)
     }
 
@@ -757,7 +871,7 @@ public actor RoomSession {
                 // restated, because a refresh that finds nothing new sends nothing at all and
                 // sending is the entire point here.
                 await refreshCatalog()
-                try? await catalogPublisher?.restate()
+                _ = try? await catalogPublisher?.restate()
             }
         }
     }
@@ -2090,6 +2204,15 @@ public actor RoomSession {
         // silent for the whole outage, when what actually happened is that this
         // client was not subscribed to them for any of it.
         lastObject.removeValue(forKey: who)
+
+        // Where they were being drawn, kept so that a return can put the
+        // subscription back without waiting for a layout pass that may never
+        // come. An application reports a box when one *changes*, and a tile torn
+        // down and rebuilt at the same size changes nothing — so a participant
+        // who leaves and comes back sits behind a roster entry, a catalog, and no
+        // video, indefinitely, because every party to the decision believes it
+        // has already been made. Read before `remove`, which is what discards it.
+        if let box = planner.layout[who] { layoutToRestore[who] = box }
 
         planner.remove(who)
         subscriptions.removeValue(forKey: who)

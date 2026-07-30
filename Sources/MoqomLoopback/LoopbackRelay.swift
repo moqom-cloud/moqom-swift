@@ -42,6 +42,9 @@ public actor LoopbackRelay {
 
     private var announcements: Set<TrackNamespace> = []
 
+    /// How many further attempts to open a track for publishing to refuse.
+    private var refusedPublishes = 0
+
     /// Which session announced what.
     ///
     /// Needed because a session ending withdraws everything it announced, which
@@ -78,6 +81,21 @@ public actor LoopbackRelay {
     public private(set) var isAcceptingConnections = true
 
     public init() {}
+
+    /// Refuse the next `count` attempts to open a track for publishing.
+    ///
+    /// For reproducing a partial recovery: the session comes back, and opening one of the
+    /// tracks on it does not.
+    public func refusePublishes(_ count: Int) {
+        refusedPublishes = count
+    }
+
+    /// Whether this attempt to open a track should be refused. Consumes one refusal.
+    func shouldRefusePublish() -> Bool {
+        guard refusedPublishes > 0 else { return false }
+        refusedPublishes -= 1
+        return true
+    }
 
     public func setAcceptingConnections(_ accepting: Bool) {
         isAcceptingConnections = accepting

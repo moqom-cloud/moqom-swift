@@ -126,7 +126,12 @@ final class AppModel {
                 )
                 return
             }
-            print("LIVE rung=video/720p codec=hevc source=camera")
+            print(
+                "LIVE rung=video/720p codec=hevc source=camera"
+                    + " fps=\(Int(launch.frameRate ?? 30))"
+                    + " playout=\(launch.playoutMilliseconds ?? 80)ms"
+                    + " layers=\(launch.flatLayers ? "flat" : "temporal")"
+            )
         case let .failed(error): print("JOIN FAILED \(error)")
         default: print("JOIN ended in an unexpected state")
         }
@@ -168,15 +173,31 @@ final class AppModel {
         }
 
         room.videoInput = .camera
+        let fps = launch.frameRate ?? 30
+
+        // Bitrate with the frame rate, not fixed. Twice the frames at the same budget is half
+        // the bits each, and a sixty frame run that looks worse than a thirty frame one has
+        // measured the budget rather than the frame rate. Not doubled either — consecutive
+        // frames sixteen milliseconds apart differ less than ones thirty-three apart, so the
+        // extra cost of the same picture is well under two-fold.
+        //
+        // The base is what HEVC needs for a talking head at this size rather than what a
+        // ladder built for H.264 asks for: 720p60 lands on two megabits, and the earlier
+        // three was buying nothing visible while making two phones on one domestic uplink
+        // compete for it. `--kbps` overrides the arithmetic entirely, which is how the
+        // question "is the link full?" gets asked without also changing the frame rate.
+        let bitrate = launch.kilobitsPerSecond.map { $0 * 1000 }
+            ?? Int(1_250_000 * (1 + (fps / 30 - 1) * 0.6))
+
         room.pinnedRung = VideoLayer(
             id: "video/720p",
             size: PixelSize(width: 1280, height: 720),
-            frameRate: 30,
+            frameRate: fps,
             // One temporal layer for the same reason as one spatial rung: hierarchical
             // P-frames are nearly free to produce, but they let a receiver drop the top
             // sub-layer under pressure, and a run that silently becomes 15fps halfway
             // through still reports itself as 30.
-            bitrate: 1_800_000,
+            bitrate: bitrate,
             temporalLayers: 1
         )
 
@@ -188,6 +209,16 @@ final class AppModel {
     /// The publisher's own counters and the receiver's latencies together, because either
     /// alone invites the wrong conclusion: frames that never arrive look like low latency,
     /// and latency measured without the drop count looks like a link that is coping.
+    private static func describe(_ state: ProcessInfo.ThermalState) -> String {
+        switch state {
+        case .nominal: "nominal"
+        case .fair: "fair"
+        case .serious: "serious"
+        case .critical: "critical"
+        @unknown default: "unknown"
+        }
+    }
+
     private func report(on room: RoomModel) {
         reporter?.cancel()
         reporter = Task { [weak room] in
@@ -205,7 +236,57 @@ final class AppModel {
                 // Alongside the latency rather than folded into it. A stream can be fast and
                 // uneven or slow and smooth, and the two complaints have different causes.
                 print("PLAY \(room.cadence.report())")
+
+                // The publisher's timeline, beside the arrivals it should be independent of.
+                // An even arrival cadence and an uneven timeline is motion that is wrong while
+                // nothing is late or missing, and it is the only line here that can say so.
+                if let timeline = room.timeline.report() { print("TIME \(timeline)") }
+
+                // The last few inches, which nothing else covers. Frames counted as arrived by
+                // PLAY and as lost by nobody can still fail to reach the screen, and a picture
+                // that misses steps while every other line reads clean is what that looks like.
+                let drawn = room.drawing
+                print(
+                    String(
+                        format: "DRAW shown=%d late=%d undescribed=%d failures=%d"
+                            + " backwards=%d reanchors=%d regrids=%d delivered=%.1f%%",
+                        drawn.enqueued,
+                        drawn.skippedNotReady,
+                        drawn.skippedUndescribed,
+                        drawn.failures,
+                        drawn.outOfOrder,
+                        drawn.reanchors,
+                        drawn.regrids,
+                        drawn.delivered * 100
+                    )
+                )
+                // The display pipeline's own account, which is the only one that can say a frame
+                // was accepted and then not shown.
+                if let shown = room.presentation {
+                    print(
+                        String(
+                            format: "SHOW total=%d dropped=%d corrupted=%d delay=%.1f ms",
+                            shown.total,
+                            shown.dropped,
+                            shown.corrupted,
+                            shown.delay * 1000
+                        )
+                    )
+                }
+
                 print("GRAB \(room.captureCadence.report())")
+
+                // The device's own limits, which every other line here would blame on the
+                // network. Capture at sixty, one hardware encode, one hardware decode and a
+                // radio held busy is enough to warm a phone up, and iOS answers a warm phone
+                // by slowing the camera down — so a capture cadence that decays while the
+                // link stays clean is a thermal reading rather than a transport bug. Low
+                // power mode does the same thing for a different reason and is worth the two
+                // words it costs to rule out.
+                print(
+                    "HOST thermal=\(Self.describe(ProcessInfo.processInfo.thermalState))"
+                        + " lowpower=\(ProcessInfo.processInfo.isLowPowerModeEnabled)"
+                )
 
                 // What the publisher did with the frames it captured, which is where an
                 // uneven arrival pattern is explained when the network turns out to be
@@ -218,7 +299,26 @@ final class AppModel {
                             + " encoded=\(video.framesEncoded)"
                             + " dropped=\(video.framesDropped)"
                             + " muted=\(video.framesMuted)"
+                            + " unroutable=\(video.framesUnroutable)"
                             + " objects=\(video.objectsPublished)"
+                    )
+
+                    // The two stages between the camera and the wire, separately. Together they
+                    // answer the question a frame rate cannot: whether a stutter was made here,
+                    // before anything touched the network. An encoder whose p95 matches its
+                    // median and a write path whose p95 is thirty times its own are the same
+                    // total delay and completely different bugs.
+                    print(
+                        String(
+                            format: "COST encode p50=%.1f p95=%.1f max=%.1f ms"
+                                + " · write p50=%.1f p95=%.1f max=%.1f ms",
+                            video.encodeLatency.median,
+                            video.encodeLatency.p95,
+                            video.encodeLatency.worst,
+                            video.writeLatency.median,
+                            video.writeLatency.p95,
+                            video.writeLatency.worst
+                        )
                     )
                 }
 
@@ -304,7 +404,17 @@ final class AppModel {
             )
             try await session.connect(to: relay.endpoint)
             let room = try await session.join(room: RoomID(roomName))
-            let model = RoomModel(session: session, room: room, identity: identity)
+            let model = RoomModel(
+                session: session,
+                room: room,
+                identity: identity,
+                statisticsInterval: launch.statisticsMilliseconds
+                    .map { .milliseconds($0) } ?? .milliseconds(250)
+            )
+            model.flatLayers = launch.flatLayers
+            if let playout = launch.playoutMilliseconds {
+                model.playoutDelay = playout > 0 ? .milliseconds(playout) : nil
+            }
             if measure { await prepareMeasurement(in: model) }
             phase = .inRoom(model)
         } catch let error as MoqomError {

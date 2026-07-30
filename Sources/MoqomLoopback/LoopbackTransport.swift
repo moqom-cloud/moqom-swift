@@ -172,6 +172,11 @@ public final class LoopbackSession: TransportSession {
         _ track: FullTrackName,
         priority: UInt8
     ) async throws(MoqomError) -> any TrackWriter {
+        // A relay that refuses to open a track is the failure worth being able to reproduce.
+        // Reopening a writer after a reconnect can fail for the same transient reason the
+        // reconnect happened, and what a publisher does about it decides whether the broadcast
+        // comes back or dies quietly with its camera still running.
+        if await relay.shouldRefusePublish() { throw MoqomError.rejected(.unavailable) }
         await relay.publish(track)
         return LoopbackWriter(track: track, priority: priority, relay: relay)
     }

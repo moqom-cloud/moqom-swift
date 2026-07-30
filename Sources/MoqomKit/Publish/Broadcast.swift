@@ -84,6 +84,19 @@ public struct BroadcastStatistics: Hashable, Sendable {
     /// stopped", which look identical from the objects published.
     public var framesMuted: Int
 
+    /// Encoded frames that had nowhere to go, because the rung had no writer.
+    ///
+    /// Distinct from ``framesDropped``, which is pressure and self-correcting. This is a
+    /// publication that has lost the track it publishes on and cannot get it back by itself:
+    /// the encoder is working, the frames are compressed, and every one of them is being
+    /// discarded on the way to the wire.
+    ///
+    /// It exists because its absence was indistinguishable from success. A broadcast whose
+    /// writer failed to reopen after a reconnect reported frames submitted, none encoded,
+    /// nothing dropped and no error, on a camera running at a perfect thirty frames a second
+    /// — a dead uplink whose every local indicator was healthy.
+    public var framesUnroutable: Int
+
     public var objectsPublished: Int
     public var currentGroup: UInt64
 
@@ -96,24 +109,109 @@ public struct BroadcastStatistics: Hashable, Sendable {
     /// ``Broadcast/setMuted(_:)``.
     public var isMuted: Bool
 
+    /// How long the encoder held each frame, from submission to compressed output.
+    ///
+    /// The first of the two costs an application controls, and the one most often assumed rather
+    /// than measured. A hardware encoder at 720p is a few milliseconds and its p95 is close to
+    /// its median; a p95 several times the median means frames are queueing at the encoder,
+    /// which no amount of network work will fix.
+    public var encodeLatency: StageLatency
+
+    /// How long the transport took to accept each object.
+    ///
+    /// The other cost, and the one that explains an uneven stream when capture and encode are
+    /// both smooth. This is not the time to reach anywhere — it is how long the publisher was
+    /// made to wait before it could hand the bytes over. A median under a millisecond with an
+    /// occasional hundred means the send path is applying back pressure in bursts, and every
+    /// frame captured during one of those arrives late at the far end in a bunch.
+    public var writeLatency: StageLatency
+
     public init(
         framesSubmitted: Int = 0,
         framesEncoded: Int = 0,
         framesDropped: Int = 0,
         framesMuted: Int = 0,
+        framesUnroutable: Int = 0,
         objectsPublished: Int = 0,
         currentGroup: UInt64 = 0,
         activeLayers: Set<LayerID> = [],
-        isMuted: Bool = false
+        isMuted: Bool = false,
+        encodeLatency: StageLatency = StageLatency(),
+        writeLatency: StageLatency = StageLatency()
     ) {
+        self.encodeLatency = encodeLatency
+        self.writeLatency = writeLatency
         self.framesSubmitted = framesSubmitted
         self.framesEncoded = framesEncoded
         self.framesDropped = framesDropped
         self.framesMuted = framesMuted
+        self.framesUnroutable = framesUnroutable
         self.objectsPublished = objectsPublished
         self.currentGroup = currentGroup
         self.activeLayers = activeLayers
         self.isMuted = isMuted
+    }
+}
+
+/// What one stage of the publish path cost, in milliseconds.
+///
+/// Percentiles rather than an average, because an average is exactly the shape of measurement
+/// that hides the problem being looked for. Thirty frames a second where twenty-nine take two
+/// milliseconds and one takes two hundred averages nine, which reads as healthy and is the
+/// arithmetic of a visible stutter.
+///
+/// A bounded window of samples, so a publication running for an hour reports what it is doing
+/// now rather than an average over everything it has ever done. The worst is kept for the whole
+/// run separately: a single stall is a fact about the run and a window would eventually forget it.
+public struct StageLatency: Sendable, Hashable {
+    public var samples: Int
+    public var median: Double
+    public var p95: Double
+    public var worst: Double
+
+    public init(samples: Int = 0, median: Double = 0, p95: Double = 0, worst: Double = 0) {
+        self.samples = samples
+        self.median = median
+        self.p95 = p95
+        self.worst = worst
+    }
+}
+
+/// Collects durations and summarises them, for one stage.
+///
+/// Deliberately not an actor and not locked: each instance lives inside the actor that writes it.
+struct StageMeter {
+    private var samples: [Double] = []
+    private var cursor = 0
+    private var count = 0
+    private var worst = 0.0
+    private static let window = 300
+
+    mutating func record(_ elapsed: Duration) {
+        let milliseconds = Double(elapsed.components.seconds) * 1000
+            + Double(elapsed.components.attoseconds) / 1e15
+        count += 1
+        worst = max(worst, milliseconds)
+        if samples.count < Self.window {
+            samples.append(milliseconds)
+        } else {
+            samples[cursor] = milliseconds
+            cursor = (cursor + 1) % Self.window
+        }
+    }
+
+    var summary: StageLatency {
+        guard !samples.isEmpty else { return StageLatency() }
+        let sorted = samples.sorted()
+        func percentile(_ fraction: Double) -> Double {
+            sorted[Int((Double(sorted.count - 1) * fraction).rounded())]
+        }
+        return StageLatency(
+            samples: count,
+            median: percentile(0.5),
+            p95: percentile(0.95),
+            worst: worst
+        )
     }
 }
 
@@ -139,6 +237,11 @@ public actor Broadcast {
     /// their encoders make independent decisions about where keyframes land. A
     /// shared counter would number one track's objects from another's output.
     private var sequencing: [LayerID: TrackSequencer] = [:]
+
+    /// When each captured frame went to the encoders, and what each stage has cost.
+    private var submitted: [FrameTimestamp: ContinuousClock.Instant] = [:]
+    private var encodeMeter = StageMeter()
+    private var writeMeter = StageMeter()
     private var statistics = BroadcastStatistics()
     private var pump: Task<Void, Never>?
 
@@ -361,6 +464,16 @@ public actor Broadcast {
         let forcesKeyFrame = frame.forcesKeyFrame || resumesWithKeyFrame
         resumesWithKeyFrame = false
 
+        // Noted against the frame's own timestamp, because that is the only thing that survives
+        // the encoder: what comes back out is different bytes, later, and in general reordered.
+        // Bounded, so a rung that stops producing output cannot turn this into a slow leak.
+        submitted[frame.timestamp] = .now
+        if submitted.count > 90 {
+            for stale in submitted.keys.sorted().prefix(submitted.count - 90) {
+                submitted.removeValue(forKey: stale)
+            }
+        }
+
         for layer in configuration.ladder.rungs where isActive(layer.id) {
             guard let encoder = encoders[layer.id] else { continue }
             do {
@@ -378,7 +491,17 @@ public actor Broadcast {
     /// One compressed frame becomes one object on one track.
     private func publish(_ encoded: EncodedFrame, on layer: LayerID) async {
         guard let writer = writers[layer], let rung = configuration.ladder.layer(id: layer) else {
+            // Counted, because this used to be the quietest failure in the SDK. A rung with no
+            // writer discards every frame the encoder produces, and returning here without
+            // saying so left the publication's own statistics describing a healthy broadcast:
+            // frames submitted, none encoded, nothing dropped.
+            statistics.framesUnroutable += 1
             return
+        }
+
+        if let at = submitted[encoded.timestamp] {
+            encodeMeter.record(.now - at)
+            statistics.encodeLatency = encodeMeter.summary
         }
 
         if encoded.isKeyFrame, !encoded.parameterSets.isEmpty {
@@ -410,12 +533,18 @@ public actor Broadcast {
             )
         )
 
+        // Timed across the group boundary as well as the object, because the boundary is the
+        // expensive half: closing one subgroup stream and opening the next is work the object
+        // write itself never does, and folding them together would hide it in the tail.
+        let handedOver = ContinuousClock.now
         do {
             try await writer.write(object)
             statistics.objectsPublished += 1
         } catch {
             statistics.framesDropped += 1
         }
+        writeMeter.record(.now - handedOver)
+        statistics.writeLatency = writeMeter.summary
         statistics.framesEncoded += 1
     }
 

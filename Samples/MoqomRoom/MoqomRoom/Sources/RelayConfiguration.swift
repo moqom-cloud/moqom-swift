@@ -129,6 +129,45 @@ struct LaunchOptions {
     /// Publish the camera on one pinned rung, for measuring rather than for calling.
     var benchmark = false
 
+    /// Encode one flat layer instead of splitting the rung into two temporal ones.
+    ///
+    /// A switch rather than a decision, because it is the thing being tested. Temporal
+    /// layering gives the relay something to shed under pressure, and it also asks the
+    /// hardware encoder to emit frames that reference each other in a pattern — which is a
+    /// plausible source of frames arriving in bunches on an otherwise even link. The only way
+    /// to know is to measure the same scene both ways, minutes apart, and a scene with a
+    /// ceiling fan in it is not one you can compare across rebuilds.
+    var flatLayers = false
+
+    /// Frames per second to capture, encode, and advertise.
+    ///
+    /// One number for all three on purpose. The rung's rate is what the encoder is told to
+    /// expect and what the catalog advertises; the capture format's rate is what the camera is
+    /// asked for. Setting them separately is how a run ends up encoding thirty frames while
+    /// claiming sixty.
+    var frameRate: Double?
+
+    /// What to give the encoder, overriding what the frame rate would imply.
+    ///
+    /// A separate knob because bitrate and frame rate are separate questions, and
+    /// tying them together means a judder investigation cannot tell a link that is
+    /// too full from a cadence that is too fast.
+    var kilobitsPerSecond: Int?
+
+    /// Milliseconds between statistics samples, or nil for the app's default of 250.
+    ///
+    /// A knob because the default is a suspect. Sampling walks the roster and hops between the
+    /// actors that also carry media, four times a second, which is the same period as a stutter
+    /// that was reported as happening "maybe every quarter second".
+    var statisticsMilliseconds: Int?
+
+    /// Milliseconds a remote tile holds frames before presenting them. Zero means on arrival.
+    ///
+    /// The knob that turns a smoothness complaint into a number. Both settings are worth
+    /// measuring: on arrival is the lowest latency the stack can produce, and the difference
+    /// between them is what the smooth picture cost.
+    var playoutMilliseconds: Int?
+
     static func current(
         arguments: [String] = ProcessInfo.processInfo.arguments
     ) -> LaunchOptions {
@@ -142,6 +181,11 @@ struct LaunchOptions {
             case "--pairing-code": options.pairingCode = value
             case "--autojoin": options.autojoin = true
             case "--benchmark": options.benchmark = true
+            case "--flat-layers": options.flatLayers = true
+            case "--fps": options.frameRate = value.flatMap(Double.init)
+            case "--kbps": options.kilobitsPerSecond = value.flatMap(Int.init)
+            case "--stats-ms": options.statisticsMilliseconds = value.flatMap(Int.init)
+            case "--playout-ms": options.playoutMilliseconds = value.flatMap(Int.init)
             default: break
             }
             index += 1

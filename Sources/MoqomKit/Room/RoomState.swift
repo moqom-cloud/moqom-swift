@@ -226,6 +226,14 @@ public enum RoomEvent: Sendable {
     /// ring to redraw and not as a grid to rearrange.
     case galleryChanged([Gallery.Slot])
 
+    /// This device's broadcast could not be put back on a reconnected session.
+    ///
+    /// The camera is still running and the room is otherwise healthy, which is exactly why
+    /// this has to be said: nothing else about the state will look wrong. Nobody is receiving
+    /// this participant's media and nothing the SDK can do will change that, so an application
+    /// should either restart the broadcast or tell the user they have gone silent.
+    case broadcastInterrupted
+
     /// Who the Picture in Picture window should draw, in order.
     ///
     /// Separate from ``galleryChanged`` because the two move independently: a

@@ -107,6 +107,14 @@ final class VideoTile {
             }
             guard let frames, let self else { return }
 
+            // Presented on a schedule rather than on arrival. Without this the picture is as
+            // uneven as the network, which on a good link is even enough to measure well and
+            // still visibly choppy: a p95 arrival gap of 80ms against a 33ms median is one frame
+            // in twenty held for two and a half frame times. The delay is the app's choice
+            // because it is a latency the user pays; the room model carries it so a benchmark
+            // can set it to zero and see both halves of the trade.
+            renderer.playoutDelay = await room.playoutDelay
+
             if let codec = await room.codec(of: identity) {
                 renderer.setCodec(codec)
             }
@@ -118,12 +126,70 @@ final class VideoTile {
             let stamp = room.trustedStamp
             let meter = room.latency
             let cadence = room.cadence
-            for await frame in frames {
-                if let stamp {
-                    meter.record(capturedAt: frame.frame.timestamp, receivedAt: stamp())
-                }
-                cadence.record()
+            let timeline = room.timeline
+            let renderer = renderer
+
+            // Drained off the main actor, and that is a measurement decision as much as a
+            // performance one. Recording arrival on the main actor cannot distinguish a network
+            // that delivers frames in clumps from a main thread that was too busy to collect
+            // them one at a time: both produce a run of near-zero gaps followed by a long one.
+            // Timestamping here, before the hop, leaves only the network in the number.
+            //
+            // The hop itself stays, and stays awaited. The display layer is main-actor bound
+            // because it is part of the view hierarchy, and handing frames over without waiting
+            // would put them on the actor's queue in an order nothing guarantees — which for
+            // video is worse than being late.
+            //
+            // A nonisolated method rather than a detached task, which was the first attempt and
+            // was wrong: a detached task does not inherit cancellation, so a tile torn down and
+            // rebuilt — which a grid does whenever somebody joins — left the old drain alive on
+            // the same stream. Two consumers then split one track between them and each renderer
+            // decoded half a stream, which looks exactly like a corrupt link.
+            await Self.drain(
+                frames,
+                into: renderer,
+                stamp: stamp,
+                meter: meter,
+                cadence: cadence,
+                timeline: timeline,
+                reportingTo: room
+            )
+        }
+    }
+
+    /// Move frames from the subscription to the layer, timestamping arrival off the main actor.
+    ///
+    /// Static and nonisolated so the loop genuinely runs off the main actor while remaining a
+    /// child of the pump task: cancelling the pump cancels this, which is what stops a torn-down
+    /// tile from competing for the stream with its replacement.
+    private nonisolated static func drain(
+        _ frames: AsyncStream<DepacketisedFrame>,
+        into renderer: VideoRenderer,
+        stamp: (@Sendable () -> Timecode)?,
+        meter: LatencyMeter,
+        cadence: CadenceMeter,
+        timeline: TimelineMeter,
+        reportingTo room: RoomModel
+    ) async {
+        var drawn = 0
+        for await frame in frames {
+            if Task.isCancelled { return }
+            if let stamp {
+                meter.record(capturedAt: frame.frame.timestamp, receivedAt: stamp())
+            }
+            cadence.record(keyFrame: frame.frame.isKeyFrame)
+            timeline.record(stamp: frame.frame.timestamp.nanoseconds)
+            drawn += 1
+
+            await MainActor.run {
                 try? renderer.enqueue(frame)
+                room.drawing = renderer.drawing
+            }
+
+            // Twice a second rather than per frame: this crosses into the display pipeline and
+            // asking it sixty times a second to describe sixty frames is its own overhead.
+            if drawn % 30 == 0, let presentation = await renderer.presentation() {
+                await MainActor.run { room.presentation = presentation }
             }
         }
     }

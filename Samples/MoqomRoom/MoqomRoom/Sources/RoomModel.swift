@@ -102,8 +102,31 @@ final class RoomModel {
     /// when the latency figures are unavailable.
     let cadence = CadenceMeter()
 
+    /// How evenly the publisher's own timestamps are spaced, which is the timeline the
+    /// picture is presented against.
+    let timeline = TimelineMeter()
+
     /// The same, on the frames this device is capturing, so the two can be compared.
     let captureCadence = CadenceMeter()
+
+    /// Encode one flat layer rather than two temporal ones. See ``LaunchOptions/flatLayers``.
+    var flatLayers = false
+
+    /// How often to sample the SDK's statistics.
+    private let statisticsInterval: Duration
+
+    /// How long remote tiles hold frames before showing them, or nil to show them on arrival.
+    ///
+    /// See ``VideoRenderer/playoutDelay``. Eighty milliseconds by default because that is about
+    /// the 95th percentile arrival gap measured on a good link, and absorbing the spread is the
+    /// whole purpose — a larger figure buys nothing but latency.
+    var playoutDelay: Duration? = .milliseconds(80)
+
+    /// What the remote tile did with the frames it was handed. See ``VideoRenderer/drawing``.
+    var drawing = VideoRenderer.Drawing()
+
+    /// What the display layer did with the frames, sampled from the renderer.
+    var presentation: VideoRenderer.Presentation?
 
     private var captureCadenceTask: Task<Void, Never>?
 
@@ -253,6 +276,7 @@ final class RoomModel {
     private let room: RoomSession
     private var pump: Task<Void, Never>?
     private var sampler: Task<Void, Never>?
+    private var connection: Task<Void, Never>?
     private var capture: PatternSource?
     private var camera: CameraSource?
 
@@ -275,10 +299,16 @@ final class RoomModel {
     private var players: [ParticipantIdentity: AudioPlayer] = [:]
     private var playback: [ParticipantIdentity: Task<Void, Never>] = [:]
 
-    init(session: MoqomSession, room: RoomSession, identity: ParticipantIdentity) {
+    init(
+        session: MoqomSession,
+        room: RoomSession,
+        identity: ParticipantIdentity,
+        statisticsInterval: Duration = .milliseconds(250)
+    ) {
         self.session = session
         self.room = room
         self.identity = identity
+        self.statisticsInterval = statisticsInterval
         layout.bind(to: room)
         #if os(iOS)
             pictureInPicture = MoqomPictureInPicture(room: room, layout: layout)
@@ -311,11 +341,18 @@ final class RoomModel {
 
         // Four times a second, which is faster than a person reads a number and
         // slow enough to be free. The stream ends itself when the room does.
+        //
+        // Adjustable because "slow enough to be free" is a claim, and a viewer describing a
+        // stutter every quarter of a second is describing this interval. Turning it down is how
+        // that gets confirmed or ruled out rather than argued about.
+        let period = statisticsInterval
         sampler = Task { [weak self, room] in
-            for await snapshot in await room.statistics(every: .milliseconds(250)) {
+            for await snapshot in await room.statistics(every: period) {
                 self?.observe(snapshot)
             }
         }
+        watchConnection()
+
         Task {
             await applyMode()
             await room.setPictureInPictureCast(cast.cast)
@@ -325,6 +362,22 @@ final class RoomModel {
 
     private func observe(_ snapshot: RoomStatistics) {
         statistics = snapshot
+    }
+
+    /// What the transport is doing, printed as it changes.
+    ///
+    /// A dropped connection is invisible in the per-second metrics: they keep
+    /// reporting, on a stream that stopped, and the numbers describe a link that
+    /// no longer exists. Half an hour was spent reading those numbers before the
+    /// relay's own log said the connection had been torn down and rebuilt — so
+    /// the client says it too, in the same log as everything else.
+    private func watchConnection() {
+        connection = Task { [weak self, session] in
+            for await state in session.states {
+                guard self != nil else { return }
+                print("SESSION \(state.description)")
+            }
+        }
     }
 
     private func apply(_ event: RoomEvent) async {
@@ -351,6 +404,14 @@ final class RoomModel {
             await refresh()
         case .audiencesChanged(let updated):
             audiences = updated
+        case .broadcastInterrupted:
+            // Said in the interface rather than only in a log. Everything on screen still
+            // looks live — the preview is running, the timer is counting — and nobody is
+            // receiving any of it.
+            lastError = MoqomError.invalidState(
+                expected: "a broadcast on a live session",
+                actual: "a publication that could not be reopened after reconnecting"
+            )
         case .qualityChanged(let who, let quality):
             // Applied straight rather than through `refresh()`: the indicator is
             // the only thing that changed, and rebuilding the roster to draw one
@@ -527,8 +588,10 @@ final class RoomModel {
         // sample runs in a simulator with nothing attached — and unlike an
         // empty relay, it produces pixels that actually encode. `SceneCapture`
         // is the third option a real build reaches for.
-        let size = PixelSize(width: 1280, height: 720)
-        let format = CaptureFormat(size: size, frameRate: 30)
+        // Capture what the rung says it publishes. A capture format chosen independently of the
+        // ladder is how a run claims sixty frames while the camera hands over thirty.
+        let size = pinnedRung?.size ?? PixelSize(width: 1280, height: 720)
+        let format = CaptureFormat(size: size, frameRate: pinnedRung?.frameRate ?? 30)
 
         let source: any FrameSource
         switch videoInput {
@@ -545,7 +608,14 @@ final class RoomModel {
                 guard await Self.cameraIsAuthorised() else {
                     throw MoqomError.platform(api: "AVCaptureDevice.requestAccess", status: -1)
                 }
-                let device = try CameraSource(format: format, position: cameraPosition)
+                let device = try CameraSource(
+                    format: format,
+                    position: cameraPosition,
+                    logger: MoqomLogger(
+                        sink: SystemLogSink(subsystem: "cloud.moqom.sample", privacy: .hashed),
+                        minimum: .debug
+                    )
+                )
                 device.start()
                 camera = device
                 source = device
@@ -570,9 +640,17 @@ final class RoomModel {
             let ladder = pinnedRung.map { LayerLadder(rungs: [$0]) }
                 ?? .defaultCamera(topSize: size)
             let published = trustedStamp.map { TimedSource(source, stamp: $0) } ?? source
+            var encoders: EncoderFactory = defaultEncoderFactory
+            if flatLayers {
+                encoders = { configuration in
+                    var flat = configuration
+                    flat.usesTemporalLayers = false
+                    return try await defaultEncoderFactory(flat)
+                }
+            }
             let publication = try await room.startBroadcast(
                 from: published,
-                configuration: BroadcastConfiguration(ladder: ladder)
+                configuration: BroadcastConfiguration(ladder: ladder, encoderFactory: encoders)
             )
             await publication.start()
             broadcast = publication
@@ -863,6 +941,8 @@ final class RoomModel {
         pump = nil
         sampler?.cancel()
         sampler = nil
+        connection?.cancel()
+        connection = nil
         #if os(iOS)
             pictureInPicture?.stop()
             endLiveActivity()

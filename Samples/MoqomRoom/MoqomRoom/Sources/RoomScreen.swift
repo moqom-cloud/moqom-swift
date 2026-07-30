@@ -690,6 +690,18 @@ struct CadenceReadout: View {
                 if reading.freezes > 0 {
                     Text(String(format: "· %d stalls %.0f%%", reading.freezes, reading.frozen * 100))
                         .foregroundStyle(.orange)
+
+                    // How often, and whether a keyframe closed them. On screen rather than only
+                    // in a log, because this is the readout somebody photographs when they say
+                    // it looks choppy, and "every 2.0s, all on keyframes" is a different bug
+                    // report from the same stall count scattered across ordinary frames.
+                    Text(String(
+                        format: "· every %.1fs key %d/%d",
+                        reading.period,
+                        reading.onKeyFrame,
+                        reading.freezes
+                    ))
+                    .foregroundStyle(.orange)
                 }
             } else {
                 Text("no frames yet")

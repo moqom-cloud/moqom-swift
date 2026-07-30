@@ -322,6 +322,85 @@ struct RoomReconnectionTests {
         await host.close()
     }
 
+    @Test("a rung whose writer will not reopen is retried until it does")
+    func aRefusedReopenIsRetried() async throws {
+        // Found on two phones after thirty-seven minutes. A reconnect happened, reopening the
+        // one rung failed, and the publication was left with no writer for the rest of the
+        // call: the camera ran at a perfect thirty frames a second, the encoder compressed
+        // every frame, and each one was discarded on the way to the wire. Nothing was logged
+        // and nothing was counted — submitted climbed, encoded froze, dropped stayed at zero.
+        //
+        // What makes it worth a test is that the happy path already had one. Rebinding works
+        // when opening the track works, and the failure only appears when it does not.
+        let relay = LoopbackRelay()
+        let host = try await session("alice", relay: relay)
+        let hostRoom = try await host.join(room: "room-42")
+        let source = FrameRelay(format: CaptureFormat(size: rung.size, frameRate: 30), depth: 16)
+        _ = try await hostRoom.startBroadcast(
+            from: source,
+            configuration: BroadcastConfiguration(
+                ladder: LayerLadder(rungs: [rung]),
+                encoderFactory: { SyntheticEncoder(configuration: $0) }
+            )
+        )
+
+        source.submit(
+            VideoFrame(
+                timestamp: FrameTimestamp(nanoseconds: 0),
+                size: rung.size,
+                surface: .synthetic(byteCount: 512),
+                forcesKeyFrame: true
+            )
+        )
+        #expect(
+            await eventually { !(await relay.objects(onTrackNamed: "video/360p")).isEmpty }
+        )
+        let before = await relay.objects(onTrackNamed: "video/360p").count
+
+        // The catalog track is opened on the way back too, so refuse enough attempts to be
+        // sure the media track is among them.
+        await relay.refusePublishes(3)
+        await relay.drop(identity("alice"))
+        #expect(
+            await eventually { await relay.log.count { $0 == .connected(identity("alice")) } == 2 }
+        )
+
+        // Frames the whole time, as a camera would. Before the fix every one of these was
+        // counted as submitted and then silently discarded.
+        for index in 1 ..< 40 {
+            source.submit(
+                VideoFrame(
+                    timestamp: FrameTimestamp(nanoseconds: UInt64(index) * 33_000_000),
+                    size: rung.size,
+                    surface: .synthetic(byteCount: 512),
+                    forcesKeyFrame: false
+                )
+            )
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+
+        // Asserted on the track being opened a second time rather than on objects arriving,
+        // and the distinction is not pedantry: a loopback writer holds the relay directly and
+        // keeps delivering after its session is dropped, so objects continue to arrive here
+        // whether or not the publisher ever reopened anything. That is also why this bug
+        // survived a suite that already tested reconnecting publishers — the double cannot
+        // express a dead stream, so the only observable difference is the reopen itself.
+        #expect(
+            await eventually(timeout: .seconds(10)) {
+                await relay.log.count {
+                    guard case let .published(track) = $0 else { return false }
+                    return track.name.value == "video/360p"
+                } == 2
+            },
+            "a refused reopen should be retried, not skipped for the rest of the call"
+        )
+
+        // And nothing was quietly discarded on the way.
+        #expect(await relay.objects(onTrackNamed: "video/360p").count > before)
+
+        await host.close()
+    }
+
     @Test("a reconnected publisher re-announces and republishes its catalog")
     func announcementAndCatalogComeBack() async throws {
         // Both were held by the dead session: the announcement was a stream, and

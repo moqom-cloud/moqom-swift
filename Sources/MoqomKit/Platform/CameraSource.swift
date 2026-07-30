@@ -49,6 +49,7 @@ import MoqomCore
     /// > which has no camera and no authorisation prompt to answer.
     public final class CameraSource: NSObject, FrameSource, @unchecked Sendable {
         public let captureFormat: CaptureFormat
+        private let logger: MoqomLogger
 
         private let box = CaptureSessionBox()
         private let output = AVCaptureVideoDataOutput()
@@ -112,10 +113,18 @@ import MoqomCore
             }
         }
 
-        public init(format: CaptureFormat, position: CameraPosition = .front) throws {
+        /// - Parameter logger: Where a capture format that cannot be honoured is reported.
+        ///   Worth passing: a device that will not give the requested frame rate keeps
+        ///   delivering at its own, and the difference is invisible until somebody counts.
+        public init(
+            format: CaptureFormat,
+            position: CameraPosition = .front,
+            logger: MoqomLogger = .silent
+        ) throws {
             captureFormat = format
             relay = FrameRelay(format: format)
             current = position
+            self.logger = logger
 
             guard let device = Self.device(for: position) else {
                 throw MoqomError.platform(api: "AVCaptureDevice.default", status: -1)
@@ -147,6 +156,79 @@ import MoqomCore
             session.addOutput(output)
             applyMirroring()
             applyRotation()
+            Self.adopt(format, on: device, logger: logger)
+        }
+
+        /// Ask the device for the size and frame rate that were requested.
+        ///
+        /// Without this the ``CaptureFormat`` handed in is documentation: the session runs at
+        /// whatever the device's default active format provides, which is thirty frames a
+        /// second on every iPhone. Asking for sixty produced thirty, and nothing said so —
+        /// the encoder was told to expect sixty, the catalog advertised sixty, and the
+        /// publisher's own counters showed a steady thirty that looked like a hardware limit
+        /// rather than a request nobody made.
+        ///
+        /// Chosen by preferring an exact size match at the requested rate, then the smallest
+        /// format that is at least as large. A format list is not sorted and not uniform
+        /// across devices, so picking the first plausible entry gets a 4K format for a 720p
+        /// request on some phones and burns the power budget on pixels that are about to be
+        /// scaled away.
+        private static func adopt(
+            _ format: CaptureFormat,
+            on device: AVCaptureDevice,
+            logger: MoqomLogger
+        ) {
+            let wanted = format.size
+            let rate = max(1, format.frameRate)
+
+            let candidates = device.formats.filter { candidate in
+                let dimensions = CMVideoFormatDescriptionGetDimensions(
+                    candidate.formatDescription
+                )
+                guard dimensions.width >= Int32(wanted.width),
+                      dimensions.height >= Int32(wanted.height)
+                else { return false }
+                return candidate.videoSupportedFrameRateRanges.contains { range in
+                    range.maxFrameRate + 0.01 >= rate && range.minFrameRate - 0.01 <= rate
+                }
+            }
+
+            // The smallest that will do, measured in pixels, so a 720p60 request does not
+            // land on a 4K60 sensor mode.
+            let best = candidates.min { left, right in
+                let a = CMVideoFormatDescriptionGetDimensions(left.formatDescription)
+                let b = CMVideoFormatDescriptionGetDimensions(right.formatDescription)
+                return Int(a.width) * Int(a.height) < Int(b.width) * Int(b.height)
+            }
+
+            guard let best else {
+                logger.warning(.media, "no capture format offers what was asked for", [
+                    LogField("width", .number(wanted.width)),
+                    LogField("height", .number(wanted.height)),
+                    LogField("frameRate", .number(Int(rate))),
+                ])
+                return
+            }
+
+            do {
+                try device.lockForConfiguration()
+            } catch {
+                logger.warning(.media, "could not configure the camera", [
+                    LogField("error", .text(String(describing: error))),
+                ])
+                return
+            }
+            defer { device.unlockForConfiguration() }
+
+            device.activeFormat = best
+
+            // Both bounds, because only setting the minimum duration leaves the device free
+            // to drop to its lowest supported rate in dim light — which is the correct
+            // photographic answer and the wrong one for a call, where a frame rate that
+            // halves when someone turns a lamp off reads as a network fault.
+            let duration = CMTime(value: 1, timescale: CMTimeScale(rate.rounded()))
+            device.activeVideoMinFrameDuration = duration
+            device.activeVideoMaxFrameDuration = duration
         }
 
         /// Open the device and begin delivering frames.
@@ -195,6 +277,11 @@ import MoqomCore
             } catch {
                 throw MoqomError.platform(api: "AVCaptureDeviceInput.init", status: -1)
             }
+
+            // The new device has its own default active format, so the request has to be made
+            // again. Otherwise flipping to the back camera mid-call silently halves the frame
+            // rate of everything after it.
+            Self.adopt(captureFormat, on: device, logger: logger)
 
             let swap = InputBox(previous: lock.withLock { input }, replacement: replacement)
             lock.withLock {
