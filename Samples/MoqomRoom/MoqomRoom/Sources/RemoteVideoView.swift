@@ -63,10 +63,21 @@ final class VideoTile {
     // tiles are at different resolutions.
     let renderer = VideoRenderer()
 
+    /// How many tiles exist right now, across the whole app.
+    ///
+    /// A census rather than a counter of anything meaningful, kept because the failure it
+    /// detects is invisible from inside any one tile: SwiftUI rebuilding a tile leaves two of
+    /// these alive for the same participant, and one stream cannot feed both. Whichever pump
+    /// wins reports perfect health, and the layer a person is looking at belongs to the other.
+    /// One per remote participant plus one for the self view is the whole expected population.
+    private(set) static var live = 0
+
     private var pump: Task<Void, Never>?
 
     /// This tile's own tap on the capture path, held so it can be stopped.
     private var preview: MediaTap<VideoFrame>?
+
+    init() { Self.live += 1 }
 
     /// Draw what this device is capturing.
     ///
@@ -192,6 +203,7 @@ final class VideoTile {
                 room.playoutSlack = renderer.playoutSlack
                 room.tileIsOnScreen = renderer.isOnScreen
                 room.tileSize = renderer.drawnSize
+                room.tileCount = VideoTile.live
             }
 
             // Twice a second rather than per frame: this crosses into the display pipeline and
@@ -232,6 +244,7 @@ final class VideoTile {
     deinit {
         pump?.cancel()
         preview?.stop()
+        MainActor.assumeIsolated { Self.live -= 1 }
     }
 }
 
@@ -305,7 +318,17 @@ final class VideoTile {
             // grid pass that happened to run meanwhile would otherwise resize
             // the layer out from under the window.
             guard renderer.layer.superlayer === layer else { return }
-            renderer.layer.frame = bounds
+
+            // Bounds and position rather than `frame`, because the mirrored preview carries a
+            // scale of minus one and a layer's frame is documented as meaningless when its
+            // transform is not the identity — Core Animation derives the frame from these two
+            // and the transform, so assigning it back is a round trip through a value that no
+            // longer describes anything.
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            renderer.layer.bounds = CGRect(origin: .zero, size: bounds.size)
+            renderer.layer.position = CGPoint(x: bounds.midX, y: bounds.midY)
+            CATransaction.commit()
         }
     }
 #elseif os(macOS)
@@ -360,8 +383,12 @@ final class VideoTile {
 
         override func layout() {
             super.layout()
-            guard renderer.layer.superlayer === layer else { return }
-            renderer.layer.frame = bounds
+            guard renderer.layer.superlayer === layer, let host = layer else { return }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            renderer.layer.bounds = CGRect(origin: .zero, size: host.bounds.size)
+            renderer.layer.position = CGPoint(x: host.bounds.midX, y: host.bounds.midY)
+            CATransaction.commit()
         }
     }
 #endif

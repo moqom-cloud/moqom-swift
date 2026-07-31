@@ -16,6 +16,7 @@ import MoqomCore
 #if canImport(AVFoundation) && (os(iOS) || os(macOS))
     import AVFoundation
     import CoreVideo
+    import VideoToolbox
 
     #if os(iOS)
         import CoreMotion
@@ -59,6 +60,20 @@ import MoqomCore
         private let output = AVCaptureVideoDataOutput()
         private let queue = DispatchQueue(label: "moqom.camera", qos: .userInteractive)
         private let relay: FrameRelay
+
+        /// The fallback rotation, its pool, and the shape it was built for. Only ever touched
+        /// from the capture queue, which is where frames are delivered. See ``upright(_:)``.
+        private var rotation90: VTPixelRotationSession?
+        private var rotationPool: CVPixelBufferPool?
+        private var rotationSource: PixelSize?
+        private var rotationMirrors = false
+
+        /// Whether the last frame was turned here rather than by the connection.
+        ///
+        /// Reported because the two paths are indistinguishable downstream and were not
+        /// equivalent: they turned opposite ways, and the only evidence was one of two phones
+        /// being upside down. Written on the capture queue, read for diagnostics.
+        public private(set) var softwareTurns = false
 
         /// Guards ``position`` and ``publishesMirrored``, which are read from
         /// whatever thread the interface runs on and written from there too,
@@ -110,6 +125,12 @@ import MoqomCore
 
         /// Whether the device is currently being moved about, by either measure below.
         public var isMoving: Bool { lock.withLock { moving } }
+
+        /// The turn the capture connection is actually applying, which is not always the one
+        /// that was asked for. See ``applyRotation``.
+        public var appliedRotationDegrees: Double {
+            output.connection(with: .video).map { Double($0.videoRotationAngle) } ?? 0
+        }
 
         #if os(iOS)
             /// Whether the person holding the device is walking, running, or riding something.
@@ -187,13 +208,25 @@ import MoqomCore
                 throw MoqomError.platform(api: "AVCaptureDevice.default", status: -1)
             }
             input = try AVCaptureDeviceInput(device: device)
+
+            // A portrait format is a request for a quarter turn, because no camera has a
+            // portrait sensor mode. Every format a device offers is landscape, and a phone
+            // held upright is a landscape sensor with the picture on its side — which is why
+            // asking for 720×1280 without this found no format at all on the way up the list
+            // and then settled on a 4K one, whose height is the first that clears 1280.
+            //
+            // Inferred rather than asked for. A caller that wants portrait frames has said so
+            // by the shape of the format, and a second parameter agreeing with it would only
+            // be a way to disagree.
+            rotation = format.size.height > format.size.width ? 90 : 0
+
             super.init()
 
             let session = box.session
             session.beginConfiguration()
-            defer { session.commitConfiguration() }
 
             guard session.canAddInput(input), session.canAddOutput(output) else {
+                session.commitConfiguration()
                 throw MoqomError.platform(api: "AVCaptureSession.canAdd", status: -1)
             }
             session.addInput(input)
@@ -211,10 +244,23 @@ import MoqomCore
             output.alwaysDiscardsLateVideoFrames = true
             output.setSampleBufferDelegate(self, queue: queue)
             session.addOutput(output)
+
+            // The format before the connection, and the connection after the commit. Both
+            // orderings are load-bearing and neither is obvious.
+            //
+            // A connection answers `isVideoRotationAngleSupported` against the format that is
+            // active *now*, and inside a configuration block that is still the device's
+            // default — so asking there gets an answer about a format that is about to be
+            // replaced. It is also why this failed on one phone and not the other despite
+            // identical code: the two ship different default formats, one of which happened
+            // to allow the turn. The failure is silent and total. The encoder is built from
+            // the rung, so it is expecting portrait, and landscape frames arrive into it.
+            Self.adopt(format, on: device, logger: logger)
+            session.commitConfiguration()
+
             applyMirroring()
             applyRotation()
             applyStabilisation()
-            Self.adopt(format, on: device, logger: logger)
         }
 
         /// Ask the device for the size and frame rate that were requested.
@@ -236,8 +282,34 @@ import MoqomCore
             on device: AVCaptureDevice,
             logger: MoqomLogger
         ) {
-            let wanted = format.size
+            // Compared against the sensor's own orientation, which is always landscape. The
+            // frames are turned afterwards, at the connection, so a portrait request of
+            // 720×1280 is a 1280×720 sensor mode and not the 4K one that is the smallest
+            // format literally 1280 pixels tall.
+            let asked = format.size
+            let wanted = asked.height > asked.width
+                ? PixelSize(width: asked.height, height: asked.width)
+                : asked
             let rate = max(1, format.frameRate)
+
+            #if os(iOS)
+                // Before the formats are read, because switching it changes which formats
+                // exist: with Center Stage on, a device offers only the formats that support
+                // it, and the choice below is made from that shortened list.
+                //
+                // Off for a call. It crops into a wide sensor and pans the crop to follow
+                // whoever it finds, which is a decision about framing that belongs to the
+                // person holding the phone, and it re-frames on its own schedule — a slow
+                // drift across the scene that an encoder pays for as full-frame motion. On
+                // the phone whose front camera is the square Center Stage sensor it also
+                // took over the shape of the output entirely: the connection was asked for a
+                // quarter turn, reported that it had taken it, and delivered landscape
+                // frames anyway, because the framing happens after the rotation.
+                if AVCaptureDevice.isCenterStageEnabled {
+                    AVCaptureDevice.centerStageControlMode = .app
+                    AVCaptureDevice.isCenterStageEnabled = false
+                }
+            #endif
 
             let candidates = device.formats.filter { candidate in
                 let dimensions = CMVideoFormatDescriptionGetDimensions(
@@ -341,9 +413,14 @@ import MoqomCore
         /// The SDK does not prompt: the prompt belongs where the app can
         /// explain itself, not at the moment a broadcast starts.
         public func start() {
-            queue.async { [box] in
+            queue.async { [weak self, box] in
                 guard !box.session.isRunning else { return }
                 box.session.startRunning()
+
+                // Again, once frames are actually flowing. A connection's properties are
+                // reset by anything that rebuilds it, and a running session is the only
+                // state in which the answer to "will you turn this?" is the final one.
+                self?.applyRotation()
             }
             #if os(iOS)
                 if stabilisation == .whenMoving { watchMotion() }
@@ -503,8 +580,18 @@ import MoqomCore
         private func applyRotation() {
             guard let connection = output.connection(with: .video) else { return }
             let wanted = lock.withLock { rotation }
-            guard wanted != 0 else { return }
-            guard connection.isVideoRotationAngleSupported(wanted) else { return }
+            guard connection.videoRotationAngle != wanted else { return }
+            guard connection.isVideoRotationAngleSupported(wanted) else {
+                // Said out loud because of what it costs silently. Everything downstream was
+                // sized from ``captureFormat``: the encoder is configured for portrait, the
+                // catalog advertises it, and the frames arriving are landscape — which is not
+                // a failure anything checks, it is a picture that is stretched and on its
+                // side at the far end while every counter reads normal.
+                logger.warning(.media, "the capture connection will not rotate", [
+                    LogField("degrees", .number(Int(wanted))),
+                ])
+                return
+            }
             connection.videoRotationAngle = wanted
         }
 
@@ -694,8 +781,11 @@ import MoqomCore
             didOutput sampleBuffer: CMSampleBuffer,
             from _: AVCaptureConnection
         ) {
-            guard let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+            guard let captured = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
             let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+            let turned = upright(captured)
+            let buffer = turned ?? captured
+            softwareTurns = turned != nil
 
             relay.submit(
                 VideoFrame(
@@ -707,6 +797,108 @@ import MoqomCore
                     surface: .pixelBuffer(buffer)
                 )
             )
+        }
+
+        /// Turn a frame the capture connection did not, or `nil` when none is needed.
+        ///
+        /// A fallback that should never run, kept because the alternative to it is what
+        /// actually happened: one of two phones on the same build set `videoRotationAngle`
+        /// to ninety, reported ninety back, and went on delivering landscape frames. The
+        /// property is a request, its getter echoes the request rather than the outcome, and
+        /// there is no third thing to ask. So the shape of the buffer is the only honest
+        /// answer, and it is checked on every frame — cheaply, because the check is two
+        /// integer reads and the work only happens when they disagree with the promise.
+        ///
+        /// `VTPixelRotationSession` rather than anything of ours: it is hardware, it keeps
+        /// the frame in the same surface type the encoder wants, and a rotation on the CPU
+        /// at sixty frames a second is not affordable on the phone that needs this.
+        private func upright(_ buffer: CVPixelBuffer) -> CVPixelBuffer? {
+            let wanted = captureFormat.size
+            let width = CVPixelBufferGetWidth(buffer)
+            let height = CVPixelBufferGetHeight(buffer)
+            guard (wanted.height > wanted.width) != (height > width) else { return nil }
+
+            guard let session = rotator(from: buffer) else { return nil }
+            var turned: CVPixelBuffer?
+            guard let pool = rotationPool,
+                  CVPixelBufferPoolCreatePixelBuffer(nil, pool, &turned) == kCVReturnSuccess,
+                  let turned
+            else { return nil }
+
+            guard VTPixelRotationSessionRotateImage(session, buffer, turned) == noErr else {
+                return nil
+            }
+            return turned
+        }
+
+        /// The rotation session and its pool, built once for a given source shape.
+        private func rotator(from buffer: CVPixelBuffer) -> VTPixelRotationSession? {
+            let width = CVPixelBufferGetWidth(buffer)
+            let height = CVPixelBufferGetHeight(buffer)
+            let mirrors = lock.withLock { mirrored }
+            if let existing = rotation90,
+               rotationSource == PixelSize(width: width, height: height),
+               rotationMirrors == mirrors
+            {
+                return existing
+            }
+
+            var created: VTPixelRotationSession?
+            guard VTPixelRotationSessionCreate(nil, &created) == noErr, let created else {
+                return nil
+            }
+
+            // Which way to turn depends on whether the connection has already mirrored, and
+            // that is geometry rather than a preference.
+            //
+            // Anticlockwise is the plain case, because that is what `videoRotationAngle`
+            // means — the angle is measured anticlockwise from the sensor's landscape, so a
+            // connection told `90` turns the opposite way from `kVTRotation_CW90`. The two
+            // read identically in code and differ by half a turn on screen, which is what one
+            // phone showed while the other, rotated by its connection, was right way up.
+            //
+            // Mirroring changes the answer. The connection mirrors in the sensor's frame,
+            // about an axis that any quarter turn carries onto the *other* axis: a horizontal
+            // flip of a landscape frame becomes a vertical flip of the portrait one, and a
+            // vertically flipped face reads as upside down rather than as a mirror. Turning
+            // the other way is exactly the half turn that converts one into the other, since
+            // a vertical flip followed by a half turn is a horizontal flip. So the mirrored
+            // path turns clockwise and arrives at the same picture the connection produces
+            // when it does both itself.
+            //
+            // The session's own flip properties would be the obvious tool and are not used:
+            // whether they apply before or after the rotation is not documented, and picking
+            // wrong is the same half turn again with nothing in the code to say which it was.
+            VTSessionSetProperty(
+                created,
+                key: kVTPixelRotationPropertyKey_Rotation,
+                value: mirrors ? kVTRotation_CW90 : kVTRotation_CCW90
+            )
+
+            let attributes: [CFString: Any] = [
+                kCVPixelBufferPixelFormatTypeKey: CVPixelBufferGetPixelFormatType(buffer),
+                kCVPixelBufferWidthKey: height,
+                kCVPixelBufferHeightKey: width,
+                kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+            ]
+            var pool: CVPixelBufferPool?
+            guard CVPixelBufferPoolCreate(
+                nil,
+                nil,
+                attributes as CFDictionary,
+                &pool
+            ) == kCVReturnSuccess else { return nil }
+
+            logger.warning(.media, "rotating frames in software; the camera would not", [
+                LogField("width", .number(width)),
+                LogField("height", .number(height)),
+            ])
+
+            rotation90 = created
+            rotationPool = pool
+            rotationSource = PixelSize(width: width, height: height)
+            rotationMirrors = mirrors
+            return created
         }
     }
     /// Carries the capture session onto the capture queue.

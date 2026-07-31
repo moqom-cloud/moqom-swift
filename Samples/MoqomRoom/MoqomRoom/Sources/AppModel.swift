@@ -145,7 +145,9 @@ final class AppModel {
             }
 
             print(
-                "LIVE rung=video/720p codec=hevc source=\(room.videoInput.rawValue)"
+                "LIVE rung=video/720p"
+                    + (room.pinnedRung.map { " \($0.size.width)x\($0.size.height)" } ?? "")
+                    + " codec=hevc source=\(room.videoInput.rawValue)"
                     + " fps=\(Int(launch.frameRate ?? 30))"
                     + " playout=\(launch.playoutMilliseconds.map { "\($0)ms fixed" } ?? "adaptive")"
                     + " layers=\(launch.flatLayers ? "flat" : "temporal")"
@@ -238,7 +240,10 @@ final class AppModel {
 
         room.pinnedRung = VideoLayer(
             id: "video/720p",
-            size: PixelSize(width: 1280, height: 720),
+            // Upright, which is how the phone is held and therefore the only shape whose
+            // pixels are all picture. The same rung landscape spends a third of its budget
+            // on the ceiling and the desk either side of whoever is talking.
+            size: RoomModel.defaultCaptureSize,
             frameRate: fps,
             // One temporal layer for the same reason as one spatial rung: hierarchical
             // P-frames are nearly free to produce, but they let a receiver drop the top
@@ -341,10 +346,11 @@ final class AppModel {
                         // cannot answer: a layer that is detached or laid out at nothing accepts
                         // frames, presents them, and shows a person nothing at all.
                         + String(
-                            format: " on-screen=%@ tile=%.0fx%.0f",
+                            format: " on-screen=%@ tile=%.0fx%.0f tiles=%d",
                             room.tileIsOnScreen ? "yes" : "no",
                             room.tileSize.width,
-                            room.tileSize.height
+                            room.tileSize.height,
+                            room.tileCount
                         )
                 )
                 // The display pipeline's own account, which is the only one that can say a frame
@@ -366,6 +372,14 @@ final class AppModel {
                         // What is in those frames, not just how many. Near zero is a black
                         // picture, which every other line here reports as a healthy stream.
                         + (room.captureBrightness.map { String(format: " luma=%.3f", $0) } ?? "")
+                        // And what shape they are, which is the only place a capture
+                        // connection that would not rotate becomes visible.
+                        + (room.captureSize.map { " size=\($0.width)x\($0.height)" } ?? "")
+                        + (room.cameraTurn.map { String(format: " turn=%.0f", $0) } ?? "")
+                        // Which of the two turns it is. They are meant to be the same picture
+                        // and were half a turn apart, so a run where the phones disagree about
+                        // which way up they are is a run where this line disagrees too.
+                        + (room.cameraTurnsInSoftware ? "(sw)" : "")
                 )
 
                 // Audio's own two ends, which share none of the machinery above. It is paced by

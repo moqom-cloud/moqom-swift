@@ -52,8 +52,9 @@ struct RoomScreen: View {
                 MoqomGalleryView(
                     slots: room.slots,
                     reportingTo: room.layout,
-                    aspect: room.mode.seatAspect,
-                    spacing: 8
+                    aspect: room.seatAspect,
+                    spacing: 8,
+                    columns: room.arrangement.columns
                 ) { slot in
                     switch room.mode {
                     case .gallery:
@@ -80,7 +81,7 @@ struct RoomScreen: View {
             if !room.slots.isEmpty, room.isBroadcasting || room.isPublishingAudio {
                 HStack {
                     Spacer()
-                    SelfView(room: room, height: 84)
+                    SelfView(room: room, height: 132)
                 }
                 .padding(.horizontal)
             }
@@ -111,6 +112,23 @@ struct RoomScreen: View {
                             Text("\(count)").tag(count)
                         }
                     }
+
+                    // Separate from the count above, and the pair is the experiment. How
+                    // many tiles there are and how they are arranged both change how big
+                    // each one is, which is the only input render-aware selection has —
+                    // so this is where a rung is chosen, and the badge on each tile is
+                    // where the choice can be read.
+                    Picker("Grid", selection: $room.arrangement) {
+                        ForEach(RoomModel.Arrangement.allCases) { choice in
+                            Text(choice.rawValue).tag(choice)
+                        }
+                    }
+
+                    // The host's mirror, and the only one there is. It is applied at the
+                    // capture connection, so it is in the pixels everybody receives rather
+                    // than a flip each viewer performs — which is what makes it a decision
+                    // at all instead of a per-client preference nobody agrees on.
+                    Toggle("Mirror my video", isOn: $room.publishesMirrored)
 
                     // Who stays on screen once the app is not. A rule rather
                     // than a list, so it keeps following the room as people
@@ -315,7 +333,7 @@ struct SelfView: View {
     var body: some View {
         if let me = room.participant(room.identity) {
             RemoteVideoView(participant: me, isSelf: true, room: room)
-                .aspectRatio(16 / 9, contentMode: .fit)
+                .aspectRatio(room.seatAspect, contentMode: .fit)
                 .frame(height: height.map { CGFloat($0) })
                 .clipShape(RoundedRectangle(cornerRadius: 10))
                 .overlay {
@@ -350,7 +368,7 @@ struct ParticipantTile: View {
 
     var body: some View {
         RemoteVideoView(participant: participant, isSelf: isSelf, room: room)
-            .aspectRatio(16 / 9, contentMode: .fit)
+            .aspectRatio(room.seatAspect, contentMode: .fit)
             .clipShape(RoundedRectangle(cornerRadius: 12))
             // The video area is black and so is the page, so without an edge a
             // tile that has not received a frame is indistinguishable from no
@@ -362,20 +380,37 @@ struct ParticipantTile: View {
                     .strokeBorder(.quaternary, lineWidth: 1)
             }
             .overlay(alignment: .bottomLeading) {
-                HStack(spacing: 4) {
-                    Text(participant.slot.identity.username.value)
-                        .font(.caption.weight(.semibold))
-                    if participant.mute.effective.contains(.audio) {
-                        Image(systemName: "mic.slash.fill")
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 4) {
+                        Text(participant.slot.identity.username.value)
+                            .font(.caption.weight(.semibold))
+                        if participant.mute.effective.contains(.audio) {
+                            Image(systemName: "mic.slash.fill")
+                        }
+                        if let quality {
+                            Text(quality)
+                                .font(.caption2.weight(.medium))
+                                .foregroundStyle(.secondary)
+                        }
                     }
-                    if let quality {
-                        Text(quality)
-                            .font(.caption2.weight(.medium))
-                            .foregroundStyle(.secondary)
+                    .padding(6)
+                    .background(.thinMaterial, in: Capsule())
+
+                    // What this tile is costing and why. The offer above is the whole
+                    // ladder's best; this is the rung being fetched for a box of this
+                    // size, which is the number that moves when the grid changes.
+                    if let fetching = room.fetching(participant.slot.identity) {
+                        Text(
+                            "\(fetching.rung) for "
+                                + "\(fetching.box.width)×\(fetching.box.height)"
+                        )
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(.thinMaterial, in: Capsule())
                     }
                 }
-                .padding(6)
-                .background(.thinMaterial, in: Capsule())
                 .padding(8)
             }
             .overlay(alignment: .topTrailing) {
@@ -399,12 +434,45 @@ struct ParticipantTile: View {
     }
 }
 
+/// One height and one shape for everything in the control row.
+///
+/// Not cosmetic. The row mixes a prominent button, several bordered ones and two menus, and
+/// each of those sizes itself from its own label — an icon-only menu is shorter than a
+/// button with two words in it, so the row came out as a line of different-sized pills with
+/// their centres wandering. Fixing the height is also what stops the row changing height
+/// when a label does: "Camera off" becoming "Camera on" is one line of text either way, but
+/// "Go live" becoming "Stop" is not.
+private struct ControlCapsule: ViewModifier {
+    /// Whether to drop the words. Everything but the primary action does, because seven
+    /// labelled controls do not fit across a phone and the row wraps or clips rather than
+    /// telling anyone it did not fit.
+    let iconOnly: Bool
+
+    func body(content: Content) -> some View {
+        Group {
+            if iconOnly {
+                content.labelStyle(.iconOnly)
+            } else {
+                content.labelStyle(.titleAndIcon)
+            }
+        }
+        .frame(height: 44)
+        .buttonBorderShape(.capsule)
+    }
+}
+
+private extension View {
+    func controlCapsule(iconOnly: Bool = true) -> some View {
+        modifier(ControlCapsule(iconOnly: iconOnly))
+    }
+}
+
 struct BroadcastControls: View {
     @Bindable var room: RoomModel
 
     var body: some View {
         VStack(spacing: 8) {
-            HStack(spacing: 12) {
+            HStack(spacing: 8) {
                 Button {
                     Task {
                         if room.isBroadcasting {
@@ -424,6 +492,7 @@ struct BroadcastControls: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(room.isBroadcasting ? .red : .accentColor)
+                .controlCapsule(iconOnly: false)
 
                 Button {
                     Task {
@@ -440,6 +509,7 @@ struct BroadcastControls: View {
                     )
                 }
                 .buttonStyle(.bordered)
+                .controlCapsule()
 
                 // Distinct from the button beside it, and the difference is the
                 // point. That one ends the publication: the track closes, the
@@ -457,6 +527,7 @@ struct BroadcastControls: View {
                 .buttonStyle(.bordered)
                 .tint(room.isMicrophoneMuted ? .red : nil)
                 .disabled(!room.isPublishingAudio)
+                .controlCapsule()
 
                 Button {
                     Task { await room.setCameraMuted(!room.isCameraMuted) }
@@ -469,6 +540,7 @@ struct BroadcastControls: View {
                 .buttonStyle(.bordered)
                 .tint(room.isCameraMuted ? .red : nil)
                 .disabled(!room.isBroadcasting)
+                .controlCapsule()
 
                 // Live, unlike the input pickers below. Switching cameras does
                 // not replace the `FrameSource` the publication is bound to, so
@@ -481,6 +553,7 @@ struct BroadcastControls: View {
                 }
                 .buttonStyle(.bordered)
                 .disabled(!room.isBroadcasting || room.videoInput != .camera)
+                .controlCapsule()
 
                 // Fixed while publishing. Swapping the source under a live
                 // publication would mean tearing down the capture the encoder is
@@ -510,10 +583,15 @@ struct BroadcastControls: View {
                 } label: {
                     Label("Input", systemImage: "slider.horizontal.3")
                 }
+                .menuStyle(.button)
                 .buttonStyle(.bordered)
+                .controlCapsule()
 
                 SceneEffectsMenu()
+                    .menuStyle(.button)
+                    .buttonStyle(.bordered)
                     .disabled(!room.isBroadcasting)
+                    .controlCapsule()
             }
 
             if room.isPublishingAudio, room.audioInput == .microphone {

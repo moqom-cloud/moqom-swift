@@ -28,6 +28,12 @@ import MoqomCore
     import CoreMedia
     import VideoToolbox
 
+    #if canImport(UIKit)
+        import UIKit
+    #elseif canImport(AppKit)
+        import AppKit
+    #endif
+
     /// Builds decodable sample buffers from published objects.
     ///
     /// Separated from the layer so the assembly is reachable from the texture
@@ -470,8 +476,22 @@ import MoqomCore
         /// health to a viewer looking at a blank tile. Reported rather than asserted because
         /// there is a legitimate moment for each: a renderer built before its view is attached is
         /// detached for an instant, and one whose tile is off screen has been given no size.
+        /// Walked to the root of the layer tree rather than checking for a parent, because a
+        /// parent is not the question. A tile that SwiftUI has torn down keeps its layer inside
+        /// the discarded view's layer, so `superlayer` stays non-nil for something nobody can
+        /// see — which is exactly the case this was added to catch and exactly the case it
+        /// missed. A layer that is genuinely visible has a window at the top of its tree.
         public var isOnScreen: Bool {
-            layer.superlayer != nil && layer.bounds.width > 1 && layer.bounds.height > 1
+            guard layer.bounds.width > 1, layer.bounds.height > 1 else { return false }
+            var root: CALayer = layer
+            while let parent = root.superlayer { root = parent }
+            #if os(iOS) || os(tvOS) || os(visionOS)
+                return (root.delegate as? UIView)?.window != nil
+            #elseif os(macOS)
+                return (root.delegate as? NSView)?.window != nil
+            #else
+                return layer.superlayer != nil
+            #endif
         }
 
         /// The size the layer is laid out at, for diagnostics.

@@ -158,27 +158,40 @@ public struct LayerLadder: Hashable, Sendable {
 
     /// A conventional camera ladder, as a starting point for callers who have
     /// not measured their own content.
+    ///
+    /// Oriented by `topSize`, and the rung names count the short side either way — a portrait
+    /// top size gives 720×1280 as `video/720p`, the same rung turned upright. A landscape
+    /// ladder under a portrait camera is not a cosmetic mismatch: the encoder is configured
+    /// from the rung, so every frame is squeezed into a shape it was not captured in, and the
+    /// only sign of it is that everyone looks wrong.
     public static func defaultCamera(topSize: PixelSize = PixelSize(width: 1920, height: 1080))
         -> LayerLadder
     {
+        let upright = topSize.height > topSize.width
+        func sized(_ long: Int, _ short: Int) -> PixelSize {
+            upright
+                ? PixelSize(width: short, height: long)
+                : PixelSize(width: long, height: short)
+        }
+
         var rungs: [VideoLayer] = [
             VideoLayer(
                 id: "video/180p",
-                size: PixelSize(width: 320, height: 180),
+                size: sized(320, 180),
                 frameRate: 30,
                 bitrate: 200_000,
                 temporalLayers: 2
             ),
             VideoLayer(
                 id: "video/360p",
-                size: PixelSize(width: 640, height: 360),
+                size: sized(640, 360),
                 frameRate: 30,
                 bitrate: 600_000,
                 temporalLayers: 3
             ),
             VideoLayer(
                 id: "video/720p",
-                size: PixelSize(width: 1280, height: 720),
+                size: sized(1280, 720),
                 frameRate: 30,
                 bitrate: 1_800_000,
                 temporalLayers: 3
@@ -188,7 +201,7 @@ public struct LayerLadder: Hashable, Sendable {
             rungs.append(
                 VideoLayer(
                     id: "video/1080p",
-                    size: PixelSize(width: 1920, height: 1080),
+                    size: sized(1920, 1080),
                     frameRate: 30,
                     bitrate: 4_000_000,
                     temporalLayers: 3

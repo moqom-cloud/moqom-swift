@@ -78,7 +78,14 @@ final class RoomModel {
     /// swapping the ``FrameSource`` the publication is bound to, which is a stop
     /// and a restart; switching between the two *cameras* is the thing that does
     /// not need one, and that is ``flipCamera()``.
-    var videoInput: VideoInput = .pattern
+    /// The camera on a device that has one, and the pattern where there is none. Defaulting
+    /// to the pattern everywhere meant a phone that showed a moving gradient until somebody
+    /// found the picker, which reads as a broken camera rather than as a deliberate default.
+    #if targetEnvironment(simulator)
+        var videoInput: VideoInput = .pattern
+    #else
+        var videoInput: VideoInput = .camera
+    #endif
 
     /// Publish exactly this rung and nothing else, when set.
     ///
@@ -175,6 +182,12 @@ final class RoomModel {
     /// How large that layer is laid out, in points.
     var tileSize: CGSize = .zero
 
+    /// How many video tiles exist anywhere in the app. See ``VideoTile/live``.
+    ///
+    /// More than one per seat plus one for the self view means a tile was rebuilt while its
+    /// predecessor was still alive, and the two are sharing one stream between them.
+    var tileCount = 0
+
     /// What the display layer did with the frames, sampled from the renderer.
     var presentation: VideoRenderer.Presentation?
 
@@ -182,6 +195,13 @@ final class RoomModel {
 
     /// How bright the picture going into the encoder is, `0` to `1`. See ``brightness(of:)``.
     var captureBrightness: Double?
+
+    /// The size of the frames the encoder is being handed.
+    ///
+    /// What was *asked* for is in the rung and is on screen twice already. This is what
+    /// arrived, and the two part company silently: a capture connection that declines to
+    /// rotate leaves the encoder configured for portrait and fed landscape.
+    var captureSize: PixelSize?
 
     enum VideoInput: String, CaseIterable, Identifiable, Sendable {
         case pattern = "Test pattern"
@@ -200,7 +220,35 @@ final class RoomModel {
     /// the person in it, and a back-camera preview that is mirrored feels broken
     /// to everyone. Only what is *published* is a matter of taste, and this
     /// sample publishes the truth.
-    var isPreviewMirrored: Bool { videoInput == .camera && cameraPosition.wantsMirroredPreview }
+    var isPreviewMirrored: Bool {
+        guard videoInput == .camera, cameraPosition.wantsMirroredPreview else { return false }
+        // Not twice. When the capture connection is already mirroring, the buffers reaching
+        // this preview are mirrored, and flipping the layer on top of that would show the
+        // person the one image nobody wants: the true scene in their own preview, while
+        // everybody else sees the mirror.
+        return !publishesMirrored
+    }
+
+    /// Whether this host mirrors the picture it sends, rather than only its own preview.
+    ///
+    /// The host's call, and it travels in the pixels because there is nowhere else for it to
+    /// travel: a viewer is shown what arrives and never flips anything itself. Mirroring at
+    /// the capture connection costs nothing — the pipeline does it before the buffer exists —
+    /// whereas a viewer-side flip would have to be agreed, carried in the catalog, and honoured
+    /// by every client that draws the track, including a recorder that draws it to a file.
+    ///
+    /// Only ever applies to a front camera. A mirrored back camera is nobody's intent.
+    var publishesMirrored = true {
+        didSet {
+            guard publishesMirrored != oldValue else { return }
+            applyMirroring()
+        }
+    }
+
+    /// Push the mirror choice at the camera, for the camera it currently is.
+    private func applyMirroring() {
+        camera?.publishesMirrored = publishesMirrored && cameraPosition.wantsMirroredPreview
+    }
 
     /// Whether this device has muted its own microphone.
     var isMicrophoneMuted: Bool { selfMuted.contains(.audio) }
@@ -293,9 +341,54 @@ final class RoomModel {
         case audioRoom = "Audio room"
 
         var id: String { rawValue }
-
-        var seatAspect: Double { self == .gallery ? 16.0 / 9.0 : 1 }
     }
+
+    /// How many tiles across the gallery draws, or `nil` to let it choose.
+    ///
+    /// Here because the arrangement is what decides how big each tile is, and how big each
+    /// tile is decides which rung the SDK subscribes to. Forcing it is the only way to ask
+    /// "what does a three-across grid actually fetch?" and read the answer off the screen
+    /// rather than reasoning about it.
+    enum Arrangement: String, CaseIterable, Identifiable, Sendable {
+        case automatic = "Automatic"
+        case oneUp = "1 across"
+        case twoUp = "2 across"
+        case threeUp = "3 across"
+        case fourUp = "4 across"
+
+        var id: String { rawValue }
+
+        var columns: Int? {
+            switch self {
+            case .automatic: nil
+            case .oneUp: 1
+            case .twoUp: 2
+            case .threeUp: 3
+            case .fourUp: 4
+            }
+        }
+    }
+
+    var arrangement: Arrangement = .automatic
+
+    /// The shape of a tile: the shape of the video, or a square for a room with none.
+    ///
+    /// Taken from what is being published rather than fixed at `16/9`, because the two have
+    /// to agree. A portrait camera in a landscape tile is not letterboxed, it is a small
+    /// strip of picture between two black bars, and the box the SDK is told about is the
+    /// tile's — so it would also ask for a rung sized for a shape nobody is sending.
+    var seatAspect: Double {
+        guard mode == .gallery else { return 1 }
+        let size = pinnedRung?.size ?? Self.defaultCaptureSize
+        return Double(size.width) / Double(size.height)
+    }
+
+    /// What the camera is asked for when no rung has been pinned.
+    ///
+    /// Portrait, because a phone is held upright and the sensor's own landscape frames are
+    /// the thing that needs turning. See ``CameraSource``, which reads the shape of this as
+    /// the instruction to turn them.
+    static let defaultCaptureSize = PixelSize(width: 720, height: 1280)
 
     /// Everything the SDK measures, resampled a few times a second.
     ///
@@ -342,6 +435,15 @@ final class RoomModel {
             return nil
         #endif
     }
+
+    /// The quarter turn the capture connection is applying, if any.
+    ///
+    /// Asked of the connection rather than of what was requested, because those are the two
+    /// things that can differ and the difference is invisible everywhere else.
+    var cameraTurn: Double? { camera?.appliedRotationDegrees }
+
+    /// Whether that turn is being done in software because the connection would not.
+    var cameraTurnsInSoftware: Bool { camera?.softwareTurns ?? false }
 
     /// Whether the camera is being carried rather than merely handled.
     ///
@@ -585,9 +687,23 @@ final class RoomModel {
     /// From their catalog rather than from an assumption, which is the whole
     /// reason the catalog exists: this label is correct for a publisher whose
     /// ladder we have never seen before.
+    /// The short side, not the height, because a portrait rung is 720×1280 and calling that
+    /// 1280p would name a resolution nobody publishes.
     func quality(of who: ParticipantIdentity) -> String? {
         guard let best = catalogs[who]?.videoLadder.highest else { return nil }
-        return "\(best.size.height)p"
+        return "\(min(best.size.width, best.size.height))p"
+    }
+
+    /// The rung actually being fetched for a tile, and the box that chose it.
+    ///
+    /// The pair rather than either alone. The rung on its own cannot be judged — 360p is
+    /// right for a thumbnail and wrong for a full screen — and the box on its own does not
+    /// say what the SDK made of it. Together they are the whole of render-aware selection,
+    /// on screen, changing as the grid changes.
+    func fetching(_ who: ParticipantIdentity) -> (rung: String, box: PixelSize)? {
+        guard let box = layout.lastReported[who]?.pixelSize else { return nil }
+        let rung = statistics?.participants[who]?.layer?.value
+        return (rung.map { $0.replacingOccurrences(of: "video/", with: "") } ?? "—", box)
     }
 
     /// Decodable frames for one participant.
@@ -634,8 +750,11 @@ final class RoomModel {
                 // Once a second at sixty, because it reads pixels off a surface the encoder is
                 // also reading and there is no question here that needs answering faster.
                 guard seen % 60 == 0 else { continue }
-                if let luma = Self.brightness(of: frame) {
-                    await MainActor.run { self.captureBrightness = luma }
+                let luma = Self.brightness(of: frame)
+                let size = frame.size
+                await MainActor.run {
+                    if let luma { self.captureBrightness = luma }
+                    self.captureSize = size
                 }
             }
         }
@@ -708,7 +827,7 @@ final class RoomModel {
         // is the third option a real build reaches for.
         // Capture what the rung says it publishes. A capture format chosen independently of the
         // ladder is how a run claims sixty frames while the camera hands over thirty.
-        let size = pinnedRung?.size ?? PixelSize(width: 1280, height: 720)
+        let size = pinnedRung?.size ?? Self.defaultCaptureSize
         let format = CaptureFormat(size: size, frameRate: pinnedRung?.frameRate ?? 30)
 
         let source: any FrameSource
@@ -737,6 +856,7 @@ final class RoomModel {
                 device.start()
                 camera = device
                 source = device
+                applyMirroring()
             } catch {
                 // Falling back rather than failing the broadcast. A simulator
                 // has no camera and the interesting half of the sample — the
@@ -817,6 +937,10 @@ final class RoomModel {
         do {
             try camera.setPosition(wanted)
             cameraPosition = wanted
+            // The mirror belongs to the front camera, not to the session, so it has to be
+            // re-decided here. A back camera that kept the flip would publish every sign and
+            // T-shirt backwards to everyone but the person holding the phone.
+            applyMirroring()
             await broadcast?.startNewGroup()
         } catch {
             lastError = error as? MoqomError
