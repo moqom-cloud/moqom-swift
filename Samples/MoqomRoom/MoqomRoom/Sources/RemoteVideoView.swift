@@ -114,6 +114,8 @@ final class VideoTile {
             // because it is a latency the user pays; the room model carries it so a benchmark
             // can set it to zero and see both halves of the trade.
             renderer.playoutDelay = await room.playoutDelay
+            renderer.playoutBounds = await room.playoutBounds
+            renderer.playoutTolerance = await room.playoutTolerance
 
             if let codec = await room.codec(of: identity) {
                 renderer.setCodec(codec)
@@ -184,6 +186,8 @@ final class VideoTile {
             await MainActor.run {
                 try? renderer.enqueue(frame)
                 room.drawing = renderer.drawing
+                    room.playoutDepth = renderer.playoutDepth
+                    room.playoutSlack = renderer.playoutSlack
             }
 
             // Twice a second rather than per frame: this crosses into the display pipeline and

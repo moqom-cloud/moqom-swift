@@ -129,7 +129,7 @@ final class AppModel {
             print(
                 "LIVE rung=video/720p codec=hevc source=camera"
                     + " fps=\(Int(launch.frameRate ?? 30))"
-                    + " playout=\(launch.playoutMilliseconds ?? 80)ms"
+                    + " playout=\(launch.playoutMilliseconds.map { "\($0)ms fixed" } ?? "adaptive")"
                     + " layers=\(launch.flatLayers ? "flat" : "temporal")"
             )
         case let .failed(error): print("JOIN FAILED \(error)")
@@ -233,6 +233,30 @@ final class AppModel {
                         + " quality=\(room.quality)"
                 )
 
+                // The number the whole exercise is for, stated rather than left to be assembled
+                // from two lines by whoever reads the log. Sensor to arrival is what the network
+                // and the encoder cost; the buffer is what smoothness cost; the sum is what a
+                // person waiting for a reply actually experiences.
+                if let link = room.latency.reading(), link.frames > 0 {
+                    // The wait charged is the headroom the frames actually have, not the delay
+                    // that was asked for: a frame sits in the schedule until it is due, and how
+                    // long that is depends on where the schedule was anchored as much as on the
+                    // setting. Falling back to the setting only before there is a measurement.
+                    let wait = (room.playoutSlack.map { $0 * 1000 })
+                        ?? (Double(room.playoutDepth.components.seconds) * 1000
+                            + Double(room.playoutDepth.components.attoseconds) / 1e15)
+                    print(
+                        String(
+                            format: "GLASS p50=%.0fms p95=%.0fms (link %.0f/%.0f + wait %.0f)",
+                            link.median + wait,
+                            link.p95 + wait,
+                            link.median,
+                            link.p95,
+                            wait
+                        )
+                    )
+                }
+
                 // Alongside the latency rather than folded into it. A stream can be fast and
                 // uneven or slow and smooth, and the two complaints have different causes.
                 print("PLAY \(room.cadence.report())")
@@ -249,7 +273,8 @@ final class AppModel {
                 print(
                     String(
                         format: "DRAW shown=%d late=%d undescribed=%d failures=%d"
-                            + " backwards=%d reanchors=%d regrids=%d delivered=%.1f%%",
+                            + " backwards=%d reanchors=%d regrids=%d delivered=%.1f%%"
+                            + " buffer=%.0fms",
                         drawn.enqueued,
                         drawn.skippedNotReady,
                         drawn.skippedUndescribed,
@@ -257,7 +282,9 @@ final class AppModel {
                         drawn.outOfOrder,
                         drawn.reanchors,
                         drawn.regrids,
-                        drawn.delivered * 100
+                        drawn.delivered * 100,
+                        Double(room.playoutDepth.components.attoseconds) / 1e15
+                            + Double(room.playoutDepth.components.seconds) * 1000
                     )
                 )
                 // The display pipeline's own account, which is the only one that can say a frame
@@ -412,8 +439,19 @@ final class AppModel {
                     .map { .milliseconds($0) } ?? .milliseconds(250)
             )
             model.flatLayers = launch.flatLayers
+
+            // A figure given on the command line is a figure to be obeyed, so it turns the
+            // adaptation off: the point of passing one is to see what that exact delay does.
             if let playout = launch.playoutMilliseconds {
+                model.playoutBounds = nil
                 model.playoutDelay = playout > 0 ? .milliseconds(playout) : nil
+            }
+            if let tolerance = launch.playoutTolerance {
+                model.playoutTolerance = tolerance
+            }
+            if let floor = launch.playoutFloorMilliseconds, var bounds = model.playoutBounds {
+                bounds.floor = .milliseconds(floor)
+                model.playoutBounds = bounds
             }
             if measure { await prepareMeasurement(in: model) }
             phase = .inRoom(model)

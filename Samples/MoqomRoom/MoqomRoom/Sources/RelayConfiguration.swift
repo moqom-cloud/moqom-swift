@@ -168,6 +168,13 @@ struct LaunchOptions {
     /// between them is what the smooth picture cost.
     var playoutMilliseconds: Int?
 
+    /// The share of frames the adaptive delay may leave unshown. See
+    /// ``VideoRenderer/playoutTolerance``. Ignored when a fixed delay is given.
+    var playoutTolerance: Double?
+
+    /// The smallest delay the adaptive buffer may settle at. See ``VideoRenderer/playoutBounds``.
+    var playoutFloorMilliseconds: Int?
+
     static func current(
         arguments: [String] = ProcessInfo.processInfo.arguments
     ) -> LaunchOptions {
@@ -186,6 +193,8 @@ struct LaunchOptions {
             case "--kbps": options.kilobitsPerSecond = value.flatMap(Int.init)
             case "--stats-ms": options.statisticsMilliseconds = value.flatMap(Int.init)
             case "--playout-ms": options.playoutMilliseconds = value.flatMap(Int.init)
+            case "--tolerance": options.playoutTolerance = value.flatMap(Double.init)
+            case "--floor-ms": options.playoutFloorMilliseconds = value.flatMap(Int.init)
             default: break
             }
             index += 1

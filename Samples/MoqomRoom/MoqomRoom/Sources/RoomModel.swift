@@ -117,10 +117,33 @@ final class RoomModel {
 
     /// How long remote tiles hold frames before showing them, or nil to show them on arrival.
     ///
-    /// See ``VideoRenderer/playoutDelay``. Eighty milliseconds by default because that is about
-    /// the 95th percentile arrival gap measured on a good link, and absorbing the spread is the
-    /// whole purpose — a larger figure buys nothing but latency.
+    /// See ``VideoRenderer/playoutDelay``. Ignored while ``playoutBounds`` is set, which is the
+    /// default: a figure chosen here would be chosen for one link on one afternoon.
     var playoutDelay: Duration? = .milliseconds(80)
+
+    /// Bounds the playout delay sizes itself within. See ``VideoRenderer/playoutBounds``.
+    ///
+    /// Adaptive by default, and from a floor of ten milliseconds, because measuring it settled the
+    /// question this used to guess at: on a relayed 60fps link, ten milliseconds of buffer showed
+    /// no visible unevenness and lost two frames in two thousand, while the same link's arrival
+    /// tail reached 140ms often enough to wreck a fixed setting anywhere near the floor. The
+    /// ceiling is generous because it is only reached while the link is misbehaving, and a quarter
+    /// second of delay is much better than the alternative during that.
+    var playoutBounds: (floor: Duration, ceiling: Duration)? = (
+        floor: .milliseconds(10),
+        ceiling: .milliseconds(250)
+    )
+
+    /// The delay currently in force on a remote tile, for display. See
+    /// ``VideoRenderer/playoutDepth``.
+    var playoutDepth: Duration = .zero
+
+    /// How many frames the adaptive delay may leave unshown. See
+    /// ``VideoRenderer/playoutTolerance``.
+    var playoutTolerance = 0.01
+
+    /// Seconds of headroom the arriving frames actually have. See ``VideoRenderer/playoutSlack``.
+    var playoutSlack: Double?
 
     /// What the remote tile did with the frames it was handed. See ``VideoRenderer/drawing``.
     var drawing = VideoRenderer.Drawing()

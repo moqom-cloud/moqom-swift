@@ -279,13 +279,83 @@ import MoqomCore
         public var playoutDelay: Duration? {
             didSet {
                 guard playoutDelay != oldValue else { return }
-                anchor = nil
-                synchroniser.setRate(0, time: .invalid)
-                grid = nil
-
-                // The delay is only a delay if the frames wait for their timestamps.
-                assembler.displaysImmediately = playoutDelay == nil
+                restartSchedule()
             }
+        }
+
+        /// Bounds within which the delay sizes itself, or `nil` to use ``playoutDelay`` as given.
+        ///
+        /// The right delay is not a property of the application, it is a property of the link and
+        /// the device at this minute, and it is the one setting where being wrong in either
+        /// direction is expensive: too small drops frames the network merely delivered late, too
+        /// large charges every participant latency they did not need. It also moves. The same two
+        /// phones on the same relay measured a tail of 20ms one minute and 140ms the next, and a
+        /// figure chosen for either is wrong for the other.
+        ///
+        /// So it is measured instead. Every frame arrives with some slack — the interval between
+        /// its arrival and the moment it is due — and the smallest slack seen recently is exactly
+        /// how much of the delay was not needed. Keeping that minimum at about one frame widens
+        /// the delay when frames start arriving close to their deadline and tightens it while they
+        /// keep arriving early, so the buffer settles at the floor on a good link and grows only
+        /// while a bad one requires it.
+        ///
+        /// `floor` is a promise about latency and `ceiling` a promise about smoothness; between
+        /// them, nobody has to choose a number that is wrong twice a minute. Both bound the delay
+        /// this asks for, which is not quite the delay the frames experience — see
+        /// ``playoutSlack``.
+        public var playoutBounds: (floor: Duration, ceiling: Duration)? {
+            didSet { restartSchedule() }
+        }
+
+        /// The share of frames the adaptive delay is willing to have arrive late.
+        ///
+        /// This is the trade, and there is no setting that avoids it: the delay must cover the
+        /// worst arrival it intends to survive, and the worst arrival on a real link is far worse
+        /// than the typical one. Sizing for every frame on a path whose median is 40ms and whose
+        /// 99th percentile is 130ms costs ninety milliseconds of latency to rescue one frame in a
+        /// hundred — a frame nobody would have seen go missing, in exchange for a delay everybody
+        /// feels in conversation.
+        ///
+        /// One percent by default, which on a measured link left about two frames in a thousand
+        /// unshown. Lower it towards zero for playback, where smoothness is everything and nobody
+        /// is waiting for a reply; raise it for conversation, where the opposite holds.
+        public var playoutTolerance = 0.01
+
+        /// The delay actually in force, which is ``playoutDelay`` unless ``playoutBounds`` is set.
+        ///
+        /// Worth showing to a person: it is the latency they are paying for smoothness, and it is
+        /// the only part of the path that answers to a setting rather than to physics.
+        public private(set) var playoutDepth: Duration = .zero
+
+        /// How much earlier than its deadline all but ``playoutTolerance`` of recent frames
+        /// arrived, in seconds. Negative means that share of them missed it.
+        ///
+        /// Worth having separately from ``playoutDepth`` because the two disagree, and the
+        /// disagreement is the interesting part: the schedule is anchored on one frame's arrival,
+        /// so whatever delay that frame happened to carry is added to the requested depth and
+        /// paid by every frame after it. A tile reporting two milliseconds of buffer and twenty
+        /// of headroom is holding twenty, and the difference is latency nobody asked for.
+        public private(set) var playoutSlack: Double?
+
+        private func restartSchedule() {
+            anchor = nil
+            synchroniser.setRate(0, time: .invalid)
+            grid = nil
+            slack = []
+            slackCursor = 0
+            playoutSlack = nil
+            catchUp = nil
+            playoutDepth = playoutBounds?.floor ?? playoutDelay ?? .zero
+
+            // The delay is only a delay if the frames wait for their timestamps.
+            assembler.displaysImmediately = requestedDelay == nil
+        }
+
+        /// The delay to schedule against: the adaptive depth where bounds are set, else what the
+        /// caller asked for, and `nil` only when nothing is scheduling at all.
+        private var requestedDelay: Duration? {
+            if playoutBounds != nil { return playoutDepth }
+            return playoutDelay
         }
 
         /// Drives presentation from the host clock when ``playoutDelay`` is set.
@@ -320,6 +390,34 @@ import MoqomCore
 
         /// The last source timestamp, for measuring the interval to the next.
         private var previousStamp: CMTime = .invalid
+
+        /// How much slack each recent frame arrived with, in seconds, for sizing the delay.
+        private var slack: [Double] = []
+        private var slackCursor = 0
+        private static let slackWindow = 600
+
+        /// When the delay was last tightened, so tightening happens gradually.
+        private var tightened = ContinuousClock.now
+
+        /// When the schedule last gave back the headroom it was anchored with, so it is rare.
+        private var reclaimed = ContinuousClock.now
+
+        /// When the clock currently running fast should return to normal, if one is.
+        private var catchUp: ContinuousClock.Instant?
+
+        /// Return the clock to real time once it has given back what it set out to.
+        ///
+        /// The measurements taken while it was running fast described a schedule that was moving
+        /// underneath them, so they go: two seconds of honest ones is a cheap price for not
+        /// deciding the next adjustment on evidence gathered mid-adjustment.
+        private func advanceCatchUp() {
+            guard let end = catchUp, ContinuousClock.now >= end else { return }
+            synchroniser.setRate(1, time: synchroniser.currentTime())
+            catchUp = nil
+            reclaimed = .now
+            slack = []
+            slackCursor = 0
+        }
 
         /// What happened to the frames handed to this renderer.
         ///
@@ -516,6 +614,124 @@ import MoqomCore
             return status == noErr ? copy : nil
         }
 
+        /// Size the delay to the slack the link is actually leaving.
+        ///
+        /// Adjusted by moving the grid rather than by re-anchoring the schedule, which matters more
+        /// than it sounds. Re-anchoring moves the timebase under every frame already queued, so
+        /// what was evenly spaced becomes early or late together and the picture lurches once for
+        /// each adjustment — a buffer that adapts by lurching is not obviously better than one that
+        /// is simply too small. Moving the grid changes when *future* frames are due and leaves
+        /// everything queued exactly where it was.
+        ///
+        /// - Parameter interval: The frame interval, used to bound how far one adjustment may move
+        ///   the picture.
+        private func resize(interval: Double, bounds: (floor: Duration, ceiling: Duration)) {
+            guard slack.count >= 120, let worst = slackQuantile(playoutTolerance) else { return }
+            playoutSlack = worst
+
+            let depth = playoutDepth.asSeconds
+            let floor = bounds.floor.asSeconds
+            let ceiling = bounds.ceiling.asSeconds
+
+            // A few milliseconds rather than nothing, because a frame that arrives exactly on its
+            // deadline is a frame the next refresh decides the fate of.
+            let margin = 0.004
+
+            // Headroom well past anything the delay accounts for, which the grid cannot give back:
+            // it is the delay of whichever frame the schedule was anchored on, added once and then
+            // paid by every frame for the rest of the call. Measured on a relayed link it was
+            // fifteen to thirty milliseconds — a third of the glass-to-glass total, bought by an
+            // accident of timing rather than by any decision.
+            //
+            // Reclaimed by moving the timebase, because that is the only thing that moves it.
+            // Walking the grid earlier instead was tried and is worse than the problem: the queue
+            // depth falls towards zero, ordinary jitter starts tripping the schedule's own limits,
+            // and both legs of a measured call ended up re-anchoring by the thousand and dropping
+            // frames by the hundred.
+            //
+            // Moved by running the clock slightly fast rather than by re-anchoring it, which is
+            // the difference between arriving early and jumping. A re-anchor puts every frame
+            // already queued past its new deadline at once, and measured that cost about four
+            // frames each time — forty across a run, for twenty milliseconds of latency. Two
+            // percent gives the same twenty back over a second, at a speed no one can see and
+            // with nothing to drop.
+            if worst > depth + 0.010, catchUp == nil, ContinuousClock.now - reclaimed > .seconds(2) {
+                let give = worst - depth
+                synchroniser.setRate(1.02, time: synchroniser.currentTime())
+                catchUp = .now + .seconds(give / 0.02)
+                return
+            }
+
+            if worst < margin {
+                // Widened at once and by the whole shortfall, because lateness costs a frame
+                // immediately while earliness costs milliseconds nobody may notice. Capped per
+                // adjustment so one pathological arrival cannot move the picture a long way at
+                // once; repeated adjustments still reach wherever the link requires.
+                let widened = min(depth + min(margin - worst, interval * 2), ceiling)
+                if widened > depth + 0.001 {
+                    shift(by: widened - depth, to: .seconds(widened))
+                }
+                return
+            }
+
+            // Tightened gradually and only past a deadband, so the delay is not forever chasing
+            // the last ten seconds by a millisecond in each direction. Two milliseconds every
+            // quarter second recovers a hundred milliseconds of unnecessary buffer in about
+            // twelve, which is fast enough to matter after a stall and slow enough to be
+            // invisible while it happens.
+            let excess = worst - margin
+            guard excess > 0.010, ContinuousClock.now - tightened > .milliseconds(250) else {
+                return
+            }
+
+            let reduced = max(depth - min(0.002, excess), floor)
+            if reduced < depth - 0.0001 {
+                tightened = .now
+                shift(by: reduced - depth, to: .seconds(reduced))
+            }
+        }
+
+        /// The slack that only the given share of recent frames fell below.
+        ///
+        /// A quantile rather than the minimum, and that is the whole design. The minimum is the
+        /// worst thing the link did in ten seconds, and sizing for it means paying its cost on
+        /// every frame forever; a low quantile says how much delay covers all but a stated few.
+        private func slackQuantile(_ share: Double) -> Double? {
+            guard !slack.isEmpty else { return nil }
+            let sorted = slack.sorted()
+            let index = Int((Double(sorted.count - 1) * max(0, min(1, share))).rounded())
+            return sorted[index]
+        }
+
+        /// Remember how much slack a frame arrived with.
+        private func record(slack seconds: Double) {
+            if slack.count < Self.slackWindow {
+                slack.append(seconds)
+            } else {
+                slack[slackCursor] = seconds
+                slackCursor = (slackCursor + 1) % Self.slackWindow
+            }
+        }
+
+        /// Move the grid, and with it every frame not yet due.
+        private func shift(by seconds: Double, to depth: Duration) {
+            guard let start = grid else { return }
+            grid = start + CMTime(seconds: seconds, preferredTimescale: 90000)
+            playoutDepth = depth
+
+            // Every remembered arrival is re-read against the grid it would now be measured
+            // against, because moving the grid changes what all of them meant. Without this the
+            // window holds ten seconds of headroom recorded before the last adjustment, each
+            // adjustment is decided on evidence that predates the previous one, and the loop
+            // tightens far past the point where the headroom was gone — measured, it walked a
+            // hundred milliseconds too early, ran out of frames, re-anchored a hundred and
+            // thirty times and ended pinned against the ceiling. The correction is exact rather
+            // than approximate: the grid moved by one amount, so every slack against it moved by
+            // that same amount.
+            for index in slack.indices { slack[index] += seconds }
+            playoutSlack = playoutSlack.map { $0 + seconds }
+        }
+
         /// Put the presented timeline where the arriving frames are.
         ///
         /// Called on the first frame and whenever the schedule has drifted out of reach of what
@@ -534,9 +750,19 @@ import MoqomCore
             // arrival cadence, the timeline and the delivery rate all stay perfect. Rare is fine
             // and is the design; often means the schedule cannot keep hold of the stream, and
             // then this is the number that says so rather than a person describing the motion.
-            if anchor != nil { drawing.reanchors += 1 }
+            if anchor != nil {
+                drawing.reanchors += 1
+
+                // The remembered headroom was headroom against the schedule that has just been
+                // replaced, and it cannot be corrected the way a grid shift can: this moves the
+                // timebase itself. Kept, it would have the adaptation act on a schedule that no
+                // longer exists.
+                slack = []
+                slackCursor = 0
+            }
 
             anchor = start
+            catchUp = nil
             synchroniser.setRate(1, time: start)
         }
 
@@ -545,7 +771,7 @@ import MoqomCore
         /// The window is deliberately wide. Correcting small errors would mean nudging the rate
         /// every few frames, and a presentation rate that is constantly adjusted is its own
         /// source of visible unevenness — the thing this exists to remove.
-        private func maintainSchedule(delay: Duration) {
+        private func maintainSchedule(delay: Duration, interval: Double?) {
             guard anchor != nil, newest.isValid else { return }
             let seconds = Double(delay.components.seconds)
                 + Double(delay.components.attoseconds) / 1e18
@@ -554,7 +780,22 @@ import MoqomCore
             // Behind means frames are being scheduled for a moment that has already passed, and
             // every one of them is shown late; far ahead means the delay has grown well past
             // what was asked for and the latency is no longer the one the caller chose.
-            if depth < 0 || depth > seconds * 3 + 0.05 {
+            //
+            // The upper bound is the delay plus a fixed allowance rather than a multiple of it,
+            // because a multiple makes the tolerance shrink with the thing being tolerated. A
+            // caller asking for 25ms was getting a 125ms ceiling on a link whose own tail reaches
+            // 90ms, so an ordinary burst re-anchored the schedule — and re-anchoring moves the
+            // timebase under everything queued, which is a visible lurch. The allowance is what a
+            // burst is worth; the delay is what the caller asked to pay on top of it.
+            //
+            // The lower bound allows a frame to be a frame late rather than demanding that none
+            // ever are, because ``playoutTolerance`` exists precisely to let a stated few miss.
+            // Re-anchoring on the first of them puts the two in opposition, and the schedule
+            // loses: measured, a leg tuned to allow five percent late re-anchored eighteen
+            // hundred times in fifty seconds, which cleared the headroom history on each one and
+            // left the adaptation with nothing to decide on.
+            let allowance = max(interval ?? 0, 0.02)
+            if depth < -allowance || depth > seconds + 0.15 {
                 anchorSchedule(to: newest, delay: delay)
             }
         }
@@ -657,8 +898,9 @@ import MoqomCore
             // nothing reads would cost a copy per frame to no effect.
             var drawn = sample
             var presentation = source
+            var cadence: Double?
             if
-                playoutDelay != nil,
+                requestedDelay != nil,
                 source.isValid,
                 let interval = interval(after: source),
                 case let even = regularise(source, interval: interval),
@@ -666,6 +908,7 @@ import MoqomCore
             {
                 drawn = retimed
                 presentation = even
+                cadence = interval
             }
 
             renderer.enqueue(drawn)
@@ -673,12 +916,19 @@ import MoqomCore
 
             if source.isValid { newestSource = source }
             if presentation.isValid { newest = presentation }
-            guard let playoutDelay, presentation.isValid else { return }
+            guard let delay = requestedDelay, presentation.isValid else { return }
             if anchor == nil {
-                anchorSchedule(to: presentation, delay: playoutDelay)
-            } else {
-                maintainSchedule(delay: playoutDelay)
+                anchorSchedule(to: presentation, delay: delay)
+                return
             }
+            maintainSchedule(delay: delay, interval: cadence)
+            advanceCatchUp()
+
+            // Measured after the schedule is known to be running, because slack against a
+            // timebase that has not started is not slack, it is the distance to a clock at zero.
+            guard let bounds = playoutBounds, let cadence, catchUp == nil else { return }
+            record(slack: (presentation - synchroniser.currentTime()).seconds)
+            if drawing.enqueued % 30 == 0 { resize(interval: cadence, bounds: bounds) }
         }
 
         /// Show a captured frame without encoding it.
@@ -816,6 +1066,13 @@ import MoqomCore
             grid = nil
             slot = 0
             previousStamp = .invalid
+        }
+    }
+
+    extension Duration {
+        /// Seconds as a `Double`, which is what CoreMedia and the arithmetic here both want.
+        fileprivate var asSeconds: Double {
+            Double(components.seconds) + Double(components.attoseconds) / 1e18
         }
     }
 #endif
