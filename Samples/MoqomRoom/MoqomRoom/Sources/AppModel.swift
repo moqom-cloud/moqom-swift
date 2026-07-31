@@ -73,6 +73,9 @@ final class AppModel {
     /// Prints the link's state while a measured run is going.
     private var reporter: Task<Void, Never>?
 
+    /// Keeps the shared clock disciplined for as long as one is.
+    private var timekeeping: Task<Void, Never>?
+
     var canJoin: Bool {
         if case .joining = phase { return !username.trimmed.isEmpty }
         return false
@@ -145,6 +148,25 @@ final class AppModel {
     ///
     /// One rung and one codec, because the point of a two-device run is a number, and a
     /// ladder gives a viewer three tracks to choose between while it is being taken.
+    /// Keep exchanging with the authority for as long as the run lasts.
+    ///
+    /// The opening burst leaves an interval of a few tens of milliseconds, set by the shortest
+    /// round trip among four attempts over Wi-Fi, and from then on it only widens as the anchor
+    /// ages. That interval is the floor on what any cross-device latency figure can claim, so a
+    /// run that measures a forty millisecond path against a thirty millisecond interval is
+    /// reporting mostly its own ignorance. Every later exchange is another chance at a shorter
+    /// round trip, and the clock keeps whichever anchor is worth the most.
+    private func discipline(_ clock: TrustedClock) {
+        timekeeping?.cancel()
+        timekeeping = Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(10))
+                if Task.isCancelled { return }
+                await clock.synchronise()
+            }
+        }
+    }
+
     private func prepareMeasurement(in room: RoomModel) async {
         // Before anything is published, because frames stamped on an undisciplined clock
         // are frames the far side cannot measure. A failure here is not fatal — the run
@@ -167,7 +189,10 @@ final class AppModel {
                     ? "CLOCK synchronised uncertainty=\(now.uncertainty)"
                     : "CLOCK NOT synchronised — latency across devices will be meaningless"
             )
-            if synchronised { room.trustedStamp = clock.stamp }
+            if synchronised {
+                room.trustedStamp = clock.stamp
+                discipline(clock)
+            }
         } else {
             print("CLOCK unavailable — latency across devices will be meaningless")
         }
@@ -466,6 +491,8 @@ final class AppModel {
 
     func leave() async {
         reporter?.cancel()
+        timekeeping?.cancel()
+        timekeeping = nil
         if case let .inRoom(model) = phase {
             await model.leave()
         }
