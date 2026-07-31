@@ -71,6 +71,16 @@ import MoqomCore
         /// being upside down. Written on the capture queue, read for diagnostics.
         public private(set) var softwareTurns = false
 
+        /// How many times the system has interrupted or failed this session, and why the last
+        /// one did. See ``watchSession``.
+        public private(set) var interruptions = 0
+        public private(set) var lastInterruption: String?
+
+        private var observers: [any NSObjectProtocol] = []
+
+        /// The last frame's sensor stamp, on the capture queue only. See ``captureOutput``.
+        private var lastCaptureStamp: CMTime?
+
         /// Guards ``position`` and ``publishesMirrored``, which are read from
         /// whatever thread the interface runs on and written from there too,
         /// while the capture queue reads them to configure the session.
@@ -204,7 +214,76 @@ import MoqomCore
             applyMirroring()
             applyRotation()
             applyStabilisation()
+            watchSession()
         }
+
+        /// Say out loud when the system takes the camera away.
+        ///
+        /// Capture stalls of several seconds show up downstream as a frozen picture, a
+        /// receiver that widens its playout buffer to cover them, and a hundred and fifty
+        /// milliseconds of latency that then takes half a minute to give back. Everything
+        /// visible at that end is a symptom, and the two explanations — the session was
+        /// interrupted, or the session was fine and something after it stopped pulling —
+        /// call for opposite fixes. `AVCaptureSession` knows which, and says so here.
+        private func watchSession() {
+            let centre = NotificationCenter.default
+            #if os(iOS)
+                observers.append(centre.addObserver(
+                    forName: AVCaptureSession.wasInterruptedNotification,
+                    object: box.session,
+                    queue: nil
+                ) { [weak self] note in
+                    let raw = note.userInfo?[AVCaptureSessionInterruptionReasonKey] as? Int
+                    let reason = raw.flatMap(AVCaptureSession.InterruptionReason.init(rawValue:))
+                    self?.interruptions += 1
+                    self?.lastInterruption = reason.map(Self.describe) ?? "unknown"
+                    self?.logger.warning(.media, "capture interrupted", [
+                        LogField("reason", .text(reason.map(Self.describe) ?? "unknown")),
+                    ])
+                })
+                observers.append(centre.addObserver(
+                    forName: AVCaptureSession.interruptionEndedNotification,
+                    object: box.session,
+                    queue: nil
+                ) { [weak self] _ in
+                    self?.logger.info(.media, "capture resumed", [])
+                })
+            #endif
+            observers.append(centre.addObserver(
+                forName: AVCaptureSession.runtimeErrorNotification,
+                object: box.session,
+                queue: nil
+            ) { [weak self] note in
+                let error = note.userInfo?[AVCaptureSessionErrorKey] as? NSError
+                self?.interruptions += 1
+                self?.lastInterruption = "runtime error \(error?.code ?? 0)"
+                self?.logger.error(.media, "capture failed", [
+                    LogField("code", .number(error?.code ?? 0)),
+                ])
+
+                // Restarted, because a runtime error stops the session and nothing else will
+                // start it again. The common one is the system reclaiming the device, and the
+                // device usually comes back.
+                self?.start()
+            })
+        }
+
+        #if os(iOS)
+            private static func describe(
+                _ reason: AVCaptureSession.InterruptionReason
+            ) -> String {
+                switch reason {
+                case .videoDeviceNotAvailableInBackground: "backgrounded"
+                case .audioDeviceInUseByAnotherClient: "microphone taken"
+                case .videoDeviceInUseByAnotherClient: "camera taken"
+                case .videoDeviceNotAvailableWithMultipleForegroundApps: "sharing the screen"
+                case .videoDeviceNotAvailableDueToSystemPressure: "system pressure"
+                @unknown default: "unknown"
+                }
+            }
+        #endif
+
+        deinit { observers.forEach(NotificationCenter.default.removeObserver) }
 
         /// Ask the device for the size and frame rate that were requested.
         ///
@@ -539,6 +618,23 @@ import MoqomCore
         ) {
             guard let captured = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
             let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+
+            // Said at the moment it happens, and with the sensor's own stamps, because a gap
+            // reported by a cadence meter minutes later cannot be lined up against anything.
+            // A frame missed here is a frame missed by the device, not by any queue of ours:
+            // these stamps are written when the sensor read the row, before this callback and
+            // before anything downstream could have been slow.
+            if let previous = lastCaptureStamp {
+                let gap = CMTimeGetSeconds(CMTimeSubtract(timestamp, previous))
+                if gap > 0.25 {
+                    logger.warning(.media, "the camera stopped", [
+                        LogField("milliseconds", .number(Int(gap * 1000))),
+                        LogField("interruptions", .number(interruptions)),
+                    ])
+                }
+            }
+            lastCaptureStamp = timestamp
+
             let turned = upright(captured)
             let buffer = turned ?? captured
             softwareTurns = turned != nil

@@ -498,6 +498,42 @@ import MoqomCore
         /// The size the layer is laid out at, for diagnostics.
         public var drawnSize: CGSize { layer.bounds.size }
 
+        /// What the display pipeline itself says, rather than what was handed to it.
+        ///
+        /// The counts in ``Drawing`` stop at the moment a frame is accepted, and everything
+        /// after that — a synchroniser that never started, a decoder waiting to be flushed, a
+        /// renderer that failed between two frames — is a black picture with a perfect stream
+        /// behind it. These are the four questions worth asking of the far side of `enqueue`.
+        public struct Timing: Sendable {
+            /// The synchroniser's rate. Zero means nothing is being presented, whatever is
+            /// queued.
+            public var rate: Float = 0
+
+            /// How far ahead of the presentation clock the newest queued frame sits, in
+            /// seconds. Negative means frames are being scheduled into the past.
+            public var ahead: Double = 0
+
+            /// `AVQueuedSampleBufferRenderingStatus`. Two is failed.
+            public var status: Int = 0
+
+            /// Whether the decoder needs flushing before it will resume.
+            public var needsFlush = false
+
+            public init() {}
+        }
+
+        public var timing: Timing {
+            var timing = Timing()
+            timing.rate = synchroniser.rate
+            if newest.isValid {
+                timing.ahead = (newest - synchroniser.currentTime()).seconds
+            }
+            let renderer = layer.sampleBufferRenderer
+            timing.status = renderer.status.rawValue
+            timing.needsFlush = renderer.requiresFlushToResumeDecoding
+            return timing
+        }
+
         /// The preview's format description, held across frames.
         ///
         /// Every frame from one camera has the same one, and building it per frame allocated a

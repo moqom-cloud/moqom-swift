@@ -56,6 +56,15 @@ struct RemoteVideoView: View {
 /// the view's identity and a grid that reorders would tear the pump down and
 /// restart it mid-group — which costs a flush and a wait for the next keyframe
 /// every time somebody joins.
+///
+/// Owned by the room and keyed by participant — see ``RoomModel/tile(for:)`` — rather than
+/// held in the representable's coordinator, which is where it used to live and where it was
+/// wrong. A coordinator belongs to a view, and a layout change replaces the view: SwiftUI
+/// builds the replacement, dismantles the original, and does not promise which of the two ends
+/// up on screen. When it kept the first, the pump had already been cancelled with it, and the
+/// second — the one still reading frames — was drawing into a layer inside a discarded view.
+/// Every counter agreed the stream was perfect, because it was. It was landing somewhere
+/// nobody could see.
 @MainActor
 final class VideoTile {
     // A renderer per tile. Sharing one across tiles would mean sharing one
@@ -117,6 +126,10 @@ final class VideoTile {
                 if frames == nil { try? await Task.sleep(for: .milliseconds(100)) }
             }
             guard let frames, let self else { return }
+
+            // Started with the drawing rather than with the room: what it answers is whether
+            // what this tile is drawing has a picture in it.
+            await room.watchReceivedPicture(of: identity)
 
             // Presented on a schedule rather than on arrival. Without this the picture is as
             // uneven as the network, which on a good link is even enough to measure well and
@@ -204,6 +217,7 @@ final class VideoTile {
                 room.tileIsOnScreen = renderer.isOnScreen
                 room.tileSize = renderer.drawnSize
                 room.tileCount = VideoTile.live
+                if drawn % 30 == 0 { room.timing = renderer.timing }
             }
 
             // Twice a second rather than per frame: this crosses into the display pipeline and
@@ -255,57 +269,59 @@ final class VideoTile {
         let isMirrored: Bool
         let room: RoomModel
 
-        func makeUIView(context: Context) -> SampleBufferView {
-            start(context.coordinator)
-            return SampleBufferView(renderer: context.coordinator.tile.renderer)
+        func makeUIView(context _: Context) -> SampleBufferView {
+            SampleBufferView(renderer: start().renderer)
         }
 
-        func updateUIView(_: SampleBufferView, context: Context) {
-            start(context.coordinator)
+        func updateUIView(_ view: SampleBufferView, context _: Context) {
+            // Re-adopted rather than assumed, because a view can be handed a different
+            // participant when the grid reorders, and because the layer may have been lent to
+            // the Picture in Picture window and needs taking back.
+            view.adopt(start().renderer)
         }
 
-        private func start(_ coordinator: Coordinator) {
-            coordinator.tile.renderer.isMirrored = isMirrored
+        /// The tile for this seat, running.
+        @discardableResult private func start() -> VideoTile {
+            let tile = room.tile(for: identity, isSelf: isSelf)
+            tile.renderer.isMirrored = isMirrored
             if isSelf {
-                coordinator.tile.attachPreview(in: room)
+                tile.attachPreview(in: room)
             } else {
-                coordinator.tile.attach(to: identity, in: room)
+                tile.attach(to: identity, in: room)
                 // Lend the window this tile's layer, so entering Picture in
                 // Picture reuses the decode already running here instead of
                 // starting a second one for the same track.
-                coordinator.identity = identity
-                room.pictureInPicture?.register(coordinator.tile.renderer, for: identity)
+                room.pictureInPicture?.register(tile.renderer, for: identity)
             }
+            return tile
         }
 
-        static func dismantleUIView(_: SampleBufferView, coordinator: Coordinator) {
-            coordinator.tile.detach()
-            if let identity = coordinator.identity {
-                coordinator.room?.pictureInPicture?.unregister(identity)
-            }
-        }
-
-        func makeCoordinator() -> Coordinator {
-            let coordinator = Coordinator()
-            coordinator.room = room
-            return coordinator
-        }
-
-        @MainActor
-        final class Coordinator {
-            let tile = VideoTile()
-            var identity: ParticipantIdentity?
-            weak var room: RoomModel?
-        }
+        // No `dismantleUIView`. The tile outlives every view that draws it and is released
+        // when the participant leaves; tearing it down here is what used to stop the picture.
     }
 
     final class SampleBufferView: UIView {
-        private let renderer: VideoRenderer
+        private var renderer: VideoRenderer
 
         init(renderer: VideoRenderer) {
             self.renderer = renderer
             super.init(frame: .zero)
             layer.addSublayer(renderer.layer)
+        }
+
+        /// Draw this renderer from now on.
+        ///
+        /// `addSublayer` reparents, so a layer drawn in another view — or lent to the Picture
+        /// in Picture window and handed back — arrives here without being detached first.
+        func adopt(_ renderer: VideoRenderer) {
+            guard renderer !== self.renderer || renderer.layer.superlayer !== layer else {
+                return
+            }
+            if renderer !== self.renderer { self.renderer.layer.removeFromSuperlayer() }
+            self.renderer = renderer
+            layer.addSublayer(renderer.layer)
+            renderer.isHosted = window != nil
+            setNeedsLayout()
         }
 
         @available(*, unavailable)
@@ -343,44 +359,46 @@ final class VideoTile {
         let isMirrored: Bool
         let room: RoomModel
 
-        func makeNSView(context: Context) -> SampleBufferView {
-            start(context.coordinator)
-            return SampleBufferView(renderer: context.coordinator.tile.renderer)
+        func makeNSView(context _: Context) -> SampleBufferView {
+            SampleBufferView(renderer: start().renderer)
         }
 
-        func updateNSView(_: SampleBufferView, context: Context) {
-            start(context.coordinator)
+        func updateNSView(_ view: SampleBufferView, context _: Context) {
+            view.adopt(start().renderer)
         }
 
-        private func start(_ coordinator: Coordinator) {
-            coordinator.tile.renderer.isMirrored = isMirrored
+        /// The tile for this seat, running. See the iOS side for why it is the room's.
+        @discardableResult private func start() -> VideoTile {
+            let tile = room.tile(for: identity, isSelf: isSelf)
+            tile.renderer.isMirrored = isMirrored
             if isSelf {
-                coordinator.tile.attachPreview(in: room)
+                tile.attachPreview(in: room)
             } else {
-                coordinator.tile.attach(to: identity, in: room)
+                tile.attach(to: identity, in: room)
             }
-        }
-
-        static func dismantleNSView(_: SampleBufferView, coordinator: Coordinator) {
-            coordinator.tile.detach()
-        }
-
-        func makeCoordinator() -> Coordinator { Coordinator() }
-
-        @MainActor
-        final class Coordinator {
-            let tile = VideoTile()
+            return tile
         }
     }
 
     final class SampleBufferView: NSView {
-        private let renderer: VideoRenderer
+        private var renderer: VideoRenderer
 
         init(renderer: VideoRenderer) {
             self.renderer = renderer
             super.init(frame: .zero)
             wantsLayer = true
             layer?.addSublayer(renderer.layer)
+        }
+
+        func adopt(_ renderer: VideoRenderer) {
+            guard renderer !== self.renderer || renderer.layer.superlayer !== layer else {
+                return
+            }
+            if renderer !== self.renderer { self.renderer.layer.removeFromSuperlayer() }
+            self.renderer = renderer
+            layer?.addSublayer(renderer.layer)
+            renderer.isHosted = window != nil
+            needsLayout = true
         }
 
         @available(*, unavailable)

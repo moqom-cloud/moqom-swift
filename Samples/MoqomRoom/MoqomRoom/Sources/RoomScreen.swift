@@ -632,12 +632,15 @@ struct BroadcastControls: View {
                 // reading from, and the sample is not the place to demonstrate
                 // that being survivable.
                 Menu {
+                    // Live, unlike the video picker below. Audio is a publication that can be
+                    // stopped and restarted in the time between two packets, and disabling
+                    // this while publishing meant the one moment a person wants to leave the
+                    // tone behind — hearing it — is the moment the control will not move.
                     Picker("Audio", selection: $room.audioInput) {
                         ForEach(RoomModel.AudioInput.allCases) { input in
                             Text(input.rawValue).tag(input)
                         }
                     }
-                    .disabled(room.isPublishingAudio)
 
                     Picker("Video", selection: $room.videoInput) {
                         ForEach(RoomModel.VideoInput.allCases) { input in

@@ -61,12 +61,23 @@ final class AppModel {
     /// Publish one pinned rung on a disciplined clock, and measure what arrives.
     ///
     /// A mode rather than a build: the same app is the thing being measured, and a separate
-    /// benchmark target would measure a different program. Off by default, because the clock
-    /// discipline talks to an NTP server and the pinned rung is the wrong shape for a call.
+    /// benchmark target would measure a different program.
+    ///
+    /// On by default, which it was not, because the figure it produces is the one everybody
+    /// asks for first and half of it cannot be had without the other device. A run with this
+    /// off shows the receiving phone's own playout hold and says underneath that the total
+    /// needs both — which reads, reasonably enough, as a glass-to-glass figure of forty
+    /// milliseconds. The cost is a handful of NTP exchanges on joining.
+    ///
+    /// The pinned rung is *not* part of it, and used to be. Pinning is what a benchmark wants
+    /// — one rung so both ends agree on what is being measured — and it is wrong for a call,
+    /// where the ladder and the layer selector are half the product. Bundling them meant the
+    /// only configuration that reported latency was also the only one that never exercised
+    /// selection.
     var measure: Bool
 
     init() {
-        measure = launch.benchmark
+        measure = true
         pairingCode = launch.pairingCode ?? ""
     }
 
@@ -125,6 +136,25 @@ final class AppModel {
         case let .inRoom(room):
             print("JOINED relay=\(relay.summary) room=\(roomName)")
             guard launch.benchmark else { return }
+
+            // Before the broadcast, because going live now brings a voice with it. Named
+            // rather than matched against one value with everything else falling through to
+            // the tone: `--audio 1` was accepted that way and published beeps for a run that
+            // was listening for voices, and nothing said so.
+            if let audio = launch.audio {
+                switch audio {
+                case "mic": room.audioInput = .microphone
+                case "tone": room.audioInput = .tone
+                default:
+                    print("AUDIO UNKNOWN \(audio) — expected mic or tone; using the microphone")
+                    room.audioInput = .microphone
+                }
+            } else {
+                // Silent on purpose. A benchmark that publishes a voice nobody asked for is
+                // measuring a different link from the one the run was set up to measure.
+                await room.stopAudio()
+            }
+
             await room.startBroadcast()
             guard room.isBroadcasting else {
                 print(
@@ -133,15 +163,11 @@ final class AppModel {
                 )
                 return
             }
-            if let audio = launch.audio {
-                room.audioInput = audio == "mic" ? .microphone : .tone
-                await room.startAudio()
-                if !room.isPublishingAudio {
-                    print(
-                        "AUDIO FAILED "
-                            + (room.lastError.map(String.init(describing:)) ?? "no reason given")
-                    )
-                }
+            if launch.audio != nil, !room.isPublishingAudio {
+                print(
+                    "AUDIO FAILED "
+                        + (room.lastError.map(String.init(describing:)) ?? "no reason given")
+                )
             }
 
             print(
@@ -237,6 +263,12 @@ final class AppModel {
         // question "is the link full?" gets asked without also changing the frame rate.
         let bitrate = launch.kilobitsPerSecond.map { $0 * 1000 }
             ?? Int(1_250_000 * (1 + (fps / 30 - 1) * 0.6))
+
+        // Only for a benchmark. See ``measure``: a call wants the whole ladder.
+        guard launch.benchmark, !launch.ladder else {
+            report(on: room)
+            return
+        }
 
         room.pinnedRung = VideoLayer(
             id: "video/720p",
@@ -352,6 +384,16 @@ final class AppModel {
                             room.tileSize.height,
                             room.tileCount
                         )
+                        // And whether anything is presenting them. A rate of zero is a queue
+                        // filling up behind a clock that never started, which every count above
+                        // reports as a stream in perfect health.
+                        + String(
+                            format: " rate=%.2f ahead=%.0fms status=%d%@",
+                            room.timing.rate,
+                            room.timing.ahead * 1000,
+                            room.timing.status,
+                            room.timing.needsFlush ? " needs-flush" : ""
+                        )
                 )
                 // The display pipeline's own account, which is the only one that can say a frame
                 // was accepted and then not shown.
@@ -380,7 +422,27 @@ final class AppModel {
                         // and were half a turn apart, so a run where the phones disagree about
                         // which way up they are is a run where this line disagrees too.
                         + (room.cameraTurnsInSoftware ? "(sw)" : "")
+                        // Whether the freezes in the cadence beside this are the system taking
+                        // the camera away. They are not the same problem as a slow queue and
+                        // they are indistinguishable from one downstream.
+                        + (room.cameraInterruptions > 0
+                            ? " interrupted=\(room.cameraInterruptions)"
+                            + (room.lastCameraInterruption.map { " (\($0))" } ?? "")
+                            : "")
                 )
+
+                // The same reading at the other end of the wire, decoded here from what
+                // actually arrived. Paired with GRAB's it says which side of the link a black
+                // tile is on, and it is the only line that can: everything else is a count of
+                // frames, and a black picture is a frame.
+                if room.receivedPictures > 0 {
+                    print(
+                        "SEEN pictures=\(room.receivedPictures)"
+                            + (room.receivedBrightness.map { String(format: " luma=%.3f", $0) }
+                                ?? "")
+                            + (room.receivedSize.map { " size=\($0.width)x\($0.height)" } ?? "")
+                    )
+                }
 
                 // Audio's own two ends, which share none of the machinery above. It is paced by
                 // a device pulling at a fixed rate rather than by a display, so its buffer sizes

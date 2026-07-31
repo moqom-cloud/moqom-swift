@@ -31,12 +31,30 @@ final class RoomModel {
 
     /// Where published audio comes from.
     ///
-    /// A tone by default so the sample runs in a simulator with no input device
-    /// and asks for no permission it does not need. The microphone is the option
-    /// that matters on a device, and it is the only way to check the thing that
-    /// cannot be checked anywhere else: whether the room's own output is being
-    /// cancelled before it goes back up the uplink.
-    var audioInput: AudioInput = .tone
+    /// The microphone on a device and a tone in a simulator, for the same reason the video
+    /// default follows the camera: a phone that publishes beeps until somebody finds the
+    /// picker reads as broken audio rather than as a deliberate default.
+    ///
+    /// The tone is still worth having, and not only for the simulator. Two phones on one desk
+    /// publishing microphones is a feedback loop, and what a benchmark measures then is the
+    /// room.
+    ///
+    /// Changing it while publishing swaps the source, which is a stop and a start of the audio
+    /// publication — done here rather than refused, because refusing it is what a person meets
+    /// as a picker that will not move.
+    #if targetEnvironment(simulator)
+        var audioInput: AudioInput = .tone { didSet { swapAudioInput(from: oldValue) } }
+    #else
+        var audioInput: AudioInput = .microphone { didSet { swapAudioInput(from: oldValue) } }
+    #endif
+
+    private func swapAudioInput(from previous: AudioInput) {
+        guard audioInput != previous, isPublishingAudio else { return }
+        Task {
+            await stopAudio(deliberately: false)
+            await startAudio()
+        }
+    }
 
     /// What the microphone is hearing. ``AudioMeter/quiet`` unless capturing.
     ///
@@ -191,10 +209,29 @@ final class RoomModel {
     /// What the display layer did with the frames, sampled from the renderer.
     var presentation: VideoRenderer.Presentation?
 
+    /// What the display pipeline is doing with them now. See ``VideoRenderer/Timing``.
+    var timing = VideoRenderer.Timing()
+
     private var captureCadenceTask: Task<Void, Never>?
 
     /// How bright the picture going into the encoder is, `0` to `1`. See ``brightness(of:)``.
     var captureBrightness: Double?
+
+    /// How bright the picture coming *out* of a remote stream is, decoded here.
+    ///
+    /// The other half of ``captureBrightness``, and the only reading that tells a black tile
+    /// apart from a tile that is never drawn. Every counter between the two says frames were
+    /// sent, arrived, and were presented; both a picture that is dark and a picture that never
+    /// reaches the glass agree with all of them. Decoding one keyframe every group here costs
+    /// a still image every couple of seconds and answers which half to look in.
+    var receivedBrightness: Double?
+
+    /// The size of that decoded picture, and how many have been sampled.
+    var receivedSize: PixelSize?
+    var receivedPictures = 0
+
+    private var receivedPictureTask: Task<Void, Never>?
+    private var watchedPublisher: ParticipantIdentity?
 
     /// The size of the frames the encoder is being handed.
     ///
@@ -459,6 +496,10 @@ final class RoomModel {
     /// Whether that turn is being done in software because the connection would not.
     var cameraTurnsInSoftware: Bool { camera?.softwareTurns ?? false }
 
+    /// How often the system has taken the camera away, and what it said the last time.
+    var cameraInterruptions: Int { camera?.interruptions ?? 0 }
+    var lastCameraInterruption: String? { camera?.lastInterruption }
+
     /// Kept so a camera switch can ask for a keyframe. Nothing else here needs
     /// it — the room owns the publication's lifetime.
     private var broadcast: Broadcast?
@@ -580,6 +621,12 @@ final class RoomModel {
         case .participantLeft(let who, _):
             catalogs.removeValue(forKey: who)
             await stopPlayback(for: who)
+            // The seat is gone, so its tile is too — this is the one place a tile is released,
+            // and it is why no view needs to.
+            releaseTile(for: who)
+            #if os(iOS)
+                pictureInPicture?.unregister(who)
+            #endif
             await refresh()
         case .audiencesChanged(let updated):
             audiences = updated
@@ -761,6 +808,61 @@ final class RoomModel {
         }
     }
 
+    /// One drawing surface per seat, for as long as the seat exists.
+    ///
+    /// Held here rather than in the view that draws it. A tile owns a decode session, a
+    /// subscription's worth of frames and a layer, and a SwiftUI view owns none of those
+    /// things for longer than the next layout pass — so a tile whose lifetime followed a
+    /// view's was rebuilt whenever the grid changed, and the rebuild is what put the frames
+    /// and the visible layer in two different objects.
+    private var tiles: [ParticipantIdentity: VideoTile] = [:]
+
+    /// Separate from the others, because this device is two pictures. The preview comes from
+    /// the camera and a subscription to this device would come from the relay; they are not
+    /// the same picture and cannot share a layer.
+    private var previewTile: VideoTile?
+
+    func tile(for who: ParticipantIdentity, isSelf: Bool) -> VideoTile {
+        if isSelf {
+            if let previewTile { return previewTile }
+            let tile = VideoTile()
+            previewTile = tile
+            return tile
+        }
+        if let existing = tiles[who] { return existing }
+        let tile = VideoTile()
+        tiles[who] = tile
+        return tile
+    }
+
+    private func releaseTile(for who: ParticipantIdentity) {
+        tiles.removeValue(forKey: who)?.detach()
+    }
+
+    /// Decode one remote participant's keyframes, purely to look at them.
+    ///
+    /// One participant rather than all of them, because this is a diagnostic and each tap is a
+    /// decode session. The first remote publisher is the one a two-device test is about.
+    func watchReceivedPicture(of who: ParticipantIdentity) {
+        guard watchedPublisher != who else { return }
+        watchedPublisher = who
+        receivedPictureTask?.cancel()
+        receivedPictureTask = Task { [weak self] in
+            guard let self else { return }
+            let tap = await room.tapVideo(from: who, policy: .classification)
+            defer { tap.stop() }
+            for await picture in tap.elements {
+                let luma = Self.brightness(of: picture.frame)
+                let size = picture.frame.size
+                await MainActor.run {
+                    if let luma { self.receivedBrightness = luma }
+                    self.receivedSize = size
+                    self.receivedPictures += 1
+                }
+            }
+        }
+    }
+
     /// The average luminance of a frame, `0` to `1`, sampled rather than summed.
     ///
     /// Exists because "no video" and "a black picture" are indistinguishable from every counter
@@ -901,6 +1003,13 @@ final class RoomModel {
             // even then everything between here and there owns the difference.
             if pinnedRung != nil { watchCaptureCadence(of: publication) }
             applyAudioPurpose()
+
+            // A voice with the picture, unless somebody has deliberately turned it off. Going
+            // live used to publish video only, and audio was a second button with a waveform
+            // on it — so the ordinary way to use this app was to broadcast, see the other
+            // person, hear nothing, and conclude that audio was broken. It is a call: the two
+            // start together, and the mute button beside them is how one goes quiet.
+            if !isPublishingAudio, !hasStoppedAudio { await startAudio() }
             #if os(iOS)
                 await startLiveActivity()
             #endif
@@ -961,9 +1070,13 @@ final class RoomModel {
         selfMuted = await room.selfMuted
     }
 
+    /// Whether the last thing anybody said about audio was to turn it off.
+    private(set) var hasStoppedAudio = false
+
     /// Publish audio, from whichever input is selected.
     func startAudio() async {
         guard !isPublishingAudio else { return }
+        hasStoppedAudio = false
 
         // Before the capture rather than after it. `AudioGraph.microphone()`
         // refuses on a listening graph, and should: a playback session has no
@@ -1152,9 +1265,18 @@ final class RoomModel {
         if let player = players.removeValue(forKey: who) {
             await player.stop()
         }
+        if watchedPublisher == who {
+            receivedPictureTask?.cancel()
+            receivedPictureTask = nil
+            watchedPublisher = nil
+        }
     }
 
-    func stopAudio() async {
+    /// - Parameter deliberately: whether a person asked for this, in which case going live
+    ///   again will not quietly turn the microphone back on. False for the internal stops —
+    ///   swapping the input is a stop and a start, and it is not a decision to be silent.
+    func stopAudio(deliberately: Bool = true) async {
+        if deliberately { hasStoppedAudio = true }
         toneTask?.cancel()
         toneTask = nil
         meterTask?.cancel()

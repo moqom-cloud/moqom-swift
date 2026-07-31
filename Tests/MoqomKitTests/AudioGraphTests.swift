@@ -72,4 +72,22 @@ struct AudioGraphPurposeTests {
             )
         }
     }
+
+    @Test("the microphone can be taken again after it is given back")
+    func theMicrophoneComesBack() throws {
+        // The mute button, in the only part of it that can be tested off a device: taking the
+        // microphone, finishing with it, and taking it again. Nothing here starts the engine,
+        // so no hardware is touched — but the refusal this pins down needed none either. The
+        // graph allows one microphone at a time and nothing ever said one was finished with,
+        // so the second time anybody went on stage they went live silent.
+        let graph = AudioGraph(configuration: .init(purpose: .videoCall))
+        _ = try graph.microphone()
+        graph.releaseMicrophone()
+        _ = try graph.microphone()
+
+        // And giving back what was never taken is not an error, because the caller cannot
+        // always know: stopping twice is ordinary.
+        graph.releaseMicrophone()
+        graph.releaseMicrophone()
+    }
 }

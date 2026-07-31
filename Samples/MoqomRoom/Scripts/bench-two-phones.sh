@@ -30,6 +30,8 @@ This script takes no arguments; everything is an environment variable.
   MOQOM_KBPS=2000        publish bitrate
   MOQOM_AUDIO=mic        publish audio: mic, or tone for a synthetic source
   MOQOM_VIDEO=camera     publish video: camera, or pattern
+  MOQOM_LADDER=1         publish the whole ladder and let the selector choose, as a call
+                         does, instead of the single pinned rung a benchmark wants
   MOQOM_PLAYOUT_MS=40    fixed playout delay, instead of the adaptive one
   MOQOM_FLOOR_MS / MOQOM_TOLERANCE / MOQOM_STATS_MS / MOQOM_FLAT_LAYERS
   MOQOM_PUBLISHER / MOQOM_VIEWER   device names (default: iPhone Air, 15 Pro)
@@ -39,6 +41,24 @@ For example:
 USAGE
     exit 2
 fi
+
+# Checked here rather than passed through, because the app has to choose something and a
+# wrong value spends the whole run being the wrong thing quietly. MOQOM_AUDIO=1 reads like
+# "yes, audio" and published a test tone, which is audible, plausible, and not what was asked.
+case "${MOQOM_AUDIO:-mic}" in
+    mic | tone) ;;
+    *)
+        echo "MOQOM_AUDIO must be mic or tone, not '$MOQOM_AUDIO'" >&2
+        exit 2
+        ;;
+esac
+case "${MOQOM_VIDEO:-camera}" in
+    camera | pattern) ;;
+    *)
+        echo "MOQOM_VIDEO must be camera or pattern, not '$MOQOM_VIDEO'" >&2
+        exit 2
+        ;;
+esac
 
 ROOM="${MOQOM_ROOM:-bench}"
 CODE="${MOQOM_PAIRING_CODE:-4242}"
@@ -60,7 +80,7 @@ else
     WHERE="--pairing-code $CODE"
     echo "relay: whatever answers to pairing code $CODE on this network"
 fi
-WHERE="$WHERE --fps $FPS${MOQOM_FLAT_LAYERS:+ --flat-layers}"
+WHERE="$WHERE --fps $FPS${MOQOM_FLAT_LAYERS:+ --flat-layers}${MOQOM_LADDER:+ --ladder}"
 WHERE="$WHERE${MOQOM_KBPS:+ --kbps $MOQOM_KBPS}"
 WHERE="$WHERE${MOQOM_STATS_MS:+ --stats-ms $MOQOM_STATS_MS}"
 WHERE="$WHERE${MOQOM_PLAYOUT_MS:+ --playout-ms $MOQOM_PLAYOUT_MS}"
@@ -283,7 +303,7 @@ if [ -n "${MOQOM_SECONDS:-}" ]; then
     for log in "$PUBLISHER_LOG" "$VIEWER_LOG"; do
         echo
         echo "--- $log"
-        grep -E '^(LINK|GLASS|PLAY|TIME|DRAW|SHOW|GRAB|HOST|SEND|COST|TALK|HEAR|OUT|  SPKR|  VIEW)' \
+        grep -E '^(LINK|GLASS|PLAY|TIME|DRAW|SHOW|GRAB|SEEN|HOST|SEND|COST|TALK|HEAR|OUT|  SPKR|  VIEW)' \
             "$log" | tail -14
     done
     exit 0

@@ -71,6 +71,12 @@ import MoqomCore
             }
             lock.unlock()
             relay.stop()
+            // Handed back, not merely stopped. The graph allows one microphone at a time and
+            // had no way to learn that this one was finished with, so the second time anybody
+            // went on stage the graph refused — one tap already — and the app went live with no
+            // voice and no error anybody would see. Stopping and starting audio is not an edge
+            // case; it is the mute button.
+            graph.releaseMicrophone()
         }
 
         /// What the microphone is hearing, for a level meter.

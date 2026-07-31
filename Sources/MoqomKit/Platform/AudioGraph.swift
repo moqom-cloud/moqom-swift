@@ -165,6 +165,7 @@ import MoqomCore
         private let lock = NSLock()
         private var voices: [Voice] = []
         private var capture: Capture?
+        private var sink: AVAudioSinkNode?
         private var running = false
         private var observers: [any NSObjectProtocol] = []
 
@@ -249,8 +250,41 @@ import MoqomCore
 
             let capture = Capture(format: format ?? configuration.format)
             self.capture = capture
-            if running { try installLocked(capture) }
+
+            // Around a stop and a start, when the engine is already running. Attaching a node
+            // to the input of a rendering engine is a graph change it accepts and then does not
+            // make: the connection exists, the callback is never called, and the microphone is
+            // silent with every counter reading zero rather than failing. The engine is only
+            // running here when somebody's voice is already playing — a viewer who then goes on
+            // stage — which is exactly the path a benchmark that publishes from launch never
+            // takes, and exactly the path a person tapping the microphone button always does.
+            if running {
+                engine.stop()
+                running = false
+                try startLocked()
+            }
             return capture.relay
+        }
+
+        /// Give the microphone back, so the next caller can have it.
+        ///
+        /// Idempotent, and safe when nothing was taken.
+        public func releaseMicrophone() {
+            lock.lock()
+            defer { lock.unlock() }
+            guard capture != nil else { return }
+            capture = nil
+            guard sink != nil else { return }
+            // Detaching a node from a rendering engine is the same graph change that attaching
+            // one is, and gets the same treatment: stop, change, start — but only if anything
+            // is left to run for.
+            let wasRunning = running
+            if wasRunning {
+                engine.stop()
+                running = false
+            }
+            uninstallLocked()
+            if wasRunning, !voices.isEmpty { try? startLocked() }
         }
 
         /// Give a participant a place in the mix.
@@ -343,16 +377,47 @@ import MoqomCore
             for voice in voices { voice.node.play() }
         }
 
+        /// Take the microphone through a sink node rather than a tap.
+        ///
+        /// A tap was the obvious way and delivered speech in hundred millisecond clumps: five
+        /// packets at once, then nothing for a tenth of a second, whatever size the tap was
+        /// asked for — the request is documented as advisory and the engine declines it. The
+        /// clumping is not cosmetic. A receiver cannot tell a bursty source from a bursty
+        /// network, so its jitter buffer sizes itself for the burst, and measured on two
+        /// phones that put the voice buffer at ninety milliseconds against twenty-five for an
+        /// evenly paced source. Video then pays it too, because the picture is held back to
+        /// meet the voice. A sink node is called once per render cycle instead, which is the
+        /// session's IO buffer — ten milliseconds here — so the packets leave as they are
+        /// spoken.
+        ///
+        /// The cost is that this runs on the render thread, where the tap did not. What
+        /// happens on it is a format conversion and an append of a few hundred samples, which
+        /// is the work the tap callback did with a hundred times as long to do it in; the
+        /// budget at this rate is not close.
         private func installLocked(_ capture: Capture) throws(MoqomError) {
             let hardware = engine.inputNode.outputFormat(forBus: 0)
             try capture.prepare(from: hardware)
 
-            // A tap buffer of zero lets the engine pick, which is what it wants
-            // and what avoids an extra copy on every callback.
-            engine.inputNode.installTap(onBus: 0, bufferSize: 0, format: hardware) {
-                buffer, _ in
+            uninstallLocked()
+            let sink = AVAudioSinkNode { _, frames, list in
+                guard let buffer = AVAudioPCMBuffer(
+                    pcmFormat: hardware,
+                    bufferListNoCopy: list
+                ) else { return noErr }
+                buffer.frameLength = frames
                 capture.ingest(buffer)
+                return noErr
             }
+            engine.attach(sink)
+            engine.connect(engine.inputNode, to: sink, format: hardware)
+            self.sink = sink
+        }
+
+        /// Remove the sink, if one is attached.
+        private func uninstallLocked() {
+            guard let sink else { return }
+            engine.detach(sink)
+            self.sink = nil
         }
 
         private func detach(_ voice: Voice) {
@@ -448,9 +513,9 @@ import MoqomCore
             defer { lock.unlock() }
 
             // Reaching for the input node at all is what has to be avoided on a
-            // playback session, not just tapping it.
+            // playback session, not just capturing from it.
             if configuration.purpose.capturesInput {
-                engine.inputNode.removeTap(onBus: 0)
+                uninstallLocked()
             }
             if running {
                 engine.stop()
