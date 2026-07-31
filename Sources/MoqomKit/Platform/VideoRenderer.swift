@@ -462,6 +462,21 @@ import MoqomCore
         /// devices read zero.
         public private(set) var drawing = Drawing()
 
+        /// Whether the layer being drawn into is somewhere a person could see it.
+        ///
+        /// The one thing every counter in this file is blind to. Frames can arrive, decode, be
+        /// accepted by the display layer and be counted as presented while the layer is detached
+        /// from the view hierarchy or laid out at no size — and then the pipeline reports perfect
+        /// health to a viewer looking at a blank tile. Reported rather than asserted because
+        /// there is a legitimate moment for each: a renderer built before its view is attached is
+        /// detached for an instant, and one whose tile is off screen has been given no size.
+        public var isOnScreen: Bool {
+            layer.superlayer != nil && layer.bounds.width > 1 && layer.bounds.height > 1
+        }
+
+        /// The size the layer is laid out at, for diagnostics.
+        public var drawnSize: CGSize { layer.bounds.size }
+
         /// The preview's format description, held across frames.
         ///
         /// Every frame from one camera has the same one, and building it per frame allocated a

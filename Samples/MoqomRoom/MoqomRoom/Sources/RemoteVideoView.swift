@@ -188,8 +188,10 @@ final class VideoTile {
             await MainActor.run {
                 try? renderer.enqueue(frame)
                 room.drawing = renderer.drawing
-                    room.playoutDepth = renderer.playoutDepth
-                    room.playoutSlack = renderer.playoutSlack
+                room.playoutDepth = renderer.playoutDepth
+                room.playoutSlack = renderer.playoutSlack
+                room.tileIsOnScreen = renderer.isOnScreen
+                room.tileSize = renderer.drawnSize
             }
 
             // Twice a second rather than per frame: this crosses into the display pipeline and

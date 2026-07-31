@@ -145,7 +145,7 @@ final class AppModel {
             }
 
             print(
-                "LIVE rung=video/720p codec=hevc source=camera"
+                "LIVE rung=video/720p codec=hevc source=\(room.videoInput.rawValue)"
                     + " fps=\(Int(launch.frameRate ?? 30))"
                     + " playout=\(launch.playoutMilliseconds.map { "\($0)ms fixed" } ?? "adaptive")"
                     + " layers=\(launch.flatLayers ? "flat" : "temporal")"
@@ -219,7 +219,7 @@ final class AppModel {
             print("CLOCK unavailable — latency across devices will be meaningless")
         }
 
-        room.videoInput = .camera
+        room.videoInput = launch.video == "pattern" ? .pattern : .camera
         let fps = launch.frameRate ?? 30
 
         // Bitrate with the frame rate, not fixed. Twice the frames at the same budget is half
@@ -337,6 +337,15 @@ final class AppModel {
                         drawn.delivered * 100,
                         room.playoutDepth.seconds * 1000
                     )
+                        // Where those frames were drawn, which is the one question the counters
+                        // cannot answer: a layer that is detached or laid out at nothing accepts
+                        // frames, presents them, and shows a person nothing at all.
+                        + String(
+                            format: " on-screen=%@ tile=%.0fx%.0f",
+                            room.tileIsOnScreen ? "yes" : "no",
+                            room.tileSize.width,
+                            room.tileSize.height
+                        )
                 )
                 // The display pipeline's own account, which is the only one that can say a frame
                 // was accepted and then not shown.
@@ -352,7 +361,12 @@ final class AppModel {
                     )
                 }
 
-                print("GRAB \(room.captureCadence.report())")
+                print(
+                    "GRAB \(room.captureCadence.report())"
+                        // What is in those frames, not just how many. Near zero is a black
+                        // picture, which every other line here reports as a healthy stream.
+                        + (room.captureBrightness.map { String(format: " luma=%.3f", $0) } ?? "")
+                )
 
                 // Audio's own two ends, which share none of the machinery above. It is paced by
                 // a device pulling at a fixed rate rather than by a display, so its buffer sizes
@@ -447,9 +461,14 @@ final class AppModel {
                 print(
                     "HOST thermal=\(Self.describe(ProcessInfo.processInfo.thermalState))"
                         + " lowpower=\(ProcessInfo.processInfo.isLowPowerModeEnabled)"
-                        // Whether the gyroscope currently has stabilisation switched on, which is
-                        // the one power draw here that comes and goes on its own.
-                        + (room.cameraIsMoving.map { " camera=\($0 ? "moving" : "steady")" } ?? "")
+                        // Whether the motion sensors currently have stabilisation switched on,
+                        // which is the one power draw here that comes and goes on its own.
+                        // `walking` rather than `moving` also says the motion permission was
+                        // granted, since that half is silent without it.
+                        + (room.cameraIsMoving.map {
+                            let state = room.cameraIsWalking ? "walking" : ($0 ? "moving" : "steady")
+                            return " camera=\(state)"
+                        } ?? "")
                 )
 
                 // What the publisher did with the frames it captured, which is where an

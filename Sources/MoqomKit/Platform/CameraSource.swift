@@ -108,10 +108,17 @@ import MoqomCore
             }
         }
 
-        /// Whether the device is currently being moved about, as the gyroscope sees it.
+        /// Whether the device is currently being moved about, by either measure below.
         public var isMoving: Bool { lock.withLock { moving } }
 
         #if os(iOS)
+            /// Whether the person holding the device is walking, running, or riding something.
+            ///
+            /// Distinct from ``isMoving``, which a hand gesture at a desk also sets. Always
+            /// false without motion permission, where ``isMoving`` still works — so the two
+            /// together are also how an application can tell whether the permission took.
+            public var isWalking: Bool { motion.isStriding }
+
             private let motion = MotionWatch()
         #endif
 
@@ -524,7 +531,8 @@ import MoqomCore
     }
 
     #if os(iOS)
-        /// Reports whether the device is being moved, from the gyroscope.
+        /// Reports whether the device is being moved, from the gyroscope and from what the
+        /// person carrying it is doing.
         ///
         /// The gyroscope rather than the accelerometer, and rate rather than orientation. What
         /// stabilisation corrects is rotation — the small involuntary turns of a hand holding a
@@ -532,11 +540,23 @@ import MoqomCore
         /// phone can be perfectly still at any angle, and gravity dominates an accelerometer at
         /// all of them, so an accelerometer answers the wrong question and answers it noisily.
         ///
-        /// > Note: no usage description and no permission prompt. Raw gyroscope and
-        /// > accelerometer data are available to any app; it is `CMMotionActivityManager` and the
-        /// > pedometer, neither of which is used here, that require `NSMotionUsageDescription`.
+        /// The gyroscope alone answers it a beat at a time, though, and walking is not a beat.
+        /// It is a sequence of them with gaps: a stride, a pause at a kerb, a stride. Judged on
+        /// rotation rate every one of those pauses looks like the phone being set down, and
+        /// stabilisation switching off and on across a walk is worse than either state, because
+        /// engaging it crops the frame and disengaging widens it — the picture visibly jumps
+        /// scale each way. `CMMotionActivityManager` names the sustained thing the gyroscope can
+        /// only sample, so the two together hold stabilisation on for the whole walk and drop it
+        /// when the walk ends.
+        ///
+        /// > Note: the activity half needs `NSMotionUsageDescription` in the application's
+        /// > `Info.plist` and the person's permission; an application without the key is
+        /// > terminated the moment it asks. Raw gyroscope data needs neither. Where permission
+        /// > is absent, refused, or the device has no motion coprocessor, this falls back to the
+        /// > gyroscope alone and everything still works — a little more eagerly.
         final class MotionWatch: @unchecked Sendable {
             private let manager = CMMotionManager()
+            private let activity = CMMotionActivityManager()
             private let queue: OperationQueue = {
                 let queue = OperationQueue()
                 queue.maxConcurrentOperationCount = 1
@@ -559,9 +579,19 @@ import MoqomCore
             private let settles = Duration.seconds(4)
 
             private var still: ContinuousClock.Instant?
+
+            /// What each sensor thinks, and what the caller was last told. Both sources report
+            /// on ``queue``, which is serial, so these need no lock.
+            private var shaking = false
+            private var striding = false
             private var reported = false
 
+            /// Whether the person is walking, running, or riding something. See ``isWalking``.
+            var isStriding: Bool { striding }
+
             func start(_ changed: @escaping @Sendable (Bool) -> Void) {
+                watchActivity(changed)
+
                 guard manager.isGyroAvailable, !manager.isGyroActive else { return }
 
                 // Twenty a second. The decision is a threshold with a four-second hold on one
@@ -572,38 +602,85 @@ import MoqomCore
                     guard let self, let rate = data?.rotationRate else { return }
                     let magnitude = (rate.x * rate.x + rate.y * rate.y + rate.z * rate.z)
                         .squareRoot()
-                    guard let now = decide(on: magnitude) else { return }
+                    shaking = settle(on: magnitude)
+                    guard let now = publish() else { return }
                     changed(now)
                 }
             }
 
-            /// The hysteresis, kept apart from the sensor plumbing so it can be reasoned about.
+            /// Follow what the person is doing, if they have allowed it.
             ///
-            /// Returns the new state only when it changed.
-            private func decide(on magnitude: Double) -> Bool? {
-                if magnitude > starts {
-                    still = nil
-                    guard !reported else { return nil }
-                    reported = true
-                    return true
+            /// Checked rather than attempted, because asking without the usage description is
+            /// not an error that can be caught — the system terminates the process. Refused and
+            /// unavailable are both ordinary: the gyroscope covers the same ground with a
+            /// shorter memory, so there is nothing here to tell anyone about or ask twice for.
+            /// A `notDetermined` status is the one case that prompts, and it prompts because
+            /// starting updates is the only way to ask.
+            private func watchActivity(_ changed: @escaping @Sendable (Bool) -> Void) {
+                guard CMMotionActivityManager.isActivityAvailable() else { return }
+                switch CMMotionActivityManager.authorizationStatus() {
+                case .denied, .restricted: return
+                default: break
                 }
 
-                guard reported, magnitude < stops else {
-                    if magnitude >= stops { still = nil }
-                    return nil
+                activity.startActivityUpdates(to: queue) { [weak self] reading in
+                    guard let self, let reading else { return }
+
+                    // Anything that carries the phone along with it. Cycling and driving are in
+                    // here with walking because they shake a held phone harder than walking
+                    // does, and `stationary` is not simply the negation of the rest: a reading
+                    // can be none of these with low confidence, which is the coprocessor saying
+                    // it does not know, and the gyroscope is the better answer then.
+                    let carried = reading.walking || reading.running
+                        || reading.cycling || reading.automotive
+                    if carried {
+                        striding = true
+                    } else if reading.stationary {
+                        striding = false
+                    }
+                    guard let now = publish() else { return }
+                    changed(now)
+                }
+            }
+
+            /// The gyroscope's hysteresis, kept apart from the sensor plumbing so it can be
+            /// reasoned about. Returns whether the device is shaking now.
+            private func settle(on magnitude: Double) -> Bool {
+                if magnitude > starts {
+                    still = nil
+                    return true
+                }
+                guard shaking else { return false }
+                guard magnitude < stops else {
+                    still = nil
+                    return true
                 }
 
                 let began = still ?? .now
                 still = began
-                guard ContinuousClock.now - began > settles else { return nil }
+                guard ContinuousClock.now - began > settles else { return true }
                 still = nil
-                reported = false
                 return false
+            }
+
+            /// The combined answer, and only when it changed.
+            ///
+            /// An OR, and the asymmetry is the point: either sensor seeing movement engages
+            /// stabilisation, and it takes both of them going quiet to let it go. Walking holds
+            /// it through the pause at a kerb that the gyroscope would have read as stillness.
+            private func publish() -> Bool? {
+                let now = shaking || striding
+                guard now != reported else { return nil }
+                reported = now
+                return now
             }
 
             func stop() {
                 manager.stopGyroUpdates()
+                activity.stopActivityUpdates()
                 still = nil
+                shaking = false
+                striding = false
                 reported = false
             }
 

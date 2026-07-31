@@ -2245,23 +2245,91 @@ public actor RoomSession {
         else { return }
 
         let who = participant.id
+        let request = SubscribeRequest(
+            track: track,
+            priority: CatalogPublisher.priority,
+            // The current catalog, not the next one. Waiting for
+            // the next version means waiting until the publisher
+            // happens to change something, which may be never.
+            start: .latestGroup
+        )
+
         catalogTasks[who] = Task { [weak self] in
-            guard let self else { return }
-            guard
-                let subscription = try? await self.connection.subscribe(
-                    SubscribeRequest(
-                        track: track,
-                        priority: CatalogPublisher.priority,
-                        // The current catalog, not the next one. Waiting for
-                        // the next version means waiting until the publisher
-                        // happens to change something, which may be never.
-                        start: .latestGroup
-                    )
-                )
-            else { return }
-            for await object in subscription.objects {
-                await self.applyCatalog(object, from: who)
+            await Self.follow(request, from: who, for: self)
+        }
+    }
+
+    /// Stay subscribed to one participant's catalog until told to stop.
+    ///
+    /// A single attempt is not enough, and its failures were all silent. Subscribing can be
+    /// refused outright — a race with the announcement, a session mid-reconnect — and it can
+    /// also succeed and deliver nothing, which is what happens when the publisher wrote its
+    /// only catalog group before this subscription reached the relay and nothing since has
+    /// made it write another. Both end the same way: a participant who is in the roster, has a
+    /// tile, has a layout box, and is never subscribed to, because the ladder that would say
+    /// what to subscribe to never arrived. The tile stays black on a link carrying the other
+    /// direction perfectly.
+    ///
+    /// So: retry a refused subscription, and treat a subscription that has said nothing for a
+    /// few seconds as refused too. The publishing side restates its catalog when someone joins,
+    /// which covers the common race from its end; this covers the same race from the end that
+    /// can actually tell it went wrong, and covers the case where the restatement itself was
+    /// lost. Once a catalog has arrived the wait no longer applies — a settled room may go
+    /// minutes without a new one, and that is not a fault.
+    private static func follow(
+        _ request: SubscribeRequest,
+        from who: ParticipantIdentity,
+        for session: RoomSession?
+    ) async {
+        var attempt = 0
+        while !Task.isCancelled {
+            guard let session else { return }
+            var subscription: (any SubscriptionHandle)?
+            do throws(MoqomError) {
+                subscription = try await session.connection.subscribe(request)
+            } catch {
+                session.logger.warning(.subscribe, "catalog subscription refused", [
+                    LogField("participant", .participant(who)),
+                    LogField("attempt", .text("\(attempt + 1)")),
+                    LogField("error", .text(String(describing: error))),
+                ])
             }
+
+            if let subscription {
+                var arrived = false
+                let watchdog = Task {
+                    try? await Task.sleep(for: .seconds(3))
+                    guard !Task.isCancelled else { return }
+                    await subscription.cancel()
+                }
+                for await object in subscription.objects {
+                    if !arrived {
+                        arrived = true
+                        watchdog.cancel()
+                        attempt = 0
+                    }
+                    await session.applyCatalog(object, from: who)
+                }
+                watchdog.cancel()
+                await subscription.cancel()
+                if arrived {
+                    // Ended after delivering, which is the publisher going away rather than a
+                    // race. Their departure cancels this task; until it does, a slow retry
+                    // costs nothing and covers a track that comes back.
+                    session.logger.warning(.subscribe, "catalog stream ended", [
+                        LogField("participant", .participant(who)),
+                    ])
+                }
+            }
+
+            attempt += 1
+            guard attempt < 8 else {
+                session.logger.error(.subscribe, "catalog never arrived", [
+                    LogField("participant", .participant(who)),
+                ])
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(250 * (1 << min(attempt, 4))))
         }
     }
 

@@ -41,6 +41,7 @@ WHERE="$WHERE${MOQOM_PLAYOUT_MS:+ --playout-ms $MOQOM_PLAYOUT_MS}"
 WHERE="$WHERE${MOQOM_TOLERANCE:+ --tolerance $MOQOM_TOLERANCE}"
 WHERE="$WHERE${MOQOM_FLOOR_MS:+ --floor-ms $MOQOM_FLOOR_MS}"
 WHERE="$WHERE${MOQOM_AUDIO:+ --audio $MOQOM_AUDIO}"
+WHERE="$WHERE${MOQOM_VIDEO:+ --video $MOQOM_VIDEO}"
 
 # By name rather than by hard-coded identifier, so this survives a re-pair. The identifier is
 # found by its shape rather than its column, because the state field ("available (paired)")
@@ -71,15 +72,24 @@ if [ -z "$PUBLISHER" ] || [ -z "$VIEWER" ]; then
     exit 1
 fi
 
+# Passed on the command line rather than relied on from the project, because the project is
+# generated: `xcodegen generate` rewrites the team to whatever `project.yml` names, and the
+# team that can sign on the machine running this is not necessarily that one. The failure is
+# also unhelpfully worded — "Supported platforms ... is empty" — so a run that lost this would
+# look like a broken toolchain rather than a missing account.
+TEAM="${MOQOM_TEAM:-LHS49D8RYY}"
+
 echo "building Release"
 APP="$(
     xcodebuild -project "$HERE/MoqomRoom.xcodeproj" -scheme MoqomRoom \
         -destination 'generic/platform=iOS' -configuration Release \
+        DEVELOPMENT_TEAM="$TEAM" \
         -showBuildSettings 2>/dev/null \
         | awk -F' = ' '/ BUILT_PRODUCTS_DIR/{d=$2} / FULL_PRODUCT_NAME/{n=$2} END{print d"/"n}'
 )"
 xcodebuild -project "$HERE/MoqomRoom.xcodeproj" -scheme MoqomRoom \
     -destination 'generic/platform=iOS' -configuration Release \
+    DEVELOPMENT_TEAM="$TEAM" \
     -allowProvisioningUpdates build >/dev/null
 
 # Retried, because the tunnel to a phone on Wi-Fi is not reliable enough to assume. It resets,

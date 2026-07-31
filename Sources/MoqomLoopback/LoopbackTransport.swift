@@ -114,6 +114,9 @@ public final class LoopbackSession: TransportSession {
     public func subscribe(
         _ request: SubscribeRequest
     ) async throws(MoqomError) -> any SubscriptionHandle {
+        if await relay.shouldRefuseSubscribe(to: request.track) {
+            throw MoqomError.rejected(.trackNotFound(request.track))
+        }
         let (stream, continuation) = AsyncStream.makeStream(
             of: TrackObject.self,
             bufferingPolicy: .bufferingNewest(64)

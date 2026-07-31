@@ -181,6 +181,14 @@ struct LaunchOptions {
     /// desk publishing microphones is a feedback loop, and what it measures is the room.
     var audio: String?
 
+    /// What to publish as video: `camera` or `pattern`. The camera by default.
+    ///
+    /// The pattern is the bisect. Everything from the encoder onwards treats the two identically,
+    /// so a pattern that arrives when a camera does not says the fault is in front of the
+    /// encoder, and a pattern that does not arrive either says it is behind it. Without it, a
+    /// dark room and a broken display path look exactly the same from both ends.
+    var video: String?
+
     static func current(
         arguments: [String] = ProcessInfo.processInfo.arguments
     ) -> LaunchOptions {
@@ -202,6 +210,7 @@ struct LaunchOptions {
             case "--tolerance": options.playoutTolerance = value.flatMap(Double.init)
             case "--floor-ms": options.playoutFloorMilliseconds = value.flatMap(Int.init)
             case "--audio": options.audio = value ?? "tone"
+            case "--video": options.video = value ?? "camera"
             default: break
             }
             index += 1

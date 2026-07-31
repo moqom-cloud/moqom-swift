@@ -168,10 +168,20 @@ final class RoomModel {
     /// What the remote tile did with the frames it was handed. See ``VideoRenderer/drawing``.
     var drawing = VideoRenderer.Drawing()
 
+    /// Whether the layer those frames are drawn into is attached and has a size.
+    /// See ``VideoRenderer/isOnScreen``.
+    var tileIsOnScreen = false
+
+    /// How large that layer is laid out, in points.
+    var tileSize: CGSize = .zero
+
     /// What the display layer did with the frames, sampled from the renderer.
     var presentation: VideoRenderer.Presentation?
 
     private var captureCadenceTask: Task<Void, Never>?
+
+    /// How bright the picture going into the encoder is, `0` to `1`. See ``brightness(of:)``.
+    var captureBrightness: Double?
 
     enum VideoInput: String, CaseIterable, Identifiable, Sendable {
         case pattern = "Test pattern"
@@ -330,6 +340,19 @@ final class RoomModel {
             return camera?.isMoving
         #else
             return nil
+        #endif
+    }
+
+    /// Whether the camera is being carried rather than merely handled.
+    ///
+    /// Only ever true where motion permission was granted, so it doubles as the answer to
+    /// whether it was: a phone that is walking and reports `moving` without `walking` is one
+    /// running on the gyroscope alone.
+    var cameraIsWalking: Bool {
+        #if os(iOS)
+            return camera?.isWalking ?? false
+        #else
+            return false
         #endif
     }
 
@@ -604,8 +627,50 @@ final class RoomModel {
             let tap = await publication.tapFrames(
                 policy: TapPolicy(cadence: .everyFrame, depth: 2)
             )
-            for await _ in tap.elements { captureCadence.record() }
+            var seen = 0
+            for await frame in tap.elements {
+                captureCadence.record()
+                seen += 1
+                // Once a second at sixty, because it reads pixels off a surface the encoder is
+                // also reading and there is no question here that needs answering faster.
+                guard seen % 60 == 0 else { continue }
+                if let luma = Self.brightness(of: frame) {
+                    await MainActor.run { self.captureBrightness = luma }
+                }
+            }
         }
+    }
+
+    /// The average luminance of a frame, `0` to `1`, sampled rather than summed.
+    ///
+    /// Exists because "no video" and "a black picture" are indistinguishable from every counter
+    /// in this app: frames captured, encoded, sent, received, decoded and presented all read
+    /// perfectly while a camera hands over darkness. This is the only reading that separates a
+    /// broken pipeline from a lens against a desk — or from a capture configuration that looked
+    /// like a power saving and was in fact a black frame.
+    private static func brightness(of frame: VideoFrame) -> Double? {
+        guard case let .pixelBuffer(buffer) = frame.surface else { return nil }
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+
+        // Plane zero of a biplanar buffer is luma, which is the whole of the question.
+        guard let base = CVPixelBufferGetBaseAddressOfPlane(buffer, 0) else { return nil }
+        let stride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
+        let height = CVPixelBufferGetHeightOfPlane(buffer, 0)
+        let width = CVPixelBufferGetWidthOfPlane(buffer, 0)
+        guard stride > 0, height > 0, width > 0 else { return nil }
+
+        let pixels = base.assumingMemoryBound(to: UInt8.self)
+        var total = 0
+        var counted = 0
+        for row in Swift.stride(from: 0, to: height, by: max(1, height / 16)) {
+            for column in Swift.stride(from: 0, to: width, by: max(1, width / 16)) {
+                total += Int(pixels[row * stride + column])
+                counted += 1
+            }
+        }
+        guard counted > 0 else { return nil }
+        return Double(total) / Double(counted) / 255
     }
 
     /// A tap per caller, and never a shared stream.

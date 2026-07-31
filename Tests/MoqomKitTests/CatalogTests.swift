@@ -305,4 +305,57 @@ struct CatalogDiscoveryTests {
             }
         )
     }
+
+    @Test("a refused catalog subscription is retried rather than abandoned")
+    func aRefusedCatalogSubscriptionIsRetried() async throws {
+        // One attempt was all a participant ever got. Subscribing to somebody's catalog
+        // happens the moment their announcement arrives, which is the busiest instant of a
+        // join and the likeliest one to be refused — and the refusal was swallowed by a
+        // `try?`, so the participant sat in the roster with a tile, a layout box, and no
+        // ladder for as long as they stayed. Nothing was logged, no counter moved, and the
+        // link carried the other direction perfectly the whole time.
+        let relay = LoopbackRelay()
+        await relay.refuseSubscribes(to: Catalog.trackName, count: 2)
+
+        let host = MoqomSession(
+            transport: LoopbackTransport(relay: relay),
+            credentials: credentials("alice"),
+            tenant: "acme"
+        )
+        try await host.connect(to: RelayEndpoint(host: "loopback"))
+        let hostRoom = try await host.join(room: "room-42")
+
+        let viewer = MoqomSession(
+            transport: LoopbackTransport(relay: relay),
+            credentials: credentials("bob"),
+            tenant: "acme"
+        )
+        try await viewer.connect(to: RelayEndpoint(host: "loopback"))
+        let viewerRoom = try await viewer.join(room: "room-42")
+
+        _ = try await hostRoom.startBroadcast(
+            from: FrameRelay(
+                format: CaptureFormat(size: PixelSize(width: 960, height: 540), frameRate: 24),
+                depth: 8
+            ),
+            configuration: BroadcastConfiguration(
+                ladder: LayerLadder(rungs: [
+                    VideoLayer(
+                        id: "video/540p",
+                        size: PixelSize(width: 960, height: 540),
+                        frameRate: 24,
+                        bitrate: 1_200_000
+                    ),
+                ]),
+                encoderFactory: { SyntheticEncoder(configuration: $0) }
+            )
+        )
+
+        #expect(
+            await eventually(timeout: .seconds(10)) {
+                await viewerRoom.catalog(of: identity("alice"))?.videoLadder.rungs.count == 1
+            },
+            "a catalog refused twice should still arrive on the third attempt"
+        )
+    }
 }

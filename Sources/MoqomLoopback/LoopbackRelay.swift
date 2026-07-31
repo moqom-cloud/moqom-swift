@@ -45,6 +45,9 @@ public actor LoopbackRelay {
     /// How many further attempts to open a track for publishing to refuse.
     private var refusedPublishes = 0
 
+    /// How many further subscriptions to refuse, by track name.
+    private var refusedSubscribes: [String: Int] = [:]
+
     /// Which session announced what.
     ///
     /// Needed because a session ending withdraws everything it announced, which
@@ -94,6 +97,22 @@ public actor LoopbackRelay {
     func shouldRefusePublish() -> Bool {
         guard refusedPublishes > 0 else { return false }
         refusedPublishes -= 1
+        return true
+    }
+
+    /// Refuse the next `count` subscriptions to tracks with this name.
+    ///
+    /// By name rather than by count alone, because a room subscribes to several tracks as it
+    /// comes up and a bare counter would refuse whichever happened to be asked for first.
+    public func refuseSubscribes(to name: String, count: Int) {
+        refusedSubscribes[name] = count
+    }
+
+    /// Whether this subscription should be refused. Consumes one refusal.
+    func shouldRefuseSubscribe(to track: FullTrackName) -> Bool {
+        let name = track.name.value
+        guard let remaining = refusedSubscribes[name], remaining > 0 else { return false }
+        refusedSubscribes[name] = remaining - 1
         return true
     }
 
