@@ -71,13 +71,6 @@ targets:
         # the app would otherwise be terminated on the first capture attempt.
         NSCameraUsageDescription: Publish your camera to the room.
         NSMicrophoneUsageDescription: Publish your microphone to the room.
-        # Motion, for `CameraSource.Stabilisation.whenMoving`. Knowing that the
-        # person is walking rather than sitting is what keeps stabilisation on
-        # across a walk instead of switching it on and off at every pause, and
-        # each switch is a visible jump in how much of the scene is in frame.
-        # An app that asks without this string is terminated, not refused.
-        NSMotionUsageDescription: >-
-          Detect when you are walking or moving so your video can be stabilised.
         # A relay on a desk is on a private address, and iOS blackholes traffic to
         # those until this string exists to be shown in a prompt. Without it the
         # connection does not fail: it hangs, which reads as a relay that is down.

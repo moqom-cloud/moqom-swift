@@ -18,10 +18,6 @@ import MoqomCore
     import CoreVideo
     import VideoToolbox
 
-    #if os(iOS)
-        import CoreMotion
-    #endif
-
     /// Which camera to open.
     public enum CameraPosition: Hashable, Sendable {
         case front
@@ -83,65 +79,12 @@ import MoqomCore
         private var mirrored = false
         private var rotation: Double = 0
         private var input: AVCaptureDeviceInput
-        private var steadying = Stabilisation.whenMoving
-        private var moving = false
-
-        /// When to spend power on holding the picture steady.
-        ///
-        /// Stabilisation is not free and is not always worth anything. It buffers frames so it
-        /// can compare them, which is latency in a live call, and it warps every one of them,
-        /// which is work on a device already encoding sixty a second. Against that it fixes the
-        /// one thing nothing downstream can: a shaking camera, which also happens to be the
-        /// worst case for the encoder, because a picture where every pixel moved is a picture
-        /// with no redundancy left to compress.
-        ///
-        /// So the useful setting is neither on nor off but *when*, and the question is about the
-        /// camera rather than the scene: a phone propped on a desk gains nothing from
-        /// stabilisation however much the person in front of it moves, and a phone in a walking
-        /// hand needs it whatever it is pointed at. The device's own gyroscope answers exactly
-        /// that question, and costs almost nothing to ask.
-        public enum Stabilisation: Hashable, Sendable {
-            /// Never. Lowest latency and lowest power, right for a fixed camera.
-            case off
-
-            /// While the device is being moved, and for a few seconds after it stops.
-            case whenMoving
-
-            /// Always, which is what `AVFoundation` does when asked for `.auto`.
-            case always
-        }
-
-        /// When the picture should be held steady. Motion-driven by default.
-        public var stabilisation: Stabilisation {
-            get { lock.withLock { steadying } }
-            set {
-                lock.withLock { steadying = newValue }
-                queue.async { [weak self] in self?.applyStabilisation() }
-                #if os(iOS)
-                    if newValue == .whenMoving { watchMotion() } else { motion.stop() }
-                #endif
-            }
-        }
-
-        /// Whether the device is currently being moved about, by either measure below.
-        public var isMoving: Bool { lock.withLock { moving } }
 
         /// The turn the capture connection is actually applying, which is not always the one
         /// that was asked for. See ``applyRotation``.
         public var appliedRotationDegrees: Double {
             output.connection(with: .video).map { Double($0.videoRotationAngle) } ?? 0
         }
-
-        #if os(iOS)
-            /// Whether the person holding the device is walking, running, or riding something.
-            ///
-            /// Distinct from ``isMoving``, which a hand gesture at a desk also sets. Always
-            /// false without motion permission, where ``isMoving`` still works — so the two
-            /// together are also how an application can tell whether the permission took.
-            public var isWalking: Bool { motion.isStriding }
-
-            private let motion = MotionWatch()
-        #endif
 
         /// Which camera is open.
         public var position: CameraPosition { lock.withLock { current } }
@@ -422,9 +365,6 @@ import MoqomCore
                 // state in which the answer to "will you turn this?" is the final one.
                 self?.applyRotation()
             }
-            #if os(iOS)
-                if stabilisation == .whenMoving { watchMotion() }
-            #endif
         }
 
         public func frames() -> AsyncStream<VideoFrame> { relay.frames() }
@@ -528,53 +468,29 @@ import MoqomCore
 
         /// Always called on the capture queue, for the same reason as ``applyMirroring``.
         ///
-        /// Stabilisation is the expensive default nobody asks for. It buffers frames to
-        /// compare them, which adds latency to a live call, and it runs a warp over every one
-        /// of them, which is real work on a device already encoding sixty a second. What it
-        /// buys is a steadier picture from a moving camera — worth having when filming, and
-        /// worth nothing for a phone propped on a desk pointed at a face.
+        /// Off, once, and never reconsidered — which is a stronger statement than it looks and
+        /// is the outcome of trying the alternative. Stabilisation was motion-driven here: the
+        /// gyroscope and the activity sensors decided when a hand-held camera needed it, which
+        /// is the genuinely useful version of the feature and is what it costs that killed it.
+        /// Changing `preferredVideoStabilizationMode` on a running connection reconfigures the
+        /// capture pipeline, and the pipeline stops while it does. Measured on two phones over
+        /// the relay: the one being held froze four times in thirty seconds, once for three and
+        /// a half, and produced no frames for seventeen percent of the run; the one on the desk
+        /// dropped nothing. Downstream, none of that is attributable — the far end sees late
+        /// frames and grows its playout buffer, so a feature meant to steady the picture
+        /// arrives as a hundred and fifty milliseconds of added latency and a stuttering one.
+        ///
+        /// Set explicitly rather than left alone, because the default is not documented to be
+        /// off and a mode inherited from whatever the device felt like is not a baseline
+        /// anybody can measure against.
         private func applyStabilisation() {
             #if os(iOS) || os(tvOS)
                 guard let connection = output.connection(with: .video) else { return }
                 guard connection.isVideoStabilizationSupported else { return }
-
-                let wanted: AVCaptureVideoStabilizationMode = lock.withLock {
-                    switch steadying {
-                    case .off: .off
-                    case .always: .standard
-                    case .whenMoving: moving ? .standard : .off
-                    }
-                }
-                guard connection.preferredVideoStabilizationMode != wanted else { return }
-
-                // `.standard` rather than `.cinematic`, which is the other one worth having and
-                // is the wrong trade here: cinematic buffers a good deal more of the future to
-                // smooth a pan, and a call cannot spend that.
-                connection.preferredVideoStabilizationMode = wanted
+                guard connection.preferredVideoStabilizationMode != .off else { return }
+                connection.preferredVideoStabilizationMode = .off
             #endif
         }
-
-        #if os(iOS)
-            /// Follow the gyroscope, and turn stabilisation on and off as it answers.
-            ///
-            /// Asymmetric on purpose. Movement engages it within a fifth of a second, because the
-            /// frames worth rescuing are the ones at the start of a shake; stillness disengages it
-            /// only after several seconds, because a switch that flips at every pause would show
-            /// as the picture jumping scale each time — stabilisation crops, and turning it off
-            /// widens the field of view back out.
-            private func watchMotion() {
-                motion.start { [weak self] rate in
-                    guard let self else { return }
-                    let changed: Bool = lock.withLock {
-                        guard moving != rate else { return false }
-                        moving = rate
-                        return true
-                    }
-                    guard changed else { return }
-                    queue.async { [weak self] in self?.applyStabilisation() }
-                }
-            }
-        #endif
 
         /// Always called on the capture queue, for the same reason as ``applyMirroring``.
         private func applyRotation() {
@@ -597,9 +513,6 @@ import MoqomCore
 
         public func stop() {
             relay.stop()
-            #if os(iOS)
-                motion.stop()
-            #endif
             queue.async { [box] in
                 if box.session.isRunning { box.session.stopRunning() }
             }
@@ -617,163 +530,6 @@ import MoqomCore
         }
     }
 
-    #if os(iOS)
-        /// Reports whether the device is being moved, from the gyroscope and from what the
-        /// person carrying it is doing.
-        ///
-        /// The gyroscope rather than the accelerometer, and rate rather than orientation. What
-        /// stabilisation corrects is rotation — the small involuntary turns of a hand holding a
-        /// phone — and rotation rate is the quantity that says how much of it is happening. A
-        /// phone can be perfectly still at any angle, and gravity dominates an accelerometer at
-        /// all of them, so an accelerometer answers the wrong question and answers it noisily.
-        ///
-        /// The gyroscope alone answers it a beat at a time, though, and walking is not a beat.
-        /// It is a sequence of them with gaps: a stride, a pause at a kerb, a stride. Judged on
-        /// rotation rate every one of those pauses looks like the phone being set down, and
-        /// stabilisation switching off and on across a walk is worse than either state, because
-        /// engaging it crops the frame and disengaging widens it — the picture visibly jumps
-        /// scale each way. `CMMotionActivityManager` names the sustained thing the gyroscope can
-        /// only sample, so the two together hold stabilisation on for the whole walk and drop it
-        /// when the walk ends.
-        ///
-        /// > Note: the activity half needs `NSMotionUsageDescription` in the application's
-        /// > `Info.plist` and the person's permission; an application without the key is
-        /// > terminated the moment it asks. Raw gyroscope data needs neither. Where permission
-        /// > is absent, refused, or the device has no motion coprocessor, this falls back to the
-        /// > gyroscope alone and everything still works — a little more eagerly.
-        final class MotionWatch: @unchecked Sendable {
-            private let manager = CMMotionManager()
-            private let activity = CMMotionActivityManager()
-            private let queue: OperationQueue = {
-                let queue = OperationQueue()
-                queue.maxConcurrentOperationCount = 1
-                queue.qualityOfService = .utility
-                return queue
-            }()
-
-            /// Radians per second at which the device counts as moving, and the lower figure it
-            /// must fall below to count as still again.
-            ///
-            /// Two thresholds rather than one, because a single one flaps: a hand hovering
-            /// either side of it would toggle stabilisation several times a second. A phone
-            /// lying on a desk reads a few hundredths from sensor noise alone, a hand holding
-            /// one still reads around a tenth, and a hand that is actually moving reads several
-            /// times that.
-            private let starts = 0.25
-            private let stops = 0.08
-
-            /// How long stillness must last before stabilisation is dropped.
-            private let settles = Duration.seconds(4)
-
-            private var still: ContinuousClock.Instant?
-
-            /// What each sensor thinks, and what the caller was last told. Both sources report
-            /// on ``queue``, which is serial, so these need no lock.
-            private var shaking = false
-            private var striding = false
-            private var reported = false
-
-            /// Whether the person is walking, running, or riding something. See ``isWalking``.
-            var isStriding: Bool { striding }
-
-            func start(_ changed: @escaping @Sendable (Bool) -> Void) {
-                watchActivity(changed)
-
-                guard manager.isGyroAvailable, !manager.isGyroActive else { return }
-
-                // Twenty a second. The decision is a threshold with a four-second hold on one
-                // side of it, so nothing here can use a faster signal, and the sensor is cheaper
-                // to read slowly.
-                manager.gyroUpdateInterval = 0.05
-                manager.startGyroUpdates(to: queue) { [weak self] data, _ in
-                    guard let self, let rate = data?.rotationRate else { return }
-                    let magnitude = (rate.x * rate.x + rate.y * rate.y + rate.z * rate.z)
-                        .squareRoot()
-                    shaking = settle(on: magnitude)
-                    guard let now = publish() else { return }
-                    changed(now)
-                }
-            }
-
-            /// Follow what the person is doing, if they have allowed it.
-            ///
-            /// Checked rather than attempted, because asking without the usage description is
-            /// not an error that can be caught — the system terminates the process. Refused and
-            /// unavailable are both ordinary: the gyroscope covers the same ground with a
-            /// shorter memory, so there is nothing here to tell anyone about or ask twice for.
-            /// A `notDetermined` status is the one case that prompts, and it prompts because
-            /// starting updates is the only way to ask.
-            private func watchActivity(_ changed: @escaping @Sendable (Bool) -> Void) {
-                guard CMMotionActivityManager.isActivityAvailable() else { return }
-                switch CMMotionActivityManager.authorizationStatus() {
-                case .denied, .restricted: return
-                default: break
-                }
-
-                activity.startActivityUpdates(to: queue) { [weak self] reading in
-                    guard let self, let reading else { return }
-
-                    // Anything that carries the phone along with it. Cycling and driving are in
-                    // here with walking because they shake a held phone harder than walking
-                    // does, and `stationary` is not simply the negation of the rest: a reading
-                    // can be none of these with low confidence, which is the coprocessor saying
-                    // it does not know, and the gyroscope is the better answer then.
-                    let carried = reading.walking || reading.running
-                        || reading.cycling || reading.automotive
-                    if carried {
-                        striding = true
-                    } else if reading.stationary {
-                        striding = false
-                    }
-                    guard let now = publish() else { return }
-                    changed(now)
-                }
-            }
-
-            /// The gyroscope's hysteresis, kept apart from the sensor plumbing so it can be
-            /// reasoned about. Returns whether the device is shaking now.
-            private func settle(on magnitude: Double) -> Bool {
-                if magnitude > starts {
-                    still = nil
-                    return true
-                }
-                guard shaking else { return false }
-                guard magnitude < stops else {
-                    still = nil
-                    return true
-                }
-
-                let began = still ?? .now
-                still = began
-                guard ContinuousClock.now - began > settles else { return true }
-                still = nil
-                return false
-            }
-
-            /// The combined answer, and only when it changed.
-            ///
-            /// An OR, and the asymmetry is the point: either sensor seeing movement engages
-            /// stabilisation, and it takes both of them going quiet to let it go. Walking holds
-            /// it through the pause at a kerb that the gyroscope would have read as stillness.
-            private func publish() -> Bool? {
-                let now = shaking || striding
-                guard now != reported else { return nil }
-                reported = now
-                return now
-            }
-
-            func stop() {
-                manager.stopGyroUpdates()
-                activity.stopActivityUpdates()
-                still = nil
-                shaking = false
-                striding = false
-                reported = false
-            }
-
-            deinit { manager.stopGyroUpdates() }
-        }
-    #endif
 
     extension CameraSource: AVCaptureVideoDataOutputSampleBufferDelegate {
         public func captureOutput(

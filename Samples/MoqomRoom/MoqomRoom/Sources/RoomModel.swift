@@ -389,7 +389,11 @@ final class RoomModel {
         var id: String { rawValue }
     }
 
-    var screen: Screen = .others
+    /// Side by side to start, because the first question about a call is whether the two
+    /// halves match: what this camera is capturing and what the other device is drawing, at the
+    /// same size on one screen. Any other default makes that a comparison between a big picture
+    /// and a thumbnail, which hides exactly the difference worth seeing.
+    var screen: Screen = .sideBySide
 
     /// The shape of a tile: the shape of the video, or a square for a room with none.
     ///
@@ -446,16 +450,6 @@ final class RoomModel {
     private var capture: PatternSource?
     private var camera: CameraSource?
 
-    /// Whether the camera is being carried about, and therefore whether it is paying for
-    /// stabilisation. `nil` when nothing is publishing from a camera.
-    var cameraIsMoving: Bool? {
-        #if os(iOS)
-            return camera?.isMoving
-        #else
-            return nil
-        #endif
-    }
-
     /// The quarter turn the capture connection is applying, if any.
     ///
     /// Asked of the connection rather than of what was requested, because those are the two
@@ -464,19 +458,6 @@ final class RoomModel {
 
     /// Whether that turn is being done in software because the connection would not.
     var cameraTurnsInSoftware: Bool { camera?.softwareTurns ?? false }
-
-    /// Whether the camera is being carried rather than merely handled.
-    ///
-    /// Only ever true where motion permission was granted, so it doubles as the answer to
-    /// whether it was: a phone that is walking and reports `moving` without `walking` is one
-    /// running on the gyroscope alone.
-    var cameraIsWalking: Bool {
-        #if os(iOS)
-            return camera?.isWalking ?? false
-        #else
-            return false
-        #endif
-    }
 
     /// Kept so a camera switch can ask for a keyframe. Nothing else here needs
     /// it — the room owns the publication's lifetime.

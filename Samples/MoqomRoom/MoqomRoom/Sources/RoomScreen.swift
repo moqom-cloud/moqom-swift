@@ -127,9 +127,22 @@ struct RoomScreen: View {
                     // decode, at the same size on the same panel. It is also the arrangement
                     // that halves every tile's box, so the rung each tile fetches changes with
                     // it — visible on the badge without touching the grid picker.
-                    HStack(spacing: 8) {
-                        SelfView(room: room, height: nil)
-                        gallery
+                    //
+                    // Halved explicitly, because neither side has a width of its own to
+                    // negotiate with. The self view is an aspect ratio around a layer and the
+                    // gallery is a `GeometryReader`; both answer "as much as you have" to any
+                    // proposal, so an `HStack` resolves them in the order it happens to try
+                    // and one of them ends up with nothing. What that looks like is a side by
+                    // side with one side missing.
+                    GeometryReader { proxy in
+                        let half = max((proxy.size.width - 8) / 2, 1)
+                        HStack(spacing: 8) {
+                            SelfView(room: room, height: nil)
+                                .frame(width: half)
+                            gallery
+                                .frame(width: half)
+                        }
+                        .frame(width: proxy.size.width, height: proxy.size.height)
                     }
                     .padding(.horizontal, 8)
                     overflowNote

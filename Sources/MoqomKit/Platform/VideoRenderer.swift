@@ -476,34 +476,24 @@ import MoqomCore
         /// health to a viewer looking at a blank tile. Reported rather than asserted because
         /// there is a legitimate moment for each: a renderer built before its view is attached is
         /// detached for an instant, and one whose tile is off screen has been given no size.
-        /// Walked to the root of the layer tree rather than checking for a parent, because a
-        /// parent is not the question. A tile that SwiftUI has torn down keeps its layer inside
-        /// the discarded view's layer, so `superlayer` stays non-nil for something nobody can
-        /// see — which is exactly the case this was added to catch and exactly the case it
-        /// missed. A layer that is genuinely visible has a window at the top of its tree.
+        ///
+        /// Answered from what the host told us rather than by walking the layer tree, which was
+        /// the first attempt and read "off screen" for tiles people were plainly watching. The
+        /// walk looked for a view with a window somewhere above the layer, and inside a SwiftUI
+        /// hierarchy the layers above a representable's own view belong to hosts whose delegates
+        /// are private or nil — so the honest answer was never reachable from down here. The view
+        /// hosting the layer is the only thing that knows, and it is told by UIKit.
         public var isOnScreen: Bool {
             guard layer.bounds.width > 1, layer.bounds.height > 1 else { return false }
-
-            // Every layer on the way up, rather than the root of the tree. The root is not the
-            // window: above it sit layers the system owns, whose delegates are private or nil,
-            // and asking only the top one answers "no" for a tile a person is looking at. The
-            // first view found with a window is the honest answer, and a discarded tile has
-            // none anywhere in its chain — which is the case worth catching.
-            var next: CALayer? = layer
-            while let current = next {
-                #if os(iOS) || os(tvOS) || os(visionOS)
-                    if let view = current.delegate as? UIView, view.window != nil { return true }
-                #elseif os(macOS)
-                    if let view = current.delegate as? NSView, view.window != nil { return true }
-                #endif
-                next = current.superlayer
-            }
-            #if os(iOS) || os(tvOS) || os(visionOS) || os(macOS)
-                return false
-            #else
-                return layer.superlayer != nil
-            #endif
+            return isHosted ?? (layer.superlayer != nil)
         }
+
+        /// Whether the view holding ``layer`` is in a window.
+        ///
+        /// Set from `didMoveToWindow`, and left `nil` by hosts that never say — in which case
+        /// ``isOnScreen`` falls back to whether the layer is parented at all, which is the most
+        /// that can be known without being told.
+        public var isHosted: Bool?
 
         /// The size the layer is laid out at, for diagnostics.
         public var drawnSize: CGSize { layer.bounds.size }

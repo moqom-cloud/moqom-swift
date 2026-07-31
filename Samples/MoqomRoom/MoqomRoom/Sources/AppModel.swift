@@ -475,14 +475,6 @@ final class AppModel {
                 print(
                     "HOST thermal=\(Self.describe(ProcessInfo.processInfo.thermalState))"
                         + " lowpower=\(ProcessInfo.processInfo.isLowPowerModeEnabled)"
-                        // Whether the motion sensors currently have stabilisation switched on,
-                        // which is the one power draw here that comes and goes on its own.
-                        // `walking` rather than `moving` also says the motion permission was
-                        // granted, since that half is silent without it.
-                        + (room.cameraIsMoving.map {
-                            let state = room.cameraIsWalking ? "walking" : ($0 ? "moving" : "steady")
-                            return " camera=\(state)"
-                        } ?? "")
                 )
 
                 // What the publisher did with the frames it captured, which is where an

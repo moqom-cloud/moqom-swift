@@ -30,8 +30,6 @@
 	<string>Connect to a relay running on your own network, for development.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Publish your microphone to the room.</string>
-	<key>NSMotionUsageDescription</key>
-	<string>Detect when you are walking or moving so your video can be stabilised.</string>
 	<key>NSSupportsLiveActivities</key>
 	<true/>
 	<key>UIBackgroundModes</key>

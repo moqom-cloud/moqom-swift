@@ -311,6 +311,11 @@ final class VideoTile {
         @available(*, unavailable)
         required init?(coder _: NSCoder) { fatalError("not used") }
 
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            renderer.isHosted = window != nil
+        }
+
         override func layoutSubviews() {
             super.layoutSubviews()
             // Only while we still hold it. The Picture in Picture window moves
@@ -380,6 +385,11 @@ final class VideoTile {
 
         @available(*, unavailable)
         required init?(coder _: NSCoder) { fatalError("not used") }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            renderer.isHosted = window != nil
+        }
 
         override func layout() {
             super.layout()

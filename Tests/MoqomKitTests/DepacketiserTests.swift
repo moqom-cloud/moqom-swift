@@ -340,4 +340,89 @@ struct RoundTripTests {
         #expect(await counting.value == 3)
         #expect(frameCount == 3)
     }
+
+    @Test("a viewer that drops one frame stream still gets frames on the next one")
+    func framesSurviveARebuiltView() async throws {
+        // What a layout change does: the tile drawing a participant is torn down and an
+        // identical one is built in its place. The old stream is abandoned, the new one is
+        // asked for, and the picture has to carry on — anything else means the application
+        // can stop its own media by rearranging its own views.
+        let relay = LoopbackRelay()
+        let host = MoqomSession(
+            transport: LoopbackTransport(relay: relay),
+            credentials: credentials("erin"),
+            tenant: "acme"
+        )
+        try await host.connect(to: RelayEndpoint(host: "loopback"))
+        let hostRoom = try await host.join(room: "room-42")
+
+        let viewer = MoqomSession(
+            transport: LoopbackTransport(relay: relay),
+            credentials: credentials("frank"),
+            tenant: "acme"
+        )
+        try await viewer.connect(to: RelayEndpoint(host: "loopback"))
+        let viewerRoom = try await viewer.join(room: "room-42")
+
+        let rung = VideoLayer(
+            id: "video/360p",
+            size: PixelSize(width: 640, height: 360),
+            frameRate: 30,
+            bitrate: 600_000
+        )
+        let source = FrameRelay(format: CaptureFormat(size: rung.size, frameRate: 30), depth: 16)
+        _ = try await hostRoom.startBroadcast(
+            from: source,
+            configuration: BroadcastConfiguration(
+                ladder: LayerLadder(rungs: [rung]),
+                encoderFactory: { SyntheticEncoder(configuration: $0) }
+            )
+        )
+
+        let who = identity("erin")
+        #expect(await eventually { await viewerRoom.roster[who] != nil })
+        await viewerRoom.updateLayout(
+            [who: RenderBox(width: 640, height: 360, scale: 1)],
+            linkBitrate: 5_000_000
+        )
+
+        func send(from index: Int, count: Int) {
+            for offset in 0 ..< count {
+                let step = index + offset
+                source.submit(
+                    VideoFrame(
+                        timestamp: FrameTimestamp(nanoseconds: UInt64(step) * 33_000_000),
+                        size: rung.size,
+                        surface: .synthetic(byteCount: 512),
+                        forcesKeyFrame: step == 0
+                    )
+                )
+            }
+        }
+
+        // The first tile reads frames from a task, and that task is cancelled when the view
+        // goes away. Cancellation is the part that matters: abandoning an iterator is
+        // harmless, but cancelling the task reading one terminates the stream itself.
+        let first = try #require(await viewerRoom.frames(from: who))
+        let reading = Task {
+            var seen = 0
+            for await _ in first { seen += 1 }
+            return seen
+        }
+        send(from: 0, count: 4)
+        try await Task.sleep(for: .milliseconds(50))
+        reading.cancel()
+        _ = await reading.value
+
+        // Its replacement asks for frames the way the first one did.
+        let second = try #require(await viewerRoom.frames(from: who))
+        send(from: 4, count: 6)
+
+        var seen = 0
+        for await _ in second {
+            seen += 1
+            if seen == 3 { break }
+        }
+        #expect(seen == 3)
+    }
 }

@@ -205,8 +205,10 @@ public actor RoomSession {
     ///
     /// Independent of ``media(from:)``: both are fed from the same pump, so
     /// consuming one does not starve the other.
+    /// Each call returns its own stream, so a caller that walks away takes only its own with
+    /// it — see ``MediaSink/frames``. Two live callers each see every frame.
     public func frames(from who: ParticipantIdentity) -> AsyncStream<DepacketisedFrame>? {
-        media[who]?.frames
+        media[who]?.frames.stream()
     }
 
     /// A participant's audio, paced by the jitter buffer.
@@ -2806,7 +2808,7 @@ public actor RoomSession {
         depacketisers[who] = depacketiser
         guard let frame else { return }
 
-        sink.framesContinuation.yield(frame)
+        sink.frames.yield(frame)
         await feedVideoTaps(frame, from: who)
     }
 
@@ -3004,8 +3006,18 @@ public actor RoomSession {
 struct MediaSink: Sendable {
     let objects: AsyncStream<TrackObject>
     let objectsContinuation: AsyncStream<TrackObject>.Continuation
-    let frames: AsyncStream<DepacketisedFrame>
-    let framesContinuation: AsyncStream<DepacketisedFrame>.Continuation
+
+    /// A stream per caller, rather than one stream handed out repeatedly.
+    ///
+    /// The distinction is invisible until a view is rebuilt, and then it is the whole
+    /// difference between a picture and a black tile. An `AsyncStream` has one consumer, and
+    /// abandoning it does not merely stop that consumer: the iterator's deinit terminates the
+    /// stream itself. So a tile torn down and replaced — which SwiftUI does for any change of
+    /// layout — killed the stream on its way out, and the replacement asked for frames, was
+    /// handed the same dead stream, and waited on it forever. Everything upstream carried on
+    /// perfectly: the subscription stayed open, reassembly kept counting frames, and the only
+    /// symptom was a tile that stopped.
+    let frames: FrameFanout
 
     init() {
         // Newest, because a subscriber that has fallen behind on live media
@@ -3014,15 +3026,57 @@ struct MediaSink: Sendable {
             of: TrackObject.self,
             bufferingPolicy: .bufferingNewest(64)
         )
-        (frames, framesContinuation) = AsyncStream.makeStream(
-            of: DepacketisedFrame.self,
-            bufferingPolicy: .bufferingNewest(64)
-        )
+        frames = FrameFanout()
     }
 
     func finish() {
         objectsContinuation.finish()
-        framesContinuation.finish()
+        frames.finish()
+    }
+}
+
+/// Delivers one participant's reassembled frames to everyone who asked for them.
+///
+/// A class with a lock rather than actor state, because it is yielded to from the receive
+/// path — which is somewhere with better things to do than await an actor — and subscribed to
+/// from the main actor when a view appears.
+final class FrameFanout: @unchecked Sendable {
+    private let lock = NSLock()
+    private var subscribers: [UUID: AsyncStream<DepacketisedFrame>.Continuation] = [:]
+    private var isFinished = false
+
+    /// A new stream, live from now, which unsubscribes itself when it ends.
+    func stream() -> AsyncStream<DepacketisedFrame> {
+        let id = UUID()
+        let (stream, continuation) = AsyncStream.makeStream(
+            of: DepacketisedFrame.self,
+            bufferingPolicy: .bufferingNewest(64)
+        )
+        continuation.onTermination = { [weak self] _ in
+            self?.lock.withLock { _ = self?.subscribers.removeValue(forKey: id) }
+        }
+        let finished: Bool = lock.withLock {
+            guard !isFinished else { return true }
+            subscribers[id] = continuation
+            return false
+        }
+        if finished { continuation.finish() }
+        return stream
+    }
+
+    func yield(_ frame: DepacketisedFrame) {
+        let all = lock.withLock { Array(subscribers.values) }
+        for subscriber in all { subscriber.yield(frame) }
+    }
+
+    func finish() {
+        let all: [AsyncStream<DepacketisedFrame>.Continuation] = lock.withLock {
+            isFinished = true
+            let existing = Array(subscribers.values)
+            subscribers.removeAll()
+            return existing
+        }
+        for subscriber in all { subscriber.finish() }
     }
 }
 
