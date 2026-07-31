@@ -388,6 +388,10 @@ import MoqomCore
         private var latched: Double?
         private static let gapWindow = 120
 
+        /// Slew applied since the interval was last corrected, and how many frames it took.
+        private var slewed = 0.0
+        private var slews = 0
+
         /// The last source timestamp, for measuring the interval to the next.
         private var previousStamp: CMTime = .invalid
 
@@ -524,6 +528,8 @@ import MoqomCore
                 latched = nil
                 gaps = []
                 gapCursor = 0
+                slewed = 0
+                slews = 0
                 drawing.regrids += 1
                 return presentation
             }
@@ -536,8 +542,37 @@ import MoqomCore
             // of a percent from the true one.
             let slew = min(max(error / 32, -0.0005), 0.0005)
             grid = start + CMTime(seconds: slew, preferredTimescale: 90000)
+            correctRate(after: slew)
 
             return start + CMTime(seconds: index * interval, preferredTimescale: 90000)
+        }
+
+        /// Fold a persistent one-way slew back into the interval it is compensating for.
+        ///
+        /// Phase and frequency are different faults and the slew alone only fixes one. A latched
+        /// interval a fraction of a percent from the true rate makes the grid drift against the
+        /// stream at a constant rate forever, and the slew then spends every frame pushing back
+        /// against it — the picture stays even, but the whole schedule walks. Measured on a leg
+        /// whose publisher ran a shade off sixty, the headroom climbed from 11ms to 50ms and was
+        /// hauled back every few seconds, so the latency a person experienced swung by forty
+        /// milliseconds continuously while every other figure looked perfect.
+        ///
+        /// The average slew over a long window *is* the frequency error, so adding it to the
+        /// interval removes the drift and leaves the slew doing what it is for: jitter.
+        private func correctRate(after slew: Double) {
+            slewed += slew
+            slews += 1
+            guard slews >= 240, var interval = latched else { return }
+
+            // Bounded at a fifth of a percent, which is far more than two crystals disagree by
+            // and far less than the distance between any two frame rates worth latching. A larger
+            // correction would mean the interval is not slightly wrong, it is the wrong rate, and
+            // the answer to that is to measure again rather than to creep towards it.
+            let correction = min(max(slewed / Double(slews), -interval / 500), interval / 500)
+            interval += correction
+            latched = interval
+            slewed = 0
+            slews = 0
         }
 
         /// The frame interval this stream is actually arriving at, in seconds.
@@ -655,7 +690,11 @@ import MoqomCore
             // frames each time — forty across a run, for twenty milliseconds of latency. Two
             // percent gives the same twenty back over a second, at a speed no one can see and
             // with nothing to drop.
-            if worst > depth + 0.010, catchUp == nil, ContinuousClock.now - reclaimed > .seconds(2) {
+            if
+                worst > depth + 0.006,
+                catchUp == nil,
+                ContinuousClock.now - reclaimed > .milliseconds(1500)
+            {
                 let give = worst - depth
                 synchroniser.setRate(1.02, time: synchroniser.currentTime())
                 catchUp = .now + .seconds(give / 0.02)
@@ -753,12 +792,23 @@ import MoqomCore
             if anchor != nil {
                 drawing.reanchors += 1
 
-                // The remembered headroom was headroom against the schedule that has just been
-                // replaced, and it cannot be corrected the way a grid shift can: this moves the
-                // timebase itself. Kept, it would have the adaptation act on a schedule that no
-                // longer exists.
-                slack = []
-                slackCursor = 0
+                // Carried across the re-anchor rather than discarded, corrected by however far
+                // the timebase moved. Discarding it is the obvious thing and it fails in exactly
+                // the situation the adaptation exists for: a link in trouble re-anchors often,
+                // each re-anchor emptied the window, the window never refilled to the two seconds
+                // a decision needs, and so the delay sat at its floor through a storm that wanted
+                // it at the ceiling. Measured during one, that was eighty-seven stalls and a
+                // third of a minute frozen while the buffer stayed at five milliseconds.
+                //
+                // The correction is the same in kind as a grid shift: the newest frame had
+                // whatever headroom it had, and after this it has exactly `delay`, so every
+                // remembered sample moves by that difference.
+                if newest.isValid {
+                    let was = (newest - synchroniser.currentTime()).seconds
+                    let moved = seconds - was
+                    for index in slack.indices { slack[index] += moved }
+                    playoutSlack = playoutSlack.map { $0 + moved }
+                }
             }
 
             anchor = start

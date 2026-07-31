@@ -522,13 +522,21 @@ struct BroadcastControls: View {
 
             LinkReadout(link: room.link, quality: room.quality)
 
-            if room.trustedStamp != nil {
-                LatencyReadout(meter: room.latency)
-            }
-
-            // Not behind the trusted clock, unlike the latency: cadence is measured on this
-            // device's own monotonic clock and stays valid when no clock has been agreed.
+            // Neither of these is behind the trusted clock, unlike the latency: the cadence and
+            // the hold are both measured on this device's own monotonic clock and stay valid
+            // when no clock has been agreed with anybody.
             if !room.participants.filter({ $0.slot.identity != room.identity }).isEmpty {
+                // Above the parts it is made of, because it is the one somebody came to read.
+                GlassReadout(
+                    meter: room.latency,
+                    wait: room.playoutSlack ?? room.playoutDepth.seconds,
+                    measured: room.trustedStamp != nil
+                )
+
+                if room.trustedStamp != nil {
+                    LatencyReadout(meter: room.latency)
+                }
+
                 CadenceReadout(meter: room.cadence)
             }
 
@@ -621,14 +629,75 @@ struct LinkReadout: View {
     }
 }
 
-/// Glass to glass, on the phone rather than in a log.
+/// The whole of it: shutter to screen, on the phone, while it is happening.
 ///
-/// The one figure a two-device run exists to produce, and the one the SDK cannot report on
-/// its own: the publisher's counters and the receiver's counters are each half of it, and the
-/// gap between them is where the network is. It only means anything because both devices
-/// stamp frames on a clock disciplined against the same service, so the error bar on that
-/// clock is shown beside the result and not tucked into a log line — a median of 60ms taken
-/// on a clock that could be 40ms out is not a latency measurement.
+/// Two things nobody can see separately, added up. Sensor to arrival is what the encoder and
+/// the network cost, and is measured across two devices against a shared clock. The wait is
+/// what the far end then holds the frame for so the motion is even, and is measured here — as
+/// the headroom the frames actually have, which is not the delay that was asked for. See
+/// ``VideoRenderer/playoutSlack``.
+///
+/// Worth the space it takes because it is the number a person actually experiences and the
+/// only one they can check against the room: hold a hand up, watch it arrive on the other
+/// phone. Everything below this line explains the total; this is the total.
+struct GlassReadout: View {
+    let meter: LatencyMeter
+
+    /// Seconds a frame waits at the far end before it is shown.
+    let wait: Double
+
+    /// Whether the two devices have agreed a clock, without which there is no total.
+    ///
+    /// The wait is still shown when they have not, because it is measured here and is true
+    /// either way. Half an answer beats the alternatives: a blank row says nothing, and a
+    /// total assembled from two unsynchronised clocks says something false.
+    let measured: Bool
+
+    @State private var reading: LatencyMeter.Reading?
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "camera.metering.matrix")
+            if !measured {
+                Text(String(format: "%.0f ms", held))
+                    .font(.caption.bold().monospacedDigit())
+                    .foregroundStyle(.primary)
+                Text("hold · glass-to-glass needs Measure on both devices")
+                    .foregroundStyle(.tertiary)
+            } else if let reading, reading.worst > 0 {
+                Text(String(format: "%.0f ms", reading.median + held))
+                    .font(.caption.bold().monospacedDigit())
+                    .foregroundStyle(.primary)
+                Text(String(format: "glass · p95 %.0f", reading.p95 + held))
+
+                // Broken out because the two halves answer to different things: the link is
+                // the network and the encoder, and the wait is a policy this app chose. A
+                // total that is mostly wait is a total somebody can do something about.
+                Text(String(format: "· link %.0f + hold %.0f", reading.median, held))
+                    .foregroundStyle(.tertiary)
+            } else {
+                Text("waiting for the other device")
+            }
+        }
+        .font(.caption2.monospacedDigit())
+        .foregroundStyle(.secondary)
+        .task {
+            while !Task.isCancelled {
+                reading = meter.reading()
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
+    }
+
+    private var held: Double { wait * 1000 }
+}
+
+/// The network half of ``GlassReadout``, with the error bar on the measurement.
+///
+/// Half of it is measured on each device, so it only means anything because both stamp frames
+/// on a clock disciplined against the same service — and the error bar on that clock belongs
+/// on screen next to the result rather than tucked into a log line. A median of 60ms taken on
+/// a clock that could be 40ms out is not a latency measurement.
 ///
 /// Polled rather than observed, because the meter is written from the frame pump on every
 /// frame and publishing that into SwiftUI would invalidate this view thirty times a second to

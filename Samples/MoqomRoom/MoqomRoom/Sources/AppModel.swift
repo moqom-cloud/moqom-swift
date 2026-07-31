@@ -160,7 +160,7 @@ final class AppModel {
         timekeeping?.cancel()
         timekeeping = Task {
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(10))
+                try? await Task.sleep(for: .seconds(5))
                 if Task.isCancelled { return }
                 await clock.synchronise()
             }
@@ -173,14 +173,20 @@ final class AppModel {
         // still streams — but it is said out loud, since the alternative is a latency
         // figure quietly built on the device's own idea of the time.
         if let clock = try? Self.trustedClock() {
-            // Synchronised repeatedly rather than once. Each exchange keeps the sample
-            // with the shortest round trip and the clock keeps the most informative
-            // anchor, so more attempts can only narrow the interval — and the interval is
-            // the floor on what any latency measured against it can claim. A single
-            // exchange over Wi-Fi to a public server lands around ±40ms, which is the same
-            // order as the latency being measured and would swamp it.
+            // Synchronised repeatedly rather than once. The offset is the reply's stamp plus
+            // half the round trip, so the error is bounded by that same half trip — the path
+            // home may have taken all of it or none. Nothing can measure that asymmetry, but
+            // a shorter exchange bounds it more tightly, and the clock keeps whichever anchor
+            // is worth the most. So attempts can only narrow the interval, and the interval
+            // is the floor on what any latency measured against it can claim.
+            //
+            // A dozen rather than four because four over Wi-Fi settled around ±30ms, which is
+            // the same order as the 45ms path being measured. Wi-Fi round trips are not
+            // distributed tightly around their median: most of the spread is scheduling and
+            // retries, so the shortest of twelve is meaningfully shorter than the shortest of
+            // four, and a dozen UDP exchanges cost nothing worth counting.
             var synchronised = false
-            for _ in 0 ..< 4 {
+            for _ in 0 ..< 12 {
                 synchronised = await clock.synchronise() || synchronised
             }
             let now = await clock.now()
@@ -267,9 +273,7 @@ final class AppModel {
                     // that was asked for: a frame sits in the schedule until it is due, and how
                     // long that is depends on where the schedule was anchored as much as on the
                     // setting. Falling back to the setting only before there is a measurement.
-                    let wait = (room.playoutSlack.map { $0 * 1000 })
-                        ?? (Double(room.playoutDepth.components.seconds) * 1000
-                            + Double(room.playoutDepth.components.attoseconds) / 1e15)
+                    let wait = (room.playoutSlack ?? room.playoutDepth.seconds) * 1000
                     print(
                         String(
                             format: "GLASS p50=%.0fms p95=%.0fms (link %.0f/%.0f + wait %.0f)",
@@ -308,8 +312,7 @@ final class AppModel {
                         drawn.reanchors,
                         drawn.regrids,
                         drawn.delivered * 100,
-                        Double(room.playoutDepth.components.attoseconds) / 1e15
-                            + Double(room.playoutDepth.components.seconds) * 1000
+                        room.playoutDepth.seconds * 1000
                     )
                 )
                 // The display pipeline's own account, which is the only one that can say a frame

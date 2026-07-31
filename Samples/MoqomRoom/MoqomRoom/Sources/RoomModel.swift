@@ -123,14 +123,15 @@ final class RoomModel {
 
     /// Bounds the playout delay sizes itself within. See ``VideoRenderer/playoutBounds``.
     ///
-    /// Adaptive by default, and from a floor of ten milliseconds, because measuring it settled the
-    /// question this used to guess at: on a relayed 60fps link, ten milliseconds of buffer showed
-    /// no visible unevenness and lost two frames in two thousand, while the same link's arrival
-    /// tail reached 140ms often enough to wreck a fixed setting anywhere near the floor. The
-    /// ceiling is generous because it is only reached while the link is misbehaving, and a quarter
-    /// second of delay is much better than the alternative during that.
+    /// Adaptive by default, and from a floor of five milliseconds, because measuring it settled
+    /// the question this used to guess at: on a relayed 60fps link the delay sat at its floor
+    /// whatever the floor was, so the floor is simply the smallest wait worth scheduling — well
+    /// under one refresh of a 60Hz display, which is the granularity anything here can actually
+    /// be shown at. The ceiling is generous because it is only reached while the link is
+    /// misbehaving, and a quarter second of delay is much better than the alternative during
+    /// that.
     var playoutBounds: (floor: Duration, ceiling: Duration)? = (
-        floor: .milliseconds(10),
+        floor: .milliseconds(5),
         ceiling: .milliseconds(250)
     )
 
@@ -140,7 +141,13 @@ final class RoomModel {
 
     /// How many frames the adaptive delay may leave unshown. See
     /// ``VideoRenderer/playoutTolerance``.
-    var playoutTolerance = 0.01
+    ///
+    /// Three percent, which is a conversation's setting rather than a cinema's. This app is two
+    /// people looking at each other, where a few milliseconds off the round trip is worth more
+    /// than a frame in thirty that nobody can point to — and the frames it gives up are the ones
+    /// arriving in the long tail of the link's jitter, which were going to be shown late and
+    /// wrong rather than not at all.
+    var playoutTolerance = 0.03
 
     /// Seconds of headroom the arriving frames actually have. See ``VideoRenderer/playoutSlack``.
     var playoutSlack: Double?
@@ -1039,4 +1046,11 @@ final class RoomModel {
             await BroadcastLiveActivity.endAll()
         }
     #endif
+}
+
+extension Duration {
+    /// Seconds as a `Double`, which is what a readout formatting milliseconds wants.
+    var seconds: Double {
+        Double(components.seconds) + Double(components.attoseconds) / 1e18
+    }
 }
