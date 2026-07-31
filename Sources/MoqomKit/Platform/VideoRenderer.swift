@@ -303,6 +303,12 @@ import MoqomCore
         /// them, nobody has to choose a number that is wrong twice a minute. Both bound the delay
         /// this asks for, which is not quite the delay the frames experience — see
         /// ``playoutSlack``.
+        ///
+        /// A floor of zero is meaningful and is the interesting setting: it does not mean frames
+        /// are shown the instant they arrive, which is what a `nil` ``playoutBounds`` and a `nil`
+        /// ``playoutDelay`` do. It means nothing here insists on a delay, and what remains is a
+        /// few milliseconds of margin against the display's own refresh plus whatever the link's
+        /// jitter turns out to require.
         public var playoutBounds: (floor: Duration, ceiling: Duration)? {
             didSet { restartSchedule() }
         }
@@ -406,21 +412,28 @@ import MoqomCore
         /// When the schedule last gave back the headroom it was anchored with, so it is rare.
         private var reclaimed = ContinuousClock.now
 
-        /// When the clock currently running fast should return to normal, if one is.
+        /// When the clock currently running fast should return to normal, and by how much it will
+        /// have moved by then.
         private var catchUp: ContinuousClock.Instant?
+        private var catchUpGive = 0.0
 
         /// Return the clock to real time once it has given back what it set out to.
         ///
-        /// The measurements taken while it was running fast described a schedule that was moving
-        /// underneath them, so they go: two seconds of honest ones is a cheap price for not
-        /// deciding the next adjustment on evidence gathered mid-adjustment.
+        /// The window of remembered headroom is corrected by what the clock made up rather than
+        /// emptied, for the same reason a grid shift corrects it: every sample in it was measured
+        /// against a schedule that has since moved, by an amount that is known exactly. Emptying
+        /// it looks harmless and is not — a decision then rests on the two seconds it takes to
+        /// refill, a low quantile of two seconds of a jittery link is mostly noise, and the delay
+        /// spends the call chasing it. Measured, that was a wait swinging between 18ms and 97ms
+        /// several times faster than the link it was supposedly tracking.
         private func advanceCatchUp() {
             guard let end = catchUp, ContinuousClock.now >= end else { return }
             synchroniser.setRate(1, time: synchroniser.currentTime())
             catchUp = nil
             reclaimed = .now
-            slack = []
-            slackCursor = 0
+            for index in slack.indices { slack[index] -= catchUpGive }
+            playoutSlack = playoutSlack.map { $0 - catchUpGive }
+            catchUpGive = 0
         }
 
         /// What happened to the frames handed to this renderer.
@@ -661,7 +674,12 @@ import MoqomCore
         /// - Parameter interval: The frame interval, used to bound how far one adjustment may move
         ///   the picture.
         private func resize(interval: Double, bounds: (floor: Duration, ceiling: Duration)) {
-            guard slack.count >= 120, let worst = slackQuantile(playoutTolerance) else { return }
+            // Five seconds of frames before anything is decided, because the figure being read is
+            // a low quantile and a low quantile of a short window is the worst sample in it. At
+            // three percent and two seconds it was the fourth-worst of a hundred and twenty,
+            // which moves tens of milliseconds between one reading and the next on a link that
+            // has not changed at all.
+            guard slack.count >= 300, let worst = slackQuantile(playoutTolerance) else { return }
             playoutSlack = worst
 
             let depth = playoutDepth.asSeconds
@@ -690,6 +708,13 @@ import MoqomCore
             // frames each time — forty across a run, for twenty milliseconds of latency. Two
             // percent gives the same twenty back over a second, at a speed no one can see and
             // with nothing to drop.
+            //
+            // Aimed at the delay and not a millisecond under it, so that this and the widening
+            // below are one controller rather than two. Aiming at the delay less its margin was
+            // tried: it parks the headroom exactly on the widening threshold, every jitter burst
+            // then widens — quickly, as it must — and the slow tightening cannot keep pace, so
+            // the delay ratchets. Measured, it reached a hundred and sixty milliseconds on a link
+            // whose jitter wanted ten.
             if
                 worst > depth + 0.006,
                 catchUp == nil,
@@ -698,6 +723,7 @@ import MoqomCore
                 let give = worst - depth
                 synchroniser.setRate(1.02, time: synchroniser.currentTime())
                 catchUp = .now + .seconds(give / 0.02)
+                catchUpGive = give
                 return
             }
 
@@ -714,12 +740,16 @@ import MoqomCore
             }
 
             // Tightened gradually and only past a deadband, so the delay is not forever chasing
-            // the last ten seconds by a millisecond in each direction. Two milliseconds every
-            // quarter second recovers a hundred milliseconds of unnecessary buffer in about
-            // twelve, which is fast enough to matter after a stall and slow enough to be
-            // invisible while it happens.
+            // the last ten seconds by a millisecond in each direction.
+            //
+            // Widening has to be immediate and tightening does not, and the gap between them is
+            // safe here only because both read the same ten seconds of history: a single burst
+            // moves a ten-second quantile very little, so the widening cannot ratchet away from
+            // a tightening that recovers eight milliseconds a second. It is not safe if that
+            // history is being thrown away — see ``advanceCatchUp``, where discarding it made
+            // this pair oscillate no matter which speeds they were given.
             let excess = worst - margin
-            guard excess > 0.010, ContinuousClock.now - tightened > .milliseconds(250) else {
+            guard excess > 0.006, ContinuousClock.now - tightened > .milliseconds(250) else {
                 return
             }
 

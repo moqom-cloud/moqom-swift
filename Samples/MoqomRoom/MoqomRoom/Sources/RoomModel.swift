@@ -123,15 +123,15 @@ final class RoomModel {
 
     /// Bounds the playout delay sizes itself within. See ``VideoRenderer/playoutBounds``.
     ///
-    /// Adaptive by default, and from a floor of five milliseconds, because measuring it settled
-    /// the question this used to guess at: on a relayed 60fps link the delay sat at its floor
-    /// whatever the floor was, so the floor is simply the smallest wait worth scheduling — well
-    /// under one refresh of a 60Hz display, which is the granularity anything here can actually
-    /// be shown at. The ceiling is generous because it is only reached while the link is
-    /// misbehaving, and a quarter second of delay is much better than the alternative during
-    /// that.
+    /// Adaptive by default, and from a floor of nothing at all, because every floor tried here
+    /// turned out to be the answer rather than a bound: the delay sat on ten, then on five, so
+    /// the figure being measured was the setting. Zero declines to guess. What the delay settles
+    /// at is then set by the link — the renderer keeps a few milliseconds of margin so a frame is
+    /// not at the mercy of the next refresh, and adds to it only as far as the jitter demands.
+    /// The ceiling is generous because it is only reached while the link is misbehaving, and a
+    /// quarter second of delay is much better than the alternative during that.
     var playoutBounds: (floor: Duration, ceiling: Duration)? = (
-        floor: .milliseconds(5),
+        floor: .zero,
         ceiling: .milliseconds(250)
     )
 
