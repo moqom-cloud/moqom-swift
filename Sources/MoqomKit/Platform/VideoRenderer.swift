@@ -483,12 +483,23 @@ import MoqomCore
         /// missed. A layer that is genuinely visible has a window at the top of its tree.
         public var isOnScreen: Bool {
             guard layer.bounds.width > 1, layer.bounds.height > 1 else { return false }
-            var root: CALayer = layer
-            while let parent = root.superlayer { root = parent }
-            #if os(iOS) || os(tvOS) || os(visionOS)
-                return (root.delegate as? UIView)?.window != nil
-            #elseif os(macOS)
-                return (root.delegate as? NSView)?.window != nil
+
+            // Every layer on the way up, rather than the root of the tree. The root is not the
+            // window: above it sit layers the system owns, whose delegates are private or nil,
+            // and asking only the top one answers "no" for a tile a person is looking at. The
+            // first view found with a window is the honest answer, and a discarded tile has
+            // none anywhere in its chain — which is the case worth catching.
+            var next: CALayer? = layer
+            while let current = next {
+                #if os(iOS) || os(tvOS) || os(visionOS)
+                    if let view = current.delegate as? UIView, view.window != nil { return true }
+                #elseif os(macOS)
+                    if let view = current.delegate as? NSView, view.window != nil { return true }
+                #endif
+                next = current.superlayer
+            }
+            #if os(iOS) || os(tvOS) || os(visionOS) || os(macOS)
+                return false
             #else
                 return layer.superlayer != nil
             #endif

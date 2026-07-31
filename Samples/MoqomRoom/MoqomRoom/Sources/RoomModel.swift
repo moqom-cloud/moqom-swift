@@ -371,6 +371,26 @@ final class RoomModel {
 
     var arrangement: Arrangement = .automatic
 
+    /// Which picture the screen is mostly given to.
+    ///
+    /// Separate from ``Arrangement``, which divides the space the gallery gets; this decides
+    /// how much space that is. The pair is what makes a tile any given size, and a tile's size
+    /// is the only input to which rung the SDK fetches — so between them they can put a real
+    /// 720p decode in a 120-point box or a 180p one across half a phone, and the badge on the
+    /// tile says which happened.
+    enum Screen: String, CaseIterable, Identifiable, Sendable {
+        /// Everyone else, with this device in a thumbnail beneath them.
+        case others = "Others"
+        /// This device's camera behind everyone else's tiles.
+        case me = "Me, full screen"
+        /// Captured and received at the same size, next to each other.
+        case sideBySide = "Side by side"
+
+        var id: String { rawValue }
+    }
+
+    var screen: Screen = .others
+
     /// The shape of a tile: the shape of the video, or a square for a room with none.
     ///
     /// Taken from what is being published rather than fixed at `16/9`, because the two have

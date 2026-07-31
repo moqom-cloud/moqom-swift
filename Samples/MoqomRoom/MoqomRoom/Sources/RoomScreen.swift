@@ -29,6 +29,49 @@ struct RoomScreen: View {
     @Bindable var room: RoomModel
     let onLeave: () async -> Void
 
+    /// Everyone but this device, in whatever space the stage leaves.
+    ///
+    /// One view rather than three copies, because it is also the thing that reports each
+    /// tile's geometry to the layer selector. Three inlined galleries would be three places
+    /// for that reporting to be dropped, and a dropped report does not look like a bug: it
+    /// looks like a viewer subscribing to a rung that is too large for the tile it is drawn in.
+    private var gallery: some View {
+        MoqomGalleryView(
+            slots: room.slots,
+            reportingTo: room.layout,
+            aspect: room.seatAspect,
+            spacing: 8,
+            columns: room.arrangement.columns
+        ) { slot in
+            switch room.mode {
+            case .gallery:
+                GalleryTile(slot: slot, room: room)
+            case .audioRoom:
+                SeatTile(slot: slot, room: room)
+            }
+        }
+    }
+
+    /// How tall the corner stack of tiles should be, in tiles.
+    ///
+    /// Capped, because the overlay is a glance at who else is here and not the gallery: a
+    /// fourth tile would reach the controls, and the point of this stage is the picture behind.
+    private var overlaidRows: Double {
+        Double(min(room.arrangement.columns == nil ? room.slots.count : 1, 3))
+    }
+
+    /// Who is audible but has no tile.
+    @ViewBuilder private var overflowNote: some View {
+        if !room.overflow.isEmpty {
+            // Not hidden and not an error. They are still audible; there is simply no tile,
+            // because sixteen decoders is a hardware limit and this is what degrading into it
+            // looks like.
+            Label("\(room.overflow.count) more listening in", systemImage: "person.2.wave.2")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
     var body: some View {
         VStack(spacing: 12) {
             if !room.watchdogs.isEmpty {
@@ -49,41 +92,48 @@ struct RoomScreen: View {
                 SelfView(room: room, height: nil)
                     .padding(.horizontal, 8)
             } else {
-                MoqomGalleryView(
-                    slots: room.slots,
-                    reportingTo: room.layout,
-                    aspect: room.seatAspect,
-                    spacing: 8,
-                    columns: room.arrangement.columns
-                ) { slot in
-                    switch room.mode {
-                    case .gallery:
-                        GalleryTile(slot: slot, room: room)
-                    case .audioRoom:
-                        SeatTile(slot: slot, room: room)
+                switch room.screen {
+                case .others:
+                    gallery
+                        .padding(.horizontal, 8)
+                    overflowNote
+
+                    if room.isBroadcasting || room.isPublishingAudio {
+                        HStack {
+                            Spacer()
+                            SelfView(room: room, height: 132)
+                        }
+                        .padding(.horizontal)
                     }
-                }
-                .padding(.horizontal, 8)
 
-                if !room.overflow.isEmpty {
-                    // Not hidden and not an error. They are still audible; there
-                    // is simply no tile, because sixteen decoders is a hardware
-                    // limit and this is what degrading into it looks like.
-                    Label(
-                        "\(room.overflow.count) more listening in",
-                        systemImage: "person.2.wave.2"
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                }
-            }
+                case .me:
+                    // The camera under everything, which is a different question from the
+                    // one the gallery answers and the reason this is not just a bigger self
+                    // view. What is being judged here is the picture this device is sending,
+                    // at the size a viewer's screen would give it, with everyone else reduced
+                    // to the corner — so the tiles overlay rather than take space from it.
+                    ZStack(alignment: .topTrailing) {
+                        SelfView(room: room, height: nil)
+                        gallery
+                            .frame(width: 120, height: 120 / room.seatAspect * overlaidRows)
+                            .padding(12)
+                    }
+                    .padding(.horizontal, 8)
+                    overflowNote
 
-            if !room.slots.isEmpty, room.isBroadcasting || room.isPublishingAudio {
-                HStack {
-                    Spacer()
-                    SelfView(room: room, height: 132)
+                case .sideBySide:
+                    // Both at once and both at half width, which is the comparison: the same
+                    // scene captured here and the same scene after encoding, a relay and a
+                    // decode, at the same size on the same panel. It is also the arrangement
+                    // that halves every tile's box, so the rung each tile fetches changes with
+                    // it — visible on the badge without touching the grid picker.
+                    HStack(spacing: 8) {
+                        SelfView(room: room, height: nil)
+                        gallery
+                    }
+                    .padding(.horizontal, 8)
+                    overflowNote
                 }
-                .padding(.horizontal)
             }
         }
         .frame(maxHeight: .infinity)
@@ -118,6 +168,15 @@ struct RoomScreen: View {
                     // each one is, which is the only input render-aware selection has —
                     // so this is where a rung is chosen, and the badge on each tile is
                     // where the choice can be read.
+                    // What the screen is mostly given to, which the grid below then
+                    // divides. Side by side is the one worth having on a test device: the
+                    // same face captured here and returned by the relay, at the same size.
+                    Picker("Stage", selection: $room.screen) {
+                        ForEach(RoomModel.Screen.allCases) { choice in
+                            Text(choice.rawValue).tag(choice)
+                        }
+                    }
+
                     Picker("Grid", selection: $room.arrangement) {
                         ForEach(RoomModel.Arrangement.allCases) { choice in
                             Text(choice.rawValue).tag(choice)
@@ -582,6 +641,32 @@ struct BroadcastControls: View {
                         .disabled(!room.isPublishingAudio || room.audioInput != .microphone)
                 } label: {
                     Label("Input", systemImage: "slider.horizontal.3")
+                }
+                .menuStyle(.button)
+                .buttonStyle(.bordered)
+                .controlCapsule()
+
+                // In the row rather than in the toolbar menu, because these two are what a
+                // test session actually touches. Between them they set every tile's size,
+                // and a tile's size is the whole input to which rung is fetched — so this is
+                // the control that changes what is being measured, and it was three taps away
+                // behind a picker for something else.
+                Menu {
+                    Picker("Stage", selection: $room.screen) {
+                        ForEach(RoomModel.Screen.allCases) { choice in
+                            Text(choice.rawValue).tag(choice)
+                        }
+                    }
+
+                    Picker("Grid", selection: $room.arrangement) {
+                        ForEach(RoomModel.Arrangement.allCases) { choice in
+                            Text(choice.rawValue).tag(choice)
+                        }
+                    }
+
+                    Toggle("Mirror my video", isOn: $room.publishesMirrored)
+                } label: {
+                    Label("Layout", systemImage: "rectangle.3.group")
                 }
                 .menuStyle(.button)
                 .buttonStyle(.bordered)

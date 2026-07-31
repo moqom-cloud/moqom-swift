@@ -14,6 +14,32 @@
 # and one that locks mid-run takes its camera with it.
 set -eu
 
+# Settings come from the environment, and anything on the command line is a mistake — so it is
+# refused rather than ignored. Ignoring it was worse than it sounds: three runs invoked with
+# `--room`, `--seconds` and `--video` ran instead with the defaults, for as long as nobody
+# stopped them, with no audio published at all, and the numbers they produced were read as a
+# latency regression and a broken microphone. A run that does not do what it was asked should
+# say so before it starts, not encode the difference into its output.
+if [ "$#" -gt 0 ]; then
+    cat >&2 <<'USAGE'
+This script takes no arguments; everything is an environment variable.
+
+  MOQOM_ROOM=name        room to join (default: bench)
+  MOQOM_SECONDS=20       stop after this long, and print each log's last report
+  MOQOM_FPS=60           capture and publish rate (default: 30)
+  MOQOM_KBPS=2000        publish bitrate
+  MOQOM_AUDIO=mic        publish audio: mic, or tone for a synthetic source
+  MOQOM_VIDEO=camera     publish video: camera, or pattern
+  MOQOM_PLAYOUT_MS=40    fixed playout delay, instead of the adaptive one
+  MOQOM_FLOOR_MS / MOQOM_TOLERANCE / MOQOM_STATS_MS / MOQOM_FLAT_LAYERS
+  MOQOM_PUBLISHER / MOQOM_VIEWER   device names (default: iPhone Air, 15 Pro)
+
+For example:
+  MOQOM_ROOM=turn3 MOQOM_SECONDS=20 MOQOM_FPS=60 MOQOM_AUDIO=mic ./Scripts/bench-two-phones.sh
+USAGE
+    exit 2
+fi
+
 ROOM="${MOQOM_ROOM:-bench}"
 CODE="${MOQOM_PAIRING_CODE:-4242}"
 BUNDLE="cloud.moqom.room"

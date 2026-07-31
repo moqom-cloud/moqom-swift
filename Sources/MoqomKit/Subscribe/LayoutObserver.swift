@@ -49,8 +49,24 @@ import MoqomCore
             self.room = room
         }
 
+        /// Which view last reported each participant, so a departing one cannot
+        /// withdraw its replacement's box. See ``withdraw(_:from:)``.
+        private var reporters: [ParticipantIdentity: UUID] = [:]
+
+        /// What is collected but not yet handed over, for tests.
+        ///
+        /// ``lastReported`` is the same thing after a flush, and a flush waits for the end of
+        /// the run loop — which is the wrong thing to assert about when the question is what a
+        /// single report or withdrawal did.
+        var current: [ParticipantIdentity: RenderBox] { boxes }
+
         /// Record where a participant is being drawn.
         public func report(_ box: RenderBox, for identity: ParticipantIdentity) {
+            report(box, for: identity, from: nil)
+        }
+
+        func report(_ box: RenderBox, for identity: ParticipantIdentity, from reporter: UUID?) {
+            if let reporter { reporters[identity] = reporter }
             guard boxes[identity] != box else { return }
             boxes[identity] = box
             scheduleFlush()
@@ -62,6 +78,23 @@ import MoqomCore
         /// its size and stops being drawn, and the planner treats those the
         /// same way only because both end in dropping video.
         public func withdraw(_ identity: ParticipantIdentity) {
+            withdraw(identity, from: nil)
+        }
+
+        /// The same, from a view that may already have been replaced.
+        ///
+        /// A withdrawal from a view that no longer owns the tile is ignored, and that is the
+        /// whole reason the token exists. SwiftUI builds a view's replacement before it takes
+        /// the original away, so any change that moves a tile — a different arrangement, a
+        /// grid that reflows, a stage that puts the gallery somewhere else — runs the new
+        /// tile's first report and *then* the old tile's disappearance. Unconditional, that
+        /// second step deletes the box the new tile just reported, the planner is told the
+        /// participant is not being drawn, and it unsubscribes. Nothing reports again, because
+        /// the surviving tile's geometry has not changed since, so the video stops for good
+        /// and every counter says the link is healthy.
+        func withdraw(_ identity: ParticipantIdentity, from reporter: UUID?) {
+            if let reporter, let owner = reporters[identity], owner != reporter { return }
+            reporters[identity] = nil
             guard boxes.removeValue(forKey: identity) != nil else { return }
             scheduleFlush()
         }
@@ -144,6 +177,15 @@ import MoqomCore
         let identity: ParticipantIdentity
         let observer: LayoutObserver
 
+        /// This view's claim on the identity, for as long as SwiftUI keeps the view alive.
+        ///
+        /// `@State` rather than a stored property because a modifier is a value that is
+        /// rebuilt on every update: a stored `UUID()` would be a new token each pass and would
+        /// mean nothing. State is keyed to the view's identity, which is exactly the lifetime
+        /// being tracked — the same tile keeps its token across updates, and a tile SwiftUI
+        /// rebuilds gets a new one.
+        @State private var token = UUID()
+
         // Points are not pixels and the ladder is in pixels. A 320pt tile is
         // two different subscriptions on a 2x phone and a 3x one, and taking
         // the scale from the environment is the only way to get it right on an
@@ -162,12 +204,13 @@ import MoqomCore
                                         height: size.height,
                                         scale: displayScale
                                     ),
-                                    for: identity
+                                    for: identity,
+                                    from: token
                                 )
                             }
                     }
                 }
-                .onDisappear { observer.withdraw(identity) }
+                .onDisappear { observer.withdraw(identity, from: token) }
         }
     }
 #endif
