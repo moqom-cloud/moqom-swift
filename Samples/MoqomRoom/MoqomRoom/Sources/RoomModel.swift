@@ -152,6 +152,19 @@ final class RoomModel {
     /// Seconds of headroom the arriving frames actually have. See ``VideoRenderer/playoutSlack``.
     var playoutSlack: Double?
 
+    /// How long this participant's voice is being held before it is played.
+    ///
+    /// The video tile uses it as a floor, which is the whole of lip sync here. The two media
+    /// have separate buffers sizing themselves against separate jitter — audio packets are
+    /// twenty milliseconds apart and video frames sixteen, and the audio buffer only shrinks
+    /// during silence — so left alone they agree by luck. In practice the voice waited eighty
+    /// milliseconds while the picture waited fifteen, which is a face whose lips run ahead of
+    /// it. Video is the one that gives, because holding a frame longer costs a frame of
+    /// latency and stretching audio costs a click.
+    func audioDelay(of who: ParticipantIdentity) -> Duration? {
+        statistics?.participants[who]?.audio?.targetDelay
+    }
+
     /// What the remote tile did with the frames it was handed. See ``VideoRenderer/drawing``.
     var drawing = VideoRenderer.Drawing()
 
@@ -309,6 +322,16 @@ final class RoomModel {
     private var connection: Task<Void, Never>?
     private var capture: PatternSource?
     private var camera: CameraSource?
+
+    /// Whether the camera is being carried about, and therefore whether it is paying for
+    /// stabilisation. `nil` when nothing is publishing from a camera.
+    var cameraIsMoving: Bool? {
+        #if os(iOS)
+            return camera?.isMoving
+        #else
+            return nil
+        #endif
+    }
 
     /// Kept so a camera switch can ask for a keyframe. Nothing else here needs
     /// it — the room owns the publication's lifetime.
@@ -764,6 +787,14 @@ final class RoomModel {
         }
 
         applyAudioPurpose()
+
+        // Opened here rather than left to the first arriving voice. The microphone path needs the
+        // engine anyway, but a synthetic source does not, and the session it configures is what
+        // decides the output route: until something starts the graph, iOS is still on whatever
+        // route the app launched with. Measured, that was the earpiece — so the first cohost to
+        // speak was played into a receiver pointing at nothing, until an unrelated event moved
+        // the route and the sound apparently arrived from nowhere.
+        try? AudioGraph.shared.start()
     }
 
     /// Publish the real microphone, through the shared audio graph.
@@ -826,12 +857,37 @@ final class RoomModel {
             var phase = 0.0
             var timestamp: UInt64 = 0
             let step = 2 * Double.pi * 440 / Double(format.sampleRate)
+
+            // Paced to a deadline rather than by sleeping for the packet duration. Sleeping for
+            // twenty milliseconds takes twenty *and a bit*, every time, so a loop built that way
+            // produces about forty-six packets a second where the publication expects fifty and
+            // fills the shortfall with silence — four dropouts a second in what is supposed to be
+            // a continuous tone, which sounds like a fault in the network rather than in the
+            // signal generator. A deadline that advances by exactly a packet absorbs the
+            // overshoot and catches up after any hesitation.
+            // Pulsed rather than continuous, which is not decoration. Publishing runs a voice
+            // detector that measures energy against a noise floor it estimates continuously, so
+            // an unchanging tone is learned as the room within a second or two and every packet
+            // after that is marked silence — the far end then plays exact zeros, correctly, and
+            // the tone is heard for about a second and never again. Suppressing a steady hum is
+            // what that detector is for; a steady hum is therefore the one signal that cannot be
+            // used to test it. Speech comes in syllables, so this does too.
+            var due = ContinuousClock.now
+            var packet = 0
             while !Task.isCancelled {
+                // Fifteen packets on, ten off: 300ms of tone every half second.
+                let speaking = packet % 25 < 15
+                packet += 1
+
                 var samples = [Float](repeating: 0, count: format.samplesPerFrame)
                 for index in samples.indices {
-                    samples[index] = Float(sin(phase)) * 0.2
+                    samples[index] = speaking ? Float(sin(phase)) * 0.2 : 0
                     phase += step
                 }
+
+                // Wrapped, so the argument to `sin` stays small over a call of any length.
+                phase.formTruncatingRemainder(dividingBy: 2 * .pi)
+
                 relay.submit(
                     AudioFrame(
                         timestamp: FrameTimestamp(nanoseconds: timestamp),
@@ -840,7 +896,8 @@ final class RoomModel {
                     )
                 )
                 timestamp += 20_000_000
-                try? await Task.sleep(for: .milliseconds(20))
+                due += .milliseconds(20)
+                try? await Task.sleep(until: due, clock: .continuous)
             }
             _ = self
         }
@@ -864,7 +921,40 @@ final class RoomModel {
             return
         }
         players[who] = player
-        playback[who] = Task { try? await player.play(outputs) }
+
+        // The error is kept rather than discarded. Playback fails for reasons that are entirely
+        // silent otherwise — an engine that will not start because the session was refused, most
+        // often — and a listener then sees a healthy subscription, rising packet counts, and no
+        // sound, with nothing anywhere saying why.
+        playback[who] = Task { [weak self] in
+            do throws(MoqomError) {
+                try await player.play(outputs)
+            } catch {
+                await MainActor.run { self?.lastError = error }
+            }
+
+            // Cleared when the stream ends, and that matters more than tidiness. The stream ends
+            // whenever the SDK tears a participant's media down — a reconnect, a seat given up
+            // and taken back — which leaves a finished task and a stopped player behind in these
+            // two dictionaries. The guard at the top of this method reads them as playback
+            // already running, so the participant comes back, their video returns, and their
+            // voice never does.
+            await self?.finishPlayback(for: who, if: player)
+        }
+    }
+
+    /// What is reaching the speaker for one participant, as opposed to what is reaching the
+    /// device. See ``AudioPlayer/Playback``.
+    func playback(of who: ParticipantIdentity) async -> AudioPlayer.Playback? {
+        await players[who]?.reading()
+    }
+
+    /// Forget a playback that ended, unless it has already been replaced.
+    private func finishPlayback(for who: ParticipantIdentity, if player: AudioPlayer) async {
+        guard players[who] === player else { return }
+        players.removeValue(forKey: who)
+        playback.removeValue(forKey: who)
+        await player.stop()
     }
 
     private func stopPlayback(for who: ParticipantIdentity) async {

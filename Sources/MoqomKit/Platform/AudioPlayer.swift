@@ -74,7 +74,7 @@ import MoqomCore
                 throw MoqomError.unsupportedAudioCodec(codec)
             }
             playbackFormat = playback
-            voice = graph.attach()
+            voice = graph.attach(format: playback)
         }
 
         /// Consume a room's audio stream until it ends.
@@ -89,6 +89,34 @@ import MoqomCore
                 schedule(samples)
             }
         }
+
+        /// What this player has actually put into the mix.
+        ///
+        /// The last measurement on the path, and the only one that distinguishes "audio is
+        /// arriving" from "audio is audible". Everything upstream counts packets; this counts
+        /// amplitude, which is the thing a listener is either hearing or not.
+        public struct Playback: Sendable, Hashable {
+            /// Buffers handed to the audio device.
+            public var buffers = 0
+
+            /// Of those, the ones that were entirely zeros.
+            public var silent = 0
+
+            /// Loudest sample scheduled recently, `0` to `1`.
+            public var peak: Float = 0
+
+            /// What the decoder made of the packets. See ``PlatformAudioDecoder/Decoding``.
+            public var decoding = PlatformAudioDecoder.Decoding()
+        }
+
+        public func reading() async -> Playback {
+            var reading = playback
+            reading.decoding = await decoder.decoding
+            playback.peak = 0
+            return reading
+        }
+
+        private var playback = Playback()
 
         public func stop() {
             guard running else { return }
@@ -126,11 +154,18 @@ import MoqomCore
             // the mixer wants; converting here rather than asking the decoder
             // for it keeps the decoder's output in the one layout every other
             // part of the SDK uses.
+            var loudest: Float = 0
             for frame in 0 ..< Int(frames) {
                 for channel in 0 ..< format.channels {
-                    channels[channel][frame] = samples[frame * format.channels + channel]
+                    let sample = samples[frame * format.channels + channel]
+                    channels[channel][frame] = sample
+                    loudest = max(loudest, abs(sample))
                 }
             }
+
+            playback.buffers += 1
+            if loudest == 0 { playback.silent += 1 }
+            playback.peak = max(playback.peak, loudest)
 
             voice.schedule(buffer)
         }

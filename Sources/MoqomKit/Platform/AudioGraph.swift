@@ -200,6 +200,18 @@ import MoqomCore
             }
         }
 
+        /// Whether the engine is actually open, which is not the same as having asked for it.
+        ///
+        /// Worth exposing because every counter upstream of the speaker can look perfect while
+        /// this is false: packets arrive, are decoded and are handed to a player node, and a
+        /// node in a stopped engine queues them silently. Nothing else in the audio path can
+        /// tell a listener the difference between that and a quiet room.
+        public var isRunning: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return running
+        }
+
         /// Configure the system, engage voice processing, and open the device.
         public func start() throws(MoqomError) {
             lock.lock()
@@ -242,13 +254,21 @@ import MoqomCore
         }
 
         /// Give a participant a place in the mix.
-        public func attach() -> Voice {
+        ///
+        /// - Parameter format: what will be scheduled on this voice. Passing it is not an
+        ///   optimisation. A connection made with `nil` takes the mixer's own format, which
+        ///   follows the output route and is commonly stereo, and `AVAudioPlayerNode` then
+        ///   asserts on the first mono buffer handed to it — `_outputFormat.channelCount ==
+        ///   buffer.format.channelCount`, a hard crash rather than a thrown error, on a call
+        ///   that had connected and gone live. Voice audio is mono, so the mismatch is the
+        ///   ordinary case and not an edge one. Stated explicitly, the mixer up-mixes.
+        public func attach(format: AVAudioFormat? = nil) -> Voice {
             lock.lock()
             defer { lock.unlock() }
 
             let voice = Voice(graph: self)
             engine.attach(voice.node)
-            engine.connect(voice.node, to: engine.mainMixerNode, format: nil)
+            engine.connect(voice.node, to: engine.mainMixerNode, format: format)
             voices.append(voice)
             return voice
         }
@@ -358,6 +378,16 @@ import MoqomCore
                     // picks its own rate and the converter absorbs whatever it
                     // picks, so this only saves a resample when it is granted.
                     try? session.setPreferredSampleRate(Double(configuration.format.sampleRate))
+
+                    // Half a packet, so the hardware hands over samples faster than the encoder
+                    // consumes them. The system's own choice is much larger, and a buffer larger
+                    // than a packet is not just latency: packets then leave in bursts of two and
+                    // three with a gap behind them, the receiver's jitter estimator reads the
+                    // bursts as an unstable link, and it sizes the playout buffer for a link that
+                    // is behaving perfectly. Measured against a synthetic source on the same
+                    // relay, the microphone reported ten times the jitter — 28ms against 2.7ms —
+                    // and bought itself ninety milliseconds of buffer with it.
+                    try? session.setPreferredIOBufferDuration(0.01)
                     try session.setActive(true)
                 } catch {
                     throw MoqomError.platform(api: "AVAudioSession.setCategory", status: -1)

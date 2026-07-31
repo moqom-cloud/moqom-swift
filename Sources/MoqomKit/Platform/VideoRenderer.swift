@@ -313,6 +313,22 @@ import MoqomCore
             didSet { restartSchedule() }
         }
 
+        /// A floor the delay must respect that is not a property of this link.
+        ///
+        /// Lip sync is the reason it exists. A participant's voice is held in its own buffer for
+        /// its own reasons, and where that buffer is deeper than this one the picture has to wait
+        /// or the lips run ahead of the words. Audio is never delayed to meet video instead: it
+        /// is a twentieth of the bitrate and every packet decodes alone, so it keeps arriving on
+        /// links where pictures have stopped, and a call that has lost its video and kept its
+        /// sound is still a call.
+        ///
+        /// Separate from ``playoutBounds`` rather than folded into its floor because this moves
+        /// while the call is running — the voice's buffer resizes itself — and setting the bounds
+        /// restarts the schedule. Restarting it twice a second would re-anchor the picture
+        /// continuously, which is a visible lurch each time and precisely what the adaptive delay
+        /// exists to avoid. This one takes effect on the next adjustment instead.
+        public var playoutFloor: Duration = .zero
+
         /// The share of frames the adaptive delay is willing to have arrive late.
         ///
         /// This is the trade, and there is no setting that avoids it: the delay must cover the
@@ -351,7 +367,9 @@ import MoqomCore
             slackCursor = 0
             playoutSlack = nil
             catchUp = nil
-            playoutDepth = playoutBounds?.floor ?? playoutDelay ?? .zero
+            playoutDepth = playoutBounds.map { min(max($0.floor, playoutFloor), $0.ceiling) }
+                ?? playoutDelay
+                ?? .zero
 
             // The delay is only a delay if the frames wait for their timestamps.
             assembler.displaysImmediately = requestedDelay == nil
@@ -443,6 +461,14 @@ import MoqomCore
         /// symptom was somebody saying the motion looked wrong while every counter on both
         /// devices read zero.
         public private(set) var drawing = Drawing()
+
+        /// The preview's format description, held across frames.
+        ///
+        /// Every frame from one camera has the same one, and building it per frame allocated a
+        /// CoreMedia object sixty times a second for a value that changes only when the capture
+        /// format does. `CMVideoFormatDescriptionMatchesImageBuffer` is the cheap check for
+        /// whether the held one still applies, which it will until the camera is reconfigured.
+        private var previewFormat: CMFormatDescription?
 
         public struct Drawing: Sendable, Hashable {
             /// Frames handed to the display layer.
@@ -683,8 +709,15 @@ import MoqomCore
             playoutSlack = worst
 
             let depth = playoutDepth.asSeconds
-            let floor = bounds.floor.asSeconds
             let ceiling = bounds.ceiling.asSeconds
+            let floor = min(max(bounds.floor, playoutFloor).asSeconds, ceiling)
+
+            // Raised to meet a floor that moved under it — the voice's buffer grew — rather than
+            // waited for, because the tightening path below only ever moves the delay down.
+            if depth < floor - 0.001 {
+                shift(by: floor - depth, to: .seconds(floor))
+                return
+            }
 
             // A few milliseconds rather than nothing, because a frame that arrives exactly on its
             // deadline is a frame the next refresh decides the fate of.
@@ -1028,15 +1061,25 @@ import MoqomCore
             if renderer.status == .failed { renderer.flush() }
             guard renderer.isReadyForMoreMediaData else { return }
 
-            var format: CMFormatDescription?
-            guard
-                CMVideoFormatDescriptionCreateForImageBuffer(
-                    allocator: kCFAllocatorDefault,
-                    imageBuffer: buffer,
-                    formatDescriptionOut: &format
-                ) == noErr,
-                let format
-            else { return }
+            if let held = previewFormat,
+               !CMVideoFormatDescriptionMatchesImageBuffer(held, imageBuffer: buffer)
+            {
+                previewFormat = nil
+            }
+
+            if previewFormat == nil {
+                var made: CMFormatDescription?
+                guard
+                    CMVideoFormatDescriptionCreateForImageBuffer(
+                        allocator: kCFAllocatorDefault,
+                        imageBuffer: buffer,
+                        formatDescriptionOut: &made
+                    ) == noErr
+                else { return }
+                previewFormat = made
+            }
+
+            guard let format = previewFormat else { return }
 
             var timing = CMSampleTimingInfo(
                 duration: .invalid,

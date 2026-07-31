@@ -35,6 +35,30 @@ import MoqomCore
         /// The last real packet's samples, for concealing the next gap.
         private var previous: [Float] = []
 
+        /// What this decoder has made of the packets it was given.
+        ///
+        /// Worth counting separately from the jitter buffer's statistics, which describe whether
+        /// packets *arrived*. A decoder that fails on every packet conceals every one of them,
+        /// and concealment with nothing to conceal from is exact silence — so the buffer reports
+        /// a perfect stream, the speaking indicators light up from the metadata, and nobody hears
+        /// anything. Every counter in the room agrees the call is fine. This is the one that
+        /// would have said otherwise.
+        public struct Decoding: Sendable, Hashable {
+            /// Packets handed to the codec.
+            public var packets = 0
+
+            /// Packets the codec refused, each one concealed instead.
+            public var failures = 0
+
+            /// Slots concealed because nothing arrived for them.
+            public var gaps = 0
+
+            /// Slots the publisher marked as silence, reproduced as zeros.
+            public var silences = 0
+        }
+
+        public private(set) var decoding = Decoding()
+
         public init(format: AudioFormat = .voice, codec: MoqomCore.AudioCodec = .opus) throws {
             self.format = format
             switch codec {
@@ -54,15 +78,20 @@ import MoqomCore
 
             switch output {
             case let .packet(packet):
-                let samples = decode(packet.data) ?? conceal(count: count)
+                decoding.packets += 1
+                let decoded = decode(packet.data)
+                if decoded == nil { decoding.failures += 1 }
+                let samples = decoded ?? conceal(count: count)
                 previous = samples
                 return samples
 
             case .silence:
+                decoding.silences += 1
                 previous = []
                 return [Float](repeating: 0, count: count)
 
             case .gap:
+                decoding.gaps += 1
                 // Faded rather than repeated. A repeated packet is a buzz at the
                 // packet rate, which is more noticeable than the level dropping.
                 let concealed = conceal(count: count)
@@ -111,6 +140,25 @@ import MoqomCore
     /// thread, from inside a call this type made, which the compiler cannot see
     /// through a C function pointer.
     private final class Decoder: @unchecked Sendable {
+        /// What the input callback returns when this packet's data is spent.
+        ///
+        /// Not `noErr`, and that distinction is the whole of a bug that made every call silent.
+        /// `AudioConverterFillComplexBuffer` is asked here for a fixed number of *frames*, so
+        /// having taken the one packet it was given it calls back again to see whether more is
+        /// coming. A callback that answers "no packets" with `noErr` is stating end of stream,
+        /// and the converter believes it permanently: it produced the first packet's samples and
+        /// then returned zero frames for every packet afterwards, for the life of the call.
+        ///
+        /// Nothing reported an error. The status was `noErr`, the frame count was zero, so the
+        /// decode looked successful and produced no samples; the jitter buffer went on counting
+        /// packets played, the speaking indicators went on lighting up from the metadata, and the
+        /// speaker went on playing nothing. A non-zero status says "not now" instead of "never",
+        /// which is what was meant, and the converter stays usable.
+        ///
+        /// The encoder's callback has the same shape and does not have the bug, because it asks
+        /// for exactly one output packet and is satisfied before the second callback happens.
+        static let noMoreData: OSStatus = 0x6E61_6461 // 'nada'
+
         private var converter: AudioConverterRef?
         private var pending = Data()
         private var description = AudioStreamPacketDescription()
@@ -204,8 +252,13 @@ import MoqomCore
                 )
             }
 
-            guard status == noErr else {
+            // `noMoreData` is this decoder's own callback saying the packet is spent, which is
+            // the ordinary way a decode ends rather than a failure. Anything else is one.
+            guard status == noErr || status == Self.noMoreData else {
                 throw MoqomError.platform(api: "AudioConverterFillComplexBuffer", status: status)
+            }
+            guard frames > 0 else {
+                throw MoqomError.platform(api: "AudioConverterFillComplexBuffer", status: 0)
             }
             return Array(samples.prefix(Int(frames) * channels))
         }
@@ -217,7 +270,7 @@ import MoqomCore
         ) -> OSStatus {
             guard !consumed else {
                 packetCount.pointee = 0
-                return noErr
+                return Self.noMoreData
             }
             consumed = true
             packetCount.pointee = 1

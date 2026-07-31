@@ -614,10 +614,11 @@ struct AudioReceptionTests {
 
 // The decoder's loss handling, through the PCM path.
 //
-// Opus needs a real audio unit, so these run the codec-free path — which is
-// enough, because the part with judgement in it is what happens when nothing
-// arrived, and that is codec-independent. What the device does with the samples
-// is untested and will stay that way until one is in the loop.
+// The PCM path for the loss cases, because the part with judgement in it is what
+// happens when nothing arrived and that is codec-independent. Opus is exercised
+// separately below and needs to be: "enough" was the belief that let a decoder
+// which produced samples for exactly one packet per call ship, because the only
+// path under test was the one that never touches the converter.
 #if canImport(AudioToolbox)
     @Suite("Audio playback")
     struct PlaybackTests {
@@ -638,6 +639,48 @@ struct AudioReceptionTests {
                     data: pcm(samples)
                 )
             )
+        }
+
+        /// The bug this exists for: audio that arrived, decoded without error, and was silent.
+        ///
+        /// One packet is not a test of a decoder. The converter is asked to fill a frame count,
+        /// so it calls back for more input after taking the packet it was given, and the answer
+        /// to that second call decides whether the decoder survives — "no more now" and it does,
+        /// "end of stream" and it returns zero frames for every packet for the rest of the call.
+        /// Both answers report `noErr`. On a call it presented as every counter healthy, the
+        /// speaking indicators lighting up, and nothing audible.
+        @Test("a decoder keeps decoding after the first packet")
+        func opusKeepsGoing() async throws {
+            let encoder = try PlatformAudioEncoder(
+                configuration: AudioEncoderConfiguration(format: .voice, codec: .opus)
+            )
+            let decoder = try PlatformAudioDecoder(format: .voice, codec: .opus)
+
+            for index in 0 ..< 5 {
+                try await encoder.encode(
+                    AudioFrame(
+                        timestamp: FrameTimestamp(nanoseconds: UInt64(index) * 20_000_000),
+                        format: .voice,
+                        samples: tone(0.6)
+                    )
+                )
+            }
+
+            var packets = encoder.encodedFrames().makeAsyncIterator()
+            for index in 0 ..< 5 {
+                let encoded = try #require(await packets.next())
+                let decoded = await decoder.decode(.packet(encoded))
+
+                // The first packet comes back short by Opus's priming delay — 120 samples of
+                // pre-skip at 48kHz, which the codec swallows before it can produce anything.
+                // Every packet after it is a full slot, and every one of them carries the tone.
+                if index == 0 {
+                    #expect(decoded.count > 0)
+                    continue
+                }
+                #expect(decoded.count == AudioFormat.voice.samplesPerFrame)
+                #expect(decoded.contains { $0 != 0 }, "packet \(index) decoded to silence")
+            }
         }
 
         @Test("a packet round-trips through the PCM path")

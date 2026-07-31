@@ -175,6 +175,12 @@ struct LaunchOptions {
     /// The smallest delay the adaptive buffer may settle at. See ``VideoRenderer/playoutBounds``.
     var playoutFloorMilliseconds: Int?
 
+    /// Publish audio as well as video: `tone` or `mic`, and nothing at all when absent.
+    ///
+    /// A tone by default even though a microphone is more realistic, because two phones on one
+    /// desk publishing microphones is a feedback loop, and what it measures is the room.
+    var audio: String?
+
     static func current(
         arguments: [String] = ProcessInfo.processInfo.arguments
     ) -> LaunchOptions {
@@ -195,6 +201,7 @@ struct LaunchOptions {
             case "--playout-ms": options.playoutMilliseconds = value.flatMap(Int.init)
             case "--tolerance": options.playoutTolerance = value.flatMap(Double.init)
             case "--floor-ms": options.playoutFloorMilliseconds = value.flatMap(Int.init)
+            case "--audio": options.audio = value ?? "tone"
             default: break
             }
             index += 1

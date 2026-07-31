@@ -17,6 +17,10 @@ import MoqomCore
     import AVFoundation
     import CoreVideo
 
+    #if os(iOS)
+        import CoreMotion
+    #endif
+
     /// Which camera to open.
     public enum CameraPosition: Hashable, Sendable {
         case front
@@ -64,6 +68,52 @@ import MoqomCore
         private var mirrored = false
         private var rotation: Double = 0
         private var input: AVCaptureDeviceInput
+        private var steadying = Stabilisation.whenMoving
+        private var moving = false
+
+        /// When to spend power on holding the picture steady.
+        ///
+        /// Stabilisation is not free and is not always worth anything. It buffers frames so it
+        /// can compare them, which is latency in a live call, and it warps every one of them,
+        /// which is work on a device already encoding sixty a second. Against that it fixes the
+        /// one thing nothing downstream can: a shaking camera, which also happens to be the
+        /// worst case for the encoder, because a picture where every pixel moved is a picture
+        /// with no redundancy left to compress.
+        ///
+        /// So the useful setting is neither on nor off but *when*, and the question is about the
+        /// camera rather than the scene: a phone propped on a desk gains nothing from
+        /// stabilisation however much the person in front of it moves, and a phone in a walking
+        /// hand needs it whatever it is pointed at. The device's own gyroscope answers exactly
+        /// that question, and costs almost nothing to ask.
+        public enum Stabilisation: Hashable, Sendable {
+            /// Never. Lowest latency and lowest power, right for a fixed camera.
+            case off
+
+            /// While the device is being moved, and for a few seconds after it stops.
+            case whenMoving
+
+            /// Always, which is what `AVFoundation` does when asked for `.auto`.
+            case always
+        }
+
+        /// When the picture should be held steady. Motion-driven by default.
+        public var stabilisation: Stabilisation {
+            get { lock.withLock { steadying } }
+            set {
+                lock.withLock { steadying = newValue }
+                queue.async { [weak self] in self?.applyStabilisation() }
+                #if os(iOS)
+                    if newValue == .whenMoving { watchMotion() } else { motion.stop() }
+                #endif
+            }
+        }
+
+        /// Whether the device is currently being moved about, as the gyroscope sees it.
+        public var isMoving: Bool { lock.withLock { moving } }
+
+        #if os(iOS)
+            private let motion = MotionWatch()
+        #endif
 
         /// Which camera is open.
         public var position: CameraPosition { lock.withLock { current } }
@@ -156,6 +206,7 @@ import MoqomCore
             session.addOutput(output)
             applyMirroring()
             applyRotation()
+            applyStabilisation()
             Self.adopt(format, on: device, logger: logger)
         }
 
@@ -194,11 +245,18 @@ import MoqomCore
             }
 
             // The smallest that will do, measured in pixels, so a 720p60 request does not
-            // land on a 4K60 sensor mode.
+            // land on a 4K60 sensor mode. Ties are broken on power: a binned mode reads fewer
+            // sensor rows, and an eight-bit mode moves two thirds of the bytes of a ten-bit
+            // one through every stage that follows. Neither shows up in the picture at this
+            // size, and together they are the difference between a phone that stays warm and
+            // one that gets hot enough for iOS to start slowing the camera down.
             let best = candidates.min { left, right in
                 let a = CMVideoFormatDescriptionGetDimensions(left.formatDescription)
                 let b = CMVideoFormatDescriptionGetDimensions(right.formatDescription)
-                return Int(a.width) * Int(a.height) < Int(b.width) * Int(b.height)
+                let pixels = (Int(a.width) * Int(a.height), Int(b.width) * Int(b.height))
+                if pixels.0 != pixels.1 { return pixels.0 < pixels.1 }
+                if isCheap(left) != isCheap(right) { return isCheap(left) }
+                return isBinned(left) && !isBinned(right)
             }
 
             guard let best else {
@@ -229,6 +287,45 @@ import MoqomCore
             let duration = CMTime(value: 1, timescale: CMTimeScale(rate.rounded()))
             device.activeVideoMinFrameDuration = duration
             device.activeVideoMaxFrameDuration = duration
+
+            // Turned off rather than left automatic. Extended-range capture runs the sensor
+            // and the ISP harder for a picture that is then compressed to two megabits and
+            // shown in a tile, and the automatic setting will engage it as soon as the scene
+            // has a bright window in it — so the same call warms up or does not depending on
+            // where somebody is sitting.
+            #if os(iOS) || os(tvOS)
+                if best.isVideoHDRSupported {
+                    device.automaticallyAdjustsVideoHDREnabled = false
+                    device.isVideoHDREnabled = false
+                }
+            #endif
+
+            // sRGB where offered, for the same reason: the wide-gamut and HLG spaces carry ten
+            // bits per component through capture and conversion, and nothing downstream of the
+            // encoder asked for them.
+            if best.supportedColorSpaces.contains(.sRGB) {
+                device.activeColorSpace = .sRGB
+            }
+        }
+
+        /// Whether a format's pixels are eight bits per component.
+        ///
+        /// Ten-bit modes are named with an `x` prefix — `x420`, `x422` — against the `420v` and
+        /// `420f` of the eight-bit ones.
+        /// Whether the sensor combines neighbouring pixels for this format, which is the cheap
+        /// way to reach a small size. Not a concept on macOS, where the answer is always no.
+        private static func isBinned(_ format: AVCaptureDevice.Format) -> Bool {
+            #if os(iOS) || os(tvOS)
+                return format.isVideoBinned
+            #else
+                return false
+            #endif
+        }
+
+        private static func isCheap(_ format: AVCaptureDevice.Format) -> Bool {
+            let subtype = CMFormatDescriptionGetMediaSubType(format.formatDescription)
+            return subtype == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                || subtype == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
         }
 
         /// Open the device and begin delivering frames.
@@ -241,6 +338,9 @@ import MoqomCore
                 guard !box.session.isRunning else { return }
                 box.session.startRunning()
             }
+            #if os(iOS)
+                if stabilisation == .whenMoving { watchMotion() }
+            #endif
         }
 
         public func frames() -> AsyncStream<VideoFrame> { relay.frames() }
@@ -309,6 +409,7 @@ import MoqomCore
                 session.commitConfiguration()
                 self?.applyMirroring()
                 self?.applyRotation()
+                self?.applyStabilisation()
             }
         }
 
@@ -342,6 +443,56 @@ import MoqomCore
         }
 
         /// Always called on the capture queue, for the same reason as ``applyMirroring``.
+        ///
+        /// Stabilisation is the expensive default nobody asks for. It buffers frames to
+        /// compare them, which adds latency to a live call, and it runs a warp over every one
+        /// of them, which is real work on a device already encoding sixty a second. What it
+        /// buys is a steadier picture from a moving camera — worth having when filming, and
+        /// worth nothing for a phone propped on a desk pointed at a face.
+        private func applyStabilisation() {
+            #if os(iOS) || os(tvOS)
+                guard let connection = output.connection(with: .video) else { return }
+                guard connection.isVideoStabilizationSupported else { return }
+
+                let wanted: AVCaptureVideoStabilizationMode = lock.withLock {
+                    switch steadying {
+                    case .off: .off
+                    case .always: .standard
+                    case .whenMoving: moving ? .standard : .off
+                    }
+                }
+                guard connection.preferredVideoStabilizationMode != wanted else { return }
+
+                // `.standard` rather than `.cinematic`, which is the other one worth having and
+                // is the wrong trade here: cinematic buffers a good deal more of the future to
+                // smooth a pan, and a call cannot spend that.
+                connection.preferredVideoStabilizationMode = wanted
+            #endif
+        }
+
+        #if os(iOS)
+            /// Follow the gyroscope, and turn stabilisation on and off as it answers.
+            ///
+            /// Asymmetric on purpose. Movement engages it within a fifth of a second, because the
+            /// frames worth rescuing are the ones at the start of a shake; stillness disengages it
+            /// only after several seconds, because a switch that flips at every pause would show
+            /// as the picture jumping scale each time — stabilisation crops, and turning it off
+            /// widens the field of view back out.
+            private func watchMotion() {
+                motion.start { [weak self] rate in
+                    guard let self else { return }
+                    let changed: Bool = lock.withLock {
+                        guard moving != rate else { return false }
+                        moving = rate
+                        return true
+                    }
+                    guard changed else { return }
+                    queue.async { [weak self] in self?.applyStabilisation() }
+                }
+            }
+        #endif
+
+        /// Always called on the capture queue, for the same reason as ``applyMirroring``.
         private func applyRotation() {
             guard let connection = output.connection(with: .video) else { return }
             let wanted = lock.withLock { rotation }
@@ -352,6 +503,9 @@ import MoqomCore
 
         public func stop() {
             relay.stop()
+            #if os(iOS)
+                motion.stop()
+            #endif
             queue.async { [box] in
                 if box.session.isRunning { box.session.stopRunning() }
             }
@@ -368,6 +522,94 @@ import MoqomCore
             }
         }
     }
+
+    #if os(iOS)
+        /// Reports whether the device is being moved, from the gyroscope.
+        ///
+        /// The gyroscope rather than the accelerometer, and rate rather than orientation. What
+        /// stabilisation corrects is rotation — the small involuntary turns of a hand holding a
+        /// phone — and rotation rate is the quantity that says how much of it is happening. A
+        /// phone can be perfectly still at any angle, and gravity dominates an accelerometer at
+        /// all of them, so an accelerometer answers the wrong question and answers it noisily.
+        ///
+        /// > Note: no usage description and no permission prompt. Raw gyroscope and
+        /// > accelerometer data are available to any app; it is `CMMotionActivityManager` and the
+        /// > pedometer, neither of which is used here, that require `NSMotionUsageDescription`.
+        final class MotionWatch: @unchecked Sendable {
+            private let manager = CMMotionManager()
+            private let queue: OperationQueue = {
+                let queue = OperationQueue()
+                queue.maxConcurrentOperationCount = 1
+                queue.qualityOfService = .utility
+                return queue
+            }()
+
+            /// Radians per second at which the device counts as moving, and the lower figure it
+            /// must fall below to count as still again.
+            ///
+            /// Two thresholds rather than one, because a single one flaps: a hand hovering
+            /// either side of it would toggle stabilisation several times a second. A phone
+            /// lying on a desk reads a few hundredths from sensor noise alone, a hand holding
+            /// one still reads around a tenth, and a hand that is actually moving reads several
+            /// times that.
+            private let starts = 0.25
+            private let stops = 0.08
+
+            /// How long stillness must last before stabilisation is dropped.
+            private let settles = Duration.seconds(4)
+
+            private var still: ContinuousClock.Instant?
+            private var reported = false
+
+            func start(_ changed: @escaping @Sendable (Bool) -> Void) {
+                guard manager.isGyroAvailable, !manager.isGyroActive else { return }
+
+                // Twenty a second. The decision is a threshold with a four-second hold on one
+                // side of it, so nothing here can use a faster signal, and the sensor is cheaper
+                // to read slowly.
+                manager.gyroUpdateInterval = 0.05
+                manager.startGyroUpdates(to: queue) { [weak self] data, _ in
+                    guard let self, let rate = data?.rotationRate else { return }
+                    let magnitude = (rate.x * rate.x + rate.y * rate.y + rate.z * rate.z)
+                        .squareRoot()
+                    guard let now = decide(on: magnitude) else { return }
+                    changed(now)
+                }
+            }
+
+            /// The hysteresis, kept apart from the sensor plumbing so it can be reasoned about.
+            ///
+            /// Returns the new state only when it changed.
+            private func decide(on magnitude: Double) -> Bool? {
+                if magnitude > starts {
+                    still = nil
+                    guard !reported else { return nil }
+                    reported = true
+                    return true
+                }
+
+                guard reported, magnitude < stops else {
+                    if magnitude >= stops { still = nil }
+                    return nil
+                }
+
+                let began = still ?? .now
+                still = began
+                guard ContinuousClock.now - began > settles else { return nil }
+                still = nil
+                reported = false
+                return false
+            }
+
+            func stop() {
+                manager.stopGyroUpdates()
+                still = nil
+                reported = false
+            }
+
+            deinit { manager.stopGyroUpdates() }
+        }
+    #endif
 
     extension CameraSource: AVCaptureVideoDataOutputSampleBufferDelegate {
         public func captureOutput(

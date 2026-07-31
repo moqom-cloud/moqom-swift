@@ -40,6 +40,7 @@ WHERE="$WHERE${MOQOM_STATS_MS:+ --stats-ms $MOQOM_STATS_MS}"
 WHERE="$WHERE${MOQOM_PLAYOUT_MS:+ --playout-ms $MOQOM_PLAYOUT_MS}"
 WHERE="$WHERE${MOQOM_TOLERANCE:+ --tolerance $MOQOM_TOLERANCE}"
 WHERE="$WHERE${MOQOM_FLOOR_MS:+ --floor-ms $MOQOM_FLOOR_MS}"
+WHERE="$WHERE${MOQOM_AUDIO:+ --audio $MOQOM_AUDIO}"
 
 # By name rather than by hard-coded identifier, so this survives a re-pair. The identifier is
 # found by its shape rather than its column, because the state field ("available (paired)")
@@ -246,7 +247,8 @@ if [ -n "${MOQOM_SECONDS:-}" ]; then
     for log in "$PUBLISHER_LOG" "$VIEWER_LOG"; do
         echo
         echo "--- $log"
-        grep -E '^(LINK|PLAY|TIME|DRAW|SHOW|GRAB|HOST|SEND|COST|  VIEW)' "$log" | tail -10
+        grep -E '^(LINK|GLASS|PLAY|TIME|DRAW|SHOW|GRAB|HOST|SEND|COST|TALK|HEAR|OUT|  SPKR|  VIEW)' \
+            "$log" | tail -14
     done
     exit 0
 fi

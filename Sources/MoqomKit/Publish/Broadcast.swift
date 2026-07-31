@@ -284,7 +284,18 @@ public actor Broadcast {
     /// Empty until the first keyframe of that rung has been encoded.
     public var decoderConfigurations: [LayerID: Data] { initialisation }
 
-    public var stats: BroadcastStatistics { statistics }
+    /// Summarised when asked rather than when recorded.
+    ///
+    /// Both meters keep a three-hundred sample window, and a percentile means a sort. Folding
+    /// that into the statistics as each frame went by sorted six hundred numbers per frame —
+    /// thirty-six thousand a second at sixty frames — to produce a figure that is read once a
+    /// second by a diagnostic line. Recording stays O(1); the sort happens per reader.
+    public var stats: BroadcastStatistics {
+        var reading = statistics
+        reading.encodeLatency = encodeMeter.summary
+        reading.writeLatency = writeMeter.summary
+        return reading
+    }
 
     /// Watch the frames this publication is about to encode.
     ///
@@ -501,7 +512,6 @@ public actor Broadcast {
 
         if let at = submitted[encoded.timestamp] {
             encodeMeter.record(.now - at)
-            statistics.encodeLatency = encodeMeter.summary
         }
 
         if encoded.isKeyFrame, !encoded.parameterSets.isEmpty {
@@ -544,7 +554,6 @@ public actor Broadcast {
             statistics.framesDropped += 1
         }
         writeMeter.record(.now - handedOver)
-        statistics.writeLatency = writeMeter.summary
         statistics.framesEncoded += 1
     }
 

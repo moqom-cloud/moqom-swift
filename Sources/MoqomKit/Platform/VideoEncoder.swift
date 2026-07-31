@@ -218,6 +218,18 @@ import MoqomCore
                 on: session
             )
 
+            // Asked for, not required: the encoder is free to decline, and declining is not a
+            // fault. Where it is honoured the hardware trades a little quality at the same
+            // bitrate for measurably less power, which on a phone holding sixty frames a second,
+            // a camera, a radio and a display is the difference between a call that stays at
+            // nominal and one that throttles the camera twenty minutes in. Best effort with
+            // `try?` because it did not exist before iOS 17 and older systems refuse it.
+            try? set(
+                kVTCompressionPropertyKey_MaximizePowerEfficiency,
+                to: kCFBooleanTrue,
+                on: session
+            )
+
             let interval = configuration.keyFrameInterval.totalSeconds
             try set(
                 kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,

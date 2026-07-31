@@ -11,6 +11,10 @@ import MoqomKit
 import MoqomLoopback
 import Observation
 
+#if os(iOS)
+    import AVFAudio
+#endif
+
 @MainActor
 @Observable
 final class AppModel {
@@ -129,11 +133,23 @@ final class AppModel {
                 )
                 return
             }
+            if let audio = launch.audio {
+                room.audioInput = audio == "mic" ? .microphone : .tone
+                await room.startAudio()
+                if !room.isPublishingAudio {
+                    print(
+                        "AUDIO FAILED "
+                            + (room.lastError.map(String.init(describing:)) ?? "no reason given")
+                    )
+                }
+            }
+
             print(
                 "LIVE rung=video/720p codec=hevc source=camera"
                     + " fps=\(Int(launch.frameRate ?? 30))"
                     + " playout=\(launch.playoutMilliseconds.map { "\($0)ms fixed" } ?? "adaptive")"
                     + " layers=\(launch.flatLayers ? "flat" : "temporal")"
+                    + " audio=\(room.isPublishingAudio ? (launch.audio ?? "on") : "off")"
             )
         case let .failed(error): print("JOIN FAILED \(error)")
         default: print("JOIN ended in an unexpected state")
@@ -240,6 +256,13 @@ final class AppModel {
     /// The publisher's own counters and the receiver's latencies together, because either
     /// alone invites the wrong conclusion: frames that never arrive look like low latency,
     /// and latency measured without the drop count looks like a link that is coping.
+    #if os(iOS)
+        private static func describe(_ route: AVAudioSessionRouteDescription) -> String {
+            let outputs = route.outputs.map(\.portType.rawValue)
+            return outputs.isEmpty ? "none" : outputs.joined(separator: ",")
+        }
+    #endif
+
     private static func describe(_ state: ProcessInfo.ThermalState) -> String {
         switch state {
         case .nominal: "nominal"
@@ -331,6 +354,89 @@ final class AppModel {
 
                 print("GRAB \(room.captureCadence.report())")
 
+                // Audio's own two ends, which share none of the machinery above. It is paced by
+                // a device pulling at a fixed rate rather than by a display, so its buffer sizes
+                // itself in packets and its failures are audible before they are visible in any
+                // video figure: late packets are a buffer too shallow for the jitter, gaps are
+                // slots concealed because nothing arrived at all, and the two are fixed by
+                // opposite things.
+                if let audio = stats?.publishing.audio {
+                    print(
+                        "TALK captured=\(audio.framesCaptured)"
+                            + " published=\(audio.packetsPublished)"
+                            + " dropped=\(audio.packetsDropped)"
+                            + " silent=\(audio.silentPackets)"
+                            // Both spacings, because the receiver sizes its buffer from how
+                            // evenly packets arrive and cannot tell an uneven sender from an
+                            // uneven network. Twenty milliseconds flat at both ends means the
+                            // jitter the far side reports is genuinely the link's.
+                            + String(
+                                format: " grab p50=%.1f p95=%.1f max=%.1f",
+                                audio.captureSpacing.median,
+                                audio.captureSpacing.p95,
+                                audio.captureSpacing.worst
+                            )
+                            + String(
+                                format: " · send p50=%.1f p95=%.1f max=%.1f ms",
+                                audio.publishSpacing.median,
+                                audio.publishSpacing.p95,
+                                audio.publishSpacing.worst
+                            )
+                    )
+                }
+                // The output path itself, which no counter above can see. A packet decoded and
+                // handed to a player node in an engine that never opened is counted as played.
+                #if os(iOS)
+                    let session = AVAudioSession.sharedInstance()
+                    print(
+                        "OUT engine=\(AudioGraph.shared.isRunning ? "running" : "stopped")"
+                            + " route=\(Self.describe(session.currentRoute))"
+                            // What the hardware granted, which is the thing that decides how
+                            // evenly packets leave here. A request is not a setting.
+                            + String(format: " io=%.1fms", session.ioBufferDuration * 1000)
+                            + " volume=\(String(format: "%.2f", session.outputVolume))"
+                            + " mic=\(AVAudioApplication.shared.recordPermission == .granted ? "granted" : "not granted")"
+                            + (room.lastError.map { " error=\($0)" } ?? "")
+                    )
+                #endif
+
+                for (who, participant) in stats?.participants ?? [:] {
+                    guard let heard = participant.audio else { continue }
+                    print(
+                        String(
+                            format: "HEAR %@ received=%d played=%d late=%d duplicate=%d gaps=%d"
+                                + " target=%.0fms jitter=%.1fms",
+                            String(describing: who.username),
+                            heard.packetsReceived,
+                            heard.packetsPlayed,
+                            heard.packetsLate,
+                            heard.packetsDuplicate,
+                            heard.gaps,
+                            heard.targetDelay.seconds * 1000,
+                            heard.jitter.seconds * 1000
+                        )
+                    )
+
+                    // The last inch, which every line above is blind to: packets can arrive,
+                    // decode, and be scheduled while containing nothing but zeros.
+                    if let played = await room.playback(of: who) {
+                        print(
+                            String(
+                                format: "  SPKR %@ buffers=%d silent=%d peak=%.3f"
+                                    + " decoded=%d failed=%d gaps=%d silences=%d",
+                                String(describing: who.username),
+                                played.buffers,
+                                played.silent,
+                                played.peak,
+                                played.decoding.packets,
+                                played.decoding.failures,
+                                played.decoding.gaps,
+                                played.decoding.silences
+                            )
+                        )
+                    }
+                }
+
                 // The device's own limits, which every other line here would blame on the
                 // network. Capture at sixty, one hardware encode, one hardware decode and a
                 // radio held busy is enough to warm a phone up, and iOS answers a warm phone
@@ -341,6 +447,9 @@ final class AppModel {
                 print(
                     "HOST thermal=\(Self.describe(ProcessInfo.processInfo.thermalState))"
                         + " lowpower=\(ProcessInfo.processInfo.isLowPowerModeEnabled)"
+                        // Whether the gyroscope currently has stabilisation switched on, which is
+                        // the one power draw here that comes and goes on its own.
+                        + (room.cameraIsMoving.map { " camera=\($0 ? "moving" : "steady")" } ?? "")
                 )
 
                 // What the publisher did with the frames it captured, which is where an

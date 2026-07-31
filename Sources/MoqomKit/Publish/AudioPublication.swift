@@ -73,6 +73,21 @@ public struct AudioPublicationStatistics: Hashable, Sendable {
 
     /// Whether ``AudioPublication/setMuted(_:)`` is holding samples back.
     public var isMuted: Bool = false
+
+    /// Wall-clock spacing between packets arriving from the source, in milliseconds.
+    ///
+    /// Should read as the packet duration — twenty milliseconds, on the default format — and a
+    /// figure that does not is the microphone handing over samples in bursts. It matters
+    /// disproportionately: the receiver's playout buffer is sized from the spacing of arrivals,
+    /// so packets that leave in bursts are read as an unstable network and answered with tens of
+    /// milliseconds of buffer that the network never asked for.
+    public var captureSpacing: StageLatency = .init()
+
+    /// The same, measured as each packet is handed to the transport.
+    ///
+    /// The pair localises unevenness. Even at capture and uneven here is the encoder or the
+    /// publish path; uneven at both is the device.
+    public var publishSpacing: StageLatency = .init()
 }
 
 /// A running audio publication.
@@ -96,6 +111,13 @@ public actor AudioPublication {
     /// Consumers watching the samples on their way to the encoder.
     private var taps: [CapturePipe<AudioFrame>] = []
 
+    /// When the last packet arrived from the source and when the last one was written, for the
+    /// spacing figures in ``AudioPublicationStatistics``.
+    private var lastCapture: ContinuousClock.Instant?
+    private var lastPublish: ContinuousClock.Instant?
+    private var captureMeter = StageMeter()
+    private var publishMeter = StageMeter()
+
     init(
         track: FullTrackName,
         configuration: AudioPublicationConfiguration,
@@ -110,7 +132,14 @@ public actor AudioPublication {
         self.writer = writer
     }
 
-    public var stats: AudioPublicationStatistics { statistics }
+    /// Summarised on read rather than on every packet: a percentile is a sort, and this is read
+    /// by a diagnostic line a few times a second.
+    public var stats: AudioPublicationStatistics {
+        var reading = statistics
+        reading.captureSpacing = captureMeter.summary
+        reading.publishSpacing = publishMeter.summary
+        return reading
+    }
 
     /// Watch the samples this publication is about to encode.
     ///
@@ -223,6 +252,10 @@ public actor AudioPublication {
     private func consume(_ frame: AudioFrame) async {
         statistics.framesCaptured += 1
 
+        let arrived = ContinuousClock.now
+        if let last = lastCapture { captureMeter.record(arrived - last) }
+        lastCapture = arrived
+
         if !taps.isEmpty {
             taps.removeAll { !$0.tap.isActive }
             for pipe in taps { pipe.offer(frame, at: frame.timestamp) }
@@ -265,6 +298,10 @@ public actor AudioPublication {
                 isSilence: packet.isSilence
             )
         )
+
+        let leaving = ContinuousClock.now
+        if let last = lastPublish { publishMeter.record(leaving - last) }
+        lastPublish = leaving
 
         do {
             try await writer.write(object)
