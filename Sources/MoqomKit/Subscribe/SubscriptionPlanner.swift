@@ -80,8 +80,23 @@ public struct SubscriptionPlanner: Sendable {
     /// silently drops video for tiles the gallery is still drawing.
     public var videoBudget: Int
 
-    public init(videoBudget: Int = 9) {
+    /// Subscribe to what each publisher offers and stop choosing.
+    ///
+    /// See ``LayerSelectionPolicy/followsPublisher``. Held here as well as on each selector
+    /// because it has to reach the selectors made later — a participant who joins after this
+    /// is set would otherwise be the one tile still adapting.
+    public var followsPublisher: Bool {
+        didSet {
+            guard followsPublisher != oldValue else { return }
+            for identity in selectors.keys {
+                selectors[identity]?.policy.followsPublisher = followsPublisher
+            }
+        }
+    }
+
+    public init(videoBudget: Int = 9, followsPublisher: Bool = false) {
         self.videoBudget = videoBudget
+        self.followsPublisher = followsPublisher
     }
 
     /// Register or replace the ladder a participant is offering.
@@ -96,14 +111,31 @@ public struct SubscriptionPlanner: Sendable {
     /// subscription is live, so it emits no unsubscribe when the participant
     /// later loses their box. The track then keeps arriving for a tile nobody
     /// is drawing: no error, no log, just bandwidth.
-    public mutating func setLadder(_ ladder: LayerLadder, for identity: ParticipantIdentity) {
+    /// - Parameter provisional: whether this is a guess made before the participant said
+    ///   anything. A guessed ladder is the right thing to size a box against and the wrong
+    ///   thing to subscribe from when the publisher is the one choosing — see
+    ///   ``LayerSelectionPolicy/followsPublisher``. Asking for the top of a guess means asking
+    ///   for a track that was never published: the relay refuses it, and the tile stays black
+    ///   until the catalog arrives and the plan is redone.
+    public mutating func setLadder(
+        _ ladder: LayerLadder,
+        for identity: ParticipantIdentity,
+        provisional: Bool = false
+    ) {
         if let existing = selectors[identity] {
-            guard existing.ladder != ladder else { return }
+            guard existing.ladder != ladder || existing.ladderIsProvisional != provisional else {
+                return
+            }
             var replacement = LayerSelector(ladder: ladder)
+            replacement.policy.followsPublisher = followsPublisher
+            replacement.ladderIsProvisional = provisional
             replacement.adopt(existing.current)
             selectors[identity] = replacement
         } else {
-            selectors[identity] = LayerSelector(ladder: ladder)
+            var selector = LayerSelector(ladder: ladder)
+            selector.policy.followsPublisher = followsPublisher
+            selector.ladderIsProvisional = provisional
+            selectors[identity] = selector
         }
     }
 

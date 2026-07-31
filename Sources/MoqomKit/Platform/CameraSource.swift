@@ -18,6 +18,10 @@ import MoqomCore
     import CoreVideo
     import VideoToolbox
 
+    #if os(iOS)
+        import UIKit
+    #endif
+
     /// Which camera to open.
     public enum CameraPosition: Hashable, Sendable {
         case front
@@ -247,6 +251,28 @@ import MoqomCore
                     queue: nil
                 ) { [weak self] _ in
                     self?.logger.info(.media, "capture resumed", [])
+
+                    // Started again, because the end of an interruption is not the resumption
+                    // of anything. A session stopped for the background stays stopped when the
+                    // app returns, and what that looks like from the other end of a call is a
+                    // publisher whose audio is perfect and whose picture froze on the frame
+                    // before a notification was read: no error, no dropped frames, a submitted
+                    // count that simply stops moving. `start()` is a no-op on a session that
+                    // is already running, so a system that does resume by itself loses
+                    // nothing here.
+                    self?.start()
+                })
+
+                // Backgrounding is not always reported as an interruption — a session stopped
+                // as the app suspends can end without one — so the return to the foreground
+                // is treated as its own reason to check. Cheap: everything below is a read of
+                // `isRunning` on a session that is already going.
+                observers.append(centre.addObserver(
+                    forName: UIApplication.didBecomeActiveNotification,
+                    object: nil,
+                    queue: nil
+                ) { [weak self] _ in
+                    self?.start()
                 })
             #endif
             observers.append(centre.addObserver(

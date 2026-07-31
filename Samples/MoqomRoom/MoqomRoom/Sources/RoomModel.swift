@@ -107,11 +107,17 @@ final class RoomModel {
 
     /// Publish exactly this rung and nothing else, when set.
     ///
-    /// A ladder is right for a call and wrong for a measurement. Three rungs is three
-    /// encode sessions sharing one hardware encoder, and a viewer that is free to move
-    /// between them whenever the estimate wobbles — so a latency or bitrate figure taken
-    /// across the run describes no single rung. Pinning one makes both ends agree on what
-    /// is being measured.
+    /// Set for every run now, not just a measured one, because the publisher is the end that
+    /// decides. Three rungs is three encode sessions sharing one hardware encoder — measured
+    /// on these two phones, 1,491 frames in and 4,472 out, the 15 Pro at `thermal=serious`
+    /// and a write that stalled for a second — to produce two pictures nobody asked for.
+    ///
+    /// And the choosing was worse than the encoding. A receiver free to move between rungs
+    /// moved a 607×1349 tile down to 180p on a bandwidth estimate that could not rise,
+    /// because the estimate can only measure the rung it is already receiving; then no object
+    /// arrived on the new rung at all and the tile went black for the rest of the call, with
+    /// the audio still perfect. One rung, chosen here, removes the switch and the arithmetic
+    /// behind it. See ``publishSize``.
     var pinnedRung: VideoLayer?
 
     /// A clock the other device also has, for measuring the gap between them.
@@ -208,6 +214,9 @@ final class RoomModel {
 
     /// What the display layer did with the frames, sampled from the renderer.
     var presentation: VideoRenderer.Presentation?
+
+    /// The same, for the unscheduled preview layer, which is the control for it.
+    var previewPresentation: VideoRenderer.Presentation?
 
     /// What the display pipeline is doing with them now. See ``VideoRenderer/Timing``.
     var timing = VideoRenderer.Timing()
@@ -451,6 +460,63 @@ final class RoomModel {
     /// the instruction to turn them.
     static let defaultCaptureSize = PixelSize(width: 720, height: 1280)
 
+    /// What to publish, for the layout this call is being drawn in.
+    ///
+    /// The publisher's decision, and the only one: a receiver takes what arrives. Which means
+    /// the size has to be chosen for the box at the *other* end, and this app can do that
+    /// honestly because both ends run the same layout — side by side gives each picture half
+    /// the width of a phone, and full screen gives it all of one.
+    ///
+    /// Rounded up to a rung rather than sized to the pixel. An encoder reconfigured every time
+    /// somebody rotates their phone is a keyframe and a stall for a difference nobody can see,
+    /// and 720p already has pixels to spare for half a phone screen at 3×.
+    var publishSize: PixelSize {
+        switch screen {
+        case .sideBySide, .others: Self.defaultCaptureSize
+        case .me: PixelSize(width: 1080, height: 1920)
+        }
+    }
+
+    /// The frame rate to publish at.
+    var publishFrameRate: Double = 30
+
+    /// What a rung of ``publishSize`` costs on the wire.
+    ///
+    /// Bits per pixel per second, times the pixels: 720p30 lands on the 1.25 megabits a
+    /// measured run of the same picture settled on. Under the ladder's own figure for 720p,
+    /// deliberately — that number is for a rung a viewer might be watching full screen, and
+    /// this one is for half a phone over a domestic uplink two phones are sharing.
+    ///
+    /// Floored, because the arithmetic above it is the kind that goes wrong by a thousand.
+    /// It did: the constant was written per pixel per second in units of megabits and applied
+    /// as bits, the encoder was asked for one and a half kilobits, and VideoToolbox did
+    /// exactly as told — it declined nineteen frames in twenty and emitted two keyframes a
+    /// second. On screen that is a black tile with healthy audio beside it and every counter
+    /// in the app reporting thirty frames captured. No rung anyone wants is under this, so
+    /// anything that computes one has made a mistake worth surviving.
+    var publishBitrate: Int {
+        let pixels = Double(publishSize.pixelCount)
+        let perPixel = 1.36
+        let base = pixels * perPixel * (1 + (publishFrameRate / 30 - 1) * 0.6)
+        return max(300_000, Int(base.rounded()))
+    }
+
+    /// The one rung this device publishes.
+    func rungForLayout() -> VideoLayer {
+        let size = publishSize
+        return VideoLayer(
+            id: LayerID("video/\(min(size.width, size.height))p"),
+            size: size,
+            frameRate: publishFrameRate,
+            bitrate: publishBitrate,
+            // One, because there is no longer anyone to shed a sub-layer for. Hierarchical
+            // P-frames let a receiver drop half the frames under pressure, and a receiver
+            // that is not choosing anything cannot use that — it only makes the frames
+            // arrive in bunches.
+            temporalLayers: 1
+        )
+    }
+
     /// Everything the SDK measures, resampled a few times a second.
     ///
     /// Nothing in the app supplies any of this. It is what makes the difference
@@ -558,6 +624,12 @@ final class RoomModel {
                 await self?.apply(event)
             }
         }
+
+        // Subscribe to whatever each publisher sends, and choose nothing. Both ends of this
+        // call run the same layout, so the sender already knows the size of the box its
+        // picture lands in — see ``rungForLayout`` — and a receiver that also has an opinion
+        // can only disagree with it. See ``RoomSession/setFollowsPublisher(_:)``.
+        Task { [room] in await room.setFollowsPublisher(true) }
 
         // Four times a second, which is faster than a person reads a number and
         // slow enough to be free. The stream ends itself when the room does.
@@ -928,10 +1000,16 @@ final class RoomModel {
         // sample runs in a simulator with nothing attached — and unlike an
         // empty relay, it produces pixels that actually encode. `SceneCapture`
         // is the third option a real build reaches for.
+        // One rung, decided here. A measured run brings its own — the point of a benchmark is
+        // that both ends agree on a figure that does not move — and any other run publishes
+        // what the layout on screen is going to draw. See ``rungForLayout``.
+        let rung = pinnedRung ?? rungForLayout()
+        pinnedRung = rung
+
         // Capture what the rung says it publishes. A capture format chosen independently of the
         // ladder is how a run claims sixty frames while the camera hands over thirty.
-        let size = pinnedRung?.size ?? Self.defaultCaptureSize
-        let format = CaptureFormat(size: size, frameRate: pinnedRung?.frameRate ?? 30)
+        let size = rung.size
+        let format = CaptureFormat(size: size, frameRate: rung.frameRate)
 
         let source: any FrameSource
         switch videoInput {
@@ -974,12 +1052,7 @@ final class RoomModel {
         }
 
         do {
-            // The ladder is capped at what is being captured. The default goes
-            // to 1080p, and a 1080p rung fed 720p frames publishes an upscale:
-            // the catalog says 1080p, the viewer subscribes for it, and the
-            // extra bitrate buys nothing.
-            let ladder = pinnedRung.map { LayerLadder(rungs: [$0]) }
-                ?? .defaultCamera(topSize: size)
+            let ladder = LayerLadder(rungs: [rung])
             let published = trustedStamp.map { TimedSource(source, stamp: $0) } ?? source
             var encoders: EncoderFactory = defaultEncoderFactory
             if flatLayers {
@@ -1001,7 +1074,18 @@ final class RoomModel {
             // only way to tell an uneven picture apart from an uneven network: if capture is
             // already lumpy the far end can do nothing but reproduce it, and if capture is
             // even then everything between here and there owns the difference.
-            if pinnedRung != nil { watchCaptureCadence(of: publication) }
+            //
+            // Watched for a ladder as well as a pinned rung, which it was not. A run driven by
+            // hand publishes the ladder, so the one configuration people actually use was also
+            // the one whose capture nothing was measuring.
+            watchCaptureCadence(of: publication)
+
+            Journal.shared.say(
+                "GO LIVE source=\(videoInput.rawValue)"
+                    + " capture=\(size.width)x\(size.height)@\(Int(format.frameRate))"
+                    + " rungs=" + ladder.rungs.map(\.id.value).joined(separator: ",")
+                    + " stamp=\(trustedStamp == nil ? "device" : "trusted")"
+            )
             applyAudioPurpose()
 
             // A voice with the picture, unless somebody has deliberately turned it off. Going

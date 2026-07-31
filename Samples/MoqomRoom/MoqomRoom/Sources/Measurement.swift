@@ -432,6 +432,15 @@ final class CadenceMeter: @unchecked Sendable {
         /// Typical seconds between one stall and the next, or zero with fewer than two.
         var period: Double
 
+        /// Seconds since the last frame, which every other figure here stops describing.
+        ///
+        /// A meter with nothing to record does not report a problem, it reports its last
+        /// answer forever: thirty frames a second, no freezes, on a camera that stopped a
+        /// minute ago and a report printed every five seconds saying so again. The gap
+        /// between the last sample and now is the only figure that can tell a healthy stream
+        /// apart from a dead one.
+        var since: Double
+
         /// How uneven the arrivals are, as the spread between the typical gap and a bad one.
         ///
         /// The number that matches the complaint: a p95 twice the median is visible, and a
@@ -443,14 +452,15 @@ final class CadenceMeter: @unchecked Sendable {
         let snapshot = lock.withLock {
             () -> (
                 gaps: [Double], frames: Int, rate: Double, freezes: Int, frozen: Double,
-                onKey: Int, period: Double
+                onKey: Int, period: Double, since: Double
             ) in
             let periods = stallPeriods.sorted()
             let typical = periods.isEmpty
                 ? 0
                 : periods[periods.count / 2]
+            let waiting = last.map { seconds(since: $0) } ?? 0
             guard let first, let last, frames > 1 else {
-                return (gaps.sorted(), frames, 0, freezes, 0, freezesOnKeyFrame, typical)
+                return (gaps.sorted(), frames, 0, freezes, 0, freezesOnKeyFrame, typical, waiting)
             }
             let span = Double((last - first).components.seconds)
                 + Double((last - first).components.attoseconds) / 1e18
@@ -461,7 +471,8 @@ final class CadenceMeter: @unchecked Sendable {
                 freezes,
                 span > 0 ? (frozen / 1000) / span : 0,
                 freezesOnKeyFrame,
-                typical
+                typical,
+                waiting
             )
         }
         let sorted = snapshot.gaps
@@ -481,7 +492,8 @@ final class CadenceMeter: @unchecked Sendable {
             freezes: snapshot.freezes,
             frozen: snapshot.frozen,
             onKeyFrame: snapshot.onKey,
-            period: snapshot.period
+            period: snapshot.period,
+            since: snapshot.since
         )
     }
 
@@ -500,5 +512,16 @@ final class CadenceMeter: @unchecked Sendable {
             reading.onKeyFrame,
             reading.period
         )
+            // Loudly, and only when it applies. A second of nothing is a hiccup; ten is the
+            // whole diagnosis, and it is worth more than every percentile in front of it.
+            + (reading.since > 1
+                ? String(format: " · NOTHING FOR %.1fs", reading.since)
+                : "")
+    }
+
+    private func seconds(since instant: ContinuousClock.Instant) -> Double {
+        let elapsed = ContinuousClock.now - instant
+        return Double(elapsed.components.seconds)
+            + Double(elapsed.components.attoseconds) / 1e18
     }
 }

@@ -100,6 +100,13 @@ public struct BroadcastStatistics: Hashable, Sendable {
     public var objectsPublished: Int
     public var currentGroup: UInt64
 
+    /// What the encoders did with the frames that never became objects.
+    ///
+    /// Summed across rungs, and read from the encoders rather than recorded here: the gap
+    /// between submitted and encoded is inside them, and until this was carried out the only
+    /// honest description of it was "somewhere in VideoToolbox".
+    public var encoding = EncoderAccounting()
+
     /// Layers currently being produced. Shrinks when
     /// ``BroadcastConfiguration/stopsUnwatchedLayers`` is on and nobody is
     /// watching.
@@ -294,6 +301,13 @@ public actor Broadcast {
         var reading = statistics
         reading.encodeLatency = encodeMeter.summary
         reading.writeLatency = writeMeter.summary
+        for encoder in encoders.values {
+            let accounting = encoder.accounting
+            reading.encoding.emitted += accounting.emitted
+            reading.encoding.declined += accounting.declined
+            reading.encoding.unreadable += accounting.unreadable
+            reading.encoding.overrun += accounting.overrun
+        }
         return reading
     }
 

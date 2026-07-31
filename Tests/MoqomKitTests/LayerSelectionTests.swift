@@ -203,4 +203,59 @@ struct LayerSelectionTests {
         #expect(selection?.video == nil)
         #expect(selection?.audio == true)
     }
+
+    @Test("a receiver told to follow the publisher takes what is offered, whatever it draws")
+    func followingThePublisherIgnoresTheBox() {
+        var selector = LayerSelector(
+            ladder: ladder,
+            policy: LayerSelectionPolicy(followsPublisher: true)
+        )
+
+        // A thumbnail, which every rule in the file would answer with 180p, on an allowance
+        // far below the top rung's bitrate — and still the rung the publisher is sending.
+        let selection = selector.update(
+            box: RenderBox(width: 80, height: 45, scale: 1),
+            allowance: NetworkAllowance(bitrate: 100_000)
+        )
+
+        #expect(selection?.video == ladder.rungs.last?.id)
+        #expect(selection?.reason == .publisherDecides)
+    }
+
+    @Test("following the publisher survives a tile leaving the screen")
+    func followingThePublisherIgnoresVisibility() {
+        // The fault this exists for: a layout change rebuilds a tile, the outgoing one reports
+        // itself off screen, the selector unsubscribes, and the picture never comes back while
+        // the audio plays on. A subscription that does not depend on the view cannot do that.
+        var selector = LayerSelector(
+            ladder: ladder,
+            policy: LayerSelectionPolicy(followsPublisher: true)
+        )
+        _ = selector.update(box: RenderBox(width: 390, height: 220, scale: 3))
+        let afterHiding = selector.update(box: .hidden)
+
+        #expect(afterHiding == nil)
+        #expect(selector.current?.video == ladder.rungs.last?.id)
+    }
+
+    @Test("a follower asks for nothing until the publisher has said what it sends")
+    func followingThePublisherWaitsForTheCatalog() {
+        // A guessed ladder is a guess about shape, for sizing a box against. Under this policy
+        // it is also a list of track names, and the top of it is a name nobody published: the
+        // relay refuses the subscription, and the tile is black until the catalog lands and
+        // the plan is redone. Better to ask a moment later and be answered.
+        var selector = LayerSelector(
+            ladder: ladder,
+            policy: LayerSelectionPolicy(followsPublisher: true)
+        )
+        selector.ladderIsProvisional = true
+
+        let guessed = selector.update(box: RenderBox(width: 390, height: 220, scale: 3))
+        #expect(guessed?.video == nil)
+        #expect(guessed?.audio == true)
+
+        selector.ladderIsProvisional = false
+        let known = selector.update(box: RenderBox(width: 390, height: 220, scale: 3))
+        #expect(known?.video == ladder.rungs.last?.id)
+    }
 }

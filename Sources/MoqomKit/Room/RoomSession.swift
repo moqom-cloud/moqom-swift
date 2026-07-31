@@ -996,6 +996,21 @@ public actor RoomSession {
     ///   own measurement, which is what an application should use — passing a
     ///   number here overrides a live estimate with a guess, and is for tests
     ///   and for integrators who genuinely know something we do not.
+    /// Take whatever each publisher offers instead of choosing a rung.
+    ///
+    /// See ``LayerSelectionPolicy/followsPublisher``. For a call where every end runs the
+    /// same layout and the sender already knows the size of the box its picture will land
+    /// in — which is most two-party calls, and none of the nine-up grids this SDK's
+    /// selection was written for.
+    ///
+    /// Layout reports are still worth making with this on: they set subscriber priority, so
+    /// the relay still sheds the smallest tile first.
+    public func setFollowsPublisher(_ follows: Bool) async {
+        guard planner.followsPublisher != follows else { return }
+        planner.followsPublisher = follows
+        await applyLayout(planner.layout, linkBitrate: nil)
+    }
+
     @discardableResult
     public func updateLayout(
         _ boxes: [ParticipantIdentity: RenderBox],
@@ -1927,7 +1942,8 @@ public actor RoomSession {
         state.roster[control.identity] = participant
         planner.setLadder(
             participant.ladders[MediaKind.video.rawValue] ?? .defaultCamera(),
-            for: control.identity
+            for: control.identity,
+            provisional: participant.ladders[MediaKind.video.rawValue] == nil
         )
         return true
     }
@@ -1999,7 +2015,8 @@ public actor RoomSession {
         state.roster[who] = participant
         planner.setLadder(
             participant.ladders[MediaKind.video.rawValue] ?? .defaultCamera(),
-            for: who
+            for: who,
+            provisional: participant.ladders[MediaKind.video.rawValue] == nil
         )
         eventContinuation.yield(.grantsChanged(who, grants))
     }
@@ -2050,7 +2067,7 @@ public actor RoomSession {
                 // A default until their catalog arrives, not a decision. It
                 // exists so that layout can proceed in the milliseconds before
                 // the catalog lands, and it is replaced rather than merged.
-                planner.setLadder(.defaultCamera(), for: joined)
+                planner.setLadder(.defaultCamera(), for: joined, provisional: true)
 
                 // What the authority already said about them, which routinely
                 // arrives first: a promotion is what causes somebody to start
@@ -2162,7 +2179,8 @@ public actor RoomSession {
         // already has.
         planner.setLadder(
             state.roster[who]?.ladders[MediaKind.video.rawValue] ?? .defaultCamera(),
-            for: who
+            for: who,
+            provisional: state.roster[who]?.ladders[MediaKind.video.rawValue] == nil
         )
         if let participant = state.roster[who] { watchCatalog(of: participant) }
         if layoutToRestore[who] != nil { scheduleLayoutRestore() }

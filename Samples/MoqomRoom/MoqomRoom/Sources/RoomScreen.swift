@@ -544,156 +544,168 @@ struct BroadcastControls: View {
 
     var body: some View {
         VStack(spacing: 8) {
-            HStack(spacing: 8) {
-                Button {
-                    Task {
-                        if room.isBroadcasting {
-                            await room.stopBroadcast()
-                        } else {
-                            await room.startBroadcast()
+            // Scrolled sideways rather than squeezed, and this is not only about the buttons.
+            // Nine capsules do not fit across a phone, and an `HStack` that cannot fit its
+            // children does not clip them — it reports the width it wanted, which every view
+            // above it then lays out against. So the row nobody could finish reading was also
+            // what pushed the two video tiles a tile-edge off each side of the screen. A
+            // scroll view accepts whatever width it is offered and keeps its overflow to
+            // itself.
+            ScrollView(.horizontal) {
+                HStack(spacing: 8) {
+                    Button {
+                        Task {
+                            if room.isBroadcasting {
+                                await room.stopBroadcast()
+                            } else {
+                                await room.startBroadcast()
+                            }
                         }
+                    } label: {
+                        Label(
+                            room.isBroadcasting ? "Stop" : "Go live",
+                            systemImage: room.isBroadcasting
+                                ? "stop.circle.fill"
+                                : "dot.radiowaves.left.and.right"
+                        )
                     }
-                } label: {
-                    Label(
-                        room.isBroadcasting ? "Stop" : "Go live",
-                        systemImage: room.isBroadcasting
-                            ? "stop.circle.fill"
-                            : "dot.radiowaves.left.and.right"
-                    )
-                    .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(room.isBroadcasting ? .red : .accentColor)
-                .controlCapsule(iconOnly: false)
+                    .buttonStyle(.borderedProminent)
+                    .tint(room.isBroadcasting ? .red : .accentColor)
+                    .controlCapsule(iconOnly: false)
 
-                Button {
-                    Task {
-                        if room.isPublishingAudio {
-                            await room.stopAudio()
-                        } else {
-                            await room.startAudio()
+                    Button {
+                        Task {
+                            if room.isPublishingAudio {
+                                await room.stopAudio()
+                            } else {
+                                await room.startAudio()
+                            }
                         }
+                    } label: {
+                        Label(
+                            room.isPublishingAudio ? "End audio" : "Audio",
+                            systemImage: room.isPublishingAudio ? "waveform.slash" : "waveform"
+                        )
                     }
-                } label: {
-                    Label(
-                        room.isPublishingAudio ? "End audio" : "Audio",
-                        systemImage: room.isPublishingAudio ? "waveform.slash" : "waveform"
-                    )
-                }
-                .buttonStyle(.bordered)
-                .controlCapsule()
-
-                // Distinct from the button beside it, and the difference is the
-                // point. That one ends the publication: the track closes, the
-                // catalog loses it, and every subscriber unsubscribes. This one
-                // stops the bytes and leaves all of that standing, so coming
-                // back is the next packet rather than a renegotiation.
-                Button {
-                    Task { await room.setMicrophoneMuted(!room.isMicrophoneMuted) }
-                } label: {
-                    Label(
-                        room.isMicrophoneMuted ? "Unmute" : "Mute",
-                        systemImage: room.isMicrophoneMuted ? "mic.slash.fill" : "mic.fill"
-                    )
-                }
-                .buttonStyle(.bordered)
-                .tint(room.isMicrophoneMuted ? .red : nil)
-                .disabled(!room.isPublishingAudio)
-                .controlCapsule()
-
-                Button {
-                    Task { await room.setCameraMuted(!room.isCameraMuted) }
-                } label: {
-                    Label(
-                        room.isCameraMuted ? "Camera on" : "Camera off",
-                        systemImage: room.isCameraMuted ? "video.slash.fill" : "video.fill"
-                    )
-                }
-                .buttonStyle(.bordered)
-                .tint(room.isCameraMuted ? .red : nil)
-                .disabled(!room.isBroadcasting)
-                .controlCapsule()
-
-                // Live, unlike the input pickers below. Switching cameras does
-                // not replace the `FrameSource` the publication is bound to, so
-                // there is nothing to tear down and nobody watching sees the
-                // participant leave the stage.
-                Button {
-                    Task { await room.flipCamera() }
-                } label: {
-                    Label("Flip", systemImage: "arrow.triangle.2.circlepath.camera")
-                }
-                .buttonStyle(.bordered)
-                .disabled(!room.isBroadcasting || room.videoInput != .camera)
-                .controlCapsule()
-
-                // Fixed while publishing. Swapping the source under a live
-                // publication would mean tearing down the capture the encoder is
-                // reading from, and the sample is not the place to demonstrate
-                // that being survivable.
-                Menu {
-                    // Live, unlike the video picker below. Audio is a publication that can be
-                    // stopped and restarted in the time between two packets, and disabling
-                    // this while publishing meant the one moment a person wants to leave the
-                    // tone behind — hearing it — is the moment the control will not move.
-                    Picker("Audio", selection: $room.audioInput) {
-                        ForEach(RoomModel.AudioInput.allCases) { input in
-                            Text(input.rawValue).tag(input)
-                        }
-                    }
-
-                    Picker("Video", selection: $room.videoInput) {
-                        ForEach(RoomModel.VideoInput.allCases) { input in
-                            Text(input.rawValue).tag(input)
-                        }
-                    }
-                    .disabled(room.isBroadcasting)
-
-                    // Here so cancellation can be measured rather than believed.
-                    // Toggling it while the far end plays gives the level
-                    // difference the canceller is worth, which is the only
-                    // honest way to know it is doing anything.
-                    Toggle("Bypass voice processing", isOn: $room.isBypassingVoiceProcessing)
-                        .disabled(!room.isPublishingAudio || room.audioInput != .microphone)
-                } label: {
-                    Label("Input", systemImage: "slider.horizontal.3")
-                }
-                .menuStyle(.button)
-                .buttonStyle(.bordered)
-                .controlCapsule()
-
-                // In the row rather than in the toolbar menu, because these two are what a
-                // test session actually touches. Between them they set every tile's size,
-                // and a tile's size is the whole input to which rung is fetched — so this is
-                // the control that changes what is being measured, and it was three taps away
-                // behind a picker for something else.
-                Menu {
-                    Picker("Stage", selection: $room.screen) {
-                        ForEach(RoomModel.Screen.allCases) { choice in
-                            Text(choice.rawValue).tag(choice)
-                        }
-                    }
-
-                    Picker("Grid", selection: $room.arrangement) {
-                        ForEach(RoomModel.Arrangement.allCases) { choice in
-                            Text(choice.rawValue).tag(choice)
-                        }
-                    }
-
-                    Toggle("Mirror my video", isOn: $room.publishesMirrored)
-                } label: {
-                    Label("Layout", systemImage: "rectangle.3.group")
-                }
-                .menuStyle(.button)
-                .buttonStyle(.bordered)
-                .controlCapsule()
-
-                SceneEffectsMenu()
-                    .menuStyle(.button)
                     .buttonStyle(.bordered)
+                    .controlCapsule()
+
+                    // Distinct from the button beside it, and the difference is the
+                    // point. That one ends the publication: the track closes, the
+                    // catalog loses it, and every subscriber unsubscribes. This one
+                    // stops the bytes and leaves all of that standing, so coming
+                    // back is the next packet rather than a renegotiation.
+                    Button {
+                        Task { await room.setMicrophoneMuted(!room.isMicrophoneMuted) }
+                    } label: {
+                        Label(
+                            room.isMicrophoneMuted ? "Unmute" : "Mute",
+                            systemImage: room.isMicrophoneMuted ? "mic.slash.fill" : "mic.fill"
+                        )
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(room.isMicrophoneMuted ? .red : nil)
+                    .disabled(!room.isPublishingAudio)
+                    .controlCapsule()
+
+                    Button {
+                        Task { await room.setCameraMuted(!room.isCameraMuted) }
+                    } label: {
+                        Label(
+                            room.isCameraMuted ? "Camera on" : "Camera off",
+                            systemImage: room.isCameraMuted ? "video.slash.fill" : "video.fill"
+                        )
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(room.isCameraMuted ? .red : nil)
                     .disabled(!room.isBroadcasting)
                     .controlCapsule()
+
+                    // Live, unlike the input pickers below. Switching cameras does
+                    // not replace the `FrameSource` the publication is bound to, so
+                    // there is nothing to tear down and nobody watching sees the
+                    // participant leave the stage.
+                    Button {
+                        Task { await room.flipCamera() }
+                    } label: {
+                        Label("Flip", systemImage: "arrow.triangle.2.circlepath.camera")
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!room.isBroadcasting || room.videoInput != .camera)
+                    .controlCapsule()
+
+                    // Fixed while publishing. Swapping the source under a live
+                    // publication would mean tearing down the capture the encoder is
+                    // reading from, and the sample is not the place to demonstrate
+                    // that being survivable.
+                    Menu {
+                        // Live, unlike the video picker below. Audio is a publication that can
+                        // be stopped and restarted in the time between two packets, and
+                        // disabling this while publishing meant the one moment a person wants
+                        // to leave the tone behind — hearing it — is the moment the control
+                        // will not move.
+                        Picker("Audio", selection: $room.audioInput) {
+                            ForEach(RoomModel.AudioInput.allCases) { input in
+                                Text(input.rawValue).tag(input)
+                            }
+                        }
+
+                        Picker("Video", selection: $room.videoInput) {
+                            ForEach(RoomModel.VideoInput.allCases) { input in
+                                Text(input.rawValue).tag(input)
+                            }
+                        }
+                        .disabled(room.isBroadcasting)
+
+                        // Here so cancellation can be measured rather than believed.
+                        // Toggling it while the far end plays gives the level
+                        // difference the canceller is worth, which is the only
+                        // honest way to know it is doing anything.
+                        Toggle("Bypass voice processing", isOn: $room.isBypassingVoiceProcessing)
+                            .disabled(!room.isPublishingAudio || room.audioInput != .microphone)
+                    } label: {
+                        Label("Input", systemImage: "slider.horizontal.3")
+                    }
+                    .menuStyle(.button)
+                    .buttonStyle(.bordered)
+                    .controlCapsule()
+
+                    // In the row rather than in the toolbar menu, because these two are what a
+                    // test session actually touches. Between them they set every tile's size,
+                    // and a tile's size is the whole input to which rung is fetched — so this
+                    // is the control that changes what is being measured, and it was three
+                    // taps away behind a picker for something else.
+                    Menu {
+                        Picker("Stage", selection: $room.screen) {
+                            ForEach(RoomModel.Screen.allCases) { choice in
+                                Text(choice.rawValue).tag(choice)
+                            }
+                        }
+
+                        Picker("Grid", selection: $room.arrangement) {
+                            ForEach(RoomModel.Arrangement.allCases) { choice in
+                                Text(choice.rawValue).tag(choice)
+                            }
+                        }
+
+                        Toggle("Mirror my video", isOn: $room.publishesMirrored)
+                    } label: {
+                        Label("Layout", systemImage: "rectangle.3.group")
+                    }
+                    .menuStyle(.button)
+                    .buttonStyle(.bordered)
+                    .controlCapsule()
+
+                    SceneEffectsMenu()
+                        .menuStyle(.button)
+                        .buttonStyle(.bordered)
+                        .disabled(!room.isBroadcasting)
+                        .controlCapsule()
+                }
+                .padding(.horizontal, 2)
             }
+            .scrollIndicators(.hidden)
+            .scrollBounceBehavior(.basedOnSize)
 
             if room.isPublishingAudio, room.audioInput == .microphone {
                 CaptureReadout(meter: room.meter, isCancellingEcho: room.isCancellingEcho)

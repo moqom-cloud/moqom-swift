@@ -129,13 +129,17 @@ struct LaunchOptions {
     /// Publish the camera on one pinned rung, for measuring rather than for calling.
     var benchmark = false
 
-    /// Publish the whole ladder and let the selector choose, as a call does.
+    /// Go live on launch the way the button does, choosing the rung from the layout.
     ///
-    /// The pinned rung is what makes a benchmark comparable, and it also means the measured
-    /// configuration is the one configuration that never exercises the ladder, the selector,
-    /// or a rung switch. Every video fault reported by hand has been in that half, and there
-    /// was no way to drive it from a script.
-    var ladder = false
+    /// Separate from ``benchmark`` because the two paths had quietly stopped being the same
+    /// program. Every scripted run pinned a rung and every run by hand sized one from the
+    /// screen, so a fault that lived in the second was invisible to all the automation aimed
+    /// at finding it — thirty frames a second in every measured run and two a second in the
+    /// hands of the person reporting the bug.
+    var live = false
+
+    /// Whether this launch should start publishing by itself.
+    var goesLive: Bool { benchmark || live }
 
     /// Encode one flat layer instead of splitting the rung into two temporal ones.
     ///
@@ -210,7 +214,7 @@ struct LaunchOptions {
             case "--pairing-code": options.pairingCode = value
             case "--autojoin": options.autojoin = true
             case "--benchmark": options.benchmark = true
-            case "--ladder": options.ladder = true
+            case "--live": options.live = true
             case "--flat-layers": options.flatLayers = true
             case "--fps": options.frameRate = value.flatMap(Double.init)
             case "--kbps": options.kilobitsPerSecond = value.flatMap(Int.init)

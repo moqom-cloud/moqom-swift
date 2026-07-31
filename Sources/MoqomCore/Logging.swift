@@ -234,6 +234,24 @@ public struct SilentLogSink: LogSink {
     public func write(_ record: LogRecord) {}
 }
 
+/// Writes to several sinks at once.
+///
+/// Because "where do the logs go" has more than one right answer at the same time: the
+/// unified log is where a developer with the device attached looks, and it is unreachable
+/// from a phone in somebody's pocket — so an application that also wants a file, or a crash
+/// reporter's breadcrumbs, should not have to choose.
+public struct BroadcastLogSink: LogSink {
+    private let sinks: [any LogSink]
+
+    public init(sinks: [any LogSink]) {
+        self.sinks = sinks
+    }
+
+    public func write(_ record: LogRecord) {
+        for sink in sinks { sink.write(record) }
+    }
+}
+
 /// Writes to the unified log, one `os.Logger` per category.
 ///
 /// The loggers are built once rather than per record: constructing an

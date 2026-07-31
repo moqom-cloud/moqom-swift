@@ -100,8 +100,38 @@ public protocol FrameEncoder: Sendable {
     /// Compressed output, in presentation order.
     func encodedFrames() -> AsyncStream<EncodedFrame>
 
+    /// What became of the frames handed over, for the ones that produced nothing.
+    ///
+    /// Defaulted, so an integrator's encoder does not have to answer. What it costs when
+    /// nobody answers is what this was added for: fifty frames submitted, one published, and
+    /// no counter anywhere between them with an opinion about the other forty-nine.
+    var accounting: EncoderAccounting { get }
+
     /// Flush and release. Idempotent.
     func close() async
+}
+
+/// Where frames went inside an encoder.
+public struct EncoderAccounting: Hashable, Sendable {
+    /// Handed to the consumer.
+    public var emitted = 0
+
+    /// The encoder produced no picture for the frame.
+    public var declined = 0
+
+    /// A picture came back that could not be read.
+    public var unreadable = 0
+
+    /// A picture was produced and the consumer was too far behind to take it.
+    public var overrun = 0
+
+    public init() {}
+
+    public var isQuiet: Bool { declined == 0 && unreadable == 0 && overrun == 0 }
+}
+
+public extension FrameEncoder {
+    var accounting: EncoderAccounting { EncoderAccounting() }
 }
 
 /// How the SDK obtains an encoder for one rung.

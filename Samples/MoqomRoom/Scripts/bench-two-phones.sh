@@ -30,9 +30,8 @@ This script takes no arguments; everything is an environment variable.
   MOQOM_KBPS=2000        publish bitrate
   MOQOM_AUDIO=mic        publish audio: mic, or tone for a synthetic source
   MOQOM_VIDEO=camera     publish video: camera, or pattern
-  MOQOM_LADDER=1         publish the whole ladder and let the selector choose, as a call
-                         does, instead of the single pinned rung a benchmark wants
   MOQOM_PLAYOUT_MS=40    fixed playout delay, instead of the adaptive one
+  MOQOM_CALL=1           publish the layout's rung, as a call does, not a pinned one
   MOQOM_FLOOR_MS / MOQOM_TOLERANCE / MOQOM_STATS_MS / MOQOM_FLAT_LAYERS
   MOQOM_PUBLISHER / MOQOM_VIEWER   device names (default: iPhone Air, 15 Pro)
 
@@ -80,7 +79,7 @@ else
     WHERE="--pairing-code $CODE"
     echo "relay: whatever answers to pairing code $CODE on this network"
 fi
-WHERE="$WHERE --fps $FPS${MOQOM_FLAT_LAYERS:+ --flat-layers}${MOQOM_LADDER:+ --ladder}"
+WHERE="$WHERE --fps $FPS${MOQOM_FLAT_LAYERS:+ --flat-layers}"
 WHERE="$WHERE${MOQOM_KBPS:+ --kbps $MOQOM_KBPS}"
 WHERE="$WHERE${MOQOM_STATS_MS:+ --stats-ms $MOQOM_STATS_MS}"
 WHERE="$WHERE${MOQOM_PLAYOUT_MS:+ --playout-ms $MOQOM_PLAYOUT_MS}"
@@ -88,6 +87,15 @@ WHERE="$WHERE${MOQOM_TOLERANCE:+ --tolerance $MOQOM_TOLERANCE}"
 WHERE="$WHERE${MOQOM_FLOOR_MS:+ --floor-ms $MOQOM_FLOOR_MS}"
 WHERE="$WHERE${MOQOM_AUDIO:+ --audio $MOQOM_AUDIO}"
 WHERE="$WHERE${MOQOM_VIDEO:+ --video $MOQOM_VIDEO}"
+
+# A measured run or a call. The difference is which rung gets published — a pinned one, or the
+# one the layout on screen asks for — and it is worth being able to script both, because for a
+# while only the pinned path was ever scripted and only the other path was ever used.
+MODE="--benchmark"
+if [ -n "${MOQOM_CALL:-}" ]; then
+    MODE="--live"
+    echo "mode: call — the rung comes from the layout, as it does under a thumb"
+fi
 
 # By name rather than by hard-coded identifier, so this survives a re-pair. The identifier is
 # found by its shape rather than its column, because the state field ("available (paired)")
@@ -203,7 +211,7 @@ launch() {
             # code, and every locked-phone run appeared to give up instantly.
             xcrun devicectl device process launch --device "$device" --console \
                 --terminate-existing "$BUNDLE" \
-                --autojoin --benchmark --username "$who" --room "$ROOM" $WHERE \
+                --autojoin $MODE --username "$who" --room "$ROOM" $WHERE \
                 > "$out" 2>&1 || true
             # Printed by the console only once the process is actually up.
             if grep -q 'Waiting for the application to terminate' "$out"; then exit 0; fi

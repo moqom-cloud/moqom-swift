@@ -77,6 +77,7 @@ final class AppModel {
     var measure: Bool
 
     init() {
+        Journal.shared.begin()
         measure = true
         pairingCode = launch.pairingCode ?? ""
     }
@@ -87,6 +88,9 @@ final class AppModel {
 
     /// Prints the link's state while a measured run is going.
     private var reporter: Task<Void, Never>?
+
+    /// The display pipeline's counters as of the last report, for reporting the change.
+    private var lastPresentation: VideoRenderer.Presentation?
 
     /// Keeps the shared clock disciplined for as long as one is.
     private var timekeeping: Task<Void, Never>?
@@ -128,14 +132,14 @@ final class AppModel {
 
         username = launch.username ?? "device"
         roomName = launch.room ?? roomName
-        print("JOINING relay=\(relay.summary) room=\(roomName) as=\(username)")
+        Journal.shared.say("JOINING relay=\(relay.summary) room=\(roomName) as=\(username)")
 
         await join()
 
         switch phase {
         case let .inRoom(room):
-            print("JOINED relay=\(relay.summary) room=\(roomName)")
-            guard launch.benchmark else { return }
+            Journal.shared.say("JOINED relay=\(relay.summary) room=\(roomName)")
+            guard launch.goesLive else { return }
 
             // Before the broadcast, because going live now brings a voice with it. Named
             // rather than matched against one value with everything else falling through to
@@ -146,7 +150,7 @@ final class AppModel {
                 case "mic": room.audioInput = .microphone
                 case "tone": room.audioInput = .tone
                 default:
-                    print("AUDIO UNKNOWN \(audio) — expected mic or tone; using the microphone")
+                    Journal.shared.say("AUDIO UNKNOWN \(audio) — expected mic or tone; using the microphone")
                     room.audioInput = .microphone
                 }
             } else {
@@ -157,30 +161,33 @@ final class AppModel {
 
             await room.startBroadcast()
             guard room.isBroadcasting else {
-                print(
+                Journal.shared.say(
                     "GO LIVE FAILED "
                         + (room.lastError.map(String.init(describing:)) ?? "no reason given")
                 )
                 return
             }
             if launch.audio != nil, !room.isPublishingAudio {
-                print(
+                Journal.shared.say(
                     "AUDIO FAILED "
                         + (room.lastError.map(String.init(describing:)) ?? "no reason given")
                 )
             }
 
-            print(
-                "LIVE rung=video/720p"
-                    + (room.pinnedRung.map { " \($0.size.width)x\($0.size.height)" } ?? "")
+            Journal.shared.say(
+                "LIVE rung=" + (room.pinnedRung?.id.value ?? "video/720p")
+                    + (room.pinnedRung.map {
+                        " \($0.size.width)x\($0.size.height)@\(Int($0.frameRate))"
+                            + " \($0.bitrate / 1000)kbps layers=\($0.temporalLayers)"
+                    } ?? "")
                     + " codec=hevc source=\(room.videoInput.rawValue)"
                     + " fps=\(Int(launch.frameRate ?? 30))"
                     + " playout=\(launch.playoutMilliseconds.map { "\($0)ms fixed" } ?? "adaptive")"
                     + " layers=\(launch.flatLayers ? "flat" : "temporal")"
                     + " audio=\(room.isPublishingAudio ? (launch.audio ?? "on") : "off")"
             )
-        case let .failed(error): print("JOIN FAILED \(error)")
-        default: print("JOIN ended in an unexpected state")
+        case let .failed(error): Journal.shared.say("JOIN FAILED \(error)")
+        default: Journal.shared.say("JOIN ended in an unexpected state")
         }
     }
 
@@ -234,7 +241,7 @@ final class AppModel {
                 synchronised = await clock.synchronise() || synchronised
             }
             let now = await clock.now()
-            print(
+            Journal.shared.say(
                 synchronised
                     ? "CLOCK synchronised uncertainty=\(now.uncertainty)"
                     : "CLOCK NOT synchronised — latency across devices will be meaningless"
@@ -244,7 +251,7 @@ final class AppModel {
                 discipline(clock)
             }
         } else {
-            print("CLOCK unavailable — latency across devices will be meaningless")
+            Journal.shared.say("CLOCK unavailable — latency across devices will be meaningless")
         }
 
         room.videoInput = launch.video == "pattern" ? .pattern : .camera
@@ -264,8 +271,14 @@ final class AppModel {
         let bitrate = launch.kilobitsPerSecond.map { $0 * 1000 }
             ?? Int(1_250_000 * (1 + (fps / 30 - 1) * 0.6))
 
-        // Only for a benchmark. See ``measure``: a call wants the whole ladder.
-        guard launch.benchmark, !launch.ladder else {
+        // The rate reaches the publisher either way: a call chooses its own rung from the
+        // layout and this is the one part of it a run is allowed to dictate.
+        room.publishFrameRate = fps
+
+        // Beyond that, only a benchmark pins anything. A call sizes its rung from the layout
+        // — see ``RoomModel/rungForLayout()`` — and a measured run wants a figure that does
+        // not move when somebody changes the screen.
+        guard launch.benchmark else {
             report(on: room)
             return
         }
@@ -317,7 +330,7 @@ final class AppModel {
                 try? await Task.sleep(for: .seconds(5))
                 guard let room else { return }
                 let stats = room.statistics
-                print(
+                Journal.shared.say(
                     "LINK \(room.latency.report())"
                         + " received=\(stats?.link.received ?? 0)bps"
                         + " lost=\(stats?.link.objectsLost ?? 0)"
@@ -334,7 +347,7 @@ final class AppModel {
                     // long that is depends on where the schedule was anchored as much as on the
                     // setting. Falling back to the setting only before there is a measurement.
                     let wait = (room.playoutSlack ?? room.playoutDepth.seconds) * 1000
-                    print(
+                    Journal.shared.say(
                         String(
                             format: "GLASS p50=%.0fms p95=%.0fms (link %.0f/%.0f + wait %.0f)",
                             link.median + wait,
@@ -348,18 +361,18 @@ final class AppModel {
 
                 // Alongside the latency rather than folded into it. A stream can be fast and
                 // uneven or slow and smooth, and the two complaints have different causes.
-                print("PLAY \(room.cadence.report())")
+                Journal.shared.say("PLAY \(room.cadence.report())")
 
                 // The publisher's timeline, beside the arrivals it should be independent of.
                 // An even arrival cadence and an uneven timeline is motion that is wrong while
                 // nothing is late or missing, and it is the only line here that can say so.
-                if let timeline = room.timeline.report() { print("TIME \(timeline)") }
+                if let timeline = room.timeline.report() { Journal.shared.say("TIME \(timeline)") }
 
                 // The last few inches, which nothing else covers. Frames counted as arrived by
                 // PLAY and as lost by nobody can still fail to reach the screen, and a picture
                 // that misses steps while every other line reads clean is what that looks like.
                 let drawn = room.drawing
-                print(
+                Journal.shared.say(
                     String(
                         format: "DRAW shown=%d late=%d undescribed=%d failures=%d"
                             + " backwards=%d reanchors=%d regrids=%d delivered=%.1f%%"
@@ -397,19 +410,37 @@ final class AppModel {
                 )
                 // The display pipeline's own account, which is the only one that can say a frame
                 // was accepted and then not shown.
+                //
+                // With the change since the last report beside the run's total, because the
+                // total on its own cannot answer the only question anyone asks of it. A third
+                // of the frames dropped reads as a broken pipeline; a third of the frames
+                // dropped in the first two seconds and none since reads as a schedule
+                // settling, and the two want opposite responses.
                 if let shown = room.presentation {
-                    print(
+                    let before = lastPresentation
+                    lastPresentation = shown
+                    Journal.shared.say(
                         String(
-                            format: "SHOW total=%d dropped=%d corrupted=%d delay=%.1f ms",
+                            format: "SHOW total=%d dropped=%d corrupted=%d delay=%.1f ms"
+                                + " · since=%d dropped=%d",
                             shown.total,
                             shown.dropped,
                             shown.corrupted,
-                            shown.delay * 1000
+                            shown.delay * 1000,
+                            shown.total - (before?.total ?? 0),
+                            shown.dropped - (before?.dropped ?? 0)
                         )
+                            + (room.previewPresentation.map {
+                                String(
+                                    format: " · preview total=%d dropped=%d",
+                                    $0.total,
+                                    $0.dropped
+                                )
+                            } ?? "")
                     )
                 }
 
-                print(
+                Journal.shared.say(
                     "GRAB \(room.captureCadence.report())"
                         // What is in those frames, not just how many. Near zero is a black
                         // picture, which every other line here reports as a healthy stream.
@@ -436,7 +467,7 @@ final class AppModel {
                 // tile is on, and it is the only line that can: everything else is a count of
                 // frames, and a black picture is a frame.
                 if room.receivedPictures > 0 {
-                    print(
+                    Journal.shared.say(
                         "SEEN pictures=\(room.receivedPictures)"
                             + (room.receivedBrightness.map { String(format: " luma=%.3f", $0) }
                                 ?? "")
@@ -451,7 +482,7 @@ final class AppModel {
                 // slots concealed because nothing arrived at all, and the two are fixed by
                 // opposite things.
                 if let audio = stats?.publishing.audio {
-                    print(
+                    Journal.shared.say(
                         "TALK captured=\(audio.framesCaptured)"
                             + " published=\(audio.packetsPublished)"
                             + " dropped=\(audio.packetsDropped)"
@@ -478,7 +509,7 @@ final class AppModel {
                 // handed to a player node in an engine that never opened is counted as played.
                 #if os(iOS)
                     let session = AVAudioSession.sharedInstance()
-                    print(
+                    Journal.shared.say(
                         "OUT engine=\(AudioGraph.shared.isRunning ? "running" : "stopped")"
                             + " route=\(Self.describe(session.currentRoute))"
                             // What the hardware granted, which is the thing that decides how
@@ -492,7 +523,7 @@ final class AppModel {
 
                 for (who, participant) in stats?.participants ?? [:] {
                     guard let heard = participant.audio else { continue }
-                    print(
+                    Journal.shared.say(
                         String(
                             format: "HEAR %@ received=%d played=%d late=%d duplicate=%d gaps=%d"
                                 + " target=%.0fms jitter=%.1fms",
@@ -510,7 +541,7 @@ final class AppModel {
                     // The last inch, which every line above is blind to: packets can arrive,
                     // decode, and be scheduled while containing nothing but zeros.
                     if let played = await room.playback(of: who) {
-                        print(
+                        Journal.shared.say(
                             String(
                                 format: "  SPKR %@ buffers=%d silent=%d peak=%.3f"
                                     + " decoded=%d failed=%d gaps=%d silences=%d",
@@ -534,7 +565,7 @@ final class AppModel {
                 // link stays clean is a thermal reading rather than a transport bug. Low
                 // power mode does the same thing for a different reason and is worth the two
                 // words it costs to rule out.
-                print(
+                Journal.shared.say(
                     "HOST thermal=\(Self.describe(ProcessInfo.processInfo.thermalState))"
                         + " lowpower=\(ProcessInfo.processInfo.isLowPowerModeEnabled)"
                 )
@@ -545,13 +576,17 @@ final class AppModel {
                 // could not keep up with, produces exactly the same picture at the far end as
                 // a link that is losing them.
                 if let video = stats?.publishing.video {
-                    print(
+                    Journal.shared.say(
                         "SEND submitted=\(video.framesSubmitted)"
                             + " encoded=\(video.framesEncoded)"
                             + " dropped=\(video.framesDropped)"
                             + " muted=\(video.framesMuted)"
                             + " unroutable=\(video.framesUnroutable)"
                             + " objects=\(video.objectsPublished)"
+                            + " · encoder emitted=\(video.encoding.emitted)"
+                            + " declined=\(video.encoding.declined)"
+                            + " unreadable=\(video.encoding.unreadable)"
+                            + " overrun=\(video.encoding.overrun)"
                     )
 
                     // The two stages between the camera and the wire, separately. Together they
@@ -559,7 +594,7 @@ final class AppModel {
                     // before anything touched the network. An encoder whose p95 matches its
                     // median and a write path whose p95 is thirty times its own are the same
                     // total delay and completely different bugs.
-                    print(
+                    Journal.shared.say(
                         String(
                             format: "COST encode p50=%.1f p95=%.1f max=%.1f ms"
                                 + " · write p50=%.1f p95=%.1f max=%.1f ms",
@@ -584,7 +619,7 @@ final class AppModel {
                 {
                     let mine = stats?.participants[who]
                     let box = room.layout.lastReported[who]
-                    print(
+                    Journal.shared.say(
                         "  VIEW \(who.username.value)"
                             + " rung=\(mine?.layer?.value ?? "none")"
                             + " box=\(box.map { "\($0.pixelSize.width)x\($0.pixelSize.height)" } ?? "unreported")"
@@ -649,7 +684,13 @@ final class AppModel {
                 // reads to find out that this exists. `.hashed` even here: a
                 // demo's log is the one most likely to end up in a screenshot.
                 logger: MoqomLogger(
-                    sink: SystemLogSink(subsystem: "cloud.moqom.sample", privacy: .hashed),
+                    sink: BroadcastLogSink(sinks: [
+                        SystemLogSink(subsystem: "cloud.moqom.sample", privacy: .hashed),
+                        // And into the file this app keeps, so a session driven by hand can
+                        // be read afterwards. Warnings only: the unified log can afford
+                        // every subscribe and every object, and a file on a phone cannot.
+                        Journal.Sink(minimum: .warning),
+                    ]),
                     minimum: .debug
                 )
             )

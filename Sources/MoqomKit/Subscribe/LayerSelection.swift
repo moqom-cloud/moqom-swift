@@ -142,6 +142,9 @@ public enum SelectionReason: String, Hashable, Sendable {
     case notVisible
     case prewarming
     case publisherOffered
+
+    /// Nothing decided it here: the publisher offers one rung and this took it.
+    case publisherDecides
 }
 
 /// Thresholds that stop the ladder oscillating.
@@ -168,16 +171,36 @@ public struct LayerSelectionPolicy: Hashable, Sendable {
     /// costs a keyframe on the way back.
     public var treatsOccludedAsHidden: Bool
 
+    /// Take whatever the publisher offers, and choose nothing.
+    ///
+    /// For a call where the publisher already knows how big it will be drawn, which is the
+    /// ordinary two-person case: both ends run the same layout, so the sender can encode the
+    /// box the receiver will draw and the receiver has nothing left to decide. Everything
+    /// below — render size, allowance, hysteresis, visibility — is then dead weight at best.
+    ///
+    /// At worst it is the fault it was built to prevent. Choosing is a resubscribe, a
+    /// resubscribe is a new track and a wait for a keyframe, and any of it going wrong is a
+    /// black tile on a call whose audio is fine. Measured on two phones: the selector dropped
+    /// a 607×1349 tile from 360p to 180p and no object ever arrived on the new rung again.
+    /// A receiver that never switches cannot fail that way.
+    ///
+    /// The cost is honest and worth stating: nothing here adapts. A link that cannot carry
+    /// what the publisher chose will drop objects rather than quietly serve a smaller
+    /// picture, and the publisher is the only end that can fix it.
+    public var followsPublisher: Bool
+
     public init(
         upgradeFactor: Double = 1.2,
         downgradeFactor: Double = 0.8,
         keepsAudioWhenHidden: Bool = true,
-        treatsOccludedAsHidden: Bool = false
+        treatsOccludedAsHidden: Bool = false,
+        followsPublisher: Bool = false
     ) {
         self.upgradeFactor = upgradeFactor
         self.downgradeFactor = downgradeFactor
         self.keepsAudioWhenHidden = keepsAudioWhenHidden
         self.treatsOccludedAsHidden = treatsOccludedAsHidden
+        self.followsPublisher = followsPublisher
     }
 
     public static let `default` = LayerSelectionPolicy()
@@ -211,6 +234,13 @@ public struct LayerSelector: Sendable {
     /// appears, on hover or touch-down, so the frame is ready before the
     /// animation finishes rather than a second after.
     private var prewarmed: LayerID?
+
+    /// Whether the ladder is a guess made before the publisher described itself.
+    ///
+    /// Only ``LayerSelectionPolicy/followsPublisher`` cares. Sizing a box against a guess is
+    /// harmless — the worst case is a rung one step off, corrected when the catalog lands —
+    /// but subscribing to the top of one is asking by name for a track nobody published.
+    public var ladderIsProvisional = false
 
     public init(ladder: LayerLadder, policy: LayerSelectionPolicy? = nil) {
         self.ladder = ladder
@@ -260,6 +290,17 @@ public struct LayerSelector: Sendable {
     }
 
     private func evaluate(box: RenderBox, allowance: NetworkAllowance) -> LayerSelection {
+        // Before the visibility check as well as before the arithmetic, because "the app is
+        // backgrounded" is the one report this cannot trust: it arrives from a layout pass,
+        // and a tile being rebuilt has looked exactly like a tile going away. Under this
+        // policy the subscription is a fact about the room rather than about the view.
+        if policy.followsPublisher {
+            guard let top = ladder.rungs.last, !ladderIsProvisional else {
+                return LayerSelection(video: nil, audio: true, reason: .publisherOffered)
+            }
+            return LayerSelection(video: top.id, audio: true, reason: .publisherDecides)
+        }
+
         let hidden = !box.visibility.wantsVideo
             && (box.visibility != .occluded || policy.treatsOccludedAsHidden)
 

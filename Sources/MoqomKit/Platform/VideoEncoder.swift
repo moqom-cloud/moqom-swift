@@ -55,6 +55,31 @@ import MoqomCore
         private let continuation: AsyncStream<EncodedFrame>.Continuation
         private var isClosed = false
 
+        /// What became of the frames handed to VideoToolbox. See ``EncoderAccounting``.
+        ///
+        /// Written from the output handler, which VideoToolbox calls on its own thread, and
+        /// read for diagnostics.
+        private let counters = Counters()
+
+        public nonisolated var accounting: EncoderAccounting { counters.value }
+
+        final class Counters: @unchecked Sendable {
+            private let lock = NSLock()
+            private var accounting = EncoderAccounting()
+
+            var value: EncoderAccounting {
+                lock.lock()
+                defer { lock.unlock() }
+                return accounting
+            }
+
+            func note(_ change: (inout EncoderAccounting) -> Void) {
+                lock.lock()
+                change(&accounting)
+                lock.unlock()
+            }
+        }
+
         public init(configuration: EncoderConfiguration) throws {
             self.configuration = configuration
             (stream, continuation) = AsyncStream.makeStream(
@@ -128,6 +153,7 @@ import MoqomCore
             }
 
             let sink = continuation
+            let counters = counters
             let status = VTCompressionSessionEncodeFrame(
                 session,
                 imageBuffer: buffer,
@@ -135,10 +161,20 @@ import MoqomCore
                 duration: .invalid,
                 frameProperties: properties as CFDictionary?,
                 infoFlagsOut: nil,
-                outputHandler: { status, _, sample in
-                    guard status == noErr, let sample else { return }
-                    if let encoded = Self.encodedFrame(from: sample) {
-                        sink.yield(encoded)
+                outputHandler: { status, flags, sample in
+                    guard status == noErr, let sample, !flags.contains(.frameDropped) else {
+                        counters.note { $0.declined += 1 }
+                        return
+                    }
+                    guard let encoded = Self.encodedFrame(from: sample) else {
+                        counters.note { $0.unreadable += 1 }
+                        return
+                    }
+                    switch sink.yield(encoded) {
+                    case .enqueued: counters.note { $0.emitted += 1 }
+                    case .dropped: counters.note { $0.overrun += 1 }
+                    case .terminated: break
+                    @unknown default: break
                     }
                 }
             )

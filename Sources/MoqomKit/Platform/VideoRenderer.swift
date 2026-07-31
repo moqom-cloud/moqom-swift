@@ -791,9 +791,24 @@ import MoqomCore
                 return
             }
 
-            // A few milliseconds rather than nothing, because a frame that arrives exactly on its
-            // deadline is a frame the next refresh decides the fate of.
-            let margin = 0.004
+            // Enough for everything that still has to happen to a frame after it is handed
+            // over, which is where the last version of this got it wrong. Slack is measured at
+            // enqueue, and a frame is not shown at enqueue: it is decoded — several
+            // milliseconds of hardware — and then composited on a refresh boundary, up to a
+            // whole refresh interval later. Four milliseconds of slack is a frame that misses
+            // both.
+            //
+            // Measured, that is exactly what it did. The controller drove the headroom onto
+            // its own four millisecond target and the display layer dropped a third of every
+            // frame it was given — 581 of 1740 in a minute — while every counter this side of
+            // it read a clean thirty frames a second, no lateness, nothing skipped. The
+            // unscheduled preview layer on the same screen, in the same app, dropped none of
+            // 1770, which is what said the panel was innocent and the schedule was not.
+            //
+            // Eighteen milliseconds covers a 720p decode and a sixty hertz refresh. A phone
+            // whose panel is faster spends the difference on latency, and it is a few
+            // milliseconds against a third of the picture.
+            let margin = 0.018
 
             // Headroom well past anything the delay accounts for, which the grid cannot give back:
             // it is the delay of whichever frame the schedule was anchored on, added once and then

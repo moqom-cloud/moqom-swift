@@ -107,8 +107,18 @@ final class VideoTile {
                 return
             }
             preview = tap
+            var drawn = 0
             for await frame in tap.elements {
                 renderer.enqueue(frame)
+
+                // The control for the received tile's own figure. This layer is on the same
+                // screen, in the same app, fed by the same camera — and nothing schedules it:
+                // frames go in as they are captured. So a drop count here is the panel's, and
+                // a drop count only on the other layer is ours.
+                drawn += 1
+                if drawn % 30 == 0, let presentation = await renderer.presentation() {
+                    room.previewPresentation = presentation
+                }
             }
         }
     }
@@ -116,72 +126,91 @@ final class VideoTile {
     func attach(to identity: ParticipantIdentity, in room: RoomModel) {
         guard pump == nil else { return }
         pump = Task { [weak self] in
-            // The stream does not exist until the planner has subscribed, and
-            // subscribing waits on a layout pass. Polling rather than being
-            // notified is the small price of not putting a second event
-            // channel in the sample.
-            var frames: AsyncStream<DepacketisedFrame>?
-            while frames == nil, !Task.isCancelled {
-                frames = await room.frames(of: identity)
-                if frames == nil { try? await Task.sleep(for: .milliseconds(100)) }
+            // Once per stream, not once per tile. A participant's frames come from a sink the
+            // session throws away whenever it stops subscribing to them — a seat given up, a
+            // catalog that ended, a reconnection — and the replacement is a different stream
+            // that this tile was never handed. Draining once and returning left the tile
+            // black from that moment on while every counter upstream reported frames arriving
+            // by the hundred, which is precisely as diagnosable as it sounds.
+            while !Task.isCancelled {
+                guard let self else { return }
+                await self.follow(identity, in: room)
+
+                // Beaten only by cancellation. Nothing here distinguishes "the stream ended
+                // because the participant left for good" from "it ended and will be back in
+                // two seconds"; the tile is destroyed either way when the roster says so.
+                if !Task.isCancelled { try? await Task.sleep(for: .milliseconds(100)) }
             }
-            guard let frames, let self else { return }
-
-            // Started with the drawing rather than with the room: what it answers is whether
-            // what this tile is drawing has a picture in it.
-            await room.watchReceivedPicture(of: identity)
-
-            // Presented on a schedule rather than on arrival. Without this the picture is as
-            // uneven as the network, which on a good link is even enough to measure well and
-            // still visibly choppy: a p95 arrival gap of 80ms against a 33ms median is one frame
-            // in twenty held for two and a half frame times. The delay is the app's choice
-            // because it is a latency the user pays; the room model carries it so a benchmark
-            // can set it to zero and see both halves of the trade.
-            renderer.playoutDelay = await room.playoutDelay
-            renderer.playoutBounds = await room.playoutBounds
-            renderer.playoutTolerance = await room.playoutTolerance
-
-            if let codec = await room.codec(of: identity) {
-                renderer.setCodec(codec)
-            }
-
-            // Measured here rather than after `enqueue`, because this is the last moment
-            // the frame is the receiver's responsibility: what follows is the display
-            // layer holding it until its presentation time, which is a queue depth the
-            // application chose and not a cost the network imposed.
-            let stamp = room.trustedStamp
-            let meter = room.latency
-            let cadence = room.cadence
-            let timeline = room.timeline
-            let renderer = renderer
-
-            // Drained off the main actor, and that is a measurement decision as much as a
-            // performance one. Recording arrival on the main actor cannot distinguish a network
-            // that delivers frames in clumps from a main thread that was too busy to collect
-            // them one at a time: both produce a run of near-zero gaps followed by a long one.
-            // Timestamping here, before the hop, leaves only the network in the number.
-            //
-            // The hop itself stays, and stays awaited. The display layer is main-actor bound
-            // because it is part of the view hierarchy, and handing frames over without waiting
-            // would put them on the actor's queue in an order nothing guarantees — which for
-            // video is worse than being late.
-            //
-            // A nonisolated method rather than a detached task, which was the first attempt and
-            // was wrong: a detached task does not inherit cancellation, so a tile torn down and
-            // rebuilt — which a grid does whenever somebody joins — left the old drain alive on
-            // the same stream. Two consumers then split one track between them and each renderer
-            // decoded half a stream, which looks exactly like a corrupt link.
-            await Self.drain(
-                frames,
-                of: identity,
-                into: renderer,
-                stamp: stamp,
-                meter: meter,
-                cadence: cadence,
-                timeline: timeline,
-                reportingTo: room
-            )
         }
+    }
+
+    /// Take one stream of this participant's frames and draw it until it ends.
+    private func follow(_ identity: ParticipantIdentity, in room: RoomModel) async {
+        // The stream does not exist until the planner has subscribed, and
+        // subscribing waits on a layout pass. Polling rather than being
+        // notified is the small price of not putting a second event
+        // channel in the sample.
+        var frames: AsyncStream<DepacketisedFrame>?
+        while frames == nil, !Task.isCancelled {
+            frames = await room.frames(of: identity)
+            if frames == nil { try? await Task.sleep(for: .milliseconds(100)) }
+        }
+        guard let frames else { return }
+
+        // Started with the drawing rather than with the room: what it answers is whether
+        // what this tile is drawing has a picture in it.
+        await room.watchReceivedPicture(of: identity)
+
+        // Presented on a schedule rather than on arrival. Without this the picture is as
+        // uneven as the network, which on a good link is even enough to measure well and
+        // still visibly choppy: a p95 arrival gap of 80ms against a 33ms median is one frame
+        // in twenty held for two and a half frame times. The delay is the app's choice
+        // because it is a latency the user pays; the room model carries it so a benchmark
+        // can set it to zero and see both halves of the trade.
+        renderer.playoutDelay = await room.playoutDelay
+        renderer.playoutBounds = await room.playoutBounds
+        renderer.playoutTolerance = await room.playoutTolerance
+
+        if let codec = await room.codec(of: identity) {
+            renderer.setCodec(codec)
+        }
+
+        // Measured here rather than after `enqueue`, because this is the last moment
+        // the frame is the receiver's responsibility: what follows is the display
+        // layer holding it until its presentation time, which is a queue depth the
+        // application chose and not a cost the network imposed.
+        let stamp = room.trustedStamp
+        let meter = room.latency
+        let cadence = room.cadence
+        let timeline = room.timeline
+        let renderer = renderer
+
+        // Drained off the main actor, and that is a measurement decision as much as a
+        // performance one. Recording arrival on the main actor cannot distinguish a network
+        // that delivers frames in clumps from a main thread that was too busy to collect
+        // them one at a time: both produce a run of near-zero gaps followed by a long one.
+        // Timestamping here, before the hop, leaves only the network in the number.
+        //
+        // The hop itself stays, and stays awaited. The display layer is main-actor bound
+        // because it is part of the view hierarchy, and handing frames over without waiting
+        // would put them on the actor's queue in an order nothing guarantees — which for
+        // video is worse than being late.
+        //
+        // A nonisolated method rather than a detached task, which was the first attempt and
+        // was wrong: a detached task does not inherit cancellation, so a tile torn down and
+        // rebuilt — which a grid does whenever somebody joins — left the old drain alive on
+        // the same stream. Two consumers then split one track between them and each renderer
+        // decoded half a stream, which looks exactly like a corrupt link.
+        await Self.drain(
+            frames,
+            of: identity,
+            into: renderer,
+            stamp: stamp,
+            meter: meter,
+            cadence: cadence,
+            timeline: timeline,
+            reportingTo: room
+        )
     }
 
     /// Move frames from the subscription to the layer, timestamping arrival off the main actor.
