@@ -649,18 +649,25 @@ final class AppModel {
         pairingProblem = nil
 
         // Before the transport is built, since what it resolves to decides both where to dial
-        // and which certificate to pin. A code that resolves to nothing stops here rather
-        // than quietly dialling whatever was in the fields, which is how a run ends up
-        // measuring the loopback and reporting it as a network.
+        // and which certificate to pin. A code that resolves to nothing falls back to the
+        // address in the fields when there is one, and stops when there is not — because the
+        // fallback in that case is the loopback, which joins, looks like a room, and measures
+        // nothing. The stopping case is the one worth refusing; refusing both taught a phone
+        // with a relay already configured to sit there failing over a stale code.
         if !pairingCode.trimmed.isEmpty {
-            guard let paired = await RelayPairing.find(code: pairingCode) else {
+            let code = pairingCode.trimmed
+            if let paired = await RelayPairing.find(code: pairingCode) {
+                relay = paired
+                pairingCode = ""
+            } else if relay.host != nil {
                 pairingProblem =
-                    "Nothing is advertising \(pairingCode.trimmed) on this network."
+                    "Nothing is advertising \(code) — using \(relay.summary) instead."
+                pairingCode = ""
+            } else {
+                pairingProblem = "Nothing is advertising \(code) on this network."
                 phase = .joining
                 return
             }
-            relay = paired
-            pairingCode = ""
         }
 
         relay.save()

@@ -332,10 +332,11 @@ final class VideoTile {
     final class SampleBufferView: UIView {
         private var renderer: VideoRenderer
 
+        /// Nothing is drawn here yet — see ``take()`` for why construction does not claim
+        /// the layer.
         init(renderer: VideoRenderer) {
             self.renderer = renderer
             super.init(frame: .zero)
-            layer.addSublayer(renderer.layer)
         }
 
         /// Draw this renderer from now on.
@@ -343,13 +344,30 @@ final class VideoTile {
         /// `addSublayer` reparents, so a layer drawn in another view — or lent to the Picture
         /// in Picture window and handed back — arrives here without being detached first.
         func adopt(_ renderer: VideoRenderer) {
-            guard renderer !== self.renderer || renderer.layer.superlayer !== layer else {
-                return
+            if renderer !== self.renderer {
+                if holdsLayer { self.renderer.layer.removeFromSuperlayer() }
+                self.renderer = renderer
             }
-            if renderer !== self.renderer { self.renderer.layer.removeFromSuperlayer() }
-            self.renderer = renderer
-            layer.addSublayer(renderer.layer)
-            renderer.isHosted = window != nil
+            take()
+        }
+
+        /// Whether this view is the one the renderer's layer is currently parented to.
+        private var holdsLayer: Bool { renderer.layer.superlayer === layer }
+
+        /// Claim the layer, but only once there is a window to draw it in.
+        ///
+        /// The condition is the whole point. There is one renderer per participant and
+        /// reparenting is unconditional, so whichever view touches the layer last wins —
+        /// and SwiftUI routinely builds a replacement representable, hands it a
+        /// participant, and then keeps the original. A replacement that claimed the layer
+        /// on its way past left it inside a view with no window: still decoding, still
+        /// presenting, still reporting a healthy stream, behind a tile that had gone
+        /// black. Waiting for a window means an orphan cannot take the layer from the view
+        /// a person is looking at, because it never gets one.
+        private func take() {
+            guard window != nil else { return }
+            if !holdsLayer { layer.addSublayer(renderer.layer) }
+            renderer.isHosted = true
             setNeedsLayout()
         }
 
@@ -358,7 +376,15 @@ final class VideoTile {
 
         override func didMoveToWindow() {
             super.didMoveToWindow()
-            renderer.isHosted = window != nil
+            if window != nil {
+                take()
+            } else if holdsLayer {
+                // Only while this view still has it. A view being dismantled after its
+                // replacement took the layer would otherwise report the renderer as
+                // unhosted, which is the reverse of the truth and hides the tile that is
+                // genuinely dark.
+                renderer.isHosted = false
+            }
         }
 
         override func layoutSubviews() {
@@ -367,7 +393,7 @@ final class VideoTile {
             // this layer into its own hierarchy and lays it out there, so a
             // grid pass that happened to run meanwhile would otherwise resize
             // the layer out from under the window.
-            guard renderer.layer.superlayer === layer else { return }
+            guard holdsLayer else { return }
 
             // Bounds and position rather than `frame`, because the mirrored preview carries a
             // scale of minus one and a layer's frame is documented as meaningless when its
@@ -416,17 +442,24 @@ final class VideoTile {
             self.renderer = renderer
             super.init(frame: .zero)
             wantsLayer = true
-            layer?.addSublayer(renderer.layer)
         }
 
         func adopt(_ renderer: VideoRenderer) {
-            guard renderer !== self.renderer || renderer.layer.superlayer !== layer else {
-                return
+            if renderer !== self.renderer {
+                if holdsLayer { self.renderer.layer.removeFromSuperlayer() }
+                self.renderer = renderer
             }
-            if renderer !== self.renderer { self.renderer.layer.removeFromSuperlayer() }
-            self.renderer = renderer
-            layer?.addSublayer(renderer.layer)
-            renderer.isHosted = window != nil
+            take()
+        }
+
+        private var holdsLayer: Bool { renderer.layer.superlayer === layer }
+
+        /// Claim the layer once there is a window to draw it in. See the iOS side for the
+        /// black tile this ordering exists to prevent.
+        private func take() {
+            guard window != nil, let host = layer else { return }
+            if !holdsLayer { host.addSublayer(renderer.layer) }
+            renderer.isHosted = true
             needsLayout = true
         }
 
@@ -435,12 +468,16 @@ final class VideoTile {
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
-            renderer.isHosted = window != nil
+            if window != nil {
+                take()
+            } else if holdsLayer {
+                renderer.isHosted = false
+            }
         }
 
         override func layout() {
             super.layout()
-            guard renderer.layer.superlayer === layer, let host = layer else { return }
+            guard holdsLayer, let host = layer else { return }
             CATransaction.begin()
             CATransaction.setDisableActions(true)
             renderer.layer.bounds = CGRect(origin: .zero, size: host.bounds.size)

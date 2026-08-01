@@ -213,7 +213,15 @@ import MoqomCore
                 return
             }
             self.slots = slots
-            adopt()
+
+            // Only while the window is up, and that qualification is the whole of this
+            // line. Adopting borrows the layer the grid is drawing into, so doing it on a
+            // roster change with no window on screen takes the picture out of the
+            // application's own tile and parents it inside a view controller nobody is
+            // looking at. Every counter keeps reading perfectly — the track arrives, the
+            // frames decode, the layer presents — and the tile is black. Starting the
+            // window adopts, which is where borrowing belongs.
+            if isActive { adopt() }
 
             // Drives the window's shape. A single participant is 16:9; a 2x2 of
             // 16:9 tiles is also 16:9, and a side-by-side pair is 32:9, which is
