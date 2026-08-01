@@ -32,6 +32,7 @@ This script takes no arguments; everything is an environment variable.
   MOQOM_VIDEO=camera     publish video: camera, or pattern
   MOQOM_PLAYOUT_MS=40    fixed playout delay, instead of the adaptive one
   MOQOM_CALL=1           publish the layout's rung, as a call does, not a pinned one
+  MOQOM_EAGER=1          encode for speed rather than power, at the cost of heat
   MOQOM_FLOOR_MS / MOQOM_TOLERANCE / MOQOM_STATS_MS / MOQOM_FLAT_LAYERS
   MOQOM_PUBLISHER / MOQOM_VIEWER   device names (default: iPhone Air, 15 Pro)
 
@@ -80,6 +81,7 @@ else
     echo "relay: whatever answers to pairing code $CODE on this network"
 fi
 WHERE="$WHERE --fps $FPS${MOQOM_FLAT_LAYERS:+ --flat-layers}"
+WHERE="$WHERE${MOQOM_EAGER:+ --eager-encoding}"
 WHERE="$WHERE${MOQOM_KBPS:+ --kbps $MOQOM_KBPS}"
 WHERE="$WHERE${MOQOM_STATS_MS:+ --stats-ms $MOQOM_STATS_MS}"
 WHERE="$WHERE${MOQOM_PLAYOUT_MS:+ --playout-ms $MOQOM_PLAYOUT_MS}"

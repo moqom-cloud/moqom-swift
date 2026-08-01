@@ -151,6 +151,14 @@ struct LaunchOptions {
     /// ceiling fan in it is not one you can compare across rebuilds.
     var flatLayers = false
 
+    /// Ask the hardware encoder for speed instead of power efficiency.
+    ///
+    /// The other half of the same experiment as ``flatLayers``, and a trade rather than a
+    /// fix: power efficiency is what keeps a long call from throttling its own camera, and it
+    /// is also several milliseconds a frame in a budget being asked to fit inside two frames
+    /// at sixty. Measured both ways or it is an opinion.
+    var eagerEncoding = false
+
     /// Frames per second to capture, encode, and advertise.
     ///
     /// One number for all three on purpose. The rung's rate is what the encoder is told to
@@ -216,6 +224,7 @@ struct LaunchOptions {
             case "--benchmark": options.benchmark = true
             case "--live": options.live = true
             case "--flat-layers": options.flatLayers = true
+            case "--eager-encoding": options.eagerEncoding = true
             case "--fps": options.frameRate = value.flatMap(Double.init)
             case "--kbps": options.kilobitsPerSecond = value.flatMap(Int.init)
             case "--stats-ms": options.statisticsMilliseconds = value.flatMap(Int.init)

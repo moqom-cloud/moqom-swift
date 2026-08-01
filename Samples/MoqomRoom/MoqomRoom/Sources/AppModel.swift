@@ -184,6 +184,7 @@ final class AppModel {
                     + " fps=\(Int(launch.frameRate ?? 30))"
                     + " playout=\(launch.playoutMilliseconds.map { "\($0)ms fixed" } ?? "adaptive")"
                     + " layers=\(launch.flatLayers ? "flat" : "temporal")"
+                    + " encode=\(launch.eagerEncoding ? "eager" : "efficient")"
                     + " audio=\(room.isPublishingAudio ? (launch.audio ?? "on") : "off")"
             )
         case let .failed(error): Journal.shared.say("JOIN FAILED \(error)")
@@ -711,6 +712,7 @@ final class AppModel {
                     .map { .milliseconds($0) } ?? .milliseconds(250)
             )
             model.flatLayers = launch.flatLayers
+            model.encodesEagerly = launch.eagerEncoding
 
             // A figure given on the command line is a figure to be obeyed, so it turns the
             // adaptation off: the point of passing one is to see what that exact delay does.

@@ -143,6 +143,9 @@ final class RoomModel {
     /// Encode one flat layer rather than two temporal ones. See ``LaunchOptions/flatLayers``.
     var flatLayers = false
 
+    /// Ask the encoder for speed rather than power. See ``LaunchOptions/eagerEncoding``.
+    var encodesEagerly = false
+
     /// How often to sample the SDK's statistics.
     private let statisticsInterval: Duration
 
@@ -1064,7 +1067,11 @@ final class RoomModel {
             }
             let publication = try await room.startBroadcast(
                 from: published,
-                configuration: BroadcastConfiguration(ladder: ladder, encoderFactory: encoders)
+                configuration: BroadcastConfiguration(
+                    ladder: ladder,
+                    prefersPowerEfficiency: !encodesEagerly,
+                    encoderFactory: encoders
+                )
             )
             await publication.start()
             broadcast = publication

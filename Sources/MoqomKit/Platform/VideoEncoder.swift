@@ -260,9 +260,13 @@ import MoqomCore
             // a camera, a radio and a display is the difference between a call that stays at
             // nominal and one that throttles the camera twenty minutes in. Best effort with
             // `try?` because it did not exist before iOS 17 and older systems refuse it.
+            //
+            // It also costs time per frame, so the caller decides. Said explicitly in both
+            // directions rather than only when it is wanted: the property is sticky on a
+            // session, and leaving it unset asks for whatever the hardware's default is.
             try? set(
                 kVTCompressionPropertyKey_MaximizePowerEfficiency,
-                to: kCFBooleanTrue,
+                to: configuration.prefersPowerEfficiency ? kCFBooleanTrue : kCFBooleanFalse,
                 on: session
             )
 

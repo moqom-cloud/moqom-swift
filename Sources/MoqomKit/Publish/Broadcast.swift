@@ -46,12 +46,16 @@ public struct BroadcastConfiguration: Sendable {
     /// synthetic one for tests. The default asks the platform for hardware.
     public var encoderFactory: EncoderFactory
 
+    /// Let the encoders trade speed for power. See ``EncoderConfiguration/prefersPowerEfficiency``.
+    public var prefersPowerEfficiency: Bool
+
     public init(
         ladder: LayerLadder = .defaultCamera(),
         codec: VideoCodec = .hevc,
         basePriority: UInt8 = 64,
         deliveryTimeout: Duration? = .milliseconds(500),
         stopsUnwatchedLayers: Bool = false,
+        prefersPowerEfficiency: Bool = true,
         encoderFactory: @escaping EncoderFactory = defaultEncoderFactory
     ) {
         self.ladder = ladder
@@ -59,6 +63,7 @@ public struct BroadcastConfiguration: Sendable {
         self.basePriority = basePriority
         self.deliveryTimeout = deliveryTimeout
         self.stopsUnwatchedLayers = stopsUnwatchedLayers
+        self.prefersPowerEfficiency = prefersPowerEfficiency
         self.encoderFactory = encoderFactory
     }
 }

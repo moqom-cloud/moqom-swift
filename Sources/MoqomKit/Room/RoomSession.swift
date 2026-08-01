@@ -764,7 +764,11 @@ public actor RoomSession {
             writers[rung.id] = try await protectedWriter(for: track, priority: priority)
             do {
                 encoders[rung.id] = try await configuration.encoderFactory(
-                    EncoderConfiguration(layer: rung, codec: configuration.codec)
+                    EncoderConfiguration(
+                        layer: rung,
+                        codec: configuration.codec,
+                        prefersPowerEfficiency: configuration.prefersPowerEfficiency
+                    )
                 )
             } catch let error as MoqomError {
                 throw error

@@ -72,16 +72,28 @@ public struct EncoderConfiguration: Sendable {
     /// How long a joiner may wait for a decodable point.
     public var keyFrameInterval: Duration
 
+    /// Let the encoder trade speed for power.
+    ///
+    /// On by default because a phone that publishes for an hour is thermally limited long
+    /// before it is compute limited, and an encoder that has throttled the camera is a worse
+    /// picture than one that took a few extra milliseconds per frame. Turn it off where the
+    /// few milliseconds are the product: measured on a 720p60 camera the difference was
+    /// around 3ms per frame, which is a fifth of the frame interval and a twelfth of a
+    /// glass-to-glass budget that is trying to stay under two frames.
+    public var prefersPowerEfficiency: Bool
+
     public init(
         layer: VideoLayer,
         codec: VideoCodec = .hevc,
         usesTemporalLayers: Bool = true,
-        keyFrameInterval: Duration = .seconds(2)
+        keyFrameInterval: Duration = .seconds(2),
+        prefersPowerEfficiency: Bool = true
     ) {
         self.layer = layer
         self.codec = codec
         self.usesTemporalLayers = usesTemporalLayers
         self.keyFrameInterval = keyFrameInterval
+        self.prefersPowerEfficiency = prefersPowerEfficiency
     }
 }
 
