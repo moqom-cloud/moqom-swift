@@ -176,12 +176,18 @@ final class RoomModel {
     /// How many frames the adaptive delay may leave unshown. See
     /// ``VideoRenderer/playoutTolerance``.
     ///
-    /// Three percent, which is a conversation's setting rather than a cinema's. This app is two
+    /// Five percent, which is a conversation's setting rather than a cinema's. This app is two
     /// people looking at each other, where a few milliseconds off the round trip is worth more
-    /// than a frame in thirty that nobody can point to — and the frames it gives up are the ones
+    /// than a frame in twenty that nobody can point to — and the frames it gives up are the ones
     /// arriving in the long tail of the link's jitter, which were going to be shown late and
     /// wrong rather than not at all.
-    var playoutTolerance = 0.03
+    ///
+    /// Five rather than one or three because a relayed link has a long tail and the low quantiles
+    /// sit out in it: measured through Los Angeles at sixty frames a second, arrivals had a 35ms
+    /// median, an 84ms 95th percentile and a 101ms 99th, so one percent asked for a 135-155ms
+    /// delay and five percent for 27-34ms. Both showed every frame and froze on none of them. The
+    /// ninety milliseconds between them bought nothing anybody could see.
+    var playoutTolerance = 0.05
 
     /// Seconds of headroom the arriving frames actually have. See ``VideoRenderer/playoutSlack``.
     var playoutSlack: Double?

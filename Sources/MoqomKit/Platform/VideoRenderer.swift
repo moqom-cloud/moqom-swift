@@ -825,9 +825,18 @@ import MoqomCore
             // Moved by running the clock slightly fast rather than by re-anchoring it, which is
             // the difference between arriving early and jumping. A re-anchor puts every frame
             // already queued past its new deadline at once, and measured that cost about four
-            // frames each time — forty across a run, for twenty milliseconds of latency. Two
-            // percent gives the same twenty back over a second, at a speed no one can see and
-            // with nothing to drop.
+            // frames each time — forty across a run, for twenty milliseconds of latency. Running
+            // fast gives the same twenty back over a second, at a speed no one can see and with
+            // nothing to drop.
+            //
+            // Over about a second whatever the size, rather than at a fixed speed. A fixed two
+            // percent is a second for the twenty milliseconds an anchor usually costs and five
+            // seconds for the hundred a jittery link produces, and five seconds is longer than
+            // the interval between the re-anchors that produce it: measured through a relay whose
+            // arrivals had a 34ms median and an 84ms 95th percentile, both legs of every call sat
+            // at 1.02 from start to finish, reported a 23-48ms delay, and made their frames wait
+            // 53-95ms the whole time. The controller was right about the delay it wanted and
+            // simply never got there.
             //
             // Aimed at the delay and not a millisecond under it, so that this and the widening
             // below are one controller rather than two. Aiming at the delay less its margin was
@@ -840,9 +849,14 @@ import MoqomCore
                 catchUp == nil,
                 ContinuousClock.now - reclaimed > .milliseconds(1500)
             {
+                // Capped at six percent because this timebase carries the picture and not the
+                // voice, so a fast clock is also lip sync closing at the same speed. Six percent
+                // for the second or two a large give takes is a couple of frames of it, against a
+                // reclaim that otherwise does not finish at all.
                 let give = worst - depth
-                synchroniser.setRate(1.02, time: synchroniser.currentTime())
-                catchUp = .now + .seconds(give / 0.02)
+                let rate = min(1.06, max(1.02, 1 + give))
+                synchroniser.setRate(Float(rate), time: synchroniser.currentTime())
+                catchUp = .now + .seconds(give / (rate - 1))
                 catchUpGive = give
                 return
             }
