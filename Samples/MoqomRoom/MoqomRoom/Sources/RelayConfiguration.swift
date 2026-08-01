@@ -32,7 +32,25 @@ struct RelayConfiguration {
     /// which is what a deployed relay with a real certificate wants.
     var certificateHashes: [String]
 
-    /// Read from launch arguments first, then the defaults database.
+    /// The relay this project is developed against.
+    ///
+    /// A device that has never been told where to go gets this rather than the loopback,
+    /// which is the difference between an app that works when it is installed and one that
+    /// joins a room containing only itself and reports excellent numbers for it. Reinstalling
+    /// wipes the defaults database, and this sample is reinstalled from a script several times
+    /// an hour, so "type the address and the hash again" was the most common step in every
+    /// session — and typing a hash by hand is how a run ends up debugging a typo.
+    ///
+    /// A development address in the source is a development address in the source. It is
+    /// pinned to a certificate that only this relay holds, so the worst a stale one can do is
+    /// fail to connect.
+    static let development = RelayConfiguration(
+        host: "34.20.244.132",
+        port: 4443,
+        certificateHashes: ["huK08Nky7+yRvSdXUSBjLzRoxIFtGCACgldT43+oceo="]
+    )
+
+    /// Read from launch arguments first, then the defaults database, then ``development``.
     ///
     /// Arguments win so that a scripted run can override whatever was last set by hand in
     /// the interface, rather than silently inheriting it.
@@ -57,12 +75,22 @@ struct RelayConfiguration {
             index += 1
         }
 
+        // Whether anything was ever saved, rather than whether what was saved is empty. The
+        // two are different answers: a blank host that somebody typed means the loopback and
+        // has to keep meaning it, and a blank host nobody has ever typed means this is a
+        // fresh install with nothing to inherit.
+        let remembered: RelayConfiguration = defaults.object(forKey: "relayHost") == nil
+            ? .development
+            : RelayConfiguration(
+                host: defaults.string(forKey: "relayHost").flatMap { $0.isEmpty ? nil : $0 },
+                port: UInt16(defaults.integer(forKey: "relayPort")).nonZero ?? 443,
+                certificateHashes: defaults.stringArray(forKey: "relayCertificateHashes") ?? []
+            )
+
         return RelayConfiguration(
-            host: host ?? defaults.string(forKey: "relayHost").flatMap { $0.isEmpty ? nil : $0 },
-            port: port ?? UInt16(defaults.integer(forKey: "relayPort")).nonZero ?? 443,
-            certificateHashes: hashes.isEmpty
-                ? defaults.stringArray(forKey: "relayCertificateHashes") ?? []
-                : hashes
+            host: host ?? remembered.host,
+            port: port ?? remembered.port,
+            certificateHashes: hashes.isEmpty ? remembered.certificateHashes : hashes
         )
     }
 
