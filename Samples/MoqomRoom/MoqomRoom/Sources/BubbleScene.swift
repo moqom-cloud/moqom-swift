@@ -72,6 +72,12 @@
         /// Bubbles removed on this device before anybody agreed.
         private var guessed: [SpaceEntityID: ContinuousClock.Instant] = [:]
 
+        /// Bubbles the field has said are climbing away.
+        ///
+        /// Still tappable — a bubble on its way out is the one worth hurrying
+        /// for — and if it is not tapped, it leaves without a pop.
+        private var leaving: Set<SpaceEntityID> = []
+
         /// How long an update is expected to be the newest one, which is how
         /// long a node is given to travel to where it now is.
         ///
@@ -86,11 +92,18 @@
 
         /// Take the state as it now is, and what just changed about it.
         func apply(_ state: SpaceSnapshot, _ delta: SpaceDelta) {
+            // Before the removals, because an update that both flags a bubble
+            // as leaving and drops it is one the renderer must not treat as a
+            // pop — and a slow link is exactly where two ticks arrive as one.
+            for (id, facts) in delta.entityFacts where facts[BubbleField.leaving] != nil {
+                leaving.insert(id)
+            }
             for entity in delta.spawned where entity.kind == BubbleField.kind {
                 add(entity)
             }
             for id in delta.removed {
                 remove(id)
+                leaving.remove(id)
                 guessed.removeValue(forKey: id)
             }
             for (id, pose) in delta.moved {
@@ -114,6 +127,7 @@
             for node in nodes.values { node.removeFromParent() }
             nodes.removeAll()
             guessed.removeAll()
+            leaving.removeAll()
             for entity in BubbleField.bubbles(in: state) { add(entity) }
         }
 
@@ -121,6 +135,7 @@
             for node in nodes.values { node.removeFromParent() }
             nodes.removeAll()
             guessed.removeAll()
+            leaving.removeAll()
         }
 
         /// Whatever bubble is under a point on screen, popped.
@@ -151,6 +166,7 @@
         // MARK: - Nodes
 
         private func add(_ entity: SpaceEntity) {
+            if entity.facts[BubbleField.leaving] != nil { leaving.insert(entity.id) }
             guard nodes[entity.id] == nil else { return }
             let hue: Double = if case let .decimal(value) = entity.facts["hue"] { value } else { 0.5 }
             let node = ModelEntity(
@@ -179,7 +195,15 @@
 
         private func remove(_ id: SpaceEntityID) {
             guard let node = nodes.removeValue(forKey: id) else { return }
-            vanish(node)
+            if leaving.remove(id) != nil {
+                // It got away. Nothing to celebrate and nothing to draw: by the
+                // time the field lets go of it, it is far above the shot, and a
+                // burst up there would read as a pop somebody was not credited
+                // for.
+                node.removeFromParent()
+            } else {
+                vanish(node)
+            }
         }
 
         /// The pop, as something to look at.
@@ -188,14 +212,40 @@
         /// because a bubble that is gone by the next frame gives no feedback at
         /// all about whether the tap landed — which is the one thing a player
         /// needs to know before deciding the game is broken.
+        ///
+        /// Large, and larger than looks sensible written down. The whole event
+        /// lasts a fifth of a second on a phone held at arm's length, and at
+        /// that duration the difference between a modest swell and this one is
+        /// the difference between a bubble that disappeared and a bubble that
+        /// was hit. It thins as it grows for the same reason: a solid sphere
+        /// three times the size reads as a bigger bubble arriving rather than
+        /// as the one that was there coming apart.
         private func vanish(_ node: ModelEntity) {
             var swollen = node.transform
-            swollen.scale *= 1.5
-            node.move(to: swollen, relativeTo: node.parent, duration: 0.12)
+            swollen.scale *= 3.2
+            node.move(to: swollen, relativeTo: node.parent, duration: 0.18)
+            thin(node)
             Task { @MainActor in
-                try? await Task.sleep(for: .milliseconds(130))
+                try? await Task.sleep(for: .milliseconds(190))
                 node.removeFromParent()
             }
+        }
+
+        /// Turn a bubble's skin to something a burst can be seen through.
+        ///
+        /// A new material rather than an animated one: RealityKit will
+        /// interpolate a transform for free and will not interpolate a colour,
+        /// and a single step to nearly transparent at the moment of the pop is
+        /// what the eye reads as the surface giving way.
+        private func thin(_ node: ModelEntity) {
+            guard var model = node.model else { return }
+            model.materials = model.materials.map { material in
+                guard let simple = material as? SimpleMaterial else { return material }
+                var faded = simple
+                faded.color = .init(tint: simple.color.tint.withAlphaComponent(0.22))
+                return faded
+            }
+            node.model = model
         }
 
         /// Take a bubble away now and remember that nobody agreed yet.

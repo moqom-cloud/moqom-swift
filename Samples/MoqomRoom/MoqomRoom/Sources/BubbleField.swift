@@ -43,9 +43,23 @@ final class BubbleField: SpaceSimulation, @unchecked Sendable {
         /// Half the width and half the depth of the volume bubbles occupy.
         static let reach: Float = 0.55
 
-        /// Where bubbles are released and where they burst on their own.
+        /// Where bubbles are released, and where they give up on being caught.
+        ///
+        /// Nothing bursts at the ceiling. A bubble that gets past it is a
+        /// bubble that got away, which is a different thing to watch and a
+        /// different thing to feel: the only pops in the game are the ones
+        /// somebody's finger caused, so a score is the whole story of the round
+        /// rather than a share of whatever happened to be reachable.
         static let floor: Float = 0.05
         static let ceiling: Float = 1.35
+
+        /// How far above the ceiling a bubble is still drawn while leaving.
+        ///
+        /// Far enough to be out of the shot on any sensible placement. It is
+        /// removed there rather than at the ceiling so that the escape is
+        /// something the player sees happen, not something they infer from a
+        /// bubble that stopped existing at head height.
+        static let departure: Float = 2.4
 
         /// The drawn size of a bubble at scale 1.
         static let radius: Float = 0.075
@@ -67,6 +81,13 @@ final class BubbleField: SpaceSimulation, @unchecked Sendable {
 
         /// How far a bubble wanders sideways as it climbs.
         var drift: Float = 0.06
+
+        /// How much faster a bubble climbs each second once it is leaving.
+        ///
+        /// An escape should read as an escape rather than as the same slow
+        /// climb continuing off the top of the shot — a player who cannot tell
+        /// that a bubble is going will not hurry, and hurrying is the game.
+        var flight: Float = 2.2
 
         static let `default` = Rules()
     }
@@ -121,13 +142,15 @@ final class BubbleField: SpaceSimulation, @unchecked Sendable {
         let seconds = Float(elapsed.wholeNanoseconds) / 1_000_000_000
         guard seconds > 0, seconds < 1 else { return }
 
-        var burst: [SpaceEntityID] = []
+        var gone: [SpaceEntityID] = []
         for (id, entity) in state.entities where entity.kind == Self.kind {
             guard var course = courses[id] else {
                 courses[id] = Self.course()
                 continue
             }
             course.phase += seconds
+            let leaving = entity.pose.position.y > Field.ceiling
+            if leaving { course.speed *= 1 + rules.flight * seconds }
             courses[id] = course
 
             var pose = entity.pose
@@ -138,20 +161,36 @@ final class BubbleField: SpaceSimulation, @unchecked Sendable {
             pose.position.x += sin(course.phase * 1.7) * course.sway * seconds
             pose.position.z += cos(course.phase * 1.1) * course.sway * seconds
 
-            if pose.position.y > Field.ceiling {
-                burst.append(id)
-            } else {
-                state.entities[id]?.pose = pose
+            if pose.position.y > Field.departure {
+                gone.append(id)
+                continue
+            }
+            state.entities[id]?.pose = pose
+
+            // Said once, and said on the entity rather than inferred from its
+            // height by the renderer. A viewer that worked it out from the pose
+            // would be reimplementing the rule, and the two copies would
+            // disagree the first time either number moved — with the visible
+            // result being a bubble that pops on one phone and drifts off the
+            // top of the other.
+            if leaving, entity.facts[Self.leaving] == nil {
+                state.entities[id]?.facts[Self.leaving] = .flag(true)
             }
         }
-        for id in burst {
+        for id in gone {
             state.entities.removeValue(forKey: id)
             courses.removeValue(forKey: id)
         }
 
         sinceSpawn += elapsed
-        let living = state.entities.values.count { $0.kind == Self.kind }
-        if sinceSpawn >= rules.spawnEvery, living < rules.capacity {
+        // Bubbles on their way out do not count against the field. They are
+        // above the shot and unreachable, and holding a place open for them
+        // would empty the playable part of the field for as long as they take
+        // to leave — which is exactly when there is nothing left to tap.
+        let catchable = state.entities.values.count {
+            $0.kind == Self.kind && $0.facts[Self.leaving] == nil
+        }
+        if sinceSpawn >= rules.spawnEvery, catchable < rules.capacity {
             sinceSpawn = .zero
             release(into: &state, at: now)
         }
@@ -233,6 +272,12 @@ extension BubbleField {
 
     /// The one verb this game understands.
     static let pop = "pop"
+
+    /// Set on a bubble that is climbing out of reach.
+    ///
+    /// The renderer's cue that this one is not going to be popped and should
+    /// not be drawn as though it were.
+    static let leaving = "leaving"
 
     /// Where a participant's score lives in the space's facts.
     ///

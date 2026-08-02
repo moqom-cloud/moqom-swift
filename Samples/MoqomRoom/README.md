@@ -325,6 +325,12 @@ Two phones in AR mode can share one world. Bubbles rise in front of both, and a
 tap on either pops it on both. It is a small game and a real test of the SDK's
 shared-space path: everything about it travels the same relay as the video.
 
+Nothing pops on its own. A bubble that reaches the top of the field accelerates
+away and is dropped once it is well out of shot, so every pop in the game is one
+somebody caused and a score is the whole story of the round. The field only
+counts the reachable ones against its capacity, so the ones on their way out do
+not leave the playable part empty behind them.
+
 **Turn it on.** Set the video source to **AR scene**, go live, and press
 **Bubbles**. A scoreboard appears at the top with everybody's count. There is no
 setup handshake to wait for — a device that finds the space unclaimed claims it.
