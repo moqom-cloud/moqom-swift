@@ -44,15 +44,19 @@ struct RelayConfiguration {
     /// A development address in the source is a development address in the source. It is
     /// pinned to a certificate that only this relay holds, so the worst a stale one can do is
     /// fail to connect.
-    /// Los Angeles (`moqom-relay-la`, us-west2-a) rather than Oregon (`moqom-relay-bench`,
-    /// us-west1-a), which is the other one and is kept for comparison. Measured over the same
-    /// two-phone run: 22ms mean round trip against Oregon's 48ms, and 37ms of link in the
-    /// glass-to-glass figure against 63ms. Both relays run the same build, so the whole of that
-    /// difference is distance.
+    /// Los Angeles rather than Oregon, which is the other region and is kept for comparison.
+    /// Measured over the same two-phone run: 22ms mean round trip against Oregon's 48ms, and
+    /// 37ms of link in the glass-to-glass figure against 63ms. Both regions run the same build,
+    /// so the whole of that difference is distance. Oregon is `34.53.113.58`.
+    ///
+    /// These are load balancers now, not machines: each address is a forwarding rule in front
+    /// of a managed instance group, and the certificate is one the whole fleet shares, so the
+    /// hash below survives an instance being replaced. Port 443 rather than 4443, because a
+    /// phone on a hotel network reaches 443 and often reaches nothing else.
     static let development = RelayConfiguration(
-        host: "34.20.244.132",
-        port: 4443,
-        certificateHashes: ["huK08Nky7+yRvSdXUSBjLzRoxIFtGCACgldT43+oceo="]
+        host: "35.235.101.37",
+        port: 443,
+        certificateHashes: ["polQTlHHCA5xpWTb02GZUdgIJoX5b0rUh0sy+VNWUto="]
     )
 
     /// Read from launch arguments first, then the defaults database, then ``development``.
