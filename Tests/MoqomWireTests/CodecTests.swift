@@ -332,6 +332,45 @@ struct ControlMessageTests {
         )
     }
 
+    @Test("the end of a publication round-trips")
+    func publishDone() throws {
+        try roundTrip(
+            PublishDone(
+                status: PublishDoneStatus.trackEnded,
+                streamCount: 17,
+                reason: "publisher stopped the track"
+            )
+        )
+        try roundTrip(PublishDone(status: PublishDoneStatus.goingAway))
+    }
+
+    /// A publisher that lost count says so with the largest varint, so a relay
+    /// that has genuinely opened that many streams is indistinguishable from
+    /// one that stopped counting. The draft accepts that; this pins which way
+    /// the ambiguity resolves, since the two readings differ in what a
+    /// subscriber does — wait for more, or give up waiting.
+    @Test("an uncounted stream total reads back as unknown")
+    func uncountedStreams() throws {
+        let bytes = encoded {
+            PublishDone(status: PublishDoneStatus.trackEnded, streamCount: varIntMaximum)
+                .write(to: &$0)
+        }
+        var reader = WireReader(bytes)
+        #expect(try PublishDone.read(from: &reader).streamCount == nil)
+    }
+
+    /// An unfamiliar status must survive rather than be mistaken for a clean
+    /// end: this build is older than the registry will be, and counting an
+    /// unknown failure as an orderly shutdown hides exactly the events worth
+    /// looking at.
+    @Test("an unrecognised end status is treated as a failure")
+    func unknownEndStatus() {
+        #expect(PublishDoneStatus.isError(0x4242))
+        #expect(!PublishDoneStatus.isError(PublishDoneStatus.trackEnded))
+        #expect(!PublishDoneStatus.isError(PublishDoneStatus.subscriptionEnded))
+        #expect(PublishDoneStatus.isError(PublishDoneStatus.tooFarBehind))
+    }
+
     @Test("generic responses round-trip")
     func responses() throws {
         try roundTrip(RequestOk())

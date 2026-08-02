@@ -10,11 +10,20 @@
 set -eu
 
 ENV_FILE="${MOQOM_GCP_ENV:-/tmp/moqom-gcp-relay.env}"
+
+# Kept from before the env file is read, because the file assigns unconditionally and there is
+# more than one relay now. Naming a zone and an instance on the command line has to reach the
+# machine named rather than whichever one was deployed last — the failure otherwise is silent and
+# convincing: a scrape of the wrong relay, which reads as one that saw no traffic at all.
+CHOSEN_PROJECT="${MOQOM_GCP_PROJECT:-}"
+CHOSEN_ZONE="${MOQOM_GCP_ZONE:-}"
+CHOSEN_INSTANCE="${MOQOM_GCP_INSTANCE:-}"
+
 if [ -r "$ENV_FILE" ]; then . "$ENV_FILE"; fi
 
-PROJECT="${MOQOM_GCP_PROJECT:-moqom-503700}"
-ZONE="${MOQOM_GCP_ZONE:-us-west1-a}"
-INSTANCE="${MOQOM_GCP_INSTANCE:-moqom-relay-bench}"
+PROJECT="${CHOSEN_PROJECT:-${MOQOM_GCP_PROJECT:-moqom-503700}}"
+ZONE="${CHOSEN_ZONE:-${MOQOM_GCP_ZONE:-us-west1-a}}"
+INSTANCE="${CHOSEN_INSTANCE:-${MOQOM_GCP_INSTANCE:-moqom-relay-bench}}"
 
 export CLOUDSDK_METRICS_ENVIRONMENT=datacloud.cursor
 
@@ -37,6 +46,6 @@ log)
     # The lines worth reading, named. A full scrape is a hundred series and the four that answer
     # "is the server the problem" are lost in it.
     $SSH --command='curl -s localhost:9443/metrics' \
-        | grep -E '^moqom_relay_(sessions|rooms|participants|tracks|tracks_silent|objects_forwarded_total|subgroups_total|forwarded_bytes_total|ingress_bytes_total|egress_bytes_total|udp_(rx|tx)_bytes_total|lost_packets_total|congestion_events_total|connection_rtt_seconds|fanout_failures_total|refusals_total)'
+        | grep -E '^moqom_relay_(sessions|rooms|participants|tracks|tracks_silent|objects_forwarded_total|subgroups_total|subgroups_shed_total|subscriptions_total|forwarded_bytes_total|ingress_bytes_total|egress_bytes_total|udp_(rx|tx)_bytes_total|lost_packets_total|congestion_events_total|connection_rtt_seconds|fanout_failures_total|refusals_total)'
     ;;
 esac

@@ -387,6 +387,79 @@ public struct SubscribeOk: ControlMessage {
     }
 }
 
+/// A publication has ended, per draft-19 §10.11.
+///
+/// The only way a subscriber learns that a track is over rather than merely
+/// quiet. Objects stopping looks the same as a publisher in a lift, and the two
+/// want opposite responses — hold the last frame and wait, or take the tile
+/// down and say who left — so the distinction cannot be inferred and has to be
+/// told.
+public struct PublishDone: ControlMessage {
+    public static let messageType = MessageType.publishDone
+
+    public var status: UInt64
+
+    /// How many data streams the publisher opened for this subscription.
+    ///
+    /// A subscriber counts arrivals against it to know whether it has
+    /// everything or is still owed a stream that was in flight when the track
+    /// ended. `nil` where the sender did not keep count, which the draft
+    /// permits and encodes as the largest varint.
+    public var streamCount: UInt64?
+
+    public var reason: String
+
+    public init(status: UInt64, streamCount: UInt64? = nil, reason: String = "") {
+        self.status = status
+        self.streamCount = streamCount
+        self.reason = reason.truncatedUTF8(to: maximumReasonLength)
+    }
+
+    public var encodedLength: Int {
+        WireSize.varInt(status)
+            + WireSize.varInt(streamCount ?? varIntMaximum)
+            + WireSize.lengthPrefixed(reason)
+    }
+
+    public func write(to writer: inout WireWriter) {
+        writer.varInt(status)
+        writer.varInt(streamCount ?? varIntMaximum)
+        writer.lengthPrefixed(reason)
+    }
+
+    public static func read(from reader: inout WireReader) throws(WireError) -> PublishDone {
+        let status = try reader.varInt()
+        let count = try reader.varInt()
+        return PublishDone(
+            status: status,
+            streamCount: count == varIntMaximum ? nil : count,
+            reason: try reader.lengthPrefixedString()
+        )
+    }
+}
+
+/// Status codes for ``PublishDone``, per draft-19 §10.11.
+public enum PublishDoneStatus {
+    public static let internalError: UInt64 = 0x0
+    public static let unauthorized: UInt64 = 0x1
+    public static let trackEnded: UInt64 = 0x2
+    public static let subscriptionEnded: UInt64 = 0x3
+    public static let goingAway: UInt64 = 0x4
+    public static let tooFarBehind: UInt64 = 0x5
+    public static let expired: UInt64 = 0x6
+    public static let updateFailed: UInt64 = 0x8
+    public static let excessiveLoad: UInt64 = 0x9
+    public static let malformedTrack: UInt64 = 0x12
+
+    /// Whether a status reports a failure rather than an orderly end.
+    ///
+    /// Unrecognised codes count as failures. Erring that way keeps a code this
+    /// build has never heard of from being counted as a clean shutdown.
+    public static func isError(_ status: UInt64) -> Bool {
+        status != trackEnded && status != subscriptionEnded
+    }
+}
+
 // MARK: - Generic responses
 
 /// Generic success response.

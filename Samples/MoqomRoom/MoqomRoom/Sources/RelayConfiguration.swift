@@ -44,6 +44,11 @@ struct RelayConfiguration {
     /// A development address in the source is a development address in the source. It is
     /// pinned to a certificate that only this relay holds, so the worst a stale one can do is
     /// fail to connect.
+    /// Los Angeles (`moqom-relay-la`, us-west2-a) rather than Oregon (`moqom-relay-bench`,
+    /// us-west1-a), which is the other one and is kept for comparison. Measured over the same
+    /// two-phone run: 22ms mean round trip against Oregon's 48ms, and 37ms of link in the
+    /// glass-to-glass figure against 63ms. Both relays run the same build, so the whole of that
+    /// difference is distance.
     static let development = RelayConfiguration(
         host: "34.20.244.132",
         port: 4443,

@@ -743,7 +743,42 @@ public actor MoqtSession: TransportSession {
             session: self
         )
         subscriptionRequests[ObjectIdentifier(subscription)] = requestID
+        watchForEnd(of: alias, on: stream)
         return subscription
+    }
+
+    /// Keep reading the request stream, because the answer is not the last word
+    /// on it.
+    ///
+    /// A publisher that stops sends PUBLISH_DONE here, and hearing it is the
+    /// difference between a tile that can say the other person left and one
+    /// that holds its last frame forever. Objects merely stopping cannot be
+    /// told from a bad network, and waiting out a bad network is the right
+    /// thing to do — so a subscription that ends in silence ends as a stall.
+    private func watchForEnd(of alias: UInt64, on stream: any QUICStream) {
+        Task { [weak self] in
+            var framer = StreamFramer()
+            reading: while true {
+                let chunk: Data?
+                do { chunk = try await stream.read() } catch { break }
+                guard let chunk else { break }
+                framer.append(chunk)
+
+                while let frame = try? framer.next() {
+                    // Anything else here is a message this build has no use
+                    // for. Ignored rather than treated as a violation: the
+                    // draft adds to what may travel on this stream, and a
+                    // subscriber that hung up over an unfamiliar message would
+                    // break against every relay newer than itself.
+                    if frame.type == .publishDone { break reading }
+                }
+            }
+            // On every way out, not only on PUBLISH_DONE. A reset or a lost
+            // connection ends the subscription just as surely, and an objects
+            // stream left open would leave its reader waiting on a track that
+            // has no publisher.
+            await self?.unregister(alias: alias)
+        }
     }
 
     /// Request IDs of the subscriptions we opened, so a joining fetch can name
