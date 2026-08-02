@@ -261,9 +261,34 @@ final class RoomModel {
     enum VideoInput: String, CaseIterable, Identifiable, Sendable {
         case pattern = "Test pattern"
         case camera = "Camera"
+        case scene = "AR scene"
 
         var id: String { rawValue }
     }
+
+    /// The sources this device can actually offer.
+    ///
+    /// A picker listing an AR scene on a simulator, or on a phone whose chip cannot run a
+    /// session, is a choice that fails at the moment somebody goes live — which reads as a
+    /// broken broadcast rather than as an unsupported option.
+    var videoInputs: [VideoInput] {
+        #if canImport(ARKit) && !targetEnvironment(simulator)
+            ARSceneSource.isSupported
+                ? VideoInput.allCases
+                : VideoInput.allCases.filter { $0 != .scene }
+        #else
+            VideoInput.allCases.filter { $0 != .scene }
+        #endif
+    }
+
+    #if canImport(ARKit) && !targetEnvironment(simulator)
+        /// The live scene, while one is being published.
+        ///
+        /// Held for the view rather than for this model: RealityKit only draws what is in a
+        /// window, so the source cannot produce a single frame until something puts its view
+        /// on screen. See ``ARSceneView``.
+        private(set) var arScene: ARSceneSource?
+    #endif
 
     /// Which camera is open, when broadcasting from one.
     private(set) var cameraPosition: CameraPosition = .front
@@ -1058,6 +1083,41 @@ final class RoomModel {
                 capture = pattern
                 source = pattern
             }
+        case .scene:
+            #if canImport(ARKit) && !targetEnvironment(simulator)
+                do {
+                    guard ARSceneSource.isSupported else { throw ARSceneError.unsupported }
+                    // An AR session is a camera, whatever it is called, and the prompt
+                    // belongs here for the same reason it does on the camera path.
+                    guard await Self.cameraIsAuthorised() else {
+                        throw MoqomError.platform(
+                            api: "AVCaptureDevice.requestAccess", status: -1
+                        )
+                    }
+
+                    let scene = ARSceneSource(format: format)
+                    try scene.start()
+                    arScene = scene
+                    source = scene
+
+                    // Full screen, because the drawable is the tile. Everywhere else the
+                    // layout decides how big a picture looks; here it decides how many
+                    // pixels the encoder is given, and a scene published from a
+                    // side-by-side thumbnail is a 720p rung upscaled from a third of that.
+                    screen = .me
+                } catch {
+                    lastError = error as? MoqomError
+                    videoInput = .pattern
+                    let pattern = PatternSource(format: format, label: identity.username.value)
+                    capture = pattern
+                    source = pattern
+                }
+            #else
+                videoInput = .pattern
+                let pattern = PatternSource(format: format, label: identity.username.value)
+                capture = pattern
+                source = pattern
+            #endif
         }
 
         do {
@@ -1116,6 +1176,9 @@ final class RoomModel {
             source.stop()
             capture = nil
             camera = nil
+            #if canImport(ARKit) && !targetEnvironment(simulator)
+                arScene = nil
+            #endif
             broadcast = nil
         }
     }
@@ -1393,6 +1456,13 @@ final class RoomModel {
         await room.stopBroadcast()
         capture = nil
         camera = nil
+        #if canImport(ARKit) && !targetEnvironment(simulator)
+            // Stopped as well as released. The session holds the camera and the render loop
+            // keeps drawing for as long as the view is on screen, neither of which ends
+            // because the last reference went away.
+            arScene?.stop()
+            arScene = nil
+        #endif
         broadcast = nil
         captureCadenceTask?.cancel()
         captureCadenceTask = nil

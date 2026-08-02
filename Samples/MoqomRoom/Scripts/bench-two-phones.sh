@@ -29,7 +29,7 @@ This script takes no arguments; everything is an environment variable.
   MOQOM_FPS=60           capture and publish rate (default: 30)
   MOQOM_KBPS=2000        publish bitrate
   MOQOM_AUDIO=mic        publish audio: mic, or tone for a synthetic source
-  MOQOM_VIDEO=camera     publish video: camera, or pattern
+  MOQOM_VIDEO=camera     publish video: camera, pattern, or scene for the AR orb
   MOQOM_PLAYOUT_MS=40    fixed playout delay, instead of the adaptive one
   MOQOM_CALL=1           publish the layout's rung, as a call does, not a pinned one
   MOQOM_EAGER=1          encode for speed rather than power, at the cost of heat
@@ -53,9 +53,9 @@ case "${MOQOM_AUDIO:-mic}" in
         ;;
 esac
 case "${MOQOM_VIDEO:-camera}" in
-    camera | pattern) ;;
+    camera | pattern | scene) ;;
     *)
-        echo "MOQOM_VIDEO must be camera or pattern, not '$MOQOM_VIDEO'" >&2
+        echo "MOQOM_VIDEO must be camera, pattern or scene, not '$MOQOM_VIDEO'" >&2
         exit 2
         ;;
 esac

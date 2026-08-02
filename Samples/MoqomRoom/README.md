@@ -35,12 +35,23 @@ namespace announcements, layer selection responds to how large the tiles are,
 per-viewer mute is an unsubscribe that never reaches the relay, and moderation
 is refused when the grants do not allow it.
 
-Nothing decodes, because nothing is encoded — the broadcast publishes synthetic
-frames carrying only their shape. **Input → Video → Camera** swaps the test
-pattern for a real `CameraSource` and is the change that makes it real; it needs
-a device, since a simulator has no camera and the app falls back to the pattern.
-`SceneCapture` is the third option, and the swap is in
-`RoomModel.startBroadcast()`.
+**Input → Video** chooses among three sources, and all three are wired in
+`RoomModel.startBroadcast()`. The test pattern needs no hardware and is what a
+simulator falls back to. **Camera** is a real `CameraSource`. **AR scene** is
+`SceneCapture` behind a RealityKit view — the camera feed with an orb floating
+half a metre in front of it — and is the input worth compressing if you want to
+know what the codec does with synthetic geometry over hand-held video, since the
+orb's hard edge is the first thing to smear when the bitrate is not there.
+
+The AR source carries two constraints the other two do not, both in
+`ARSceneSource.swift`. RealityKit only draws what is in a window, so the scene
+*is* the self tile rather than being previewed in one, and choosing it switches
+the layout to full screen — the tile's size is the drawable's, and a scene
+published from a side-by-side thumbnail is a 720p rung upscaled from a third of
+that. And the renderer's texture is `bgra10_xr_srgb`, which cannot be copied into
+a pixel buffer, so it is converted before `SceneCapture` sees it; skip that and
+the broadcast is a uniform field of magenta that every frame counter in the app
+reports as healthy.
 
 ## Camera, microphone, and mute
 
@@ -293,7 +304,10 @@ package's 505 tests drive `RoomSession` directly and never render.
 
 What a green simulator run does **not** cover is everything a simulator does not
 have: the camera, the VideoToolbox encoder, the Metal scene capture, and the
-RealityKit tap. Those compile and have never executed. `Broadcast` also
+RealityKit tap. Those compile and are only exercised on hardware — the AR path
+has since been run on two phones through a relay, at 60 frames a second each way
+with nothing skipped, which is the first thing to drive the SDK's RealityKit hook
+end to end. `Broadcast` also
 publishes a per-frame descriptor rather than encoded bytes, so a tile appearing
 means the roster works, not that video moves.
 

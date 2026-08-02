@@ -21,32 +21,54 @@ struct RemoteVideoView: View {
     let room: RoomModel
 
     var body: some View {
-        // Read here rather than inside the representable so that observation
-        // actually sees it. A property read in `updateUIView` is not a body
-        // read, and the flip button would leave the preview facing the wrong
-        // way until something else happened to redraw the tile.
+        picture
+            .background(.black)
+            .overlay {
+                if participant.presence != .connected {
+                    Image(systemName: "person.crop.circle.badge.clock")
+                        .font(.largeTitle)
+                        .foregroundStyle(.secondary)
+                } else if participant.mute.effective.contains(.video) {
+                    // The reason a mute is published rather than inferred from the
+                    // objects stopping. Without the catalog saying so, this tile
+                    // would show a frozen last frame and no way to tell it from a
+                    // stalled uplink.
+                    Image(systemName: "video.slash.fill")
+                        .font(.largeTitle)
+                        .foregroundStyle(.secondary)
+                }
+            }
+    }
+
+    /// The scene itself for a device publishing one, and decoded frames for everything else.
+    ///
+    /// Not a preview of the published frames in the AR case, and it could not be: RealityKit
+    /// draws only what is in a window, so this view is what makes the scene exist at all.
+    /// The tile's size is therefore also the drawable's, which is why the scene switches the
+    /// screen to full width when it starts.
+    @ViewBuilder
+    private var picture: some View {
+        #if canImport(ARKit) && !targetEnvironment(simulator)
+            if isSelf, room.videoInput == .scene, let scene = room.arScene {
+                ARSceneView(source: scene)
+            } else {
+                layer
+            }
+        #else
+            layer
+        #endif
+    }
+
+    // Read here rather than inside the representable so that observation actually sees it. A
+    // property read in `updateUIView` is not a body read, and the flip button would leave the
+    // preview facing the wrong way until something else happened to redraw the tile.
+    private var layer: some View {
         VideoLayerView(
             identity: participant.slot.identity,
             isSelf: isSelf,
             isMirrored: isSelf && room.isPreviewMirrored,
             room: room
         )
-        .background(.black)
-        .overlay {
-            if participant.presence != .connected {
-                Image(systemName: "person.crop.circle.badge.clock")
-                    .font(.largeTitle)
-                    .foregroundStyle(.secondary)
-            } else if participant.mute.effective.contains(.video) {
-                // The reason a mute is published rather than inferred from the
-                // objects stopping. Without the catalog saying so, this tile
-                // would show a frozen last frame and no way to tell it from a
-                // stalled uplink.
-                Image(systemName: "video.slash.fill")
-                    .font(.largeTitle)
-                    .foregroundStyle(.secondary)
-            }
-        }
     }
 }
 

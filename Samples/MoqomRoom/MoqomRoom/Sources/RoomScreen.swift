@@ -651,7 +651,7 @@ struct BroadcastControls: View {
                         }
 
                         Picker("Video", selection: $room.videoInput) {
-                            ForEach(RoomModel.VideoInput.allCases) { input in
+                            ForEach(room.videoInputs) { input in
                                 Text(input.rawValue).tag(input)
                             }
                         }

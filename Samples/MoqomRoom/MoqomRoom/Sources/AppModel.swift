@@ -255,7 +255,12 @@ final class AppModel {
             Journal.shared.say("CLOCK unavailable — latency across devices will be meaningless")
         }
 
-        room.videoInput = launch.video == "pattern" ? .pattern : .camera
+        switch launch.video {
+        case "pattern": room.videoInput = .pattern
+        case "scene", "ar": room.videoInput = .scene
+        default: room.videoInput = .camera
+        }
+
         let fps = launch.frameRate ?? 30
 
         // Bitrate with the frame rate, not fixed. Twice the frames at the same budget is half
@@ -589,6 +594,16 @@ final class AppModel {
                             + " unreadable=\(video.encoding.unreadable)"
                             + " overrun=\(video.encoding.overrun)"
                     )
+
+                    // What the scene handed over, when the source is one. The drawable's
+                    // size is the number worth watching: it comes from the tile's layout
+                    // rather than from the rung, so a scene can be published from fewer
+                    // pixels than it is encoded at and nothing else here would say so.
+                    #if canImport(ARKit) && !targetEnvironment(simulator)
+                        if let scene = room.arScene {
+                            Journal.shared.say("SCENE \(scene.status)")
+                        }
+                    #endif
 
                     // The two stages between the camera and the wire, separately. Together they
                     // answer the question a frame rate cannot: whether a stutter was made here,
