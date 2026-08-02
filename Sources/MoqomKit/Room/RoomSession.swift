@@ -448,8 +448,89 @@ public actor RoomSession {
         await begin()
     }
 
+    // MARK: - The shared space
+
+    /// The room's shared space, if this session joined it.
+    private var space: SpaceSession?
+
+    /// What it would take to build that space again on a new connection.
+    ///
+    /// Kept because a space is not restorable from its own state: the
+    /// simulation is the application's, and a reconnect that handed back an
+    /// empty one would look to the player like the game had been reset by the
+    /// network.
+    private var spacePlan: (
+        simulation: any SpaceSimulation,
+        configuration: SpaceSession.Configuration,
+        clock: SpaceTimeReading
+    )?
+
+    /// Join the room's shared space: replicated state that is not media.
+    ///
+    /// Separate from going live, and deliberately. A space costs a subscription
+    /// and nothing else until something happens in it, so a viewer can watch
+    /// one without a camera — and an application that wants a board without a
+    /// call should not have to start one.
+    ///
+    /// Calling twice returns the space already joined rather than a second one,
+    /// because two simulations on one track is precisely the split brain the
+    /// epoch fence exists to survive rather than to encourage.
+    @discardableResult
+    public func joinSpace(
+        _ simulation: any SpaceSimulation,
+        configuration: SpaceSession.Configuration = SpaceSession.Configuration(),
+        clock: @escaping SpaceTimeReading = { .fallback() }
+    ) async throws(MoqomError) -> SpaceSession {
+        if let space { return space }
+        let joined = try SpaceSession(
+            tenant: tenant,
+            room: room,
+            identity: identity,
+            connection: connection,
+            simulation: simulation,
+            configuration: configuration,
+            clock: clock,
+            logger: logger
+        )
+        space = joined
+        spacePlan = (simulation, configuration, clock)
+        await joined.start()
+        return joined
+    }
+
+    /// The shared space this session joined, if any.
+    public var sharedSpace: SpaceSession? { space }
+
+    public func leaveSpace() async {
+        await space?.stop()
+        space = nil
+        spacePlan = nil
+    }
+
     /// Re-announce and re-open every writer this room was publishing through.
     private func rebindPublications(to session: any TransportSession) async {
+        // The space is rebuilt rather than repointed, because everything it
+        // holds — the subscription it reads, the writer it publishes through,
+        // the announcement that makes it reachable — belonged to the session
+        // that died. Its state is not carried over either: whoever is leading
+        // now will send a snapshot, and asserting a remembered world over the
+        // top of that is how a reconnecting client resurrects things the rest
+        // of the room has already finished with.
+        if let plan = spacePlan {
+            await space?.stop()
+            space = try? SpaceSession(
+                tenant: tenant,
+                room: room,
+                identity: identity,
+                connection: session,
+                simulation: plan.simulation,
+                configuration: plan.configuration,
+                clock: plan.clock,
+                logger: logger
+            )
+            await space?.start()
+        }
+
         if let broadcast {
             let publishNamespace = broadcast.namespace
             await restore(broadcast, on: session)
@@ -668,6 +749,9 @@ public actor RoomSession {
         controlRepair = nil
         await authority?.finish()
         authority = nil
+        await space?.stop()
+        space = nil
+        spacePlan = nil
         waiting.removeAll()
         layoutRestore?.cancel()
         layoutRestore = nil

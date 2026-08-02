@@ -290,6 +290,46 @@ final class RoomModel {
         private(set) var arScene: ARSceneSource?
     #endif
 
+    // MARK: - The shared space
+
+    /// Whether this device has joined the room's bubble field.
+    private(set) var isSharing = false
+
+    /// Whether this device is the one simulating it.
+    ///
+    /// Worth showing. The two roles are meant to be indistinguishable to play,
+    /// and the only way to know whether that is actually true is to be able to
+    /// see which one you are while playing.
+    private(set) var isRunningTheField = false
+
+    /// Who has popped what, best first.
+    private(set) var standings: [Score] = []
+
+    /// How many bubbles are up.
+    private(set) var bubblesUp = 0
+
+    struct Score: Identifiable, Hashable {
+        var id: String { who }
+        let who: String
+        let score: Int
+    }
+
+    private var space: SpaceSession?
+    private var spacePump: Task<Void, Never>?
+
+    /// Whether the shared space can be joined at all right now.
+    ///
+    /// It needs somewhere to draw, and the AR scene is that: the bubbles are
+    /// RealityKit entities in the session's own view. Offering it beside a test
+    /// pattern would be a switch that turns nothing on.
+    var canShare: Bool {
+        #if canImport(ARKit) && !targetEnvironment(simulator)
+            return arScene != nil
+        #else
+            return false
+        #endif
+    }
+
     /// Which camera is open, when broadcasting from one.
     private(set) var cameraPosition: CameraPosition = .front
 
@@ -1183,6 +1223,120 @@ final class RoomModel {
         }
     }
 
+    // MARK: - Playing in the shared space
+
+    /// Join the room's bubble field, and put it in the scene.
+    ///
+    /// Whether this device ends up running the field is not decided here and
+    /// deliberately cannot be: `SpaceSession` claims it if nobody else has and
+    /// stands down if somebody better placed does. The interface says which of
+    /// the two happened; nothing here chooses it.
+    func startSharing() async {
+        #if canImport(ARKit) && !targetEnvironment(simulator)
+            guard !isSharing, let scene = arScene else { return }
+
+            let field = BubbleScene()
+            field.onPop = { [weak self] id in
+                guard let self else { return }
+                Task { await self.pop(id) }
+            }
+
+            let configuration = SpaceSession.Configuration()
+            field.cadence = 1 / configuration.tickRate
+            scene.show(field)
+
+            let stamp = trustedStamp
+            do {
+                let joined = try await room.joinSpace(
+                    BubbleField(),
+                    configuration: configuration,
+                    // The same clock the glass-to-glass figures are on, so that
+                    // "who popped it first" is settled on a timeline both
+                    // phones share rather than on arrival order at whichever
+                    // one happens to be simulating.
+                    clock: { stamp?() ?? .fallback() }
+                )
+                space = joined
+                isSharing = true
+                field.reset(to: await joined.state)
+                follow(joined, with: field)
+                Journal.shared.say("SPACE joined room=\(room.room.value)")
+            } catch {
+                lastError = error as? MoqomError
+                scene.hideField()
+            }
+        #endif
+    }
+
+    func stopSharing() async {
+        spacePump?.cancel()
+        spacePump = nil
+        space = nil
+        isSharing = false
+        isRunningTheField = false
+        standings = []
+        bubblesUp = 0
+        await room.leaveSpace()
+        #if canImport(ARKit) && !targetEnvironment(simulator)
+            arScene?.hideField()
+        #endif
+    }
+
+    #if canImport(ARKit) && !targetEnvironment(simulator)
+        /// Draw everything the space says, for as long as it says anything.
+        private func follow(_ space: SpaceSession, with field: BubbleScene) {
+            spacePump?.cancel()
+            spacePump = Task { [weak self] in
+                for await event in space.events {
+                    guard let self else { return }
+                    switch event {
+                    case let .changed(state, delta):
+                        field.apply(state, delta)
+                        standings = BubbleField.standings(in: state).map {
+                            Score(who: $0.who, score: $0.score)
+                        }
+                        bubblesUp = BubbleField.bubbles(in: state).count
+                    case let .roleChanged(role):
+                        isRunningTheField = role == .leading
+                        Journal.shared.say("SPACE role=\(role)")
+                    case let .authorityChanged(who):
+                        // The world is about to be restated by somebody else,
+                        // and the entity names they use are their own. Starting
+                        // from their snapshot rather than folding it into what
+                        // the last authority left is what keeps two bubbles
+                        // from sharing a node.
+                        field.reset(to: await space.state)
+                        Journal.shared.say(
+                            "SPACE authority=\(who?.username.value ?? "nobody")"
+                        )
+                    }
+                }
+            }
+        }
+
+        /// Tell the space this device popped something.
+        private func pop(_ id: SpaceEntityID) async {
+            await space?.act(verb: BubbleField.pop, subject: id)
+        }
+    #endif
+
+    /// Pop something, anything, as though a finger had landed on it.
+    ///
+    /// For a scripted run, where there is no finger. What it exercises is the
+    /// half of the space a tap-free run never reaches: an intent published
+    /// under this participant's own namespace, authorised by the relay,
+    /// applied by whoever is simulating, and scored back to both devices. That
+    /// last step is the one worth a two-phone test — the loopback proves the
+    /// mechanism, and only a real relay proves it will carry it.
+    @discardableResult
+    func popSomething() async -> Bool {
+        guard let space else { return false }
+        let bubbles = BubbleField.bubbles(in: await space.state)
+        guard let target = bubbles.randomElement() else { return false }
+        await space.act(verb: BubbleField.pop, subject: target.id)
+        return true
+    }
+
     /// Ask once, and answer from the recorded decision after that.
     private static func cameraIsAuthorised() async -> Bool {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
@@ -1453,6 +1607,11 @@ final class RoomModel {
 
     func stopBroadcast() async {
         guard isBroadcasting else { return }
+        // The field is drawn in the scene's view, so it goes when the scene
+        // does. Leaving the space as well as hiding it, because a device with
+        // nothing on screen that is still simulating for everybody else is a
+        // game the player cannot see themselves losing.
+        if isSharing { await stopSharing() }
         await room.stopBroadcast()
         capture = nil
         camera = nil

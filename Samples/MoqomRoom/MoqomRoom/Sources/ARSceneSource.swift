@@ -112,6 +112,16 @@
         /// The orb, kept so it can be animated.
         nonisolated(unsafe) private var orb: ModelEntity?
 
+        /// The shared bubbles, when the room is playing rather than posing.
+        ///
+        /// Replaces the orb rather than joining it. The orb exists to give the
+        /// encoder something moving to chew on, and a field of bubbles does
+        /// that better — while also being a thing two people can both see.
+        @MainActor private(set) var field: BubbleScene?
+
+        /// Installed once, and only when there is something to tap.
+        @MainActor private var tapping: UITapGestureRecognizer?
+
         /// What this source is doing, for the log.
         ///
         /// The drawable is the interesting half. It is chosen by SwiftUI's layout rather
@@ -491,17 +501,66 @@
             view.environment.background = .cameraFeed()
         }
 
-        /// A glowing sphere floating in front of the camera, bobbing so the scene is never
-        /// static.
-        ///
-        /// Motion matters more than looks. A still overlay compresses to nothing after the
-        /// first frame, and a codec handed nothing to do reports a bitrate and a latency no
-        /// real broadcast will ever see.
-        @MainActor
-        private func buildScene() {
-            view.scene.anchors.removeAll()
+    /// Put a shared bubble field in the scene, and let taps reach it.
+    ///
+    /// Separate from ``start()`` because the field belongs to the room and the
+    /// scene belongs to the device: a broadcast can begin before anybody has
+    /// joined a space, and joining one should not restart the camera.
+    @MainActor
+    func show(_ field: BubbleScene) {
+        self.field = field
+        orb?.removeFromParent()
+        orb = nil
+        if !view.scene.anchors.contains(where: { $0 === field.root }) {
+            view.scene.addAnchor(field.root)
+        }
+        installTapHandling()
+    }
 
-            let sphere = ModelEntity(
+    @MainActor
+    func hideField() {
+        field?.clear()
+        field.map { view.scene.removeAnchor($0.root) }
+        field = nil
+        buildScene()
+    }
+
+    @MainActor
+    private func installTapHandling() {
+        guard tapping == nil else { return }
+        let recogniser = UITapGestureRecognizer(target: self, action: #selector(handleTap))
+        view.addGestureRecognizer(recogniser)
+        tapping = recogniser
+    }
+
+    @MainActor
+    @objc private func handleTap(_ recogniser: UITapGestureRecognizer) {
+        guard let field else { return }
+        field.pop(at: recogniser.location(in: view), in: view)
+    }
+
+    /// A glowing sphere floating in front of the camera, bobbing so the scene is never
+    /// static.
+    ///
+    /// Motion matters more than looks. A still overlay compresses to nothing after the
+    /// first frame, and a codec handed nothing to do reports a bitrate and a latency no
+    /// real broadcast will ever see.
+    @MainActor
+    private func buildScene() {
+        view.scene.anchors.removeAll()
+        if let field {
+            // The field survives a rebuild: it is the room's state, not the
+            // scene's, and dropping it here would empty a space that is still
+            // being played in on the other phone.
+            view.scene.addAnchor(field.root)
+            let light = DirectionalLight()
+            light.light.intensity = 2600
+            light.look(at: [0, 0, -0.5], from: [0.4, 0.6, 0], relativeTo: field.root)
+            field.root.addChild(light)
+            return
+        }
+
+        let sphere = ModelEntity(
                 mesh: .generateSphere(radius: 0.08),
                 materials: [SimpleMaterial(color: .cyan, roughness: 0.15, isMetallic: true)]
             )

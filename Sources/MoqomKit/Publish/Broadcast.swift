@@ -105,6 +105,14 @@ public struct BroadcastStatistics: Hashable, Sendable {
     public var objectsPublished: Int
     public var currentGroup: UInt64
 
+    /// Encoder sessions replaced after they stopped accepting frames.
+    ///
+    /// Nonzero means the uplink recovered from something it used to die of. A
+    /// count that keeps climbing means it is dying repeatedly, which is a
+    /// different problem and one no other counter here would show — a rebuild
+    /// restores every other number to looking healthy.
+    public var encodersRebuilt: Int
+
     /// What the encoders did with the frames that never became objects.
     ///
     /// Summed across rungs, and read from the encoders rather than recorded here: the gap
@@ -146,6 +154,7 @@ public struct BroadcastStatistics: Hashable, Sendable {
         framesUnroutable: Int = 0,
         objectsPublished: Int = 0,
         currentGroup: UInt64 = 0,
+        encodersRebuilt: Int = 0,
         activeLayers: Set<LayerID> = [],
         isMuted: Bool = false,
         encodeLatency: StageLatency = StageLatency(),
@@ -160,6 +169,7 @@ public struct BroadcastStatistics: Hashable, Sendable {
         self.framesUnroutable = framesUnroutable
         self.objectsPublished = objectsPublished
         self.currentGroup = currentGroup
+        self.encodersRebuilt = encodersRebuilt
         self.activeLayers = activeLayers
         self.isMuted = isMuted
     }
@@ -508,12 +518,75 @@ public actor Broadcast {
             guard let encoder = encoders[layer.id] else { continue }
             do {
                 try await encoder.encode(frame, forcingKeyFrame: forcesKeyFrame)
+                refusals[layer.id] = nil
             } catch {
                 // A rejected frame is a dropped frame, not a failed broadcast.
                 // Encoders reject under back pressure and recover on the next
                 // one; tearing down the publication would turn a hiccup into an
                 // outage.
                 statistics.framesDropped += 1
+                await noteRefusal(on: layer.id)
+            }
+        }
+    }
+
+    /// Rungs whose encoder is refusing frames, and how many in a row.
+    private var refusals: [LayerID: Int] = [:]
+
+    /// How many refusals in a row mean the session is gone rather than busy.
+    ///
+    /// Back pressure is a frame or two. A VideoToolbox session that has been
+    /// invalidated — by memory pressure, by the app losing the encoder to
+    /// something else, by a foreground transition it did not survive — refuses
+    /// every frame from then on, and the two are the same error to the caller.
+    /// Half a second of solid refusals tells them apart.
+    private static let refusalsBeforeRebuild = 15
+
+    /// Replace a rung's encoder once it has stopped taking frames altogether.
+    ///
+    /// Worth the complexity because the failure it fixes is silent and total: a
+    /// broadcast in this state still captures, still holds its writers, still
+    /// reports itself as live, and sends nothing for the rest of the call. It
+    /// showed up in a two-phone run as a picture that froze after seven seconds
+    /// on one handset while every other counter looked healthy.
+    private func noteRefusal(on layer: LayerID) async {
+        let count = (refusals[layer] ?? 0) + 1
+        refusals[layer] = count
+        guard count == Self.refusalsBeforeRebuild else { return }
+        guard let rung = configuration.ladder.layer(id: layer) else { return }
+
+        let replacement: any FrameEncoder
+        do {
+            replacement = try await configuration.encoderFactory(
+                EncoderConfiguration(
+                    layer: rung,
+                    codec: configuration.codec,
+                    prefersPowerEfficiency: configuration.prefersPowerEfficiency
+                )
+            )
+        } catch {
+            // Left counting. If the platform cannot give out an encoder now it
+            // may in a second, and the next refusal after this one will ask
+            // again rather than this holding the loop open waiting.
+            refusals[layer] = 0
+            return
+        }
+
+        await encoders[layer]?.close()
+        drains[layer]?.cancel()
+        encoders[layer] = replacement
+        refusals[layer] = 0
+        statistics.encodersRebuilt += 1
+
+        // The new session shares nothing with the old one, so the first frame
+        // out of it has to be a keyframe or every subscriber holds a picture
+        // that references frames this encoder never produced.
+        resumesWithKeyFrame = true
+
+        let output = replacement.encodedFrames()
+        drains[layer] = Task { [weak self] in
+            for await encoded in output {
+                await self?.publish(encoded, on: layer)
             }
         }
     }

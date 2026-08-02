@@ -89,6 +89,13 @@ WHERE="$WHERE${MOQOM_TOLERANCE:+ --tolerance $MOQOM_TOLERANCE}"
 WHERE="$WHERE${MOQOM_FLOOR_MS:+ --floor-ms $MOQOM_FLOOR_MS}"
 WHERE="$WHERE${MOQOM_AUDIO:+ --audio $MOQOM_AUDIO}"
 WHERE="$WHERE${MOQOM_VIDEO:+ --video $MOQOM_VIDEO}"
+# Joins the shared bubble field on both phones. Only does anything with
+# MOQOM_VIDEO=scene, since the bubbles are entities in the AR session's view —
+# and the reason to script it at all is that the state is meant to be identical
+# on both devices, which is a thing to diff two logs for rather than to judge by
+# glancing between two screens.
+WHERE="$WHERE${MOQOM_BUBBLES:+ --bubbles}"
+WHERE="$WHERE${MOQOM_POP_EVERY:+ --pop-every $MOQOM_POP_EVERY}"
 
 # A measured run or a call. The difference is which rung gets published — a pinned one, or the
 # one the layout on screen asks for — and it is worth being able to script both, because for a

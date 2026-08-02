@@ -200,4 +200,133 @@ struct PublishPipelineTests {
         let configurations = await broadcast.decoderConfigurations
         #expect(configurations["video/360p"] != nil)
     }
+
+    /// The case a phone produced and no counter explained: an encoder session
+    /// that dies mid-call and refuses everything afterwards, while capture,
+    /// writers and the announcement all stay perfectly healthy.
+    @Test("a broadcast whose encoder stops taking frames builds another one")
+    func aDeadEncoderIsReplaced() async throws {
+        let relay = LoopbackRelay()
+        let host = MoqomSession(
+            transport: LoopbackTransport(relay: relay),
+            credentials: credentials("alice"),
+            tenant: "acme"
+        )
+        try await host.connect(to: RelayEndpoint(host: "loopback"))
+        let hostRoom = try await host.join(room: "room-42")
+
+        let source = FrameRelay(
+            format: CaptureFormat(size: PixelSize(width: 640, height: 360), frameRate: 30),
+            depth: 16
+        )
+        let ladder = LayerLadder(rungs: [
+            VideoLayer(
+                id: "video/360p",
+                size: PixelSize(width: 640, height: 360),
+                frameRate: 30,
+                bitrate: 600_000
+            ),
+        ])
+
+        // The first encoder handed out dies after four frames; anything built
+        // after it works. That is the shape of the real failure — the session
+        // is gone, not the hardware.
+        let built = Tally()
+        let broadcast = try await hostRoom.startBroadcast(
+            from: source,
+            configuration: BroadcastConfiguration(
+                ladder: ladder,
+                encoderFactory: { configuration -> any FrameEncoder in
+                    guard built.next() == 1 else {
+                        return SyntheticEncoder(configuration: configuration)
+                    }
+                    return FailingEncoder(configuration: configuration, healthyFrames: 4)
+                }
+            )
+        )
+
+        for index in 0 ..< 40 {
+            source.submit(
+                VideoFrame(
+                    timestamp: FrameTimestamp(nanoseconds: UInt64(index) * 33_000_000),
+                    size: PixelSize(width: 640, height: 360),
+                    surface: .synthetic(byteCount: 640 * 360 * 3 / 2),
+                    forcesKeyFrame: index == 0
+                )
+            )
+            // One at a time, because the recovery is counted in consecutive
+            // refusals and submitting forty at once would race the rebuild.
+            try await Task.sleep(for: .milliseconds(4))
+        }
+
+        #expect(await eventually { await broadcast.stats.encodersRebuilt == 1 })
+
+        // The point of the rebuild, rather than the rebuild itself: objects
+        // arriving at the relay again, after a stretch where none did.
+        let before = await broadcast.stats.objectsPublished
+        for index in 40 ..< 60 {
+            source.submit(
+                VideoFrame(
+                    timestamp: FrameTimestamp(nanoseconds: UInt64(index) * 33_000_000),
+                    size: PixelSize(width: 640, height: 360),
+                    surface: .synthetic(byteCount: 640 * 360 * 3 / 2)
+                )
+            )
+        }
+        #expect(await eventually { await broadcast.stats.objectsPublished > before })
+
+        // And what it resumed with is decodable on its own: the new session
+        // shares no reference frames with the one that died.
+        let published = await relay.objects(onTrackNamed: "video/360p")
+        #expect(published.dropFirst(4).first?.isKeyFrame == true)
+    }
+}
+
+/// Counts how many encoders the factory has been asked for.
+private final class Tally: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func next() -> Int {
+        lock.withLock {
+            count += 1
+            return count
+        }
+    }
+}
+
+/// An encoder that works for a while and then refuses everything.
+private actor FailingEncoder: FrameEncoder {
+    nonisolated let configuration: EncoderConfiguration
+
+    private let healthyFrames: Int
+    private var taken = 0
+    private let stream: AsyncStream<EncodedFrame>
+    private let continuation: AsyncStream<EncodedFrame>.Continuation
+
+    init(configuration: EncoderConfiguration, healthyFrames: Int) {
+        self.configuration = configuration
+        self.healthyFrames = healthyFrames
+        (stream, continuation) = AsyncStream.makeStream(of: EncodedFrame.self)
+    }
+
+    func encode(_ frame: VideoFrame, forcingKeyFrame: Bool) async throws {
+        guard taken < healthyFrames else {
+            throw MoqomError.platform(api: "VTCompressionSessionEncodeFrame", status: -12903)
+        }
+        taken += 1
+        continuation.yield(
+            EncodedFrame(
+                timestamp: frame.timestamp,
+                isKeyFrame: forcingKeyFrame || frame.forcesKeyFrame || taken == 1,
+                temporalLayer: 0,
+                data: Data(repeating: 0x5A, count: 128),
+                parameterSets: []
+            )
+        )
+    }
+
+    nonisolated func encodedFrames() -> AsyncStream<EncodedFrame> { stream }
+
+    func close() async { continuation.finish() }
 }

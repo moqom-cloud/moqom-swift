@@ -95,6 +95,28 @@ final class AppModel {
     /// Keeps the shared clock disciplined for as long as one is.
     private var timekeeping: Task<Void, Never>?
 
+    /// Stands in for a finger, in a run that has none.
+    private var popping: Task<Void, Never>?
+
+    /// Pop a bubble every so often, so a scripted run exercises intents.
+    ///
+    /// The scores in the two logs are what this is for: a pop is decided by one
+    /// device and has to arrive at the other as a number that matches. Nothing
+    /// a single phone prints can tell those apart from a pop that was applied
+    /// locally and never left.
+    private func popRepeatedly(in room: RoomModel, every seconds: Double) {
+        popping?.cancel()
+        popping = Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(seconds))
+                if Task.isCancelled { return }
+                // Silent when there is nothing up, which is the first few
+                // seconds of a field and not worth a line each time.
+                if await room.popSomething() { Journal.shared.say("SPACE popped") }
+            }
+        }
+    }
+
     var canJoin: Bool {
         if case .joining = phase { return !username.trimmed.isEmpty }
         return false
@@ -187,6 +209,16 @@ final class AppModel {
                     + " encode=\(launch.eagerEncoding ? "eager" : "efficient")"
                     + " audio=\(room.isPublishingAudio ? (launch.audio ?? "on") : "off")"
             )
+
+            // After the broadcast, because the field is drawn in the scene's
+            // view and there is no scene until something is being published
+            // from one.
+            if launch.bubbles {
+                await room.startSharing()
+                if let every = launch.popEverySeconds {
+                    popRepeatedly(in: room, every: every)
+                }
+            }
         case let .failed(error): Journal.shared.say("JOIN FAILED \(error)")
         default: Journal.shared.say("JOIN ended in an unexpected state")
         }
@@ -589,6 +621,8 @@ final class AppModel {
                             + " muted=\(video.framesMuted)"
                             + " unroutable=\(video.framesUnroutable)"
                             + " objects=\(video.objectsPublished)"
+                            + (video.encodersRebuilt > 0
+                                ? " rebuilt=\(video.encodersRebuilt)" : "")
                             + " · encoder emitted=\(video.encoding.emitted)"
                             + " declined=\(video.encoding.declined)"
                             + " unreadable=\(video.encoding.unreadable)"
@@ -604,6 +638,23 @@ final class AppModel {
                             Journal.shared.say("SCENE \(scene.status)")
                         }
                     #endif
+
+                    // The shared space, from this device's point of view. Two
+                    // logs side by side are the test: the bubble count and the
+                    // scores are replicated state, so a line that differs
+                    // between the phones is the replication failing — which is
+                    // not otherwise visible from either one alone, since each
+                    // renders its own copy perfectly happily.
+                    if room.isSharing {
+                        let scores = room.standings
+                            .map { "\($0.who)=\($0.score)" }
+                            .joined(separator: " ")
+                        Journal.shared.say(
+                            "SPACE role=\(room.isRunningTheField ? "authority" : "follower")"
+                                + " bubbles=\(room.bubblesUp)"
+                                + (scores.isEmpty ? "" : " · \(scores)")
+                        )
+                    }
 
                     // The two stages between the camera and the wire, separately. Together they
                     // answer the question a frame rate cannot: whether a stutter was made here,

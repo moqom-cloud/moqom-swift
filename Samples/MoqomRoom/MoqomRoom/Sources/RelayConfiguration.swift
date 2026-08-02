@@ -242,6 +242,17 @@ struct LaunchOptions {
     /// dark room and a broken display path look exactly the same from both ends.
     var video: String?
 
+    /// Join the shared bubble field once the broadcast is up.
+    ///
+    /// Here rather than only in the interface because the interesting half of a
+    /// shared space is what two devices agree about, and agreement is a thing
+    /// to read out of two logs rather than to judge by looking at two screens.
+    /// Popping still takes a finger; everything before it does not.
+    var bubbles = false
+
+    /// Seconds between scripted pops, where a run has nobody to tap.
+    var popEverySeconds: Double?
+
     static func current(
         arguments: [String] = ProcessInfo.processInfo.arguments
     ) -> LaunchOptions {
@@ -266,6 +277,8 @@ struct LaunchOptions {
             case "--floor-ms": options.playoutFloorMilliseconds = value.flatMap(Int.init)
             case "--audio": options.audio = value ?? "tone"
             case "--video": options.video = value ?? "camera"
+            case "--bubbles": options.bubbles = true
+            case "--pop-every": options.popEverySeconds = value.flatMap(Double.init)
             default: break
             }
             index += 1

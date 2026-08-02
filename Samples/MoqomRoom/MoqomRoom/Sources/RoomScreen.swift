@@ -150,6 +150,12 @@ struct RoomScreen: View {
             }
         }
         .frame(maxHeight: .infinity)
+        .overlay(alignment: .top) {
+            if room.isSharing {
+                Scoreboard(room: room)
+                    .padding(.top, 6)
+            }
+        }
         // On the video area rather than on the screen, because the system
         // measures this view to decide whether to open the window when the app
         // is backgrounded, and animates the window out of its frame.
@@ -539,6 +545,49 @@ private extension View {
     }
 }
 
+/// Who is winning, how much is in the air, and which phone is doing the work.
+///
+/// The last of those is the one that earns its place. The two roles are meant
+/// to play identically, and a scoreboard that did not say which this device is
+/// would make the only way to check that be to compare two phones by hand.
+struct Scoreboard: View {
+    let room: RoomModel
+
+    var body: some View {
+        HStack(spacing: 12) {
+            ForEach(room.standings) { standing in
+                HStack(spacing: 4) {
+                    Text(standing.who)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                    Text("\(standing.score)")
+                        .font(.caption.weight(.bold).monospacedDigit())
+                }
+            }
+
+            if room.standings.isEmpty {
+                Text("Tap the bubbles")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider().frame(height: 12)
+
+            Label("\(room.bubblesUp)", systemImage: "circle.hexagongrid")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+
+            Image(systemName: room.isRunningTheField ? "cpu.fill" : "antenna.radiowaves.left.and.right")
+                .font(.caption2)
+                .foregroundStyle(room.isRunningTheField ? .purple : .secondary)
+                .help(room.isRunningTheField ? "This device is running the field" : "Following")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(.regularMaterial, in: Capsule())
+    }
+}
+
 struct BroadcastControls: View {
     @Bindable var room: RoomModel
 
@@ -633,6 +682,31 @@ struct BroadcastControls: View {
                     .buttonStyle(.bordered)
                     .disabled(!room.isBroadcasting || room.videoInput != .camera)
                     .controlCapsule()
+
+                    // Only while an AR scene is on screen, because the bubbles are
+                    // entities in that scene's view. Enabled rather than hidden when
+                    // it cannot be joined would be a control that does nothing on
+                    // every other source.
+                    if room.canShare || room.isSharing {
+                        Button {
+                            Task {
+                                if room.isSharing {
+                                    await room.stopSharing()
+                                } else {
+                                    await room.startSharing()
+                                }
+                            }
+                        } label: {
+                            Label(
+                                room.isSharing ? "Leave bubbles" : "Bubbles",
+                                systemImage: room.isSharing
+                                    ? "circle.slash" : "circle.hexagongrid.fill"
+                            )
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(room.isSharing ? .purple : nil)
+                        .controlCapsule()
+                    }
 
                     // Fixed while publishing. Swapping the source under a live
                     // publication would mean tearing down the capture the encoder is

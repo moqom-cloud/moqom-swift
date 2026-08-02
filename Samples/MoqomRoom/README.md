@@ -319,6 +319,49 @@ Compare any number here against `Scripts/relay-metrics-gcp.sh` before believing
 it — a run that looks clean on the phones while the relay reports shed subgroups
 was smooth because somebody's frames were thrown away.
 
+## The shared bubble field
+
+Two phones in AR mode can share one world. Bubbles rise in front of both, and a
+tap on either pops it on both. It is a small game and a real test of the SDK's
+shared-space path: everything about it travels the same relay as the video.
+
+**Turn it on.** Set the video source to **AR scene**, go live, and press
+**Bubbles**. A scoreboard appears at the top with everybody's count. There is no
+setup handshake to wait for — a device that finds the space unclaimed claims it.
+
+**Who simulates.** One participant runs the field and the rest render what
+arrives. The scoreboard says which you are, and the two are meant to be
+indistinguishable to play. Nobody chooses this: `SpaceSession` claims an unheard
+space after a quiet interval, stands down when it sees a higher epoch, and
+settles a two-way tie by name. A host that walks into a tunnel is replaced
+inside two seconds, and the bubbles that were up stay up, because the successor
+continues from the last state it received rather than starting a new world.
+
+**What a tap does.** A viewer cannot write to the space — one writer is what
+keeps the two devices from disagreeing. A tap publishes a `SpaceIntent` on the
+tapper's own track instead, and whoever is simulating decides. The pop is drawn
+immediately on the tapper's screen and reconciled from the next authoritative
+update, so a race is resolved by the loser seeing the winner's name on the score
+rather than by their own bubble un-popping.
+
+**Scripted.** Neither half needs a finger to test:
+
+```sh
+MOQOM_ROOM=bubbles MOQOM_VIDEO=scene MOQOM_BUBBLES=1 MOQOM_POP_EVERY=2 \
+    MOQOM_SECONDS=60 Scripts/bench-two-phones.sh
+```
+
+`--pop-every` stands in for a tap, and both logs then carry a `SPACE` line each
+report with the role, the bubbles up, and every score. Diffing the two is the
+test: the scores are replicated state, so a line that disagrees between the
+phones is replication failing — which neither phone can tell you on its own,
+since each renders its own copy perfectly happily.
+
+A sixty-second run through the Los Angeles relay: one authority, one follower,
+61 pops between them, and identical scoreboards on both handsets at every
+report. Video ran alongside it the whole time at 720p thirty frames a second,
+66ms glass to glass on the follower, nothing dropped or unroutable.
+
 ## Verification status
 
 The app runs. `MoqomRoomUITests` drives it on a simulator in CI with eight tests:
@@ -334,7 +377,10 @@ have: the camera, the VideoToolbox encoder, the Metal scene capture, and the
 RealityKit tap. Those compile and are only exercised on hardware — the AR path
 has since been run on two phones through a relay, at 60 frames a second each way
 with nothing skipped, which is the first thing to drive the SDK's RealityKit hook
-end to end. `Broadcast` also
+end to end. The shared bubble field has been run the same way, with scripted
+pops in place of taps; what remains unexercised on hardware there is the tap
+itself — the raycast into the bubble and the optimistic hide — since everything
+downstream of it is what the scripted run drives. `Broadcast` also
 publishes a per-frame descriptor rather than encoded bytes, so a tile appearing
 means the roster works, not that video moves.
 
