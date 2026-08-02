@@ -292,6 +292,33 @@ the subtraction between them to be a latency at all.
 Not currently measurable this way: MLVC. It produces no bitstream on device
 because the rANS entropy coder is not wired in, so there is nothing to send.
 
+### Through a relay that is not on the desk
+
+A relay on the Mac shares the phones' Wi-Fi, so the measurement includes that
+link twice and the leg an actual call would traverse not at all. The app
+therefore defaults to a relay on Compute Engine in Los Angeles, and these two
+scripts put a build on it and drive both phones through it:
+
+```sh
+MOQOM_GCP_ZONE=us-west2-a MOQOM_GCP_INSTANCE=moqom-relay-la Scripts/relay-on-gcp.sh
+. /tmp/moqom-gcp-relay.env && export MOQOM_RELAY_HOST MOQOM_RELAY_PORT MOQOM_RELAY_CERT_HASH
+MOQOM_SECONDS=90 Scripts/bench-two-phones.sh
+```
+
+Both are idempotent, and the second prints the same block the readout shows,
+per phone, at the end of the run. Leave the **Pairing code** field empty when
+connecting by hand: it is a Bonjour lookup for a relay on the LAN, and with
+nothing advertising the code the connection fails before the host and hash
+below it are ever tried.
+
+Los Angeles rather than Oregon on measurement: mean round trip from this desk
+was 21.8ms against 47.5ms, which is most of a frame at sixty. A recent
+ninety-second run measured 56–57ms glass to glass at the median and 70ms at the
+95th, 720p at thirty frames a second in both directions, every frame delivered.
+Compare any number here against `Scripts/relay-metrics-gcp.sh` before believing
+it — a run that looks clean on the phones while the relay reports shed subgroups
+was smooth because somebody's frames were thrown away.
+
 ## Verification status
 
 The app runs. `MoqomRoomUITests` drives it on a simulator in CI with eight tests:
