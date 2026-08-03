@@ -132,6 +132,78 @@ struct TimedSource: FrameSource {
     func resume() { wrapped.resume() }
 }
 
+/// The same trick for audio, and it has to be the same trick.
+///
+/// A run measures latency by comparing a stamp made here against a clock read there, which
+/// only means anything if both devices agree on the clock — hence ``TimedSource`` for video.
+/// Audio went unstamped, so the two media left this device quoting unrelated timelines: the
+/// camera's frames on the shared clock and the microphone's packets on this device's own.
+/// Nothing at the far end could then say whether a voice was ahead of its face or behind it,
+/// which is a hard thing to fix and an easy thing to not notice, because the two arrive close
+/// enough to look aligned in every counter that does not measure it.
+struct TimedAudioSource: AudioSource {
+    private let wrapped: any AudioSource
+    private let stamp: @Sendable () -> Timecode
+
+    init(_ wrapped: any AudioSource, stamp: @escaping @Sendable () -> Timecode) {
+        self.wrapped = wrapped
+        self.stamp = stamp
+    }
+
+    var format: AudioFormat { wrapped.format }
+
+    func frames() -> AsyncStream<AudioFrame> {
+        let upstream = wrapped.frames()
+        let stamp = stamp
+        return AsyncStream { continuation in
+            let pump = Task {
+                // One offset for the whole run, taken as the smallest of the first second's
+                // worth, exactly as the video side takes it: the difference between the two
+                // clocks is constant and the delay in observing it is not. Audio packets are
+                // continuous by construction — the capture timeline advances by a packet's
+                // duration whatever the thread was doing — so re-anchoring on a discrepancy
+                // is not wanted here. A jump would be a clock moving under a live call, and
+                // moving the audio timeline in the middle of a sentence is worse than the
+                // error it would correct.
+                var offset: Int64?
+                var settling = 0
+
+                for await frame in upstream {
+                    let captured = Int64(bitPattern: frame.timestamp.nanoseconds)
+                    let now = stamp().nanoseconds
+
+                    if captured > 0 {
+                        let candidate = now - captured
+                        if let current = offset, settling >= 50 {
+                            offset = current
+                        } else if let current = offset {
+                            offset = min(current, candidate)
+                        } else {
+                            offset = candidate
+                        }
+                        settling += 1
+                    }
+
+                    let shared = offset.map { captured + $0 } ?? now
+                    continuation.yield(
+                        AudioFrame(
+                            timestamp: FrameTimestamp(nanoseconds: UInt64(max(0, shared))),
+                            format: frame.format,
+                            samples: frame.samples
+                        )
+                    )
+                }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in pump.cancel() }
+        }
+    }
+
+    func stop() { wrapped.stop() }
+    func suspend() { wrapped.suspend() }
+    func resume() { wrapped.resume() }
+}
+
 /// Collects one-way latencies and reports what they were.
 ///
 /// Percentiles rather than a mean, because the mean of a latency distribution is the one

@@ -397,6 +397,36 @@ final class AppModel {
                     )
                 }
 
+                // Lip sync, stated as one signed number rather than left to be inferred from
+                // the four it is made of. Both media are quoted against the same clock and
+                // measured to the point where a person receives them: a picture reaches the
+                // eye when the network has delivered it and the playout schedule has held it,
+                // and a voice reaches the ear when the network has delivered it, the jitter
+                // buffer has let it go, the queue in front of the speaker has drained to it
+                // and the device's output path has finished with it.
+                //
+                // Positive means the picture is behind the voice. Negative means the face
+                // moves first, which is the one people notice, and which is what a phone on
+                // this stack did by a fifth of a second while every counter looked healthy.
+                if let picture = room.latency.reading(), picture.frames > 0,
+                   let voice = room.voiceLatency.reading(), voice.frames > 0 {
+                    let eye = picture.median + (room.playoutSlack ?? room.playoutDepth.seconds) * 1000
+                    let ear = voice.median + room.earDelay.seconds * 1000
+                    Journal.shared.say(
+                        String(
+                            format: "SYNC %+.0fms (eye %.0f = link %.0f + wait %.0f,"
+                                + " ear %.0f = link %.0f + hold %.0f)",
+                            eye - ear,
+                            eye,
+                            picture.median,
+                            eye - picture.median,
+                            ear,
+                            voice.median,
+                            room.earDelay.seconds * 1000
+                        )
+                    )
+                }
+
                 // Alongside the latency rather than folded into it. A stream can be fast and
                 // uneven or slow and smooth, and the two complaints have different causes.
                 Journal.shared.say("PLAY \(room.cadence.report())")
@@ -553,6 +583,20 @@ final class AppModel {
                             // What the hardware granted, which is the thing that decides how
                             // evenly packets leave here. A request is not a setting.
                             + String(format: " io=%.1fms", session.ioBufferDuration * 1000)
+                            // The hardware's own delay in each direction, which is
+                            // part of mouth-to-ear and is charged to the media path
+                            // by everything that only counts packets. Voice
+                            // processing raises both, and a phone on a Bluetooth
+                            // headset raises them by more than the network costs.
+                            + String(
+                                format: " out=%.0fms in=%.0fms",
+                                session.outputLatency * 1000,
+                                session.inputLatency * 1000
+                            )
+                            + String(
+                                format: " late=%.0fms",
+                                AudioGraph.shared.capturedLate.seconds * 1000
+                            )
                             + " volume=\(String(format: "%.2f", session.outputVolume))"
                             + " mic=\(AVAudioApplication.shared.recordPermission == .granted ? "granted" : "not granted")"
                             + (room.lastError.map { " error=\($0)" } ?? "")
@@ -578,11 +622,13 @@ final class AppModel {
 
                     // The last inch, which every line above is blind to: packets can arrive,
                     // decode, and be scheduled while containing nothing but zeros.
-                    if let played = await room.playback(of: who) {
+                    if let played = room.playback(of: who) {
                         Journal.shared.say(
                             String(
                                 format: "  SPKR %@ buffers=%d silent=%d peak=%.3f"
-                                    + " decoded=%d failed=%d gaps=%d silences=%d queued=%.0fms",
+                                    + " decoded=%d failed=%d gaps=%d silences=%d"
+                                    + " queued=%.0fms target=%.0fms"
+                                    + " trimmed=%d dropped=%d starved=%d",
                                 String(describing: who.username),
                                 played.buffers,
                                 played.silent,
@@ -591,7 +637,11 @@ final class AppModel {
                                 played.decoding.failures,
                                 played.decoding.gaps,
                                 played.decoding.silences,
-                                played.queued.seconds * 1000
+                                played.queued.seconds * 1000,
+                                played.target.seconds * 1000,
+                                played.trimmed,
+                                played.dropped,
+                                played.starved
                             )
                         )
                     }

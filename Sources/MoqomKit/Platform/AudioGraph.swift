@@ -17,7 +17,7 @@
 // against a reference containing nothing, and three rendering the audio it
 // needed to cancel. Voice processing was switched on and could not work.
 //
-// So: one engine, `AVAudioPlayerNode` per participant into its mixer, and the
+// So: one engine, one source node per participant into its mixer, and the
 // microphone tapped off the same engine's input. Everything the per-participant
 // design cares about survives that, which is worth being explicit about because
 // the shape looks like a mixer and mixing is what we refuse to do:
@@ -36,6 +36,7 @@
 
 import Foundation
 import MoqomCore
+import os
 
 #if canImport(AVFAudio)
     import AVFAudio
@@ -126,62 +127,202 @@ import MoqomCore
         ///
         /// A handle rather than a raw node, so ``AudioPlayer`` cannot reach into
         /// the engine and so detaching is something the graph observes.
+        ///
+        /// The device pulls from this rather than being pushed into. That is
+        /// the difference between a queue whose depth is decided by the
+        /// listener and one decided by whatever the network happened to deliver
+        /// in a burst: with `scheduleBuffer` the packets of a burst all sit in
+        /// front of the speaker and stay there, so a single bad second on the
+        /// link becomes a permanent fifth of a second between a face and its
+        /// voice. Measured on two phones through a relay, one direction sat at
+        /// 200ms and the other climbed to 480ms and stayed. A render callback
+        /// takes exactly what the hardware needs at exactly the hardware's
+        /// rate, which makes the depth a number this code chooses.
         public final class Voice: @unchecked Sendable {
-            let node = AVAudioPlayerNode()
+            let node: AVAudioSourceNode
             private weak var graph: AudioGraph?
-
-            /// Frames handed to the node since it started playing, guarded by
-            /// ``counting``.
-            private var scheduled: AVAudioFramePosition = 0
-            private let counting = NSLock()
+            private let ring: PCMRing
+            private let channels: Int
 
             /// This listener's volume for this participant, `0` to `1`.
+            ///
+            /// Applied while rendering rather than on the node, because the
+            /// render block is where the samples already are.
             public var volume: Float {
-                get { node.volume }
-                set { node.volume = max(0, min(1, newValue)) }
+                get { ring.gain }
+                set { ring.gain = max(0, min(1, newValue)) }
             }
 
-            init(graph: AudioGraph) { self.graph = graph }
+            init(graph: AudioGraph, format: AVAudioFormat) {
+                self.graph = graph
+                channels = Int(format.channelCount)
+                // A second of slack. The depth is held far below this by the
+                // player; the capacity only bounds what a pathological burst
+                // can cost in memory.
+                ring = PCMRing(
+                    capacity: Int(format.sampleRate) * Int(format.channelCount),
+                    channels: Int(format.channelCount),
+                    sampleRate: format.sampleRate
+                )
+                let ring = ring
+                node = AVAudioSourceNode(format: format) { silence, _, frames, buffers in
+                    let filled = ring.render(
+                        Int(frames),
+                        into: UnsafeMutableAudioBufferListPointer(buffers)
+                    )
+                    if filled == 0 { silence.pointee = true }
+                    return noErr
+                }
+            }
 
-            /// Hand the device more samples.
-            public func schedule(_ buffer: AVAudioPCMBuffer) {
-                counting.withLock { scheduled += AVAudioFramePosition(buffer.frameLength) }
-                node.scheduleBuffer(buffer, completionHandler: nil)
+            /// Hand the device more samples, interleaved.
+            ///
+            /// Returns how many frames were taken. A short answer means the
+            /// ring is full, which the caller is expected to treat as the
+            /// device being ahead of the network rather than as an error.
+            @discardableResult
+            public func write(_ samples: [Float]) -> Int {
+                ring.write(samples)
             }
 
             /// How much audio is waiting in front of the speaker.
             ///
-            /// The last unmeasured stretch of the receive path, and the one that
-            /// decides lip sync. Everything upstream of it is sized against the
-            /// link: the jitter buffer holds a packet for as long as the link's
-            /// jitter says it must. This queue is sized by nothing at all — a
-            /// burst of packets is scheduled the moment it arrives and comes out
-            /// of the speaker at the device's own rate, so whatever the burst
-            /// added stays added, and the voice sits that much further behind
-            /// the picture for the rest of the call.
-            ///
-            /// Negative while the node is starved, which is worth seeing rather
-            /// than clamping: it means the device is rendering silence because
-            /// nothing arrived in time.
-            public var queued: Duration {
-                guard
-                    let render = node.lastRenderTime,
-                    let played = node.playerTime(forNodeTime: render),
-                    played.sampleRate > 0
-                else { return .zero }
-                let ahead = counting.withLock { scheduled } - played.sampleTime
-                return .seconds(Double(ahead) / played.sampleRate)
-            }
+            /// This is the last stretch of a listener's mouth-to-ear delay and,
+            /// until it was measured, the part nothing reported. It is what
+            /// lip sync has to be told about: the picture cannot be aligned to
+            /// a voice whose delay nobody knows.
+            public var queued: Duration { ring.queued }
 
-            public func play() {
-                counting.withLock { scheduled = 0 }
-                node.play()
-            }
+            /// Times the device asked for samples and there were none.
+            public var starved: Int { ring.starved }
+
+            /// Drop everything waiting, for a listener who has stopped
+            /// listening. Whatever is in the ring is stale by definition.
+            public func flush() { ring.flush() }
+
+            public func play() {}
 
             /// Take this participant out of the mix.
             public func remove() {
                 graph?.detach(self)
                 graph = nil
+            }
+        }
+
+        /// Samples in one end, whatever the device asked for out of the other.
+        ///
+        /// Everything here happens under one lock, including the render side.
+        /// A lock on the audio thread is a thing to be nervous about and the
+        /// nervousness is right in general: a render callback that waits on a
+        /// thread which then takes a page fault produces a dropout. It is
+        /// tolerable here because the critical section is a bounded copy with
+        /// no allocation, no ObjC and no syscall, and because the alternative —
+        /// a lock-free ring with atomics — is a thing to get subtly wrong once
+        /// and then debug at three in the morning through a dropout that only
+        /// happens on somebody else's phone. If profiling ever shows this
+        /// waiting, the fix is the atomic version, not a bigger buffer.
+        private final class PCMRing: @unchecked Sendable {
+            private let storage: UnsafeMutableBufferPointer<Float>
+            private let channels: Int
+            private let sampleRate: Double
+            private let state: OSAllocatedUnfairLock<State>
+
+            private struct State {
+                var head = 0
+                var count = 0
+                var starved = 0
+                var gain: Float = 1
+            }
+
+            init(capacity: Int, channels: Int, sampleRate: Double) {
+                let rounded = max(channels, capacity - capacity % channels)
+                storage = .allocate(capacity: rounded)
+                storage.initialize(repeating: 0)
+                self.channels = channels
+                self.sampleRate = sampleRate
+                state = OSAllocatedUnfairLock(initialState: State())
+            }
+
+            deinit { storage.deallocate() }
+
+            var gain: Float {
+                get { state.withLock { $0.gain } }
+                set { state.withLock { $0.gain = newValue } }
+            }
+
+            var starved: Int { state.withLock { $0.starved } }
+
+            var queued: Duration {
+                let frames = state.withLock { $0.count } / channels
+                return .seconds(Double(frames) / sampleRate)
+            }
+
+            func flush() {
+                state.withLock { state in
+                    state.head = 0
+                    state.count = 0
+                }
+            }
+
+            /// - Returns: frames taken, which is short of the offer when full.
+            func write(_ samples: [Float]) -> Int {
+                state.withLock { state in
+                    let room = storage.count - state.count
+                    let taking = min(samples.count, room - room % channels)
+                    guard taking > 0 else { return 0 }
+                    var index = (state.head + state.count) % storage.count
+                    for offset in 0 ..< taking {
+                        storage[index] = samples[offset]
+                        index += 1
+                        if index == storage.count { index = 0 }
+                    }
+                    state.count += taking
+                    return taking / channels
+                }
+            }
+
+            /// Fill the device's buffers, padding with silence if short.
+            ///
+            /// - Returns: frames of real audio, `0` when there was none.
+            func render(
+                _ frames: Int,
+                into buffers: UnsafeMutableAudioBufferListPointer
+            ) -> Int {
+                // Unchecked because the device's buffer list is not `Sendable`
+                // and cannot be: it is a pointer the render thread owns for the
+                // duration of this call and nothing else may touch.
+                state.withLockUnchecked { state in
+                    let available = min(frames, state.count / channels)
+                    if available < frames { state.starved += 1 }
+                    let gain = state.gain
+                    var index = state.head
+
+                    // One buffer per channel when the format is deinterleaved,
+                    // which is what this graph uses, and a single buffer when it
+                    // is not. Both are handled because the format comes from the
+                    // caller and a wrong guess here is silence, not a crash.
+                    let deinterleaved = buffers.count == channels
+                    for frame in 0 ..< frames {
+                        for channel in 0 ..< channels {
+                            var sample: Float = 0
+                            if frame < available {
+                                sample = storage[index] * gain
+                                index += 1
+                                if index == storage.count { index = 0 }
+                            }
+                            let target = deinterleaved ? channel : 0
+                            let position = deinterleaved
+                                ? frame
+                                : frame * channels + channel
+                            guard let data = buffers[target].mData else { continue }
+                            data.assumingMemoryBound(to: Float.self)[position] = sample
+                        }
+                    }
+
+                    state.head = index
+                    state.count -= available * channels
+                    return available
+                }
             }
         }
 
@@ -389,9 +530,12 @@ import MoqomCore
             lock.lock()
             defer { lock.unlock() }
 
-            let voice = Voice(graph: self)
+            // A source node renders in the format it was built with, so unlike
+            // a player node it cannot be handed one later.
+            let rendering = format ?? engine.mainMixerNode.outputFormat(forBus: 0)
+            let voice = Voice(graph: self, format: rendering)
             engine.attach(voice.node)
-            engine.connect(voice.node, to: engine.mainMixerNode, format: format)
+            engine.connect(voice.node, to: engine.mainMixerNode, format: rendering)
             voices.append(voice)
             return voice
         }
@@ -408,6 +552,19 @@ import MoqomCore
             let capture = self.capture
             lock.unlock()
             return capture?.meter ?? .quiet
+        }
+
+        /// How far behind real time the capture timeline has fallen.
+        ///
+        /// Zero when nothing is capturing. A steady figure is the pipeline's
+        /// own delay; one that grows is the device's sample rate differing from
+        /// the nominal one, which nothing here corrects and which arrives at
+        /// the far end as audio drifting away from the picture.
+        public var capturedLate: Duration {
+            lock.lock()
+            let capture = self.capture
+            lock.unlock()
+            return capture?.capturedLate ?? .zero
         }
 
         /// Whether to bypass voice processing without tearing the graph down.
@@ -470,8 +627,6 @@ import MoqomCore
                 throw MoqomError.platform(api: "AVAudioEngine.start", status: -1)
             }
             running = true
-
-            for voice in voices { voice.node.play() }
         }
 
         /// Take the microphone through a sink node rather than a tap.
@@ -496,13 +651,29 @@ import MoqomCore
             try capture.prepare(from: hardware)
 
             uninstallLocked()
-            let sink = AVAudioSinkNode { _, frames, list in
+            #if os(iOS) || os(visionOS) || os(tvOS)
+                let inputLatency = AVAudioSession.sharedInstance().inputLatency
+            #else
+                let inputLatency: TimeInterval = 0
+            #endif
+            let sink = AVAudioSinkNode { time, frames, list in
                 guard let buffer = AVAudioPCMBuffer(
                     pcmFormat: hardware,
                     bufferListNoCopy: list
                 ) else { return noErr }
                 buffer.frameLength = frames
-                capture.ingest(buffer)
+
+                // The device's own reading of when this was heard, less what
+                // the input path costs, which makes it the moment in the room
+                // rather than the moment the sample reached this thread. The
+                // camera quotes its frames the same way, and that is the entire
+                // basis on which a receiver can hold the two together.
+                var captured: UInt64?
+                if time.pointee.mFlags.contains(.hostTimeValid) {
+                    let seconds = AVAudioTime.seconds(forHostTime: time.pointee.mHostTime)
+                    captured = UInt64(max(0, (seconds - inputLatency) * 1e9))
+                }
+                capture.ingest(buffer, captured: captured)
                 return noErr
             }
             engine.attach(sink)
@@ -520,7 +691,7 @@ import MoqomCore
         private func detach(_ voice: Voice) {
             lock.lock()
             defer { lock.unlock() }
-            voice.node.stop()
+            voice.flush()
             engine.detach(voice.node)
             voices.removeAll { $0 === voice }
         }
@@ -694,6 +865,30 @@ import MoqomCore
         private var carry: [Float] = []
         private var nextTimestamp: UInt64 = 0
 
+        /// When the first packet of this capture was cut, on the host clock,
+        /// and how far behind real time the newest one is. Guarded by ``lock``.
+        ///
+        /// The capture timeline advances by a packet's nominal duration rather
+        /// than by a clock reading, which is right — a timeline assembled from
+        /// wall-clock reads inherits the scheduling jitter — but it means the
+        /// timeline says nothing about how long the pipeline is actually
+        /// holding audio, and a backlog here is indistinguishable downstream
+        /// from a slow network. This is that difference, measured: the gap
+        /// between when a packet says it was captured and when it was really
+        /// cut. It should be a small constant. Growth is the device's true
+        /// sample rate pulling away from the nominal one.
+        ///
+        /// The origin is where the timeline is nailed to the host clock, and
+        /// nailing it there is what lets a receiver put a voice next to a face.
+        /// It used to be zero: the first packet of a call said it was captured
+        /// at the beginning of time, and every one after it counted up from
+        /// there. Video says when it was captured, on the clock the camera
+        /// reports, so the two media arrived describing unrelated timelines and
+        /// no amount of care downstream could align them. They can be aligned
+        /// now because they are quoted against the same clock.
+        private var origin: UInt64 = 0
+        private var lag: Duration = .zero
+
         /// Measured here rather than downstream, because the samples are
         /// already in cache on this thread and a meter that lagged the audio by
         /// a queue hop would be useless for the thing it is for: watching
@@ -714,6 +909,12 @@ import MoqomCore
             lock.lock()
             defer { lock.unlock() }
             return voice.meter
+        }
+
+        var capturedLate: Duration {
+            lock.lock()
+            defer { lock.unlock() }
+            return lag
         }
 
         func prepare(from hardware: AVAudioFormat) throws(MoqomError) {
@@ -750,11 +951,24 @@ import MoqomCore
         /// feels like -- commonly 4.4ms on an iPhone -- and Opus wants exactly
         /// 20ms, so converting before accumulating means the accumulator counts
         /// in the units the encoder asked for.
-        func ingest(_ buffer: AVAudioPCMBuffer) {
+        /// - Parameter captured: when the hardware says the first sample of this
+        ///   buffer was heard, in nanoseconds on the host clock, or `nil` where
+        ///   the device did not say. Used once, to anchor the timeline.
+        func ingest(_ buffer: AVAudioPCMBuffer, captured: UInt64? = nil) {
             lock.lock()
             guard let converter, let target else {
                 lock.unlock()
                 return
+            }
+
+            if origin == 0 {
+                // The samples already accumulated belong before this buffer, so
+                // the timeline starts that much earlier than the reading.
+                let waiting = UInt64(
+                    Double(carry.count / format.channels) / Double(format.sampleRate) * 1e9
+                )
+                let now = captured ?? DispatchTime.now().uptimeNanoseconds
+                origin = now > waiting ? now - waiting : now
             }
 
             let ratio = target.sampleRate / buffer.format.sampleRate
@@ -790,7 +1004,7 @@ import MoqomCore
                 let samples = Array(carry.prefix(packet))
                 carry.removeFirst(packet)
                 let frame = AudioFrame(
-                    timestamp: FrameTimestamp(nanoseconds: nextTimestamp),
+                    timestamp: FrameTimestamp(nanoseconds: origin + nextTimestamp),
                     format: format,
                     samples: samples
                 )
@@ -803,6 +1017,10 @@ import MoqomCore
                 nextTimestamp += UInt64(
                     1_000_000_000 / (format.sampleRate / format.samplesPerFrame)
                 )
+            }
+            if !ready.isEmpty {
+                let now = DispatchTime.now().uptimeNanoseconds
+                lag = .nanoseconds(Int64(now - origin) - Int64(nextTimestamp))
             }
             lock.unlock()
 

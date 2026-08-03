@@ -77,17 +77,130 @@ import MoqomCore
             voice = graph.attach(format: playback)
         }
 
+        /// How much audio this player is willing to have waiting for the
+        /// speaker.
+        ///
+        /// The listener's half of mouth-to-ear, and the number lip sync is
+        /// aligned to. It has to cover the link's jitter, because past the
+        /// jitter buffer's filling phase this queue is the only thing between a
+        /// late packet and a hole in the speech, so ``RoomSession`` keeps it in
+        /// step with what that buffer has learned about the link.
+        ///
+        /// Held rather than merely aimed at: audio arrives at the sender's rate
+        /// and leaves at the listener's, and the difference — a burst, a stall,
+        /// two crystals disagreeing by a hundredth of a percent — accumulates
+        /// in front of the speaker with nothing to remove it. Left alone it
+        /// only grows, which is a voice that falls further behind its face for
+        /// as long as the call lasts.
+        public private(set) var aim: Duration = .milliseconds(60)
+
+        public func aim(at delay: Duration) {
+            aim = max(.milliseconds(40), min(delay, .milliseconds(400)))
+        }
+
+        /// What the aim turned out not to cover, added to it.
+        ///
+        /// The jitter buffer's estimate is of the link, and the queue also has
+        /// to survive this device: a thermal throttle, a route change, the
+        /// decoder waiting on an actor. Those show up only as a device asking
+        /// for samples that are not there, so that is what this listens to.
+        /// Up quickly, because the evidence is a dropout somebody heard, and
+        /// down slowly, because the absence of dropouts is not evidence that
+        /// the next one will not happen.
+        private var pressure: Duration = .zero
+        private var starvedBefore = 0
+        private var cleanPackets = 0
+        private var primed = false
+
+        /// The depth actually being held. See ``aim`` and ``Playback/queued``.
+        public var target: Duration { aim + pressure }
+
         /// Consume a room's audio stream until it ends.
         ///
         /// Every slot is played, including the ones the jitter buffer marked as
         /// a gap: the device needs a buffer per slot, and skipping the gaps
-        /// would advance the clock past them.
-        public func play(_ outputs: AsyncStream<JitterBufferOutput>) async throws(MoqomError) {
+        /// would advance the clock past them. The exception is a queue that has
+        /// grown past ``target``, where a slot the publisher marked as silence
+        /// is dropped instead of played — the listener cannot hear a silence
+        /// that was not played, and dropping them is how the delay comes back
+        /// down without anybody hearing it happen. A room is quiet between a
+        /// third and a half of the time, which is enough to recover a burst
+        /// within seconds.
+        /// - Parameter written: called with each packet's capture time as it
+        ///   goes to the device, for a caller measuring mouth-to-ear. This
+        ///   rather than an audio tap, which is the obvious way and measures
+        ///   the wrong thing: a tap runs its own decoder behind its own stream,
+        ///   so what it times is the tap. It read four hundred milliseconds on
+        ///   a link that turned out to be delivering in seventy.
+        public func play(
+            _ outputs: AsyncStream<JitterBufferOutput>,
+            written: (@Sendable (FrameTimestamp) -> Void)? = nil
+        ) async throws(MoqomError) {
             try start()
             for await output in outputs {
+                // Quiet slots do not count as speech for this, and the
+                // distinction is the whole of it: a ring that empties while
+                // nobody is talking has cost the listener nothing, and treating
+                // it as a dropout buys insurance against a silence with a
+                // permanently deeper queue. The first version did exactly that
+                // and settled at a quarter of a second on a link whose jitter
+                // never exceeded ten milliseconds.
+                if output != .silence { voiced = 12 } else if voiced > 0 { voiced -= 1 }
+                answer(voice.starved, whileSpeaking: voiced > 0)
+
+                let queued = voice.queued
+                // Trimmed above the target rather than at it, because a queue
+                // held exactly at target is a queue one late packet away from a
+                // hole, and the trimming is what would have put it there.
+                if queued > target + .milliseconds(20), output == .silence {
+                    playback.trimmed += 1
+                    continue
+                }
+
+                // Speech, and still too deep: the queue is past anything the
+                // link's jitter justifies and the excess is pure delay. Losing
+                // a packet is audible and losing the argument with the delay is
+                // audible for the rest of the call.
+                if queued > target + .milliseconds(200) {
+                    playback.dropped += 1
+                    continue
+                }
+
                 let samples = await decoder.decode(output)
-                schedule(samples)
+                write(samples)
+                if case let .packet(packet) = output { written?(packet.timestamp) }
             }
+        }
+
+        /// Slots of speech still counted as recent, in packets. See ``play(_:)``.
+        private var voiced = 0
+
+        /// Fold what the device has been doing into the depth being held.
+        private func answer(_ starved: Int, whileSpeaking speaking: Bool) {
+            // The device asks for samples from the moment the engine runs, and
+            // the first ones arrive whenever the room gets round to sending
+            // them. Everything before the first packet is a device waiting to
+            // be joined, not a queue that was too shallow.
+            guard primed else {
+                primed = true
+                starvedBefore = starved
+                return
+            }
+
+            if starved > starvedBefore {
+                starvedBefore = starved
+                guard speaking else { return }
+                cleanPackets = 0
+                pressure = min(.milliseconds(200), pressure + .milliseconds(20))
+                return
+            }
+
+            cleanPackets += 1
+            // Fifty packets to the second, so this is ten seconds of a device
+            // that asked for nothing it did not get.
+            guard cleanPackets >= 500, pressure > .zero else { return }
+            cleanPackets = 0
+            pressure = max(.zero, pressure - .milliseconds(10))
         }
 
         /// What this player has actually put into the mix.
@@ -114,6 +227,27 @@ import MoqomCore
             /// of the speaker describes a link that sounds nothing like it.
             public var queued: Duration = .zero
 
+            /// Silences dropped to bring ``queued`` back to target. Inaudible.
+            public var trimmed = 0
+
+            /// Speech dropped for the same reason, which is not inaudible and
+            /// should be rare. A number that climbs means the queue is being
+            /// fed faster than the device drains it for longer than a burst,
+            /// which is a clock difference rather than a network one.
+            public var dropped = 0
+
+            /// Times the device asked for samples and the ring was empty.
+            public var starved = 0
+
+            /// The depth being held, which is the figure lip sync should align
+            /// the picture to: the momentary ``queued`` swings by a packet or
+            /// two between readings and a video buffer chasing it would resize
+            /// itself all call.
+            public var target: Duration = .zero
+
+            /// Frames the ring refused because it was full.
+            public var refused = 0
+
             /// What the decoder made of the packets. See ``PlatformAudioDecoder/Decoding``.
             public var decoding = PlatformAudioDecoder.Decoding()
         }
@@ -122,6 +256,8 @@ import MoqomCore
             var reading = playback
             reading.decoding = await decoder.decoding
             reading.queued = voice.queued
+            reading.starved = voice.starved
+            reading.target = target
             playback.peak = 0
             return reading
         }
@@ -146,38 +282,22 @@ import MoqomCore
             running = true
         }
 
-        private func schedule(_ samples: [Float]) {
-            let frames = AVAudioFrameCount(samples.count / format.channels)
-            guard
-                frames > 0,
-                let buffer = AVAudioPCMBuffer(
-                    pcmFormat: playbackFormat,
-                    frameCapacity: frames
-                ),
-                let channels = buffer.floatChannelData
-            else { return }
+        private func write(_ samples: [Float]) {
+            guard !samples.isEmpty else { return }
 
-            buffer.frameLength = frames
-
-            // Interleaved in, deinterleaved out. `AVAudioPCMBuffer`'s
-            // non-interleaved layout is one pointer per channel, which is what
-            // the mixer wants; converting here rather than asking the decoder
-            // for it keeps the decoder's output in the one layout every other
-            // part of the SDK uses.
             var loudest: Float = 0
-            for frame in 0 ..< Int(frames) {
-                for channel in 0 ..< format.channels {
-                    let sample = samples[frame * format.channels + channel]
-                    channels[channel][frame] = sample
-                    loudest = max(loudest, abs(sample))
-                }
-            }
+            for sample in samples { loudest = max(loudest, abs(sample)) }
 
             playback.buffers += 1
             if loudest == 0 { playback.silent += 1 }
             playback.peak = max(playback.peak, loudest)
 
-            voice.schedule(buffer)
+            // Interleaved the whole way now: the ring deinterleaves into the
+            // device's buffers while it renders, so nothing on this path has to
+            // build an `AVAudioPCMBuffer` per packet.
+            let taken = voice.write(samples)
+            let offered = samples.count / format.channels
+            if taken < offered { playback.refused += offered - taken }
         }
     }
 #endif

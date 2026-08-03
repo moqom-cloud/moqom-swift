@@ -129,6 +129,13 @@ final class RoomModel {
     /// What the far side's frames cost to arrive.
     let latency = LatencyMeter()
 
+    /// The same for their voice, measured where the jitter buffer lets a packet go.
+    ///
+    /// Half of lip sync, and the half nothing measured. A run could say to the millisecond
+    /// how long a picture took to arrive and had no equivalent figure for the sound, so the
+    /// two could only be compared by assertion.
+    let voiceLatency = LatencyMeter()
+
     /// Whether they arrive evenly, which needs no clock agreement and so is measured even
     /// when the latency figures are unavailable.
     let cadence = CadenceMeter()
@@ -192,7 +199,7 @@ final class RoomModel {
     /// Seconds of headroom the arriving frames actually have. See ``VideoRenderer/playoutSlack``.
     var playoutSlack: Double?
 
-    /// How long this participant's voice is being held before it is played.
+    /// How long this participant's voice is being held before it is heard.
     ///
     /// The video tile uses it as a floor, which is the whole of lip sync here. The two media
     /// have separate buffers sizing themselves against separate jitter — audio packets are
@@ -201,9 +208,40 @@ final class RoomModel {
     /// milliseconds while the picture waited fifteen, which is a face whose lips run ahead of
     /// it. Video is the one that gives, because holding a frame longer costs a frame of
     /// latency and stretching audio costs a click.
+    ///
+    /// Measured at the speaker rather than taken from the jitter buffer's target, which is
+    /// what this used to return and which is the smaller half of the answer. Past the filling
+    /// phase that buffer hands packets straight on and the queue in front of the device holds
+    /// them, so the target described a delay of twenty milliseconds while two hundred were
+    /// actually being waited out — and the picture was aligned to the wrong one of the two,
+    /// which is why a face on a phone ran a fifth of a second ahead of its voice.
     func audioDelay(of who: ParticipantIdentity) -> Duration? {
-        statistics?.participants[who]?.audio?.targetDelay
+        guard let jitter = statistics?.participants[who]?.audio?.targetDelay else { return nil }
+        return (heard[who]?.target ?? jitter) + outputLatency
     }
+
+    /// Everything between the jitter buffer letting a packet go and a listener hearing it.
+    ///
+    /// The queue held in front of the speaker plus what the device's output path costs. The
+    /// counterpart of the playout delay on the video side, and the figure the picture is
+    /// aligned to.
+    var earDelay: Duration {
+        let held = heard.values.map(\.target).max() ?? .zero
+        return held + outputLatency
+    }
+
+    /// What the device says its own output path costs, which is part of when a
+    /// listener hears a packet and none of it is visible to the media code.
+    private var outputLatency: Duration {
+        #if os(iOS)
+            .seconds(AVAudioSession.sharedInstance().outputLatency)
+        #else
+            .zero
+        #endif
+    }
+
+    /// The last reading from each participant's player. See ``playback(of:)``.
+    private(set) var heard: [ParticipantIdentity: AudioPlayer.Playback] = [:]
 
     /// What the remote tile did with the frames it was handed. See ``VideoRenderer/drawing``.
     var drawing = VideoRenderer.Drawing()
@@ -742,6 +780,17 @@ final class RoomModel {
 
     private func observe(_ snapshot: RoomStatistics) {
         statistics = snapshot
+
+        // The players hold their queue to whatever the link's jitter turned out
+        // to need, which is a figure only the jitter buffer knows and only this
+        // snapshot carries out of the SDK.
+        for (who, participant) in snapshot.participants {
+            guard let audio = participant.audio, let player = players[who] else { continue }
+            Task { @MainActor [weak self] in
+                await player.aim(at: audio.targetDelay + .milliseconds(20))
+                self?.heard[who] = await player.reading()
+            }
+        }
     }
 
     /// What the transport is doing, printed as it changes.
@@ -1464,11 +1513,13 @@ final class RoomModel {
         }
 
         do {
-            let publication = try await room.startAudio(from: source)
+            let published: any AudioSource =
+                trustedStamp.map { TimedAudioSource(source, stamp: $0) } ?? source
+            let publication = try await room.startAudio(from: published)
             await publication.start()
             isPublishingAudio = true
         } catch {
-            lastError = error
+            lastError = error as? MoqomError
             source.stop()
             return
         }
@@ -1570,6 +1621,7 @@ final class RoomModel {
             return
         }
         players[who] = player
+        let written = measureVoice()
 
         // The error is kept rather than discarded. Playback fails for reasons that are entirely
         // silent otherwise — an engine that will not start because the session was refused, most
@@ -1577,7 +1629,7 @@ final class RoomModel {
         // sound, with nothing anywhere saying why.
         playback[who] = Task { [weak self] in
             do throws(MoqomError) {
-                try await player.play(outputs)
+                try await player.play(outputs, written: written)
             } catch {
                 await MainActor.run { self?.lastError = error }
             }
@@ -1592,10 +1644,24 @@ final class RoomModel {
         }
     }
 
+    /// Time a participant's packets from their microphone to this device's speaker queue.
+    ///
+    /// Only under a trusted clock, because without one the subtraction is between two devices
+    /// that disagree about what time it is and the answer is whatever they disagree by.
+    private func measureVoice() -> (@Sendable (FrameTimestamp) -> Void)? {
+        guard let stamp = trustedStamp else { return nil }
+        let meter = voiceLatency
+        return { captured in meter.record(capturedAt: captured, receivedAt: stamp()) }
+    }
+
     /// What is reaching the speaker for one participant, as opposed to what is reaching the
     /// device. See ``AudioPlayer/Playback``.
-    func playback(of who: ParticipantIdentity) async -> AudioPlayer.Playback? {
-        await players[who]?.reading()
+    ///
+    /// The reading taken on the statistics tick rather than a fresh one, because taking a
+    /// reading resets the peak: two callers asking at two intervals each see the amplitude
+    /// the other one has already cleared.
+    func playback(of who: ParticipantIdentity) -> AudioPlayer.Playback? {
+        heard[who]
     }
 
     /// Forget a playback that ended, unless it has already been replaced.
