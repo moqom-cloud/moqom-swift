@@ -124,6 +124,39 @@ public actor LoopbackRelay {
         sessions[who, default: []].append(session)
     }
 
+    /// Push a track at a participant, the way a server-initiated PUBLISH does.
+    ///
+    /// The direction the rest of this fabric does not have. Everything else
+    /// here reaches a client because the client asked — a subscription, a
+    /// prefix watch, a fetch — and a relay telling somebody they have been
+    /// force-muted is the case where there is nothing to ask.
+    ///
+    /// One object per call, each in its own group, which is what the relay does
+    /// with `.policy`: the document is absolute, so a reader that missed one is
+    /// stale rather than wrong.
+    ///
+    /// - Returns: how many of that participant's sessions were pushed to.
+    @discardableResult
+    public func push(
+        _ payload: Data,
+        on track: FullTrackName,
+        to who: ParticipantIdentity
+    ) -> Int {
+        let live = sessions[who] ?? []
+        for session in live {
+            let group = pushed[track, default: 0]
+            pushed[track] = group + 1
+            session.offer(track).yield(
+                TrackObject(group: group, object: 0, payload: payload, isKeyFrame: true)
+            )
+        }
+        return live.count
+    }
+
+    /// How many objects have been pushed on each track, which is also the next
+    /// group number.
+    private var pushed: [FullTrackName: UInt64] = [:]
+
     /// Take a participant's connection away, as the network would.
     ///
     /// Every session that identity has opened, because a reconnect leaves the

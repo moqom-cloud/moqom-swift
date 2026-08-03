@@ -623,6 +623,25 @@ import MoqomCore
             }
         }
 
+        /// Close the device and leave the stream open.
+        ///
+        /// The session is stopped and the relay is not, which is the whole
+        /// difference from ``stop()``: the green indicator goes out, the
+        /// publication above stays up, and ``resume()`` costs a session start
+        /// rather than a rejoin. Reacquisition is not free — a few hundred
+        /// milliseconds before the first frame, more if another app took the
+        /// camera meanwhile — which is why this is reserved for a mute somebody
+        /// else imposed rather than used for the mute button.
+        public func suspend() {
+            queue.async { [box] in
+                if box.session.isRunning { box.session.stopRunning() }
+            }
+        }
+
+        public func resume() {
+            start()
+        }
+
         private static func device(for position: CameraPosition) -> AVCaptureDevice? {
             switch position {
             case .front:

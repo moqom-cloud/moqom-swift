@@ -130,6 +130,11 @@ import MoqomCore
             let node = AVAudioPlayerNode()
             private weak var graph: AudioGraph?
 
+            /// Frames handed to the node since it started playing, guarded by
+            /// ``counting``.
+            private var scheduled: AVAudioFramePosition = 0
+            private let counting = NSLock()
+
             /// This listener's volume for this participant, `0` to `1`.
             public var volume: Float {
                 get { node.volume }
@@ -140,10 +145,38 @@ import MoqomCore
 
             /// Hand the device more samples.
             public func schedule(_ buffer: AVAudioPCMBuffer) {
+                counting.withLock { scheduled += AVAudioFramePosition(buffer.frameLength) }
                 node.scheduleBuffer(buffer, completionHandler: nil)
             }
 
-            public func play() { node.play() }
+            /// How much audio is waiting in front of the speaker.
+            ///
+            /// The last unmeasured stretch of the receive path, and the one that
+            /// decides lip sync. Everything upstream of it is sized against the
+            /// link: the jitter buffer holds a packet for as long as the link's
+            /// jitter says it must. This queue is sized by nothing at all — a
+            /// burst of packets is scheduled the moment it arrives and comes out
+            /// of the speaker at the device's own rate, so whatever the burst
+            /// added stays added, and the voice sits that much further behind
+            /// the picture for the rest of the call.
+            ///
+            /// Negative while the node is starved, which is worth seeing rather
+            /// than clamping: it means the device is rendering silence because
+            /// nothing arrived in time.
+            public var queued: Duration {
+                guard
+                    let render = node.lastRenderTime,
+                    let played = node.playerTime(forNodeTime: render),
+                    played.sampleRate > 0
+                else { return .zero }
+                let ahead = counting.withLock { scheduled } - played.sampleTime
+                return .seconds(Double(ahead) / played.sampleRate)
+            }
+
+            public func play() {
+                counting.withLock { scheduled = 0 }
+                node.play()
+            }
 
             /// Take this participant out of the mix.
             public func remove() {
@@ -167,6 +200,10 @@ import MoqomCore
         private var capture: Capture?
         private var sink: AVAudioSinkNode?
         private var running = false
+
+        /// What the graph was for before its microphone was suspended, and the
+        /// flag that says it was. See ``suspendMicrophone()``.
+        private var suspendedPurpose: Purpose?
         private var observers: [any NSObjectProtocol] = []
 
         public init(configuration: Configuration = Configuration()) {
@@ -226,6 +263,58 @@ import MoqomCore
             guard running else { return }
             engine.stop()
             running = false
+        }
+
+        /// Give the input device back without disturbing playback.
+        ///
+        /// The graph keeps rendering, so a participant who has been force-muted
+        /// still hears the room. What changes is the session's category: the
+        /// engine becomes a ``Purpose/listening`` one, which is the only thing
+        /// that actually puts the orange indicator out. Detaching the sink is
+        /// not enough and the difference matters — a `playAndRecord` session
+        /// holds the microphone whether or not anything is reading it, so a
+        /// mute implemented by dropping samples leaves the user looking at a
+        /// light that says otherwise.
+        ///
+        /// The microphone is not released, so the ``AudioRelay`` a publication
+        /// is reading stays valid across the whole suspension and resuming
+        /// needs no cooperation from it.
+        public func suspendMicrophone() {
+            lock.lock()
+            let purpose = configuration.purpose
+            guard suspendedPurpose == nil, purpose.capturesInput else {
+                lock.unlock()
+                return
+            }
+            suspendedPurpose = purpose
+            let format = configuration.format
+            lock.unlock()
+
+            try? reconfigure(Configuration(purpose: .listening, format: format))
+        }
+
+        /// Open the input device again, as whatever the graph was for before.
+        ///
+        /// Does nothing if the microphone was never suspended, so this is safe
+        /// to call on a lift that arrives twice.
+        public func resumeMicrophone() throws(MoqomError) {
+            lock.lock()
+            guard let purpose = suspendedPurpose else {
+                lock.unlock()
+                return
+            }
+            suspendedPurpose = nil
+            let format = configuration.format
+            lock.unlock()
+
+            try reconfigure(Configuration(purpose: purpose, format: format))
+        }
+
+        /// Whether the input device has been handed back for a mute.
+        public var isMicrophoneSuspended: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return suspendedPurpose != nil
         }
 
         /// Take the microphone, converted and packetised to `format`.
@@ -365,7 +454,15 @@ import MoqomCore
                 isCancellingEcho = false
             }
 
-            if let capture { try installLocked(capture) }
+            // Only when the session is one that records. A graph whose
+            // microphone is suspended keeps its `Capture` — the publication
+            // above is still holding its relay — and connecting the input node
+            // anyway would reopen the device this is meant to have given back.
+            if let capture, configuration.purpose.capturesInput {
+                try installLocked(capture)
+            } else {
+                uninstallLocked()
+            }
 
             do {
                 try engine.start()

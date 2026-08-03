@@ -58,6 +58,10 @@ public final class LoopbackSession: TransportSession {
     private let interruptionContinuation: AsyncStream<TransportFailure>.Continuation
     private let interrupted = OnceFlag()
 
+    private let offerStream: AsyncStream<TrackOffer>
+    private let offerContinuation: AsyncStream<TrackOffer>.Continuation
+    private let offered = Offers()
+
     init(relay: LoopbackRelay, negotiated: NegotiatedParameters) {
         self.relay = relay
         parameters = negotiated
@@ -65,6 +69,7 @@ public final class LoopbackSession: TransportSession {
             of: TransportFailure.self,
             bufferingPolicy: .bufferingNewest(1)
         )
+        (offerStream, offerContinuation) = AsyncStream.makeStream(of: TrackOffer.self)
     }
 
     public var negotiated: NegotiatedParameters {
@@ -72,6 +77,27 @@ public final class LoopbackSession: TransportSession {
     }
 
     public var interruptions: AsyncStream<TransportFailure> { interruptionStream }
+
+    public var offers: AsyncStream<TrackOffer> { offerStream }
+
+    /// Push a track at this session, the way a relay's PUBLISH does.
+    ///
+    /// Returns where to write the track's objects. Offering a track that has
+    /// already been offered reuses the stream the consumer is reading rather
+    /// than starting a second one, which is what the real session does with a
+    /// second PUBLISH for the same name — a participant muted twice must not
+    /// have to notice that they were.
+    @discardableResult
+    public func offer(_ track: FullTrackName) -> AsyncStream<TrackObject>.Continuation {
+        if let existing = offered.continuation(for: track) { return existing }
+        let (stream, continuation) = AsyncStream.makeStream(
+            of: TrackObject.self,
+            bufferingPolicy: .unbounded
+        )
+        offered.set(continuation, for: track)
+        offerContinuation.yield(TrackOffer(track: track, objects: stream))
+        return continuation
+    }
 
     /// Drop this session as if the network had gone away.
     ///
@@ -188,7 +214,35 @@ public final class LoopbackSession: TransportSession {
         // Finished without yielding, so a deliberate close is never mistaken for
         // a drop and never provokes a reconnect.
         if interrupted.claim() { interruptionContinuation.finish() }
+        offered.finishAll()
+        offerContinuation.finish()
         await relay.close(code: code)
+    }
+}
+
+/// The tracks a session has been offered, by name.
+private final class Offers: @unchecked Sendable {
+    private let lock = NSLock()
+    private var streams: [FullTrackName: AsyncStream<TrackObject>.Continuation] = [:]
+
+    func continuation(for track: FullTrackName) -> AsyncStream<TrackObject>.Continuation? {
+        lock.lock()
+        defer { lock.unlock() }
+        return streams[track]
+    }
+
+    func set(_ continuation: AsyncStream<TrackObject>.Continuation, for track: FullTrackName) {
+        lock.lock()
+        defer { lock.unlock() }
+        streams[track] = continuation
+    }
+
+    func finishAll() {
+        lock.lock()
+        let all = streams.values
+        streams.removeAll()
+        lock.unlock()
+        for continuation in all { continuation.finish() }
     }
 }
 

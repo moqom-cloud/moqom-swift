@@ -582,7 +582,7 @@ final class AppModel {
                         Journal.shared.say(
                             String(
                                 format: "  SPKR %@ buffers=%d silent=%d peak=%.3f"
-                                    + " decoded=%d failed=%d gaps=%d silences=%d",
+                                    + " decoded=%d failed=%d gaps=%d silences=%d queued=%.0fms",
                                 String(describing: who.username),
                                 played.buffers,
                                 played.silent,
@@ -590,7 +590,8 @@ final class AppModel {
                                 played.decoding.packets,
                                 played.decoding.failures,
                                 played.decoding.gaps,
-                                played.decoding.silences
+                                played.decoding.silences,
+                                played.queued.seconds * 1000
                             )
                         )
                     }

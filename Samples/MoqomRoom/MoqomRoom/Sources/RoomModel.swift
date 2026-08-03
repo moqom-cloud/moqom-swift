@@ -378,6 +378,20 @@ final class RoomModel {
 
     private(set) var selfMuted: MediaKind = []
 
+    /// What a moderator is holding down on this device.
+    ///
+    /// The camera and microphone are closed while this is non-empty — the
+    /// hardware, not just the encoders — so the indicators are out and the
+    /// interface has to say why, or the user is looking at a dead preview with
+    /// no explanation.
+    private(set) var forceMuted: MediaKind = []
+
+    /// What the moderator has let go of and this device has not turned back on.
+    ///
+    /// The unmute is the user's and only the user's, so this is the cue to
+    /// offer it rather than a state to clear automatically.
+    private(set) var resumableAfterForceMute: MediaKind = []
+
     /// What each participant says they are publishing.
     private(set) var catalogs: [ParticipantIdentity: Catalog] = [:]
 
@@ -795,6 +809,13 @@ final class RoomModel {
             // on its own stream; this arrives so an app that wants to draw a
             // "2 in the small window" hint has somewhere to notice it.
             break
+        case let .captureRestricted(held, resumable):
+            forceMuted = held
+            resumableAfterForceMute = resumable
+            Journal.shared.say(
+                "MUTE held=\(held.rawValue) resumable=\(resumable.rawValue)"
+            )
+            await refresh()
         case .participantJoined, .presenceChanged,
              .muteChanged, .grantsChanged, .spotlightChanged:
             await refresh()
@@ -1382,6 +1403,17 @@ final class RoomModel {
     private func setSelfMuted(_ kinds: MediaKind) async {
         await room.setSelfMuted(kinds)
         selfMuted = await room.selfMuted
+    }
+
+    /// Turn the hardware back on after a moderator let go of it.
+    ///
+    /// The button this sits behind is the only thing in the app that can do it.
+    /// A lift arriving from the relay deliberately does nothing on its own, so
+    /// nobody's camera comes back on while they are looking away from the phone.
+    func resumeAfterForceMute() async {
+        _ = await room.resumeAfterForceMute()
+        resumableAfterForceMute = await room.resumableAfterForceMute
+        forceMuted = await room.forceMuted
     }
 
     /// Whether the last thing anybody said about audio was to turn it off.

@@ -70,6 +70,21 @@ public actor RoomSession {
     /// their own microphone has not changed and must not be quietly discarded.
     private var ownMute: MediaKind = []
 
+    /// What the relay is holding down on this device, as it last said.
+    ///
+    /// Separate from ``ownMute`` because the two are lifted by different
+    /// people, and separate from the roster entry for the same reason it is:
+    /// this arrives on a track of its own and must survive the roster being
+    /// rebuilt by a reconnect.
+    private var enforced = ParticipantPolicy()
+
+    /// Kinds the relay has stopped enforcing that this device has not turned
+    /// back on. See ``resumeAfterForceMute(_:)``.
+    private var freed: MediaKind = []
+
+    /// Reads the `.policy` track the relay pushes at this session.
+    private var policyTask: Task<Void, Never>?
+
     private var videoTaps: [ParticipantIdentity: [ReceiveVideoPipe]] = [:]
     private var audioTaps: [ParticipantIdentity: [ReceiveAudioPipe]] = [:]
 
@@ -360,6 +375,7 @@ public actor RoomSession {
     /// Start watching the room prefix.
     func begin() async {
         watchControl()
+        watchPolicy()
         guard rosterTask == nil else { return }
         let stream: AsyncStream<AnnouncementEvent>
         do {
@@ -431,6 +447,14 @@ public actor RoomSession {
         controlRepair = nil
         repairedAt = nil
         log = RoomLog(policy: log.policy)
+
+        // The offers belonged to the dead session; what they said does not go
+        // with them. `enforced` is the relay's decision about this participant
+        // and the control plane is holding it, so the next relay re-states it
+        // from the snapshot it loads — and keeping it in the meantime is what
+        // stops a reconnect from being a way to unmute yourself.
+        policyTask?.cancel()
+        policyTask = nil
         waiting.removeAll()
 
         for task in replayTasks.values { task.cancel() }
@@ -872,6 +896,15 @@ public actor RoomSession {
         )
         broadcast = live
 
+        // A camera started while its owner is force-muted comes up closed.
+        // Somebody muted before they went live and then pressing the camera
+        // button is the ordinary case, not an exotic one, and a publication
+        // that ignored the standing restriction would light the indicator for
+        // media the relay is not carrying.
+        if enforced.mutedForEveryone.union(freed).contains(.video) {
+            await live.setCaptureRestricted(true)
+        }
+
         // Published before the first frame. A viewer that receives media for a
         // track the catalog does not mention cannot build a decoder for it, and
         // the failure looks like a codec problem rather than an ordering one.
@@ -1052,6 +1085,9 @@ public actor RoomSession {
             writer: writer
         )
         audio = publication
+        if enforced.mutedForEveryone.union(freed).contains(.audio) {
+            await publication.setCaptureRestricted(true)
+        }
         await publication.start()
 
         // The catalog, not just a refresh of one. An audio-only participant has
@@ -1761,6 +1797,150 @@ public actor RoomSession {
 
     private func holdControl(_ subscription: any SubscriptionHandle) {
         controlSubscription = subscription
+    }
+
+    // MARK: - What the relay will not carry
+
+    /// Follow the `.policy` track the relay pushes at this session.
+    ///
+    /// Nothing is subscribed to. A subscription is a request, and a participant
+    /// being force-muted is by definition somebody who has not asked — the
+    /// relay offers the track with a server-initiated PUBLISH, which is the one
+    /// direction that reaches a client with nothing on its mind.
+    ///
+    /// Every offer is read rather than only the first. A second mute is a
+    /// second PUBLISH, and a session that stopped after one would enforce the
+    /// first restriction it was given for as long as it lasted.
+    private func watchPolicy() {
+        guard policyTask == nil else { return }
+        let offers = connection.offers
+
+        policyTask = Task { [weak self] in
+            await withTaskGroup(of: Void.self) { group in
+                for await offer in offers {
+                    guard offer.track.name.value == ParticipantPolicy.trackName else { continue }
+                    group.addTask { [weak self] in
+                        for await object in offer.objects {
+                            await self?.receivePolicy(object)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func receivePolicy(_ object: TrackObject) async {
+        guard let policy = try? ParticipantPolicy.decode(object.payload) else {
+            logger.warning(
+                .control,
+                "undecodable policy object",
+                [LogField("payload", .redacted(bytes: object.payload.count))]
+            )
+            return
+        }
+        // A version this build does not understand is not an empty policy. The
+        // relay is enforcing something either way, and reading a newer document
+        // as "nothing is muted" would put the camera back on while the room
+        // still cannot see it.
+        guard policy.version == 1 else {
+            logger.warning(.control, "unreadable policy version", [
+                LogField("version", .number(policy.version)),
+            ])
+            return
+        }
+        await apply(policy)
+    }
+
+    /// Make this device's hardware agree with what the relay is enforcing.
+    private func apply(_ policy: ParticipantPolicy) async {
+        let was = enforced
+        enforced = policy
+
+        // Only the everyone-scope closes a device. An audience mute is still
+        // being watched by the hosts, so stopping the camera for it would take
+        // the participant off the screens of the people who muted them from
+        // everyone else's.
+        let held = policy.mutedForEveryone
+        let lifted = was.mutedForEveryone.subtracting(held)
+
+        // Held on to rather than acted on. A mute the relay has stopped
+        // enforcing is permission to unmute, and turning a camera back on
+        // because somebody else stopped objecting is exactly the surprise this
+        // whole path exists to avoid — the device that was closed is opened by
+        // the person sitting in front of it. See ``resumeAfterForceMute(_:)``.
+        freed.formUnion(lifted)
+        freed.subtract(held)
+
+        if was.mutedForEveryone != held {
+            // Everything the relay is holding down, and everything it has let
+            // go of that this device has not been asked to reopen. A lift
+            // therefore changes nothing about the hardware, which is the point.
+            await restrictCapture(held.union(freed))
+            logger.info(.media, "force mute changed", [
+                LogField("audio", .flag(held.contains(.audio))),
+                LogField("video", .flag(held.contains(.video))),
+                LogField("resumable", .flag(!freed.isEmpty)),
+            ])
+        }
+
+        if var participant = state.roster[identity] {
+            participant.mute.forcedForEveryone = held
+            participant.mute.forcedForAudience = policy.mutedForAudience
+            state.roster[identity] = participant
+            eventContinuation.yield(.muteChanged(identity, participant.mute))
+        }
+        eventContinuation.yield(.captureRestricted(held: held, resumable: freed))
+    }
+
+    /// Close or open this device's capture to match `closed`.
+    private func restrictCapture(_ closed: MediaKind) async {
+        await broadcast?.setCaptureRestricted(closed.contains(.video))
+        await audio?.setCaptureRestricted(closed.contains(.audio))
+
+        // Told to the room after the hardware, so a catalog claiming silence is
+        // never published while packets are still in flight behind it.
+        _ = await refreshCatalog()
+    }
+
+    /// What a moderator is holding down on this device right now.
+    public var forceMuted: MediaKind { enforced.mutedForEveryone }
+
+    /// What this device may turn back on, having been force-muted and released.
+    ///
+    /// Empty in the ordinary case. Non-empty means the relay would now carry
+    /// this participant's media and their hardware is still off, which is a
+    /// state an interface has to surface — otherwise a released participant
+    /// sits in silence waiting for a camera nobody is going to start.
+    public var resumableAfterForceMute: MediaKind { freed }
+
+    /// Turn the camera or microphone back on after a force-mute was lifted.
+    ///
+    /// The only way capture comes back, and deliberately the only way. A lift
+    /// arrives from the relay and a resume comes from the person: a server that
+    /// could reopen a device would be a server that can open a device, which is
+    /// a different feature and one nobody should ship by accident.
+    ///
+    /// Kinds still being enforced are ignored rather than refused. The relay is
+    /// not carrying them, so opening the hardware would light an indicator for
+    /// media that goes nowhere.
+    @discardableResult
+    public func resumeAfterForceMute(_ kinds: MediaKind = .all) async -> MediaKind {
+        let resuming = freed.intersection(kinds).subtracting(enforced.mutedForEveryone)
+        guard !resuming.isEmpty else { return [] }
+        freed.subtract(resuming)
+
+        if resuming.contains(.video) { await broadcast?.setCaptureRestricted(false) }
+        if resuming.contains(.audio) { await audio?.setCaptureRestricted(false) }
+        _ = await refreshCatalog()
+
+        logger.info(.media, "capture resumed after a force mute", [
+            LogField("audio", .flag(resuming.contains(.audio))),
+            LogField("video", .flag(resuming.contains(.video))),
+        ])
+        eventContinuation.yield(
+            .captureRestricted(held: enforced.mutedForEveryone, resumable: freed)
+        )
+        return resuming
     }
 
     private func receiveControl(_ object: TrackObject) async {

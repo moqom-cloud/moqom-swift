@@ -105,6 +105,15 @@ import MoqomCore
             /// Loudest sample scheduled recently, `0` to `1`.
             public var peak: Float = 0
 
+            /// Audio handed to the device and not yet heard. See
+            /// ``AudioGraph/Voice/queued``.
+            ///
+            /// Part of this participant's mouth-to-ear delay and, until it was
+            /// measured, the part nobody could see: a jitter buffer reporting a
+            /// twenty millisecond target while a fifth of a second sat in front
+            /// of the speaker describes a link that sounds nothing like it.
+            public var queued: Duration = .zero
+
             /// What the decoder made of the packets. See ``PlatformAudioDecoder/Decoding``.
             public var decoding = PlatformAudioDecoder.Decoding()
         }
@@ -112,6 +121,7 @@ import MoqomCore
         public func reading() async -> Playback {
             var reading = playback
             reading.decoding = await decoder.decoding
+            reading.queued = voice.queued
             playback.peak = 0
             return reading
         }

@@ -105,6 +105,20 @@ public actor MoqtSession: TransportSession {
 
     public nonisolated var interruptions: AsyncStream<TransportFailure> { interruptionStream }
 
+    private let offerStream: AsyncStream<TrackOffer>
+    private let offerContinuation: AsyncStream<TrackOffer>.Continuation
+
+    public nonisolated var offers: AsyncStream<TrackOffer> { offerStream }
+
+    /// Objects for a track the peer pushed, by the track it pushed.
+    ///
+    /// Keyed by name rather than by alias because a peer re-offers a track it
+    /// has already offered — a second mute is a second PUBLISH — and each offer
+    /// brings a new alias. Handing the consumer a second stream for the same
+    /// track would make it choose between abandoning the first (and missing
+    /// whatever is still in flight on it) and reading both (and racing them).
+    private var offered: [FullTrackName: Offer] = [:]
+
     init(carrier: any QUICCarrier, role: SessionRole) {
         self.carrier = carrier
         self.role = role
@@ -122,6 +136,7 @@ public actor MoqtSession: TransportSession {
             of: TransportFailure.self,
             bufferingPolicy: .bufferingNewest(1)
         )
+        (offerStream, offerContinuation) = AsyncStream.makeStream(of: TrackOffer.self)
     }
 
     /// Report that the session has ended on its own, once.
@@ -523,6 +538,10 @@ public actor MoqtSession: TransportSession {
                     var reader = WireReader(frame.body)
                     guard let request = try? SubscribeNamespace.read(from: &reader) else { break }
                     await acceptNamespaceWatch(request, on: stream)
+                case .publish:
+                    var reader = WireReader(frame.body)
+                    guard let offer = try? Publish.read(from: &reader) else { break }
+                    accept(offer)
                 case .publishNamespace:
                     // Nothing for a client to do with a peer's announcement
                     // beyond acknowledging it: the roster is built from the
@@ -537,6 +556,37 @@ public actor MoqtSession: TransportSession {
         if let subscribedTrack {
             await outboundTracks[subscribedTrack]?.removeSubscriber(stream: stream)
         }
+    }
+
+    /// Take delivery of a track the peer decided we should have.
+    ///
+    /// Nothing is sent back. Draft-19 lets objects flow before a PUBLISH is
+    /// accepted, and MOQOM's relay drops its end of the request stream as soon
+    /// as it has written the offer, so a PUBLISH_OK would arrive at a stream
+    /// that is already gone. Refusing an offer is resetting it, which a client
+    /// that has stopped reading gets for free.
+    private func accept(_ offer: Publish) {
+        if let existing = offered[offer.track] {
+            // Rebind the name onto the new alias, keeping the stream the
+            // consumer is already reading. Deliberately not `unregister`: that
+            // finishes the continuation, and this is the same track arriving
+            // again rather than a track going away.
+            inboundTracks.removeValue(forKey: existing.alias)
+            pendingAliases.removeValue(forKey: existing.alias)
+            offered[offer.track] = Offer(alias: offer.trackAlias, continuation: existing.continuation)
+            register(existing.continuation, for: offer.trackAlias)
+            return
+        }
+
+        let (stream, continuation) = AsyncStream.makeStream(of: TrackObject.self)
+        offered[offer.track] = Offer(alias: offer.trackAlias, continuation: continuation)
+        register(continuation, for: offer.trackAlias)
+        offerContinuation.yield(TrackOffer(track: offer.track, objects: stream))
+    }
+
+    private struct Offer {
+        let alias: UInt64
+        let continuation: AsyncStream<TrackObject>.Continuation
     }
 
     private func answerSubscribe(_ request: Subscribe, on stream: any QUICStream) async {
@@ -1224,6 +1274,8 @@ public actor MoqtSession: TransportSession {
         readers.removeAll()
         for continuation in inboundTracks.values { continuation.finish() }
         inboundTracks.removeAll()
+        offered.removeAll()
+        offerContinuation.finish()
         goawayContinuation?.finish()
         // Finished without yielding: this teardown was asked for, and reporting
         // it as an interruption would have the session above reconnect to a

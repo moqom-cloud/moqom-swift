@@ -270,6 +270,14 @@ public actor Broadcast {
     /// Whether ``setMuted(_:)`` is currently holding frames back.
     public private(set) var isMuted = false
 
+    /// Whether the camera has been closed by somebody other than its owner.
+    ///
+    /// Kept apart from ``isMuted`` because the two are lifted by different
+    /// people. Folding a moderator's mute into the participant's own would mean
+    /// a lift turning a camera back on that its owner had switched off, and the
+    /// person it surprises is the one who was already being moderated.
+    public private(set) var isRestricted = false
+
     /// Set while unmuting, and cleared by the frame that carries the keyframe.
     private var resumesWithKeyFrame = false
 
@@ -435,8 +443,8 @@ public actor Broadcast {
     public func setMuted(_ muted: Bool) async {
         guard muted != isMuted else { return }
         isMuted = muted
-        statistics.isMuted = muted
-        guard !muted else { return }
+        statistics.isMuted = muted || isRestricted
+        guard !muted, !isRestricted else { return }
 
 
         // Coming back is not simply the opposite of going away. Subscribers
@@ -445,6 +453,31 @@ public actor Broadcast {
         // continuation would be missing its keyframe, and one already watching
         // would be handed frames referencing pictures that were never sent.
         // Same reasoning as a reconnect, and the same remedy.
+        await startNewGroup()
+        resumesWithKeyFrame = true
+    }
+
+    /// Close the camera, or open it again, without taking the publication down.
+    ///
+    /// The stronger form of ``setMuted(_:)`` and the one a force-mute uses: the
+    /// frames stop because the device is shut, so the claim the user reads off
+    /// the indicator and the claim the relay is making finally agree. Everything
+    /// else stands — announcement, tracks, subscribers — so this is still not
+    /// ``stop()``.
+    ///
+    /// Restoring costs whatever the camera takes to warm up, and the first
+    /// frame after it is a keyframe.
+    public func setCaptureRestricted(_ restricted: Bool) async {
+        guard restricted != isRestricted else { return }
+        isRestricted = restricted
+        statistics.isMuted = restricted || isMuted
+
+        guard !restricted else {
+            source.suspend()
+            return
+        }
+        source.resume()
+        guard !isMuted else { return }
         await startNewGroup()
         resumesWithKeyFrame = true
     }
@@ -496,7 +529,7 @@ public actor Broadcast {
         // show a source still producing into a publication that is not sending.
         // Reporting them as never submitted would make a muted broadcast look
         // like a dead camera.
-        guard !isMuted else {
+        guard !isMuted, !isRestricted else {
             statistics.framesMuted += 1
             return
         }

@@ -105,6 +105,10 @@ public actor AudioPublication {
     /// Whether ``setMuted(_:)`` is currently holding samples back.
     public private(set) var isMuted = false
 
+    /// Whether the microphone has been closed by somebody other than its owner.
+    /// See ``Broadcast/isRestricted`` for why this is not the same flag.
+    public private(set) var isRestricted = false
+
     /// Position within the current group.
     private var packetInGroup = 0
 
@@ -236,6 +240,27 @@ public actor AudioPublication {
         if muted { statistics.isSpeaking = false }
     }
 
+    /// Give the microphone back, or take it again, without ending the
+    /// publication.
+    ///
+    /// What ``setMuted(_:)`` deliberately does not do, for the case where the
+    /// participant is not the one deciding. The input device is released
+    /// through ``AudioGraph/suspendMicrophone()``, so the indicator goes out
+    /// and the room stays audible; echo cancellation reconverges when the
+    /// microphone comes back, which is a cost worth paying for a moderator's
+    /// mute and not for a mute button.
+    public func setCaptureRestricted(_ restricted: Bool) async {
+        guard restricted != isRestricted else { return }
+        isRestricted = restricted
+        statistics.isMuted = restricted || isMuted
+        if restricted {
+            statistics.isSpeaking = false
+            source.suspend()
+        } else {
+            source.resume()
+        }
+    }
+
     public func stop() async {
         capture?.cancel()
         capture = nil
@@ -264,7 +289,7 @@ public actor AudioPublication {
         // After the taps, so a transcriber keeps working while the user is
         // muted, and before the encoder, so nothing is compressed that cannot
         // be sent. Not counted as a drop: see ``AudioPublicationStatistics``.
-        guard !isMuted else {
+        guard !isMuted, !isRestricted else {
             statistics.framesMuted += 1
             return
         }

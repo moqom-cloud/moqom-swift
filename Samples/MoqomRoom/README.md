@@ -97,6 +97,20 @@ still open — the SDK is explicit that this stops the bytes rather than releasi
 the camera, and an app that wants the stronger claim has to stop the device and
 pay the reacquisition latency.
 
+**A moderator's mute is the other case, and it does put the light out.** It
+arrives from the relay on the participant's own `.policy` track, and the SDK
+closes the capture device rather than only the encoder — `AVCaptureSession`
+stopped, `AVAudioSession` dropped to a listening category, indicator off. The
+banner at the top of the screen says who did it, and the mute button for that
+kind is disabled, because pressing it would do nothing the relay has not already
+done.
+
+Lifting it does not turn anything back on. The relay saying it would carry the
+media again is permission, and the **Resume** button on that banner is the only
+thing in the app that acts on it — `RoomSession.resumeAfterForceMute(_:)`. A
+server that could reopen a camera is a server that can open a camera, and the
+difference is the whole reason the unmute lives on the device.
+
 ## The two layouts
 
 **Room → Layout** switches between them, and **Room → Tiles** changes the box

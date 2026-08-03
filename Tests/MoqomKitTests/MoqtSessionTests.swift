@@ -278,6 +278,135 @@ struct MoqtSessionTests {
         reader.cancel()
         await publisher.close(code: 0, reason: "done")
     }
+
+    /// A PUBLISH the peer sends unasked, which is how a relay reaches a session
+    /// that has subscribed to nothing — a participant being force-muted, above
+    /// all. Written onto the carrier by hand because there is deliberately no
+    /// client API for offering a track: this end only ever receives one.
+    @Test("a track the peer pushes arrives as an offer, objects and all")
+    func serverInitiatedPublish() async throws {
+        let (clientCarrier, serverCarrier) = MemoryCarrier.pair()
+        async let accepting = MoqtSession.accept(over: serverCarrier)
+        async let dialling = MoqtSession.connect(
+            over: clientCarrier,
+            credentials: credentials("alice")
+        )
+        let (server, client) = try await (accepting, dialling)
+
+        let policy = try track(".policy")
+        let alias: UInt64 = 9
+
+        let offered = Collector<TrackOffer>()
+        let watching = Task {
+            for await offer in client.offers { await offered.append(offer) }
+        }
+
+        let request = try await serverCarrier.openBidirectionalStream()
+        var control = WireWriter(capacity: 128)
+        try ControlFrame.write(
+            Publish(requestID: 1, track: policy, trackAlias: alias),
+            to: &control
+        )
+        try await request.write(control.bytes)
+
+        #expect(await eventually { await offered.items.count == 1 })
+        let offer = try #require(await offered.items.first)
+        #expect(offer.track == policy)
+
+        // The objects follow on a unidirectional stream naming the alias the
+        // offer chose, which is the half a client cannot infer: nothing it sent
+        // ever mentioned this track.
+        var body = WireWriter(capacity: 64)
+        let header = SubgroupHeader(trackAlias: alias, group: 0, priority: 128)
+        header.write(to: &body)
+        var subgroup = SubgroupWriter(header: header)
+        try subgroup.write(
+            SubgroupObject(object: 0, content: .payload(Data("muted".utf8))),
+            to: &body
+        )
+        let data = try await serverCarrier.openUnidirectionalStream()
+        try await data.write(body.bytes)
+
+        let received = Collector<TrackObject>()
+        let reading = Task {
+            for await object in offer.objects { await received.append(object) }
+        }
+        #expect(await eventually { await received.items.count == 1 })
+        #expect(
+            await received.items.first.map { String(decoding: $0.payload, as: UTF8.self) }
+                == "muted"
+        )
+
+        watching.cancel()
+        reading.cancel()
+        await client.close(code: 0, reason: "done")
+        await server.close(code: 0, reason: "done")
+    }
+
+    /// A second offer for the same track — a second mute — continues the stream
+    /// the consumer is already reading. Handing out a second one would leave a
+    /// client choosing between abandoning the first and racing both.
+    @Test("re-offering a track keeps the stream the consumer already has")
+    func reofferingReusesTheStream() async throws {
+        let (clientCarrier, serverCarrier) = MemoryCarrier.pair()
+        async let accepting = MoqtSession.accept(over: serverCarrier)
+        async let dialling = MoqtSession.connect(
+            over: clientCarrier,
+            credentials: credentials("alice")
+        )
+        let (server, client) = try await (accepting, dialling)
+
+        let policy = try track(".policy")
+        let offered = Collector<TrackOffer>()
+        let watching = Task {
+            for await offer in client.offers { await offered.append(offer) }
+        }
+
+        let received = Collector<TrackObject>()
+        var reading: Task<Void, Never>?
+
+        for (index, alias) in [UInt64(4), UInt64(5)].enumerated() {
+            let request = try await serverCarrier.openBidirectionalStream()
+            var control = WireWriter(capacity: 128)
+            try ControlFrame.write(
+                Publish(requestID: UInt64(index) + 1, track: policy, trackAlias: alias),
+                to: &control
+            )
+            try await request.write(control.bytes)
+
+            if index == 0 {
+                #expect(await eventually { await offered.items.count == 1 })
+                let offer = try #require(await offered.items.first)
+                reading = Task {
+                    for await object in offer.objects { await received.append(object) }
+                }
+            }
+
+            var body = WireWriter(capacity: 64)
+            let header = SubgroupHeader(trackAlias: alias, group: UInt64(index), priority: 128)
+            header.write(to: &body)
+            var subgroup = SubgroupWriter(header: header)
+            try subgroup.write(
+                SubgroupObject(object: 0, content: .payload(Data("policy-\(index)".utf8))),
+                to: &body
+            )
+            let data = try await serverCarrier.openUnidirectionalStream()
+            try await data.write(body.bytes)
+
+            #expect(await eventually { await received.items.count == index + 1 })
+        }
+
+        #expect(await offered.items.count == 1, "a re-offer started a second stream")
+        #expect(
+            await received.items.map { String(decoding: $0.payload, as: UTF8.self) }
+                == ["policy-0", "policy-1"]
+        )
+
+        watching.cancel()
+        reading?.cancel()
+        await client.close(code: 0, reason: "done")
+        await server.close(code: 0, reason: "done")
+    }
 }
 
 /// Somewhere for a reading task to put what it received.

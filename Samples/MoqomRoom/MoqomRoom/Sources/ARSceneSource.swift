@@ -184,6 +184,22 @@
             view.session.pause()
         }
 
+        /// Pause the AR session, which is what holds the camera.
+        ///
+        /// An AR scene is a camera however it is dressed up, so a moderator's
+        /// mute has to reach the session and not only the frames coming out of
+        /// it. Pausing keeps the scene and its anchors, so resuming is the
+        /// session relocalising rather than the room being rebuilt.
+        func suspend() {
+            guard lock.withLock({ isRunning }) else { return }
+            Task { @MainActor [weak self] in self?.view.session.pause() }
+        }
+
+        func resume() {
+            guard lock.withLock({ isRunning }) else { return }
+            Task { @MainActor [weak self] in try? self?.configureSession(resetting: false) }
+        }
+
         func frames() -> AsyncStream<VideoFrame> { relay.frames() }
 
         // MARK: - The render callback
@@ -476,15 +492,20 @@
 
         /// The user-facing camera, so the orb floats in the scene with whoever is on the
         /// call rather than behind them.
+        /// - Parameter resetting: Whether to start the world over. True when the
+        ///   scene is being built; false when the session is only coming back
+        ///   from a mute, where resetting would take the shared bubbles with it.
         @MainActor
-        private func configureSession() throws {
+        private func configureSession(resetting: Bool = true) throws {
+            let options: ARSession.RunOptions =
+                resetting ? [.resetTracking, .removeExistingAnchors] : []
             if ARFaceTrackingConfiguration.isSupported {
                 let configuration = ARFaceTrackingConfiguration()
                 configuration.isWorldTrackingEnabled = false
-                view.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
+                view.session.run(configuration, options: options)
             } else if ARWorldTrackingConfiguration.isSupported {
                 let configuration = ARWorldTrackingConfiguration()
-                view.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
+                view.session.run(configuration, options: options)
             } else {
                 throw ARSceneError.unsupported
             }

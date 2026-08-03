@@ -79,6 +79,11 @@ struct RoomScreen: View {
                     .padding(.horizontal)
             }
 
+            if !room.forceMuted.isEmpty || !room.resumableAfterForceMute.isEmpty {
+                ForceMuteBanner(room: room)
+                    .padding(.horizontal)
+            }
+
             if room.participants.isEmpty {
                 ContentUnavailableView(
                     "Nobody on stage",
@@ -301,6 +306,69 @@ struct WatchdogBanner: View {
         case .tenant: "Operated by this room's host"
         case let .thirdParty(name): "Operated by \(name)"
         }
+    }
+}
+
+/// What a moderator has stopped on this device, and the way back.
+///
+/// Worth a banner rather than a badge on the mute button, because the state is
+/// not the one that button describes. The camera is closed and the indicator is
+/// out, the mute control did not do it, and pressing that control will not undo
+/// it — which is a confusing minute for anybody not told what happened.
+///
+/// The resume is a button and never automatic. A lift means the relay would
+/// carry this participant's media again; whether the camera opens is the
+/// participant's to decide, and doing it for them is how somebody ends up
+/// broadcasting a room they had walked away from.
+struct ForceMuteBanner: View {
+    @Bindable var room: RoomModel
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline) {
+            Label {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(headline).font(.subheadline.weight(.medium))
+                    Text(detail).font(.caption).foregroundStyle(.secondary)
+                }
+            } icon: {
+                Image(systemName: room.forceMuted.isEmpty ? "hand.raised.slash" : "hand.raised.fill")
+            }
+
+            Spacer()
+
+            if !room.resumableAfterForceMute.isEmpty {
+                Button("Resume") {
+                    Task { await room.resumeAfterForceMute() }
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding()
+        .background(
+            (room.forceMuted.isEmpty ? Color.green : Color.orange).opacity(0.14),
+            in: RoundedRectangle(cornerRadius: 12)
+        )
+    }
+
+    private var headline: String {
+        room.forceMuted.isEmpty
+            ? "A host has unmuted you"
+            : "A host muted your \(describe(room.forceMuted))"
+    }
+
+    private var detail: String {
+        room.forceMuted.isEmpty
+            ? "Your \(describe(room.resumableAfterForceMute)) stays off until you turn it back on."
+            : "The hardware is off, so nothing is being captured."
+    }
+
+    private func describe(_ kinds: MediaKind) -> String {
+        var named: [String] = []
+        if kinds.contains(.audio) { named.append("microphone") }
+        if kinds.contains(.video) { named.append("camera") }
+        if kinds.contains(.screenShare) { named.append("screen share") }
+        return named.isEmpty ? "media" : named.formatted(.list(type: .and))
     }
 }
 
@@ -654,7 +722,12 @@ struct BroadcastControls: View {
                     }
                     .buttonStyle(.bordered)
                     .tint(room.isMicrophoneMuted ? .red : nil)
-                    .disabled(!room.isPublishingAudio)
+                    // Disabled under a moderator's mute rather than left to do
+                    // nothing. Nothing is what it would do — the relay is not
+                    // carrying the track either way — and a control that
+                    // silently fails is worse than one that is plainly out of
+                    // reach. The banner above says who took it away.
+                    .disabled(!room.isPublishingAudio || room.forceMuted.contains(.audio))
                     .controlCapsule()
 
                     Button {
@@ -667,7 +740,7 @@ struct BroadcastControls: View {
                     }
                     .buttonStyle(.bordered)
                     .tint(room.isCameraMuted ? .red : nil)
-                    .disabled(!room.isBroadcasting)
+                    .disabled(!room.isBroadcasting || room.forceMuted.contains(.video))
                     .controlCapsule()
 
                     // Live, unlike the input pickers below. Switching cameras does

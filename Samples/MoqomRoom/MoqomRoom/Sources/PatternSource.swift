@@ -30,6 +30,9 @@ final class PatternSource: FrameSource, @unchecked Sendable {
     private let pool: CVPixelBufferPool?
     private var task: Task<Void, Never>?
 
+    /// Whether ``stop()`` has been called, so a resume after it stays stopped.
+    private var stopped = false
+
     /// A second copy of every frame, for the local preview.
     ///
     /// A tee rather than a second consumer of `frames()`: a `FrameSource`
@@ -69,10 +72,24 @@ final class PatternSource: FrameSource, @unchecked Sendable {
     }
 
     func stop() {
+        stopped = true
         task?.cancel()
         task = nil
         relay.stop()
         previewContinuation.finish()
+    }
+
+    /// Stop drawing. There is no camera here and so no light to put out, but a
+    /// muted source that keeps rendering is a phone warming itself up for
+    /// frames nobody will receive.
+    func suspend() {
+        task?.cancel()
+        task = nil
+    }
+
+    func resume() {
+        guard !stopped else { return }
+        start()
     }
 
     private func start() {

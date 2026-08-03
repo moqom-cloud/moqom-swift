@@ -79,6 +79,20 @@ import MoqomCore
             graph.releaseMicrophone()
         }
 
+        /// Hand the input device back, keeping this source usable.
+        ///
+        /// Done on the graph whether or not this source started it. Ownership
+        /// decides who runs the lifecycle, and this is not the lifecycle: it is
+        /// a mute that has to be visible on the hardware, and a caller holding
+        /// its own graph wants the light out just as much.
+        public func suspend() {
+            graph.suspendMicrophone()
+        }
+
+        public func resume() {
+            try? graph.resumeMicrophone()
+        }
+
         /// What the microphone is hearing, for a level meter.
         public var meter: AudioMeter { graph.meter }
 

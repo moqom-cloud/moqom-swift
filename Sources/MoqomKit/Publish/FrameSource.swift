@@ -44,6 +44,31 @@ public protocol FrameSource: Sendable {
 
     /// Stop producing. Idempotent.
     func stop()
+
+    /// Let go of the capture hardware without ending the stream.
+    ///
+    /// The difference from ``stop()`` is what can follow it. Stopping is final
+    /// — the stream finishes and the publication above it has to be rebuilt —
+    /// whereas this leaves everything standing and produces no frames, so
+    /// ``resume()`` is a camera warming up rather than a rejoin.
+    ///
+    /// What it is for is the indicator. A force-muted participant is entitled
+    /// to see the light go out, and no amount of dropping frames further down
+    /// achieves that: the light reports the device being open, which is a
+    /// claim only the source can make.
+    func suspend()
+
+    /// Open the hardware again. Idempotent, and does nothing after ``stop()``.
+    ///
+    /// > Important: There is deliberately no default implementation of these
+    /// > two, although most sources have no hardware and want an empty one.
+    /// > A default is inherited by a source that wraps another — a decorator
+    /// > that measures frames, say — and a wrapper which forwards everything
+    /// > else while silently swallowing this one leaves the camera open under
+    /// > a moderator's mute, with every counter above it reporting the mute as
+    /// > applied. That happened, on a phone, with the light on: the relay had
+    /// > stopped carrying the video and the sensor was still running.
+    func resume()
 }
 
 /// A source someone else pushes into.
@@ -85,6 +110,15 @@ public final class FrameRelay: FrameSource, Sendable {
     public func stop() {
         continuation.finish()
     }
+
+    /// Nothing to release: whoever is pushing owns whatever is producing.
+    ///
+    /// A renderer that keeps drawing keeps submitting, and those frames are
+    /// dropped above rather than here — the publication is what knows it is
+    /// muted. If the thing behind the renderer is a camera, pausing it is the
+    /// app's to do, and only the app can.
+    public func suspend() {}
+    public func resume() {}
 }
 
 /// A source that produces nothing, for a publication that is authorised but not
@@ -105,4 +139,8 @@ public struct IdleFrameSource: FrameSource {
     }
 
     public func stop() {}
+
+    /// Produces nothing already, so there is nothing to hold or hand back.
+    public func suspend() {}
+    public func resume() {}
 }

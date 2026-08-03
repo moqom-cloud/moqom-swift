@@ -115,6 +115,19 @@ public protocol TransportSession: Sendable, AnyObject {
         _ request: SubscribeRequest
     ) async throws(MoqomError) -> any SubscriptionHandle
 
+    /// Tracks the peer has pushed without being asked for them.
+    ///
+    /// Draft-19's server-initiated PUBLISH, and the only way a relay can tell a
+    /// session something it did not ask about. MOQOM uses it for exactly one
+    /// thing — see ``ParticipantPolicy`` — because it is the only mechanism
+    /// that reaches a participant who is publishing and subscribing to nothing
+    /// relevant, which is precisely the person a moderator wants to mute.
+    ///
+    /// Each offer's objects begin flowing whether or not anybody reads them, so
+    /// a consumer that ignores this stream costs a bounded buffer and nothing
+    /// else.
+    var offers: AsyncStream<TrackOffer> { get }
+
     /// Ask for objects that have already been published.
     ///
     /// The counterpart to `subscribe`, and the only way to get anything the
@@ -228,6 +241,26 @@ public struct SubscribeRequest: Hashable, Sendable {
         self.priority = priority
         self.deliveryTimeout = deliveryTimeout
         self.start = start
+    }
+}
+
+public extension TransportSession {
+    /// No offers, for a session whose peer never pushes.
+    var offers: AsyncStream<TrackOffer> {
+        AsyncStream { $0.finish() }
+    }
+}
+
+/// A track the peer opened on its own.
+public struct TrackOffer: Sendable {
+    public let track: FullTrackName
+
+    /// Objects as they arrive, ending when the peer stops the offer.
+    public let objects: AsyncStream<TrackObject>
+
+    public init(track: FullTrackName, objects: AsyncStream<TrackObject>) {
+        self.track = track
+        self.objects = objects
     }
 }
 

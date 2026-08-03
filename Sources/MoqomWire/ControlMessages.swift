@@ -346,6 +346,65 @@ public struct Subscribe: ControlMessage {
     }
 }
 
+/// Offer a track to a peer that did not ask for it.
+///
+/// The mirror image of ``Subscribe``: the publisher opens the stream and picks
+/// the alias itself, and objects may start flowing before the offer is
+/// accepted. A peer that does not want the track answers ``RequestError`` and
+/// stops reading.
+///
+/// MOQOM's relay uses this for one thing, and it is the reason this message is
+/// implemented at all: telling a participant what a moderator will no longer
+/// let them publish. There is no other way for a relay to say something to a
+/// session that has not asked it anything — see `.policy` in ``RoomSession``.
+public struct Publish: ControlMessage {
+    public static let messageType = MessageType.publish
+
+    public var requestID: UInt64
+    public var track: FullTrackName
+    /// Chosen by the publisher, unlike in ``SubscribeOk``.
+    public var trackAlias: UInt64
+    public var parameters: Parameters
+    public var properties: Parameters
+
+    public init(
+        requestID: UInt64,
+        track: FullTrackName,
+        trackAlias: UInt64,
+        parameters: Parameters = Parameters(),
+        properties: Parameters = Parameters()
+    ) {
+        self.requestID = requestID
+        self.track = track
+        self.trackAlias = trackAlias
+        self.parameters = parameters
+        self.properties = properties
+    }
+
+    public var encodedLength: Int {
+        WireSize.varInt(requestID) + track.encodedLength + WireSize.varInt(trackAlias)
+            + parameters.encodedLengthCounted + properties.encodedLength
+    }
+
+    public func write(to writer: inout WireWriter) {
+        writer.varInt(requestID)
+        track.write(to: &writer)
+        writer.varInt(trackAlias)
+        parameters.writeCounted(to: &writer)
+        properties.write(to: &writer)
+    }
+
+    public static func read(from reader: inout WireReader) throws(WireError) -> Publish {
+        Publish(
+            requestID: try reader.varInt(),
+            track: try FullTrackName.read(from: &reader),
+            trackAlias: try reader.varInt(),
+            parameters: try Parameters.readCounted(from: &reader),
+            properties: try Parameters.readToEnd(from: &reader)
+        )
+    }
+}
+
 /// Successful subscription response.
 ///
 /// The track alias is the whole point: from here on the data plane names this

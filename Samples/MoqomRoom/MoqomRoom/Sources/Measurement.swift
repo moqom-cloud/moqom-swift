@@ -122,6 +122,14 @@ struct TimedSource: FrameSource {
     }
 
     func stop() { wrapped.stop() }
+
+    // Forwarded, and the reason is worth a line: this is a decorator, so
+    // anything it does not pass on is a capability the source underneath
+    // quietly loses. Not forwarding these two meant a moderator's mute stopped
+    // the encoder while the camera stayed open, on a run that reported the mute
+    // as applied and left the indicator lit.
+    func suspend() { wrapped.suspend() }
+    func resume() { wrapped.resume() }
 }
 
 /// Collects one-way latencies and reports what they were.

@@ -17,6 +17,17 @@ public protocol AudioSource: Sendable {
     func frames() -> AsyncStream<AudioFrame>
 
     func stop()
+
+    /// Let go of the microphone without ending the stream. See
+    /// ``FrameSource/suspend()``, which this is the audio half of.
+    func suspend()
+
+    /// Take the microphone back.
+    ///
+    /// > Important: No default implementation, for the reason
+    /// > ``FrameSource/resume()`` gives — a wrapper that inherits an empty one
+    /// > leaves the microphone open under a mute and says it closed it.
+    func resume()
 }
 
 /// How to compress one audio track.
@@ -178,4 +189,9 @@ public final class AudioRelay: AudioSource {
     public func frames() -> AsyncStream<AudioFrame> { stream }
 
     public func stop() { continuation.finish() }
+
+    /// Nothing to release: whoever is submitting owns the input, if there is
+    /// one. The frames that keep arriving are dropped by the publication.
+    public func suspend() {}
+    public func resume() {}
 }

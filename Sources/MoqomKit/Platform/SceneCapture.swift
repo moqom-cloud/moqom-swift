@@ -75,6 +75,9 @@ import MoqomCore
         /// The texture format most recently refused, guarded by ``lock``.
         private var reportedFormat: MTLPixelFormat?
 
+        /// Whether a mute is standing over this source. Guarded by ``lock``.
+        private var suspended = false
+
         /// - Parameters:
         ///   - format: What the renderer will produce. Must match the texture
         ///     handed to ``submit(texture:at:on:)``; a mismatch is a scaling
@@ -143,6 +146,10 @@ import MoqomCore
             at timestamp: FrameTimestamp,
             on commandBuffer: any MTLCommandBuffer
         ) {
+            // Dropped before the blit rather than after it, so a suspended
+            // source costs the render thread nothing at all.
+            guard !lock.withLock({ suspended }) else { return }
+
             // A same-size blit is a copy; a different size is a scale, which is
             // a render pass and not something to do behind the caller's back on
             // their command buffer. Configure the format to match the renderer.
@@ -215,6 +222,7 @@ import MoqomCore
         /// For a renderer that draws straight into a pooled buffer — the
         /// visionOS `RealityRenderer` path — where there is nothing to blit.
         public func submit(pixelBuffer: CVPixelBuffer, at timestamp: FrameTimestamp) {
+            guard !lock.withLock({ suspended }) else { return }
             relay.submit(
                 VideoFrame(
                     timestamp: timestamp,
@@ -230,6 +238,18 @@ import MoqomCore
         public func frames() -> AsyncStream<VideoFrame> { relay.frames() }
 
         public func stop() { relay.stop() }
+
+        /// Stop passing frames on, and say plainly what that does not do.
+        ///
+        /// The renderer above keeps drawing — it is the app's own scene and the
+        /// SDK does not drive it — so this is one step short of what the same
+        /// call achieves on a camera. If the scene is an AR one, the session
+        /// behind it holds the camera and the indicator stays lit until the app
+        /// pauses it, which is the app's call to make and not one that can be
+        /// made from here.
+        public func suspend() { lock.withLock { suspended = true } }
+
+        public func resume() { lock.withLock { suspended = false } }
 
         /// Complain once per texture size that does not match the configuration.
         ///

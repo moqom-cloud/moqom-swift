@@ -192,6 +192,17 @@ public enum RoomEvent: Sendable {
     case participantLeft(ParticipantIdentity, DepartureReason)
     case presenceChanged(ParticipantIdentity, Presence)
     case muteChanged(ParticipantIdentity, MuteState)
+
+    /// A moderator's mute reached this device and closed its hardware, or
+    /// stopped doing so.
+    ///
+    /// Distinct from ``muteChanged(_:_:)``, which is about anybody and is a
+    /// statement of fact. This one is about *this* device and is a prompt:
+    /// `held` is what the relay is enforcing and `resumable` is what it has
+    /// released and this device has not turned back on, because only the person
+    /// in front of it may do that. A non-empty `resumable` is an interface's cue
+    /// to offer the unmute — see ``RoomSession/resumeAfterForceMute(_:)``.
+    case captureRestricted(held: MediaKind, resumable: MediaKind)
     case grantsChanged(ParticipantIdentity, Grants)
     case spotlightChanged(ParticipantIdentity?)
 
