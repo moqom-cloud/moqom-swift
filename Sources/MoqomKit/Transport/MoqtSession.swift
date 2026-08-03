@@ -167,7 +167,13 @@ public actor MoqtSession: TransportSession {
         // The token goes in a session option rather than per-request because
         // it authorises the connection; per-request DPoP proofs bind actions
         // and are carried on the requests themselves.
-        if let token = try? Parameter.bytes(SetupOption.authorizationToken, credentials.token) {
+        //
+        // Sent only when there is one. An empty token is not a weaker claim, it
+        // is a malformed one: a relay that verifies reads an option that cannot
+        // parse and ends the session, where a client that claimed nothing would
+        // have been let in and limited by address.
+        if !credentials.token.isEmpty,
+           let token = try? Parameter.bytes(SetupOption.authorizationToken, credentials.token) {
             options.insert(token)
         }
         if let implementation = try? Parameter.string(

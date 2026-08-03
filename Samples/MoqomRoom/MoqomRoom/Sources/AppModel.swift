@@ -750,10 +750,14 @@ final class AppModel {
                 transport: relay.transport(),
                 credentials: DeviceCredentials(
                     identity: identity,
-                    token: Data(),
+                    // Minted by whatever stands in for this application's server: the
+                    // sample has none, so `deploy/tools/join.sh` mints one and passes it
+                    // in. Empty against a relay that verifies means a session that
+                    // connects and may publish nothing.
+                    token: relay.token,
                     proofSigner: { challenge in challenge }
                 ),
-                tenant: "demo",
+                tenant: TenantID(launch.tenant),
                 // The sample opts in, because the sample is what an integrator
                 // reads to find out that this exists. `.hashed` even here: a
                 // demo's log is the one most likely to end up in a screenshot.

@@ -123,7 +123,10 @@ extension RelayConfiguration {
         self.init(
             host: host,
             port: record["port"].flatMap(UInt16.init) ?? 443,
-            certificateHashes: [hash]
+            certificateHashes: [hash],
+            // A relay found by pairing code is one on somebody's laptop, which has no
+            // control plane to have been given keys by and so asks for no credential.
+            token: Data()
         )
     }
 }

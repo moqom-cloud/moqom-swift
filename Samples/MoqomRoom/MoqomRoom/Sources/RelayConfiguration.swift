@@ -32,6 +32,20 @@ struct RelayConfiguration {
     /// which is what a deployed relay with a real certificate wants.
     var certificateHashes: [String]
 
+    /// The token this device presents when it dials, or empty for none.
+    ///
+    /// An application mints these on its own server, where it knows who its user is; the
+    /// phone never asks the control plane for one, because a phone that could mint its own
+    /// token could mint any token. This sample has no server, so `deploy/tools/join.sh`
+    /// stands in for one and hands the result to a launch argument.
+    ///
+    /// Empty is a working configuration and not a broken one. A relay with no verification
+    /// keys admits the session and charges it to its address; a relay with keys admits it
+    /// and permits it nothing, which looks like a broadcast that connects and then carries
+    /// no tracks. That second case is the one worth recognising from a screenshot, so the
+    /// summary below says which of the two this is.
+    var token: Data
+
     /// The relay this project is developed against.
     ///
     /// A device that has never been told where to go gets this rather than the loopback,
@@ -53,10 +67,13 @@ struct RelayConfiguration {
     /// of a managed instance group, and the certificate is one the whole fleet shares, so the
     /// hash below survives an instance being replaced. Port 443 rather than 4443, because a
     /// phone on a hotel network reaches 443 and often reaches nothing else.
+    /// No token here, deliberately: one expires within the hour, so a token compiled into
+    /// the app would be wrong for all but the first run after every build.
     static let development = RelayConfiguration(
         host: "35.235.101.37",
         port: 443,
-        certificateHashes: ["polQTlHHCA5xpWTb02GZUdgIJoX5b0rUh0sy+VNWUto="]
+        certificateHashes: ["polQTlHHCA5xpWTb02GZUdgIJoX5b0rUh0sy+VNWUto="],
+        token: Data()
     )
 
     /// Read from launch arguments first, then the defaults database, then ``development``.
@@ -70,6 +87,7 @@ struct RelayConfiguration {
         var host: String?
         var port: UInt16?
         var hashes: [String] = []
+        var token: Data?
 
         var index = 0
         while index < arguments.count {
@@ -79,6 +97,11 @@ struct RelayConfiguration {
             case "--relay-host": host = value
             case "--relay-port": port = value.flatMap(UInt16.init)
             case "--relay-cert-hash": value.map { hashes.append($0) }
+            // An argument and not a saved setting: a token lasts an hour, and one
+            // remembered across launches would be a puzzle rather than a convenience —
+            // the app would work in the morning and stop by lunchtime with no change to
+            // anything a person could see.
+            case "--relay-token": token = value.flatMap { $0.data(using: .utf8) }
             default: break
             }
             index += 1
@@ -93,13 +116,15 @@ struct RelayConfiguration {
             : RelayConfiguration(
                 host: defaults.string(forKey: "relayHost").flatMap { $0.isEmpty ? nil : $0 },
                 port: UInt16(defaults.integer(forKey: "relayPort")).nonZero ?? 443,
-                certificateHashes: defaults.stringArray(forKey: "relayCertificateHashes") ?? []
+                certificateHashes: defaults.stringArray(forKey: "relayCertificateHashes") ?? [],
+                token: Data()
             )
 
         return RelayConfiguration(
             host: host ?? remembered.host,
             port: port ?? remembered.port,
-            certificateHashes: hashes.isEmpty ? remembered.certificateHashes : hashes
+            certificateHashes: hashes.isEmpty ? remembered.certificateHashes : hashes,
+            token: token ?? Data()
         )
     }
 
@@ -140,7 +165,12 @@ struct RelayConfiguration {
     var summary: String {
         guard let host else { return "loopback (no relay configured)" }
         let trust = certificateHashes.isEmpty ? "system trust" : "pinned"
-        return "\(host):\(port), \(trust)"
+        // Worth a word even though it is one more thing on the screen: a session with no
+        // token connects to a relay that verifies and then carries nothing, and the two
+        // failures — cannot reach the relay, and reached it with no credential — look
+        // identical from the outside.
+        let credential = token.isEmpty ? "no token" : "token"
+        return "\(host):\(port), \(trust), \(credential)"
     }
 }
 
@@ -153,6 +183,14 @@ struct RelayConfiguration {
 struct LaunchOptions {
     var username: String?
     var room: String?
+
+    /// Which tenant this session belongs to.
+    ///
+    /// It has to match the tenant the token was minted for, because that is half of what a
+    /// relay compares a namespace against: a token for one tenant and a broadcast under
+    /// another is a session that connects, announces, and is refused every track. The
+    /// default suits the loopback, where nothing checks.
+    var tenant = "demo"
 
     /// A pairing code to resolve instead of being told the relay's address and hash.
     ///
@@ -267,6 +305,7 @@ struct LaunchOptions {
             switch arguments[index] {
             case "--username": options.username = value
             case "--room": options.room = value
+            case "--tenant": value.map { options.tenant = $0 }
             case "--pairing-code": options.pairingCode = value
             case "--autojoin": options.autojoin = true
             case "--benchmark": options.benchmark = true

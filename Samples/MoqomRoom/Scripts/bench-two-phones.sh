@@ -35,6 +35,8 @@ This script takes no arguments; everything is an environment variable.
   MOQOM_EAGER=1          encode for speed rather than power, at the cost of heat
   MOQOM_FLOOR_MS / MOQOM_TOLERANCE / MOQOM_STATS_MS / MOQOM_FLAT_LAYERS
   MOQOM_PUBLISHER / MOQOM_VIEWER   device names (default: iPhone Air, 15 Pro)
+  MOQOM_MINT=1           mint a token per phone from the deployed control plane
+  MOQOM_TENANT=moqom     which tenant, and it must be the token's
 
 For example:
   MOQOM_ROOM=turn3 MOQOM_SECONDS=20 MOQOM_FPS=60 MOQOM_AUDIO=mic ./Scripts/bench-two-phones.sh
@@ -64,6 +66,31 @@ ROOM="${MOQOM_ROOM:-bench}"
 CODE="${MOQOM_PAIRING_CODE:-4242}"
 BUNDLE="cloud.moqom.room"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Who the relay thinks these phones are.
+#
+# A deployed relay verifies the token a session presents and permits nothing to
+# a session with none — it connects, announces, and every track is refused,
+# which from the phone is indistinguishable from a relay that drops everything.
+# So a run against one needs a token per phone, and the tenant has to be the
+# tenant the token was minted for.
+#
+# Minted here rather than checked in, because they expire in fifteen minutes.
+# The relay against a laptop has no keys and needs none of this, which is why
+# this is off unless asked for.
+TENANT="${MOQOM_TENANT:-moqom}"
+PUBLISHER_TOKEN="${MOQOM_PUBLISHER_TOKEN:-}"
+VIEWER_TOKEN="${MOQOM_VIEWER_TOKEN:-}"
+if [ -n "${MOQOM_MINT:-}" ]; then
+    JOIN="${MOQOM_JOIN:-$HERE/../../../moqom/deploy/tools/join.sh}"
+    if [ ! -x "$JOIN" ]; then
+        echo "MOQOM_MINT is set but $JOIN is not there — set MOQOM_JOIN to it" >&2
+        exit 2
+    fi
+    echo "minting a token for each phone"
+    PUBLISHER_TOKEN="$(MOQOM_TENANT=$TENANT "$JOIN" publisher "$ROOM")"
+    VIEWER_TOKEN="$(MOQOM_TENANT=$TENANT "$JOIN" viewer "$ROOM")"
+fi
 
 # Where the relay is. Bonjour discovery by default, which only works for the relay on this Mac —
 # a pairing code is a local-network mechanism and there is nothing to discover across the
@@ -204,6 +231,7 @@ launch() {
     device="$1"
     who="$2"
     out="$3"
+    token="${4:-}"
     (
         # Patient rather than prompt, because the thing being waited for is often a person. A
         # phone that locks itself between the install and the launch refuses the launch, and
@@ -220,7 +248,8 @@ launch() {
             # code, and every locked-phone run appeared to give up instantly.
             xcrun devicectl device process launch --device "$device" --console \
                 --terminate-existing "$BUNDLE" \
-                --autojoin $MODE --username "$who" --room "$ROOM" $WHERE \
+                --autojoin $MODE --username "$who" --room "$ROOM" \
+                --tenant "$TENANT" ${token:+--relay-token "$token"} $WHERE \
                 > "$out" 2>&1 || true
             # Printed by the console only once the process is actually up.
             if grep -q 'Waiting for the application to terminate' "$out"; then exit 0; fi
@@ -246,7 +275,7 @@ VIEWER_LOG="$LOGS-viewer.log"
 : > "$VIEWER_LOG"
 
 echo "launching $PUBLISHER_NAME as the publisher"
-launch "$PUBLISHER" publisher "$PUBLISHER_LOG"
+launch "$PUBLISHER" publisher "$PUBLISHER_LOG" "$PUBLISHER_TOKEN"
 
 # Waited on the publisher actually going live rather than on a fixed delay, because the point of
 # the ordering is that the second phone arrives at a room that is already broadcasting. A sleep
@@ -262,7 +291,7 @@ if ! grep -q '^LIVE' "$PUBLISHER_LOG" 2>/dev/null; then
 fi
 
 echo "launching $VIEWER_NAME as the late joiner"
-launch "$VIEWER" viewer "$VIEWER_LOG"
+launch "$VIEWER" viewer "$VIEWER_LOG" "$VIEWER_TOKEN"
 
 cat <<EOF
 
