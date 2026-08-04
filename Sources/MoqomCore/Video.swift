@@ -101,6 +101,35 @@ public struct VideoLayer: Hashable, Sendable, Identifiable {
         self.bitrate = bitrate
         self.temporalLayers = max(1, temporalLayers)
     }
+
+    /// The same rung at the aspect ratio of what is being captured.
+    ///
+    /// The short side is held and the long side follows, rounded to an even
+    /// number of pixels: chroma is subsampled by two in both directions, so an
+    /// odd dimension is a size half the encoders in the world will refuse and the
+    /// rest will quietly round for you.
+    public func reshaped(toAspectOf capture: PixelSize) -> VideoLayer {
+        guard capture.width > 0, capture.height > 0 else { return self }
+
+        let short = min(size.width, size.height)
+        let upright = capture.height > capture.width
+        let ratio = upright
+            ? Double(capture.height) / Double(capture.width)
+            : Double(capture.width) / Double(capture.height)
+        let long = max(short, Int((Double(short) * ratio).rounded()) & ~1)
+        let resized = upright
+            ? PixelSize(width: short, height: long)
+            : PixelSize(width: long, height: short)
+
+        guard resized != size else { return self }
+        return VideoLayer(
+            id: id,
+            size: resized,
+            frameRate: frameRate,
+            bitrate: bitrate,
+            temporalLayers: temporalLayers
+        )
+    }
 }
 
 /// The rungs a publisher offers, ascending.
@@ -135,6 +164,28 @@ public struct LayerLadder: Hashable, Sendable {
     public var highest: VideoLayer? { rungs.last }
 
     public func layer(id: LayerID) -> VideoLayer? { rungs.first { $0.id == id } }
+
+    /// The same ladder, turned to the shape of what is being captured.
+    ///
+    /// Every rung keeps its identity — its ``LayerID``, and therefore the track
+    /// it publishes on — its short side, its frame rate and its bitrate. Only
+    /// the long side moves, to whatever the new aspect asks for. That is the
+    /// division a live layout change needs: the shape of the picture is the
+    /// source's business and may change while a broadcast runs, whereas the
+    /// rungs are a contract with subscribers, who chose one by name and would
+    /// have to be told to choose again if the names moved underneath them.
+    ///
+    /// Short side rather than pixel count, because the short side is what the
+    /// rung is named after and what a viewer reads as the quality. Holding the
+    /// pixel count instead would make `video/720p` mean 933×525 in landscape and
+    /// 720×1280 in portrait, so rotating a phone would appear to change quality.
+    public func reshaped(toAspectOf capture: PixelSize) -> LayerLadder {
+        guard capture.width > 0, capture.height > 0 else { return self }
+        return LayerLadder(
+            rungs: rungs.map { $0.reshaped(toAspectOf: capture) },
+            kind: kind
+        )
+    }
 
     /// Position of `id` in the ladder, for hysteresis comparisons.
     public func index(of id: LayerID) -> Int? { rungs.firstIndex { $0.id == id } }

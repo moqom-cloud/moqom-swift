@@ -66,7 +66,7 @@ import MoqomCore
         private var rotation90: VTPixelRotationSession?
         private var rotationPool: CVPixelBufferPool?
         private var rotationSource: PixelSize?
-        private var rotationMirrors = false
+        private var rotationTurn: Turn?
 
         /// Whether the last frame was turned here rather than by the connection.
         ///
@@ -710,12 +710,18 @@ import MoqomCore
         /// the frame in the same surface type the encoder wants, and a rotation on the CPU
         /// at sixty frames a second is not affordable on the phone that needs this.
         private func upright(_ buffer: CVPixelBuffer) -> CVPixelBuffer? {
-            let wanted = captureFormat.size
-            let width = CVPixelBufferGetWidth(buffer)
-            let height = CVPixelBufferGetHeight(buffer)
-            guard (wanted.height > wanted.width) != (height > width) else { return nil }
+            let delivered = PixelSize(
+                width: CVPixelBufferGetWidth(buffer),
+                height: CVPixelBufferGetHeight(buffer)
+            )
+            let (rotation, mirrors) = lock.withLock { (self.rotation, mirrored) }
+            guard let turn = Self.turn(
+                toReach: rotation,
+                having: delivered,
+                mirrored: mirrors
+            ) else { return nil }
 
-            guard let session = rotator(from: buffer) else { return nil }
+            guard let session = rotator(from: buffer, turning: turn) else { return nil }
             var turned: CVPixelBuffer?
             guard let pool = rotationPool,
                   CVPixelBufferPoolCreatePixelBuffer(nil, pool, &turned) == kCVReturnSuccess,
@@ -728,14 +734,62 @@ import MoqomCore
             return turned
         }
 
+        /// Which way a frame has to be turned here, if it does.
+        ///
+        /// Separated out and given no camera to depend on because the decision is the part
+        /// that was wrong, and it was wrong in a way that could not fail visibly: it compared
+        /// the delivered shape against ``captureFormat``, which is what the source was asked
+        /// for when it opened. Those agree until the rotation is changed while the camera runs
+        /// — publishing landscape from a portrait-configured source, which is what a host
+        /// changing layout does — and from then on this turned every frame back to the
+        /// original shape. The rotation appeared to be accepted, nothing changed shape, and
+        /// each frame paid for a hardware rotation to arrive where it already was.
+        ///
+        /// - Parameters:
+        ///   - rotation: What ``rotationDegrees`` asks for. Every sensor format is landscape,
+        ///     so an odd quarter turn is what portrait means, and that is the only question.
+        ///   - delivered: The shape of the frame that arrived, which is the one honest account
+        ///     of what the connection did.
+        ///   - mirrored: Whether the connection is also mirroring. It flips in the sensor's
+        ///     frame, about an axis a quarter turn carries onto the other one, so the
+        ///     direction that arrives upright depends on it.
+        static func turn(
+            toReach rotation: Double,
+            having delivered: PixelSize,
+            mirrored: Bool
+        ) -> Turn? {
+            let quarters = Int((rotation / 90).rounded())
+            let upright = quarters % 2 != 0
+            guard upright != (delivered.height > delivered.width) else { return nil }
+
+            // Anticlockwise is the plain case, because that is what `videoRotationAngle`
+            // means — the angle is measured anticlockwise from the sensor's landscape, so a
+            // connection told `90` turns the opposite way from `kVTRotation_CW90`. The two
+            // read identically in code and differ by half a turn on screen, which is what one
+            // phone showed while the other, rotated by its connection, was right way up.
+            //
+            // Mirroring changes the answer, and so does turning back out of portrait rather
+            // than into it, since those two turns are inverses. Both conditions flip the
+            // direction, so two of them cancel.
+            return (mirrored == upright) ? Turn.clockwise : Turn.anticlockwise
+        }
+
+        /// A quarter turn, in the direction that arrives the right way up.
+        enum Turn: Equatable {
+            case clockwise
+            case anticlockwise
+        }
+
         /// The rotation session and its pool, built once for a given source shape.
-        private func rotator(from buffer: CVPixelBuffer) -> VTPixelRotationSession? {
+        private func rotator(
+            from buffer: CVPixelBuffer,
+            turning turn: Turn
+        ) -> VTPixelRotationSession? {
             let width = CVPixelBufferGetWidth(buffer)
             let height = CVPixelBufferGetHeight(buffer)
-            let mirrors = lock.withLock { mirrored }
             if let existing = rotation90,
                rotationSource == PixelSize(width: width, height: height),
-               rotationMirrors == mirrors
+               rotationTurn == turn
             {
                 return existing
             }
@@ -745,31 +799,20 @@ import MoqomCore
                 return nil
             }
 
-            // Which way to turn depends on whether the connection has already mirrored, and
-            // that is geometry rather than a preference.
-            //
-            // Anticlockwise is the plain case, because that is what `videoRotationAngle`
-            // means — the angle is measured anticlockwise from the sensor's landscape, so a
-            // connection told `90` turns the opposite way from `kVTRotation_CW90`. The two
-            // read identically in code and differ by half a turn on screen, which is what one
-            // phone showed while the other, rotated by its connection, was right way up.
-            //
-            // Mirroring changes the answer. The connection mirrors in the sensor's frame,
-            // about an axis that any quarter turn carries onto the *other* axis: a horizontal
-            // flip of a landscape frame becomes a vertical flip of the portrait one, and a
-            // vertically flipped face reads as upside down rather than as a mirror. Turning
-            // the other way is exactly the half turn that converts one into the other, since
-            // a vertical flip followed by a half turn is a horizontal flip. So the mirrored
-            // path turns clockwise and arrives at the same picture the connection produces
-            // when it does both itself.
+            // Mirroring is why the direction is not obvious, and it is geometry rather than a
+            // preference: the connection mirrors in the sensor's frame, about an axis that any
+            // quarter turn carries onto the *other* axis. A horizontal flip of a landscape
+            // frame becomes a vertical flip of the portrait one, and a vertically flipped face
+            // reads as upside down rather than as a mirror. See ``turn(toReach:having:mirrored:)``,
+            // which is where the choice is made and tested.
             //
             // The session's own flip properties would be the obvious tool and are not used:
             // whether they apply before or after the rotation is not documented, and picking
-            // wrong is the same half turn again with nothing in the code to say which it was.
+            // wrong is a half turn with nothing in the code to say which it was.
             VTSessionSetProperty(
                 created,
                 key: kVTPixelRotationPropertyKey_Rotation,
-                value: mirrors ? kVTRotation_CW90 : kVTRotation_CCW90
+                value: turn == .clockwise ? kVTRotation_CW90 : kVTRotation_CCW90
             )
 
             let attributes: [CFString: Any] = [
@@ -794,7 +837,7 @@ import MoqomCore
             rotation90 = created
             rotationPool = pool
             rotationSource = PixelSize(width: width, height: height)
-            rotationMirrors = mirrors
+            rotationTurn = turn
             return created
         }
     }

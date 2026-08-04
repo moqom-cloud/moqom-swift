@@ -191,6 +191,15 @@ struct RelayInteropTests {
             "the relay never subscribed upstream, log:\n\(relay.logContents)"
         )
 
+        // The keyframe carries what a real one carries: a capture time, and the
+        // decoder configuration for the group it opens. The configuration is the
+        // interesting one here because it is the first *bytes-valued* object
+        // property this SDK sends — an odd type, length-prefixed rather than a
+        // bare varint — and whether a relay written separately reads that the same
+        // way is exactly the kind of thing only interop can answer. Get it wrong
+        // and a viewer's geometry comes from whatever the catalog last said.
+        let sets = [Data([0x40, 0x01, 0x0C]), Data([0x42, 0x02, 0xD0, 0x05, 0x00])]
+        let configuration = DecoderConfiguration.encode(sets)
         let payloads = ["keyframe", "delta", "delta-2"]
         for (index, payload) in payloads.enumerated() {
             try await writer.write(
@@ -199,7 +208,11 @@ struct RelayInteropTests {
                     object: UInt64(index),
                     priority: 128,
                     payload: Data(payload.utf8),
-                    isKeyFrame: index == 0
+                    isKeyFrame: index == 0,
+                    properties: ObjectProperties(
+                        captureTime: FrameTimestamp(nanoseconds: UInt64(index) * 33_000_000),
+                        configuration: index == 0 ? configuration : nil
+                    )
                 )
             )
         }
@@ -217,6 +230,15 @@ struct RelayInteropTests {
         )
         #expect(objects.map { String(decoding: $0.payload, as: UTF8.self) } == payloads)
         #expect(objects.map(\.object) == [0, 1, 2], "object IDs must survive the relay")
+
+        // Both properties, byte for byte. A relay that dropped the configuration
+        // would leave a viewer unable to tell that a publisher had changed the
+        // shape of its picture, and a relay that mangled it would have them decode
+        // the new shape against the old description.
+        #expect(objects.first?.properties.configuration == configuration)
+        #expect(DecoderConfiguration.decode(objects[0].properties.configuration ?? Data()) == sets)
+        #expect(objects[1].properties.captureTime?.nanoseconds == 33_000_000)
+        #expect(objects.dropFirst().allSatisfy { $0.properties.configuration == nil })
 
         reader.cancel()
         await subscription.cancel()

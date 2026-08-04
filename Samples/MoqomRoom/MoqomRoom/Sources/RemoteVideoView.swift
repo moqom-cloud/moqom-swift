@@ -262,6 +262,19 @@ final class VideoTile {
 
             await MainActor.run {
                 try? renderer.enqueue(frame)
+
+                // The publisher changed the shape of the picture. Read after enqueueing,
+                // because the format description this reports is built from the keyframe
+                // that was just handed over — and read at all because the tile's own aspect
+                // has to follow it, or a correctly delivered reshape shows up as a picture
+                // letterboxed inside a tile still laid out for the previous one.
+                if frame.changesFormat {
+                    room.receivedReshapes += 1
+                    room.receivedShape = renderer.presentedSize
+                } else if room.receivedShape == nil {
+                    room.receivedShape = renderer.presentedSize
+                }
+
                 room.drawing = renderer.drawing
                 room.playoutDepth = renderer.playoutDepth
                 room.playoutSlack = renderer.playoutSlack

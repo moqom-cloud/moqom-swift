@@ -27,7 +27,19 @@ final class PatternSource: FrameSource, @unchecked Sendable {
     let captureFormat: CaptureFormat
 
     private let relay: FrameRelay
-    private let pool: CVPixelBufferPool?
+
+    /// The pool the pattern is drawn into, replaced when the shape changes.
+    ///
+    /// A `var` because this source can change size while it runs, which is the
+    /// one thing a camera cannot do: a capture device negotiates a format when it
+    /// opens and keeps it. Here there is nothing to negotiate with, so the sample
+    /// can demonstrate a host changing layout mid-call without a second device
+    /// and without rotating anything. See ``resize(to:)``.
+    private var pool: CVPixelBufferPool?
+
+    /// The size being drawn, which after a ``resize(to:)`` is not the size the
+    /// source was asked for.
+    private var drawn: PixelSize
     private var task: Task<Void, Never>?
 
     /// Whether ``stop()`` has been called, so a resume after it stays stopped.
@@ -51,6 +63,7 @@ final class PatternSource: FrameSource, @unchecked Sendable {
         // would be a different colour on every launch and the colour would
         // stop meaning anything.
         hue = Double(label.utf8.reduce(0) { ($0 &* 31 &+ Int($1)) % 360 }) / 360
+        drawn = format.size
         pool = Self.makePool(size: format.size)
         (previewStream, previewContinuation) = AsyncStream.makeStream(
             of: VideoFrame.self,
@@ -77,6 +90,24 @@ final class PatternSource: FrameSource, @unchecked Sendable {
         task = nil
         relay.stop()
         previewContinuation.finish()
+    }
+
+    /// Draw at a different size from the next frame on.
+    ///
+    /// Nothing else has to be told. A publication follows the shape of the frames
+    /// it is given — see `BroadcastConfiguration.followsCaptureShape` — so
+    /// changing the pattern's size is the whole of a layout change from the
+    /// publisher's side: the rung keeps its name, the encoder is rebuilt at the
+    /// new size, and the switch lands on a keyframe.
+    ///
+    /// The pool is replaced rather than resized because a `CVPixelBufferPool` is
+    /// created around a pixel format and a size; buffers already lent out stay
+    /// valid, and the last few frames of the old size drain through the encoder
+    /// while the new pool starts filling.
+    func resize(to size: PixelSize) {
+        guard size.width > 0, size.height > 0, size != drawn else { return }
+        drawn = size
+        pool = Self.makePool(size: size)
     }
 
     /// Stop drawing. There is no camera here and so no light to put out, but a

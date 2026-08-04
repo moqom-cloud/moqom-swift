@@ -85,6 +85,19 @@ import MoqomCore
             format = try Self.makeFormat(from: sets, codec: codec)
         }
 
+        /// The size of the picture being described, once anything is.
+        ///
+        /// Read from the format description rather than from a catalog, so it is
+        /// the size of the frames actually being decoded. The two disagree for a
+        /// moment whenever a publisher changes geometry, and a view laid out from
+        /// the catalog's answer letterboxes until the disagreement resolves.
+        public var presentedSize: PixelSize? {
+            guard let format else { return nil }
+            let dimensions = CMVideoFormatDescriptionGetDimensions(format)
+            guard dimensions.width > 0, dimensions.height > 0 else { return nil }
+            return PixelSize(width: Int(dimensions.width), height: Int(dimensions.height))
+        }
+
         /// Wrap one encoded frame.
         ///
         /// Returns `nil` before parameter sets have arrived. That is a normal
@@ -581,6 +594,15 @@ import MoqomCore
             /// frame rate, and the smoothing it provides is not being had.
             public var regrids = 0
 
+            /// Times the publisher changed the shape of the picture.
+            ///
+            /// A host switching layout, and expected to be occasional and deliberate. Worth
+            /// counting because it is the one event that changes what a viewer is looking at
+            /// without anything going wrong, so it is the first thing to rule out when somebody
+            /// reports that a tile "jumped": one reshape is a layout change, a stream of them is
+            /// a publisher oscillating between two geometries.
+            public var reshapes = 0
+
             public init() {}
 
             /// The share of frames that reached the display layer.
@@ -1031,14 +1053,32 @@ import MoqomCore
             assembler.setCodec(codec)
         }
 
+        /// The size of the frames now being decoded, once any have been.
+        ///
+        /// What a view should lay itself out against. It follows the publisher
+        /// through a geometry change, which a size taken from the catalog does
+        /// not do promptly: the reshaped keyframe and the catalog version that
+        /// describes it are on different tracks and arrive in either order.
+        public var presentedSize: PixelSize? { assembler.presentedSize }
+
         /// Draw a reassembled frame, flushing first when objects were lost.
         ///
         /// The gap handling is why this overload exists rather than leaving
         /// callers to unwrap the frame themselves: enqueueing across a hole
         /// feeds the decoder references that never arrived, and the artefacts
         /// last until the next keyframe.
+        ///
+        /// A change of shape is not a gap and is deliberately not flushed. The
+        /// display layer takes a queue of sample buffers each carrying its own
+        /// format description, so handing it a differently sized keyframe is a
+        /// supported thing to do and it switches at that frame. Flushing instead
+        /// would throw away the frames already queued behind it, blank the last
+        /// picture, and drop the presentation anchor — three visible costs for an
+        /// event that needs none of them, since the publisher's timeline did not
+        /// break and its geometry is the only thing that moved.
         public func enqueue(_ frame: DepacketisedFrame) throws(MoqomError) {
             if frame.followsGap { flush() }
+            if frame.changesFormat { drawing.reshapes += 1 }
             try enqueue(frame.frame)
         }
 

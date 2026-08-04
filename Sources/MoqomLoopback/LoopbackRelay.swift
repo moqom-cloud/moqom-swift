@@ -217,6 +217,16 @@ public actor LoopbackRelay {
             .flatMap(\.value)
     }
 
+    /// The names of every track anything has been published on.
+    ///
+    /// For a test whose question is which tracks exist rather than what is on
+    /// them — a publisher that changes the shape of its video must do it on the
+    /// track it is already using, and the way that goes wrong is a second track
+    /// appearing beside the first.
+    public func trackNames() -> [String] {
+        Array(Set(delivered.keys.map(\.name.value))).sorted()
+    }
+
     /// Namespaces currently announced under a prefix.
     public func announcements(under prefix: TrackNamespace) -> [TrackNamespace] {
         announcements.filter { $0.starts(with: prefix) }.sorted { $0.description < $1.description }

@@ -18,10 +18,15 @@
 // the link lost it — and the renderer's correct response is to flush and wait,
 // which it can only do if someone tells it.
 //
-// Parameter sets come from the catalog, not from the bitstream. That is the
-// whole reason a viewer can join at an arbitrary group: the configuration
-// arrived before the media did, so there is no wait for the next IDR to carry
-// it inline.
+// Parameter sets arrive two ways and the difference is not redundancy. The
+// catalog carries them ahead of the media, which is what lets a viewer join at
+// an arbitrary group without waiting for an IDR. Each keyframe carries them
+// again, which is what lets the picture change shape: a publisher may switch
+// geometry mid-track when its host changes layout, and the group that opens the
+// new geometry describes itself rather than depending on a catalog update
+// winning a race against the media it describes.
+//
+// So the keyframe wins where they disagree, and a disagreement is not a fault.
 
 import Foundation
 import MoqomCore
@@ -83,6 +88,23 @@ public struct DepacketisedFrame: Sendable {
     /// the decoder frames whose references are missing, and the artefacts
     /// persist until the next keyframe regardless.
     public let followsGap: Bool
+
+    /// This keyframe describes a different picture than the one before it.
+    ///
+    /// Deliberately not a kind of gap, though the code once treated it as one.
+    /// Nothing was lost: the publisher changed geometry and this frame opens the
+    /// new one, complete and decodable. Reporting it as a gap made a renderer
+    /// blank itself and re-anchor its clock, so a host rotating their phone cost
+    /// every viewer a black flash — for an event where the correct behaviour is
+    /// to keep showing the last picture until this one decodes and then simply
+    /// be a different size.
+    public let changesFormat: Bool
+
+    public init(frame: EncodedFrame, followsGap: Bool, changesFormat: Bool = false) {
+        self.frame = frame
+        self.followsGap = followsGap
+        self.changesFormat = changesFormat
+    }
 }
 
 /// Reassembles a video track's objects into decodable frames.
@@ -103,6 +125,10 @@ public struct VideoDepacketiser: Sendable {
     private var group: UInt64?
     private var object: UInt64?
 
+    /// Whether a keyframe has supplied the configuration. See
+    /// ``setDecoderConfiguration(_:)``.
+    private var configuredInBand = false
+
     /// Set when the next frame follows a hole, cleared when it is reported.
     private var gapPending = false
 
@@ -116,12 +142,24 @@ public struct VideoDepacketiser: Sendable {
 
     /// Install the configuration from a catalog track.
     ///
+    /// Only until the media starts describing itself. The first keyframe to
+    /// carry its own configuration ends the catalog's authority here, and the
+    /// reason is a race that has a wrong answer rather than a slow one: the
+    /// catalog is a different track, so a publisher that changes geometry
+    /// publishes a new catalog version and a reshaped keyframe at nearly the
+    /// same moment, and they can arrive in either order. If the catalog could
+    /// still write here, a version describing the *old* geometry landing just
+    /// after the new keyframe would replace a correct configuration with a stale
+    /// one — and the viewer would tear the picture until the next keyframe
+    /// rather than simply changing size.
+    ///
     /// - Returns: Whether the buffer parsed. A rejected configuration leaves
     ///   the previous one in place, because a viewer already decoding should
     ///   not be stopped by a malformed republish.
     @discardableResult
     public mutating func setDecoderConfiguration(_ data: Data) -> Bool {
         guard let sets = DecoderConfiguration.decode(data) else { return false }
+        guard !configuredInBand else { return true }
         guard sets != parameterSets else { return true }
         parameterSets = sets
 
@@ -169,15 +207,20 @@ public struct VideoDepacketiser: Sendable {
             return nil
         }
 
+        // Taken before the continuity check, because a keyframe that carries its
+        // own configuration is decodable whatever preceded it, and because the
+        // answer changes what the frame means: the same keyframe is a recovery
+        // after loss or a change of shape, and a renderer treats those
+        // differently.
+        let reshaped = adoptConfiguration(carriedBy: input)
+
         noteContinuity(of: input)
         started = true
         group = input.group
         object = input.object
 
         // The sets go on the keyframe rather than every frame so the assembler
-        // rebuilds its format description at group boundaries and nowhere
-        // else. They come from the catalog either way; this just chooses where
-        // to hand them over.
+        // rebuilds its format description at group boundaries and nowhere else.
         let frame = EncodedFrame(
             timestamp: input.properties.captureTime ?? FrameTimestamp(nanoseconds: 0),
             isKeyFrame: input.isKeyFrame,
@@ -188,7 +231,39 @@ public struct VideoDepacketiser: Sendable {
         framesProduced += 1
 
         defer { gapPending = false }
-        return DepacketisedFrame(frame: frame, followsGap: gapPending)
+        return DepacketisedFrame(
+            frame: frame,
+            followsGap: gapPending,
+            changesFormat: reshaped
+        )
+    }
+
+    /// Take the configuration a keyframe carries, if it says something new.
+    ///
+    /// - Returns: Whether this object changed the format. False when the sets
+    ///   match what is already installed, which is the common case: every
+    ///   keyframe carries them and almost none of them are news.
+    private mutating func adoptConfiguration(carriedBy input: TrackObject) -> Bool {
+        guard
+            input.isKeyFrame,
+            let carried = input.properties.configuration,
+            let sets = DecoderConfiguration.decode(carried)
+        else { return false }
+
+        configuredInBand = true
+        guard sets != parameterSets else { return false }
+        parameterSets = sets
+
+        // No `gapPending` and no reset of `started`, which is the entire
+        // difference from taking a configuration off the catalog. There the sets
+        // arrive detached from the media and the frame they apply to is still to
+        // come, so everything in flight is suspect. Here they arrive *on* the
+        // first frame they describe.
+        //
+        // First configuration of the stream is not a change of shape either. It
+        // is the shape, and a viewer that reported its own first frame as a
+        // reshape would make every join look like a layout switch.
+        return framesProduced > 0
     }
 
     /// Work out whether anything is missing in front of this object.

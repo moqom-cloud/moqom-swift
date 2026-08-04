@@ -49,6 +49,20 @@ public struct BroadcastConfiguration: Sendable {
     /// Let the encoders trade speed for power. See ``EncoderConfiguration/prefersPowerEfficiency``.
     public var prefersPowerEfficiency: Bool
 
+    /// Follow the source when it changes the shape of what it captures.
+    ///
+    /// On by default because the alternative is worse in a way that is hard to
+    /// see: a source that starts producing a different aspect — a host switching
+    /// layout, a rotation, a scene whose tiling changed — hands the encoder
+    /// frames it was not configured for, and the encoder squeezes them into the
+    /// shape it was built with. Everyone then looks stretched, and nothing
+    /// anywhere reports an error.
+    ///
+    /// Following means the rungs are reshaped to the new aspect and the tracks
+    /// carry on under the same names, with the switch landing on a keyframe. See
+    /// ``Broadcast/reshape(toAspectOf:)``.
+    public var followsCaptureShape: Bool
+
     public init(
         ladder: LayerLadder = .defaultCamera(),
         codec: VideoCodec = .hevc,
@@ -56,6 +70,7 @@ public struct BroadcastConfiguration: Sendable {
         deliveryTimeout: Duration? = .milliseconds(500),
         stopsUnwatchedLayers: Bool = false,
         prefersPowerEfficiency: Bool = true,
+        followsCaptureShape: Bool = true,
         encoderFactory: @escaping EncoderFactory = defaultEncoderFactory
     ) {
         self.ladder = ladder
@@ -64,6 +79,7 @@ public struct BroadcastConfiguration: Sendable {
         self.deliveryTimeout = deliveryTimeout
         self.stopsUnwatchedLayers = stopsUnwatchedLayers
         self.prefersPowerEfficiency = prefersPowerEfficiency
+        self.followsCaptureShape = followsCaptureShape
         self.encoderFactory = encoderFactory
     }
 }
@@ -105,6 +121,33 @@ public struct BroadcastStatistics: Hashable, Sendable {
     public var objectsPublished: Int
     public var currentGroup: UInt64
 
+    /// Times the publication changed the shape of what it sends.
+    ///
+    /// One per layout change on the host. A number that climbs on its own means
+    /// something upstream is oscillating between two aspect ratios, which costs a
+    /// keyframe and a doubled encode every time it happens.
+    public var reshapes = 0
+
+    /// Changes of shape given up on, the previous shape being restored.
+    ///
+    /// Should be zero. One means a handover that never landed, which is a
+    /// keyframe that went missing between an encoder and this actor, and what a
+    /// viewer saw was the previous shape stretched to hold a differently shaped
+    /// picture. Worth surfacing rather than retrying quietly: the retry is
+    /// automatic and the reason it was needed is not visible anywhere else.
+    public var reshapesAbandoned = 0
+
+    /// Encoded frames discarded because their encoder no longer owns the track.
+    ///
+    /// Almost always the cost of a seamless reshape, and it should be a frame or
+    /// two per reshape. A hardware encoder holds frames internally, so when a rung
+    /// switches shape the old session is still carrying pictures that were
+    /// captured before the switch; those cannot go out after the keyframe that
+    /// reshaped the track, because a subscriber would decode them against the new
+    /// format and see the picture tear. The same applies, more rarely, to a session
+    /// that was replaced after it stopped accepting frames.
+    public var framesOutOfShape = 0
+
     /// Encoder sessions replaced after they stopped accepting frames.
     ///
     /// Nonzero means the uplink recovered from something it used to die of. A
@@ -145,6 +188,9 @@ public struct BroadcastStatistics: Hashable, Sendable {
     /// occasional hundred means the send path is applying back pressure in bursts, and every
     /// frame captured during one of those arrives late at the far end in a bunch.
     public var writeLatency: StageLatency
+
+    /// The shape now being published, once it differs from what was configured.
+    public var shape: LayerLadder?
 
     public init(
         framesSubmitted: Int = 0,
@@ -260,6 +306,52 @@ public actor Broadcast {
     /// shared counter would number one track's objects from another's output.
     private var sequencing: [LayerID: TrackSequencer] = [:]
 
+    /// The geometry being published now, which starts as the configured one.
+    ///
+    /// Held apart from `configuration.ladder` because that one is the request and
+    /// this one is the fact. They differ from the moment the source changes shape,
+    /// and the catalog has to describe this one.
+    private var shape: LayerLadder
+
+    /// Encoders for a shape that is being switched to but has not landed.
+    ///
+    /// A rung is in here from the moment its replacement encoder is built until
+    /// that encoder produces a keyframe, which is the object that reshapes the
+    /// track. Both encoders exist during that window and only one of them is
+    /// being fed — see ``consume(_:)`` for why it is the new one.
+    private var incoming: [LayerID: any FrameEncoder] = [:]
+    private var incomingDrains: [LayerID: Task<Void, Never>] = [:]
+
+    /// The shape ``incoming`` is encoding at, while a handover is in progress.
+    private var reshaping: LayerLadder?
+
+    /// Which encoder generation owns each rung's track.
+    ///
+    /// Incremented when a rung's encoder is replaced, and carried by that
+    /// encoder's drain, so output from a session that has been superseded can be
+    /// recognised and dropped. Without it the old encoder's pipeline empties
+    /// itself onto the wire after the switch, in the previous shape, behind the
+    /// keyframe that changed it.
+    private var generations: [LayerID: Int] = [:]
+
+    /// A frame whose shape disagrees with what is being published, and how many
+    /// in a row. See ``framesBeforeReshape``.
+    private var disagreeing: (aspect: Double, count: Int)?
+
+    /// How many frames of a new shape are enough to act on.
+    ///
+    /// Two, because one is not evidence. A rotation can produce a single frame at
+    /// an intermediate size, and a reshape costs a keyframe on every rung — an
+    /// expensive answer to a question that answers itself on the next frame.
+    private static let framesBeforeReshape = 2
+
+    /// Ignore aspect differences smaller than this.
+    ///
+    /// A pixel of rounding in either dimension is not a layout change, and an
+    /// exact comparison would reshape on every frame for a source whose height is
+    /// odd.
+    private static let aspectTolerance = 0.01
+
     /// When each captured frame went to the encoders, and what each stage has cost.
     private var submitted: [FrameTimestamp: ContinuousClock.Instant] = [:]
     private var encodeMeter = StageMeter()
@@ -306,8 +398,24 @@ public actor Broadcast {
         self.announcement = announcement
         self.writers = writers
         self.encoders = encoders
+        shape = configuration.ladder
         statistics.activeLayers = Set(writers.keys)
     }
+
+    /// The rungs as they are being published, which follows the source's shape.
+    public var currentLadder: LayerLadder { shape }
+
+    /// Each time the published shape changes, for a caller that has to republish
+    /// something describing it.
+    ///
+    /// A stream rather than a `didSet` or a poll, because the catalog is the thing
+    /// that has to follow and the catalog is owned by the session rather than by
+    /// the publication. Buffering the newest one only: a subscriber that missed an
+    /// intermediate shape has no use for it, since the current one supersedes it
+    /// completely.
+    public nonisolated var reshapes: AsyncStream<LayerLadder> { reshaped.stream }
+
+    private let reshaped = Reshapes()
 
     /// The decoder configuration each rung has produced so far.
     ///
@@ -372,12 +480,7 @@ public actor Broadcast {
         // schedule; draining them from the capture loop would couple every
         // rung's latency to the slowest one.
         for (id, encoder) in encoders {
-            let output = encoder.encodedFrames()
-            drains[id] = Task { [weak self] in
-                for await encoded in output {
-                    await self?.publish(encoded, on: id)
-                }
-            }
+            drains[id] = drain(encoder, on: id, generation: generation(of: id))
         }
 
         let frames = source.frames()
@@ -387,6 +490,22 @@ public actor Broadcast {
             }
         }
     }
+
+    /// Route one encoder's output onto its track, tagged with which session it is.
+    private func drain(
+        _ encoder: any FrameEncoder,
+        on layer: LayerID,
+        generation: Int
+    ) -> Task<Void, Never> {
+        let output = encoder.encodedFrames()
+        return Task { [weak self] in
+            for await encoded in output {
+                await self?.publish(encoded, on: layer, generation: generation)
+            }
+        }
+    }
+
+    private func generation(of layer: LayerID) -> Int { generations[layer] ?? 0 }
 
     /// Start a new group at the next frame.
     ///
@@ -490,10 +609,20 @@ public actor Broadcast {
         taps.removeAll()
         for drain in drains.values { drain.cancel() }
         drains.removeAll()
+        for drain in incomingDrains.values { drain.cancel() }
+        incomingDrains.removeAll()
         for encoder in encoders.values {
             await encoder.close()
         }
         encoders.removeAll()
+
+        // A reshape that was in flight when the publication stopped still holds
+        // hardware sessions. Nothing will promote them now.
+        for encoder in incoming.values {
+            await encoder.close()
+        }
+        incoming.removeAll()
+        reshaping = nil
         for writer in writers.values {
             await writer.finish()
         }
@@ -534,8 +663,60 @@ public actor Broadcast {
             return
         }
 
+        await followShape(of: frame)
+
         let forcesKeyFrame = frame.forcesKeyFrame || resumesWithKeyFrame
         resumesWithKeyFrame = false
+
+        // While a handover is in flight the new encoders get the frames and the
+        // old ones get nothing, which is the whole reason the switch is invisible.
+        //
+        // The alternative — keep feeding both until the new one produces its
+        // keyframe — sounds more careful and cannot work: the frames arriving now
+        // are the new shape, so the old session would be encoding pictures it was
+        // not built for, which is the stretching this exists to avoid. What keeps
+        // the picture continuous instead is that the old encoder has frames of the
+        // *old* shape still inside it, and those keep publishing until the new
+        // keyframe arrives to replace them.
+        // A handover that is not finishing has to end, because while it runs the old
+        // encoders are not being fed and the only thing publishing is the one that
+        // has produced nothing. Half a second of that is a frozen picture, and every
+        // second after it is the same.
+        //
+        // Reverting means the previous shape resumes on frames that are now a
+        // different shape, so the encoder squeezes them and everyone looks
+        // stretched. That is the right way round: stretched and live beats correctly
+        // shaped and stopped, and the counter says which happened.
+        if let began = handoverBegan, clock.now - began > Self.longestHandover {
+            await abandonTheReshape()
+        }
+
+        if reshaping != nil {
+            for encoder in incoming.values {
+                // Every frame of the handover, not just the first, because the
+                // handover turns on one object arriving and an encoder's output
+                // stream is entitled to discard it. It keeps the newest frames
+                // and drops the oldest under back pressure — correct for live
+                // media, and it means the keyframe that reshapes the track is
+                // exactly the object most likely to be thrown away when the
+                // pipeline is behind, which is when a reshape is most likely to
+                // be happening.
+                //
+                // So whatever survives the buffer is a keyframe. In the healthy
+                // case that costs nothing, because the drain runs between frames
+                // and the handover is over after one; under pressure it costs a
+                // few whole pictures on a link that was already dropping frames,
+                // which is the cheaper end of the trade against a stream that
+                // publishes nothing until the encoder's own keyframe interval
+                // comes round two seconds later.
+                do {
+                    try await encoder.encode(frame, forcingKeyFrame: true)
+                } catch {
+                    statistics.framesDropped += 1
+                }
+            }
+            return
+        }
 
         // Noted against the frame's own timestamp, because that is the only thing that survives
         // the encoder: what comes back out is different bytes, later, and in general reordered.
@@ -563,6 +744,185 @@ public actor Broadcast {
         }
     }
 
+    /// When the handover in progress began, if one has.
+    private var handoverBegan: ContinuousClock.Instant?
+
+    /// Measured rather than counted in frames, which is what this was and which was
+    /// wrong in a way worth keeping a note about. What the deadline protects against
+    /// is a frozen picture, and a frozen picture is a duration. Frames are a proxy for
+    /// it only while they arrive at the rate the camera promises: feed this actor
+    /// faster than its drain tasks get scheduled — a test, a machine under load — and
+    /// fifteen frames go by before the new encoder has run once, so every handover is
+    /// abandoned just before it would have landed, retried, and abandoned again.
+    private let clock = ContinuousClock()
+
+    /// How long a handover may go on before the previous shape is restored.
+    ///
+    /// Half a second, which at 30fps is fifteen frames. It should take one; anything
+    /// past a few is a keyframe that went missing rather than a slow encoder, and
+    /// while this runs the only encoder being fed is the one that has not produced
+    /// anything.
+    private static let longestHandover: Duration = .milliseconds(500)
+
+    /// Give up on a change of shape and put the previous one back.
+    private func abandonTheReshape() async {
+        for drain in incomingDrains.values { drain.cancel() }
+        incomingDrains.removeAll()
+        for encoder in incoming.values { await encoder.close() }
+        incoming.removeAll()
+        reshaping = nil
+        handoverBegan = nil
+        statistics.reshapesAbandoned += 1
+
+        // The rungs missed every frame of the handover, so the group they were
+        // part-way through cannot be continued into: a viewer joining the
+        // continuation would be missing its keyframe. Same reasoning as coming
+        // back from a mute, and the same remedy.
+        await startNewGroup()
+        resumesWithKeyFrame = true
+    }
+
+    /// Notice that the source has changed the shape of what it captures.
+    ///
+    /// Frame-driven rather than announced, and that is the important choice.
+    /// ``FrameSource/captureFormat`` is what a source intends and is not
+    /// renegotiated while it runs, so a layout change shows up as frames of a
+    /// different size and nowhere else. Acting on the frames also means an encoder
+    /// for a shape is only ever built once frames of that shape exist, so there is
+    /// no window in which the wrong session is being fed.
+    private func followShape(of frame: VideoFrame) async {
+        guard configuration.followsCaptureShape, reshaping == nil else { return }
+        guard frame.size.width > 0, frame.size.height > 0 else { return }
+
+        let captured = Double(frame.size.width) / Double(frame.size.height)
+        let published = shape.rungs.first.map {
+            Double($0.size.width) / Double($0.size.height)
+        }
+        guard let published, abs(captured - published) > Self.aspectTolerance else {
+            disagreeing = nil
+            return
+        }
+
+        // Counted against the aspect rather than a plain tally, so a source that
+        // wobbles between two shapes never accumulates its way to a switch.
+        if let held = disagreeing, abs(held.aspect - captured) <= Self.aspectTolerance {
+            disagreeing = (captured, held.count + 1)
+        } else {
+            disagreeing = (captured, 1)
+        }
+        guard disagreeing?.count ?? 0 >= Self.framesBeforeReshape else { return }
+        disagreeing = nil
+
+        await reshape(toAspectOf: frame.size)
+    }
+
+    /// Publish at the aspect ratio of what is being captured.
+    ///
+    /// The rungs keep their short sides and their names; only the long side moves.
+    /// See ``LayerLadder/reshaped(toAspectOf:)`` and ``reshape(to:)``.
+    public func reshape(toAspectOf capture: PixelSize) async {
+        // Derived from the configured ladder every time rather than from the
+        // current shape, so a sequence of layout changes cannot accumulate
+        // rounding into rungs that drift away from what was asked for.
+        await reshape(to: configuration.ladder.reshaped(toAspectOf: capture))
+    }
+
+    /// Publish differently sized pictures on the same tracks.
+    ///
+    /// Everything a subscriber holds stays valid: the namespace, the track names,
+    /// the subscriptions, the rung it chose. What changes is the size of the
+    /// pictures inside those tracks, and it changes at a keyframe carrying the
+    /// decoder configuration for the new size, so a viewer neither resubscribes
+    /// nor waits for a catalog to catch up.
+    ///
+    /// Which is why the rungs must keep their identities: a ``LayerID`` is a track
+    /// name, so renaming one is not a change of size but a different publication,
+    /// and every subscriber would have to be told to go and find it. Rungs in
+    /// `ladder` that this publication does not already have are ignored.
+    ///
+    /// Takes effect when the new encoders produce that keyframe, a frame or two
+    /// away. Until then the previous size keeps going out, because a subscriber
+    /// shown the old picture for two more frames has seen nothing happen and one
+    /// shown nothing has seen a glitch. That is the whole of the overlap: two
+    /// encoders exist for as long as it takes the new one to emit one frame.
+    public func reshape(to ladder: LayerLadder) async {
+        let target = LayerLadder(
+            rungs: ladder.rungs.filter { encoders[$0.id] != nil },
+            kind: ladder.kind
+        )
+        // Rung by rung rather than ladder against ladder, because a caller may pass
+        // a ladder covering only some of the rungs and an unchanged subset is still
+        // unchanged. A reshape that changes nothing still costs every rung a
+        // keyframe, so it is worth being sure.
+        let settled = target.rungs.allSatisfy { $0 == shape.layer(id: $0.id) }
+        guard !target.isEmpty, !settled, target != reshaping else { return }
+
+        var built: [LayerID: any FrameEncoder] = [:]
+        for rung in target.rungs {
+            do {
+                built[rung.id] = try await configuration.encoderFactory(
+                    EncoderConfiguration(
+                        layer: rung,
+                        codec: configuration.codec,
+                        prefersPowerEfficiency: configuration.prefersPowerEfficiency
+                    )
+                )
+            } catch {
+                // All or nothing. Reshaping some rungs and not others would leave
+                // a publication whose ladder disagrees with itself, and a viewer
+                // switching rungs mid-call would change aspect as a side effect of
+                // changing quality.
+                for encoder in built.values { await encoder.close() }
+                return
+            }
+        }
+        guard !built.isEmpty else { return }
+
+        reshaping = target
+        incoming = built
+        handoverBegan = clock.now
+        for (id, encoder) in built {
+            incomingDrains[id] = drain(encoder, on: id, generation: generation(of: id) + 1)
+        }
+    }
+
+    /// Hand a rung's track over to the encoder that reshaped it.
+    ///
+    /// Called with the keyframe that will be the first object of the new shape,
+    /// and returns whether the caller should go on to publish it.
+    private func promote(_ layer: LayerID, to encoder: any FrameEncoder) async -> Bool {
+        guard let rung = reshaping?.layer(id: layer) else { return false }
+
+        // Generation first, so any output still inside the old session is
+        // recognised as stale by the time it arrives.
+        generations[layer] = generation(of: layer) + 1
+
+        let retired = encoders[layer]
+        encoders[layer] = encoder
+        drains[layer]?.cancel()
+        drains[layer] = incomingDrains.removeValue(forKey: layer)
+        incoming.removeValue(forKey: layer)
+        await retired?.close()
+
+        shape = LayerLadder(
+            rungs: shape.rungs.map { $0.id == layer ? rung : $0 },
+            kind: shape.kind
+        )
+
+        // The handover is over when the last rung has switched. Announced then and
+        // not per rung: the catalog describes the whole ladder, and republishing it
+        // mid-handover would advertise a mixture of shapes that was true for a
+        // few milliseconds.
+        if incoming.isEmpty {
+            reshaping = nil
+            handoverBegan = nil
+            statistics.reshapes += 1
+            statistics.shape = shape
+            reshaped.announce(shape)
+        }
+        return true
+    }
+
     /// Rungs whose encoder is refusing frames, and how many in a row.
     private var refusals: [LayerID: Int] = [:]
 
@@ -586,7 +946,12 @@ public actor Broadcast {
         let count = (refusals[layer] ?? 0) + 1
         refusals[layer] = count
         guard count == Self.refusalsBeforeRebuild else { return }
-        guard let rung = configuration.ladder.layer(id: layer) else { return }
+
+        // The shape being published, not the one that was configured. A rung whose
+        // encoder dies after a layout change has to come back at the size its
+        // subscribers are decoding; rebuilding it from the original ladder would
+        // undo the reshape and nothing would say so.
+        guard let rung = shape.layer(id: layer) else { return }
 
         let replacement: any FrameEncoder
         do {
@@ -611,22 +976,46 @@ public actor Broadcast {
         refusals[layer] = 0
         statistics.encodersRebuilt += 1
 
+        // A generation of its own, for the same reason a reshape takes one: the
+        // session being replaced may still emit, and its output belongs to a track
+        // it no longer owns.
+        generations[layer] = generation(of: layer) + 1
+
         // The new session shares nothing with the old one, so the first frame
         // out of it has to be a keyframe or every subscriber holds a picture
         // that references frames this encoder never produced.
         resumesWithKeyFrame = true
 
-        let output = replacement.encodedFrames()
-        drains[layer] = Task { [weak self] in
-            for await encoded in output {
-                await self?.publish(encoded, on: layer)
-            }
-        }
+        drains[layer] = drain(replacement, on: layer, generation: generation(of: layer))
     }
 
     /// One compressed frame becomes one object on one track.
-    private func publish(_ encoded: EncodedFrame, on layer: LayerID) async {
-        guard let writer = writers[layer], let rung = configuration.ladder.layer(id: layer) else {
+    ///
+    /// The generation says which encoder session produced this, and it is checked
+    /// rather than trusted because a rung can change shape underneath its own
+    /// pipeline. Three cases arrive here and only one of them is ordinary:
+    /// output from the session that currently owns the track, the keyframe from a
+    /// session that is about to take it over, and — for a frame or two after that
+    /// — pictures of the previous shape emerging from a session that has already
+    /// been retired.
+    private func publish(_ encoded: EncodedFrame, on layer: LayerID, generation: Int) async {
+        let current = self.generation(of: layer)
+        if generation != current {
+            // Ahead of the current generation: this is the replacement encoder's
+            // output during a handover. Only its keyframe is publishable, and
+            // publishing it is what completes the switch.
+            guard
+                generation == current + 1,
+                encoded.isKeyFrame,
+                let encoder = incoming[layer],
+                await promote(layer, to: encoder)
+            else {
+                statistics.framesOutOfShape += 1
+                return
+            }
+        }
+
+        guard let writer = writers[layer], let rung = shape.layer(id: layer) else {
             // Counted, because this used to be the quietest failure in the SDK. A rung with no
             // writer discards every frame the encoder produces, and returning here without
             // saying so left the publication's own statistics describing a healthy broadcast:
@@ -664,6 +1053,13 @@ public actor Broadcast {
             isKeyFrame: encoded.isKeyFrame,
             properties: ObjectProperties(
                 captureTime: encoded.timestamp,
+                // On every keyframe, not only the ones that change something. A
+                // group is then decodable from itself, which is what the relay's
+                // cache needs: it keys groups by track name, the shape of a track
+                // can change, and nothing in the cache knows that. A joiner handed
+                // an older group has to be able to read it without asking what the
+                // publisher is doing now.
+                configuration: encoded.isKeyFrame ? initialisation[layer] : nil,
                 temporalLayer: encoded.temporalLayer
             )
         )
@@ -696,6 +1092,29 @@ public actor Broadcast {
         return UInt8(min(255, Int(configuration.basePriority) + index * 8))
     }
 
+}
+
+/// The published shape, as it changes.
+///
+/// A separate object so the stream can be handed out from a non-isolated
+/// property: an actor cannot expose its own stored continuation without either
+/// making the accessor async, which is awkward at a call site that just wants to
+/// start a task, or making the property non-isolated, which a stored actor
+/// property cannot be.
+private final class Reshapes: Sendable {
+    let stream: AsyncStream<LayerLadder>
+    private let continuation: AsyncStream<LayerLadder>.Continuation
+
+    init() {
+        (stream, continuation) = AsyncStream.makeStream(
+            of: LayerLadder.self,
+            bufferingPolicy: .bufferingNewest(1)
+        )
+    }
+
+    deinit { continuation.finish() }
+
+    func announce(_ ladder: LayerLadder) { continuation.yield(ladder) }
 }
 
 /// Where the next object on a track goes.

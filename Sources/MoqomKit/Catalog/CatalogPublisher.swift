@@ -163,12 +163,19 @@ public extension Catalog {
     /// next version.
     static func describing(
         _ configuration: BroadcastConfiguration,
+        ladder: LayerLadder? = nil,
         decoderConfigurations: [LayerID: Data] = [:],
         audio: AudioPublicationConfiguration? = nil,
         keyID: UInt64? = nil,
         muted: MediaKind = []
     ) -> Catalog {
-        var tracks: [CatalogTrack] = configuration.ladder.rungs.enumerated().map { index, rung in
+        // The live ladder when there is one, because a publication's geometry can
+        // move after it starts: the rungs keep their names and their short sides,
+        // and the shape follows the source. The configuration's own ladder is what
+        // it was asked for, which after a layout change is no longer what is
+        // being sent.
+        let ladder = ladder ?? configuration.ladder
+        var tracks: [CatalogTrack] = ladder.rungs.enumerated().map { index, rung in
             CatalogTrack(
                 name: rung.id.value,
                 kind: .video,
@@ -179,7 +186,7 @@ public extension Catalog {
                 frameRate: rung.frameRate,
                 bitrate: rung.bitrate,
                 rung: index,
-                isPrimary: index == configuration.ladder.rungs.count - 1
+                isPrimary: index == ladder.rungs.count - 1
             )
         }
 

@@ -132,9 +132,19 @@ top of `Sources/MoqomKit/Transport/Transport.swift`.
   temporal layer — surviving to the wire.
 - **Reassembly.** Dropping what precedes the first keyframe, counting holes in
   object numbering, distinguishing the next group from a skipped one, and
-  parameter sets arriving from the catalog rather than the bitstream. Plus a
-  round trip: a broadcast through the real packetiser, the relay, and the real
-  depacketiser, arriving as the frames that were encoded.
+  parameter sets arriving both from the catalog and on each keyframe — with the
+  keyframe winning, because the catalog is a different track and can arrive after
+  the media it describes. Plus a round trip: a broadcast through the real
+  packetiser, the relay, and the real depacketiser, arriving as the frames that
+  were encoded.
+- **A live change of shape.** A host changing layout mid-call: the rung keeps its
+  name and its short side, a new encoder overlaps only until its first keyframe,
+  and the switch is a group boundary carrying the decoder configuration for the
+  new geometry. Asserted from the viewer's side, which is where it matters — one
+  reshape reported, no gap, frames either side of the seam, and a timeline that
+  does not restart. Also that a single odd-sized frame is not a layout change,
+  that a handover which loses its keyframe recovers rather than stalling, and
+  that a viewer joining afterwards can decode a cached group from before it.
 - **Audio.** Encoder framing, and a jitter buffer's fill behaviour, reordering,
   late and duplicate packets, gap concealment, and jitter estimate.
 - **Voice activity.** That silence, a constant offset, and a steady room are all

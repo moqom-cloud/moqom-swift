@@ -31,6 +31,7 @@ This script takes no arguments; everything is an environment variable.
   MOQOM_AUDIO=mic        publish audio: mic, or tone for a synthetic source
   MOQOM_VIDEO=camera     publish video: camera, pattern, or scene for the AR orb
   MOQOM_PLAYOUT_MS=40    fixed playout delay, instead of the adaptive one
+  MOQOM_RESHAPE_EVERY=6  turn the publisher's picture on its side this often, and back
   MOQOM_CALL=1           publish the layout's rung, as a call does, not a pinned one
   MOQOM_EAGER=1          encode for speed rather than power, at the cost of heat
   MOQOM_FLOOR_MS / MOQOM_TOLERANCE / MOQOM_STATS_MS / MOQOM_FLAT_LAYERS
@@ -123,6 +124,11 @@ WHERE="$WHERE${MOQOM_VIDEO:+ --video $MOQOM_VIDEO}"
 # glancing between two screens.
 WHERE="$WHERE${MOQOM_BUBBLES:+ --bubbles}"
 WHERE="$WHERE${MOQOM_POP_EVERY:+ --pop-every $MOQOM_POP_EVERY}"
+# Turns the publisher's picture on its side and back on a timer, which is a layout change
+# without a thumb. On a timer because the evidence is in the other phone's log and has to be
+# lined up against the moment: the publisher prints SHAPE, and the viewer's DRAW line should
+# change its `shape=` and add one to `reshapes` without its gap or stall counters moving.
+WHERE="$WHERE${MOQOM_RESHAPE_EVERY:+ --reshape-every $MOQOM_RESHAPE_EVERY}"
 
 # A measured run or a call. The difference is which rung gets published — a pinned one, or the
 # one the layout on screen asks for — and it is worth being able to script both, because for a
@@ -352,6 +358,21 @@ if [ -n "${MOQOM_SECONDS:-}" ]; then
         grep -E '^(LINK|GLASS|PLAY|TIME|DRAW|SHOW|GRAB|SEEN|HOST|SEND|COST|TALK|HEAR|OUT|  SPKR|  VIEW)' \
             "$log" | tail -14
     done
+
+    # A run that changed shape gets its own answer, because the tail above cannot give it: the
+    # question is not what the last report said but whether the picture followed the publisher
+    # each time and cost nothing when it did. So: every shape the viewer decoded in order,
+    # against every change the publisher made.
+    if [ -n "${MOQOM_RESHAPE_EVERY:-}" ]; then
+        echo
+        echo "--- shape changes"
+        grep -h '^SHAPE' "$PUBLISHER_LOG" | sed 's/^/publisher: /'
+        # Only when it changes, so a run of identical reports collapses to the moments that
+        # matter. The stall count comes along because a seam that cost a freeze shows up there
+        # and nowhere else.
+        grep -o 'shape=[0-9x]* reshapes=[0-9]*' "$VIEWER_LOG" | awk '
+            $0 != last { print "viewer:    " $0; last = $0 }'
+    fi
     exit 0
 fi
 

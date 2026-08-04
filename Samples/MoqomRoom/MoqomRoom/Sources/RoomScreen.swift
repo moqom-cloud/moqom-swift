@@ -659,6 +659,16 @@ struct Scoreboard: View {
 struct BroadcastControls: View {
     @Bindable var room: RoomModel
 
+    /// Selecting a shape is an action rather than a stored preference, so this cannot be
+    /// `$room.publishShape`: the picture only changes because the source is asked to draw
+    /// differently, and that is asynchronous.
+    private var shape: Binding<RoomModel.Shape> {
+        Binding(
+            get: { room.publishShape },
+            set: { choice in Task { await room.setPublishShape(choice) } }
+        )
+    }
+
     var body: some View {
         VStack(spacing: 8) {
             // Scrolled sideways rather than squeezed, and this is not only about the buttons.
@@ -834,6 +844,18 @@ struct BroadcastControls: View {
                                 Text(choice.rawValue).tag(choice)
                             }
                         }
+
+                        // Live, and the point of it is that it is live: this changes the shape
+                        // of the picture everyone else is decoding, mid-call, without
+                        // resubscribing anybody. What a viewer should see is their tile change
+                        // proportions between one frame and the next — no black flash, no
+                        // freeze, no gap. Anything else is the seam showing.
+                        Picker("My video shape", selection: shape) {
+                            ForEach(RoomModel.Shape.allCases) { choice in
+                                Text(choice.rawValue).tag(choice)
+                            }
+                        }
+                        .disabled(room.videoInput == .scene)
 
                         Toggle("Mirror my video", isOn: $room.publishesMirrored)
                     } label: {

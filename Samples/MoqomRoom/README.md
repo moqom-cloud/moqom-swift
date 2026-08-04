@@ -134,6 +134,38 @@ publishing moves to `AudioGraph.Purpose.listening`, which is a playback session 
 no microphone held, no orange indicator, and audio that survives the screen
 locking, which is what the `audio` background mode in `Info.plist` is for.
 
+## Changing the shape of what you publish, mid-call
+
+**Room → Layout → My video shape** turns the live publication between portrait and
+landscape while it is running. The rung keeps its name and its short side, so
+nothing resubscribes; the switch lands on a keyframe that carries the decoder
+configuration for the new size, and the far tile changes proportions between one
+frame and the next.
+
+Worth watching on the *other* phone, since that is where it either works or shows.
+`Scripts/bench-two-phones.sh` with `MOQOM_RESHAPE_EVERY=8` does it on a timer and
+prints both halves: the publisher's `SHAPE` lines against the viewer's `DRAW`, whose
+`shape=` and `reshapes=` should follow each one.
+
+What it costs, measured over two phones on a 1.3Mbps link — because "seamless" is a
+claim and these are the numbers behind it:
+
+- Nothing is lost or blanked. `delivered=100.0%`, `lost=0`, `failures=0`, and no
+  flush: the renderer keeps the last picture until the new one decodes. On the
+  publisher's side `out-of-shape=0` and `abandoned=0`, so the handover completes on
+  the first keyframe every time and no frame is encoded for a track it no longer owns.
+- Two frames go out at the old aspect. A single differently shaped frame is not
+  treated as a layout change — a rotation can produce one on its own — so the first
+  two are encoded by the old session, which squeezes them. Two frames is 66ms.
+- A keyframe per rung, which on a thin link is the real cost. An IDR is many times
+  the size of a delta, so the arrival gap at the seam grows from about 170ms to
+  between 200 and 270ms, and the cadence report attributes those stalls with
+  `onkey=`. Unavoidable in kind: a decoder cannot change format without one.
+- On a camera, the capture connection hiccups for about 130ms while it changes
+  rotation. That one is the camera's rather than the SDK's — it shows up on the
+  publisher's own `GRAB` and `TIME` lines, and it happens whether or not the
+  publication follows.
+
 ## Leaving the app
 
 Two features that only exist once the app is no longer the thing on screen, and

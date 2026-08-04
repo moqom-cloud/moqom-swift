@@ -158,6 +158,93 @@ struct DepacketiserTests {
         #expect(depacketiser.decoderParameterSets == good)
     }
 
+    // MARK: - A publisher that changes shape
+
+    private func reshaping(
+        group: UInt64,
+        to sets: [Data]
+    ) -> TrackObject {
+        TrackObject(
+            group: group,
+            object: 0,
+            priority: 64,
+            payload: Data([0x00]),
+            isKeyFrame: true,
+            properties: ObjectProperties(
+                captureTime: FrameTimestamp(nanoseconds: group * 1000),
+                configuration: DecoderConfiguration.encode(sets)
+            )
+        )
+    }
+
+    @Test("a keyframe carrying new parameter sets changes the format without a gap")
+    func inBandConfigurationIsNotAGap() {
+        // The distinction the renderer acts on. A gap means flush, blank, and
+        // re-anchor; a reshape means keep the last picture and change size at
+        // this frame. Reporting the second as the first is a black flash every
+        // time a host rotates their phone.
+        var depacketiser = VideoDepacketiser()
+        let portrait = [Data([0x40, 0x02, 0xD0, 0x05, 0x00])]
+        let landscape = [Data([0x40, 0x05, 0x00, 0x02, 0xD0])]
+
+        _ = depacketiser.accept(reshaping(group: 0, to: portrait))
+        _ = depacketiser.accept(object(group: 0, object: 1))
+
+        let reshaped = depacketiser.accept(reshaping(group: 1, to: landscape))
+        #expect(reshaped?.changesFormat == true)
+        #expect(reshaped?.followsGap == false)
+        #expect(reshaped?.frame.parameterSets == landscape)
+        #expect(depacketiser.objectsLost == 0)
+
+        // And the frames after it decode against the new format without being
+        // told again.
+        let next = depacketiser.accept(object(group: 1, object: 1))
+        #expect(next?.changesFormat == false)
+        #expect(next != nil)
+    }
+
+    @Test("the first keyframe of a stream is not a change of shape")
+    func theFirstConfigurationIsNotAReshape() {
+        // Otherwise every join reports a layout change, and the one counter that
+        // would tell a real reshape from a publisher oscillating between two
+        // geometries counts joins instead.
+        var depacketiser = VideoDepacketiser()
+        let first = depacketiser.accept(reshaping(group: 7, to: [Data([0x40, 0x01])]))
+        #expect(first?.changesFormat == false)
+        #expect(first?.frame.parameterSets == [Data([0x40, 0x01])])
+    }
+
+    @Test("a repeated configuration on every keyframe changes nothing")
+    func unchangedConfigurationIsNotAReshape() {
+        // Every keyframe carries the sets so that a group is decodable from
+        // itself. Almost none of them are news, and treating each as a change
+        // would rebuild the format description twice a second.
+        var depacketiser = VideoDepacketiser()
+        let sets = [Data([0x40, 0x01])]
+        _ = depacketiser.accept(reshaping(group: 0, to: sets))
+        let again = depacketiser.accept(reshaping(group: 1, to: sets))
+        #expect(again?.changesFormat == false)
+    }
+
+    @Test("a stale catalog cannot undo a reshape the media already made")
+    func theCatalogDefersToTheKeyframe() {
+        // The race with a wrong answer rather than a slow one. A publisher that
+        // changes geometry republishes its catalog and emits a reshaped keyframe
+        // at nearly the same moment, on different tracks, so a version describing
+        // the old geometry can land just after the new keyframe. Applied, it
+        // would tear the picture until the next keyframe.
+        var depacketiser = VideoDepacketiser()
+        let was = [Data([0x40, 0x02, 0xD0])]
+        let now = [Data([0x40, 0x05, 0x00])]
+
+        depacketiser.setDecoderConfiguration(DecoderConfiguration.encode(was))
+        _ = depacketiser.accept(reshaping(group: 0, to: now))
+        depacketiser.setDecoderConfiguration(DecoderConfiguration.encode(was))
+
+        #expect(depacketiser.decoderParameterSets == now)
+        #expect(depacketiser.accept(object(group: 0, object: 1)) != nil)
+    }
+
     @Test("timestamps and temporal layers come back off the properties")
     func metadataSurvives() {
         // These travel as MOQT object properties precisely so a relay can

@@ -28,6 +28,23 @@ public enum MoqomObjectProperty {
     /// and no display pipeline resolves better than a microsecond anyway.
     public static let captureTimeMicroseconds: UInt64 = 0x78
 
+    /// Decoder configuration for the group this object opens.
+    ///
+    /// Odd, so it carries bytes: the length-prefixed parameter sets of
+    /// ``DecoderConfiguration``. Only ever on a keyframe, which is roughly once
+    /// every two seconds per rung, so the hundred-odd bytes it costs are not
+    /// per-frame overhead.
+    ///
+    /// The catalog carries the same sets, and this does not replace it — a
+    /// viewer still wants a decoder built before the first object arrives. What
+    /// this adds is that a group is decodable from itself. That matters because
+    /// the geometry can change mid-track, and the relay caches by track name
+    /// with no idea that it has: a joiner served an older group from the cache
+    /// would otherwise decode it against whichever parameter sets the catalog
+    /// happened to be advertising, which is a stretched or torn picture rather
+    /// than an error.
+    public static let configuration: UInt64 = 0x79
+
     /// Temporal layer index, `0` being the base.
     public static let temporalLayer: UInt64 = 0x7A
 
@@ -47,6 +64,14 @@ extension ObjectProperties {
            let parameter = try? Parameter.integer(
                MoqomObjectProperty.captureTimeMicroseconds,
                captureTime.nanoseconds / 1000
+           )
+        {
+            items.append(parameter)
+        }
+        if let configuration, !configuration.isEmpty,
+           let parameter = try? Parameter.bytes(
+               MoqomObjectProperty.configuration,
+               configuration
            )
         {
             items.append(parameter)
@@ -81,6 +106,7 @@ extension ObjectProperties {
         let silence = parameters.integer(MoqomObjectProperty.silence)
         self.init(
             captureTime: microseconds.map { FrameTimestamp(nanoseconds: $0 * 1000) },
+            configuration: parameters.bytes(MoqomObjectProperty.configuration),
             temporalLayer: layer.map { Int($0) },
             // Absent means "not stated", which for audio means not silence. It
             // stays `nil` rather than becoming `false` so a video object does

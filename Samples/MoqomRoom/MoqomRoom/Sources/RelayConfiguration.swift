@@ -295,6 +295,15 @@ struct LaunchOptions {
     /// Seconds between scripted pops, where a run has nobody to tap.
     var popEverySeconds: Double?
 
+    /// Seconds between scripted turns of the published picture, portrait to landscape and back.
+    ///
+    /// Because the thing being tested is what happens to the *other* phone, and the other
+    /// phone's account of it is a log rather than a screen. Doing this by thumb means the
+    /// moment of the change is known only approximately and only to the person who tapped,
+    /// which is no use for reading a viewer's frame arrivals either side of the seam. On a
+    /// timer, both logs bracket it.
+    var reshapeEverySeconds: Double?
+
     static func current(
         arguments: [String] = ProcessInfo.processInfo.arguments
     ) -> LaunchOptions {
@@ -322,6 +331,7 @@ struct LaunchOptions {
             case "--video": options.video = value ?? "camera"
             case "--bubbles": options.bubbles = true
             case "--pop-every": options.popEverySeconds = value.flatMap(Double.init)
+            case "--reshape-every": options.reshapeEverySeconds = value.flatMap(Double.init)
             default: break
             }
             index += 1

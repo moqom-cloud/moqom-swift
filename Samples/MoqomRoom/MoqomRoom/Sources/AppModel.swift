@@ -98,6 +98,33 @@ final class AppModel {
     /// Stands in for a finger, in a run that has none.
     private var popping: Task<Void, Never>?
 
+    /// Turns the published picture on its side and back, in the same sort of run.
+    private var reshaping: Task<Void, Never>?
+
+    /// Change the shape of what is published every so often.
+    ///
+    /// The publisher's half of a two-log test. What it prints is the intent and the moment,
+    /// and the answer is in the other phone's log: a `RECV` line whose dimensions change at
+    /// the same second, without the gap counter moving and without a stall being reported.
+    /// Both halves are needed, because a publisher can report a reshape it completed
+    /// perfectly and still have handed its viewers a black flash.
+    private func reshapeRepeatedly(in room: RoomModel, every seconds: Double) {
+        reshaping?.cancel()
+        reshaping = Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(seconds))
+                if Task.isCancelled { return }
+                guard await room.isBroadcasting else { continue }
+
+                let next: RoomModel.Shape = await room.publishShape == .upright
+                    ? .sideways
+                    : .upright
+                await room.setPublishShape(next)
+                Journal.shared.say("SHAPE publishing \(next.rawValue.lowercased())")
+            }
+        }
+    }
+
     /// Pop a bubble every so often, so a scripted run exercises intents.
     ///
     /// The scores in the two logs are what this is for: a pop is decided by one
@@ -209,6 +236,10 @@ final class AppModel {
                     + " encode=\(launch.eagerEncoding ? "eager" : "efficient")"
                     + " audio=\(room.isPublishingAudio ? (launch.audio ?? "on") : "off")"
             )
+
+            if let every = launch.reshapeEverySeconds {
+                reshapeRepeatedly(in: room, every: every)
+            }
 
             // After the broadcast, because the field is drawn in the scene's
             // view and there is no scene until something is being published
@@ -465,6 +496,17 @@ final class AppModel {
                             room.tileSize.height,
                             room.tileCount
                         )
+                        // The shape being decoded, beside the tile it is drawn in. Together
+                        // they answer whether a layout change landed: the two dimensions
+                        // change within a frame of each other, `reshapes` goes up by one, and
+                        // the gap and stall counters above do not move. A picture that
+                        // changed shape while the tile did not is a reshape the receiver
+                        // took and the interface ignored, which reads as letterboxing.
+                        + String(
+                            format: " shape=%@ reshapes=%d",
+                            room.receivedShape.map { "\($0.width)x\($0.height)" } ?? "unknown",
+                            drawn.reshapes
+                        )
                         // And whether anything is presenting them. A rate of zero is a queue
                         // filling up behind a clock that never started, which every count above
                         // reports as a stream in perfect health.
@@ -679,6 +721,19 @@ final class AppModel {
                             + " objects=\(video.objectsPublished)"
                             + (video.encodersRebuilt > 0
                                 ? " rebuilt=\(video.encodersRebuilt)" : "")
+                            // Only once something has changed shape, because on a run that
+                            // never does these are three zeros in the middle of the line
+                            // people read for something else. When they do appear they are
+                            // what a handover cost: how many, how many frames were thrown
+                            // away because their encoder no longer owned the track, and how
+                            // many changes were given up on. The last should be zero, and a
+                            // reshape costing much more than a frame or two is the seam
+                            // showing.
+                            + (video.reshapes > 0 || video.reshapesAbandoned > 0
+                                ? " reshapes=\(video.reshapes)"
+                                    + " out-of-shape=\(video.framesOutOfShape)"
+                                    + " abandoned=\(video.reshapesAbandoned)"
+                                : "")
                             + " · encoder emitted=\(video.encoding.emitted)"
                             + " declined=\(video.encoding.declined)"
                             + " unreadable=\(video.encoding.unreadable)"
@@ -868,6 +923,10 @@ final class AppModel {
         reporter?.cancel()
         timekeeping?.cancel()
         timekeeping = nil
+        popping?.cancel()
+        popping = nil
+        reshaping?.cancel()
+        reshaping = nil
         if case let .inRoom(model) = phase {
             await model.leave()
         }

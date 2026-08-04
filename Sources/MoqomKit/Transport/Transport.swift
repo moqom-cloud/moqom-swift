@@ -474,6 +474,19 @@ public struct ObjectProperties: Hashable, Sendable {
     /// arrival would reproduce every jitter the network added.
     public var captureTime: FrameTimestamp?
 
+    /// The parameter sets a decoder needs for this group, on its keyframe.
+    ///
+    /// Present so that a group can be decoded without reference to anything
+    /// that arrived before it. The publisher's geometry is allowed to change
+    /// while a track runs — a host switching layout — and when it does, the
+    /// keyframe that opens the new geometry carries the configuration for it.
+    /// A viewer therefore never has to wait for a catalog to catch up with a
+    /// picture that has already changed shape.
+    ///
+    /// In ``DecoderConfiguration``'s length-prefixed form, and `nil` on
+    /// everything but a keyframe.
+    public var configuration: Data?
+
     /// `0` for the base layer, higher for frames nothing depends on.
     ///
     /// The relay drops the highest layer first under congestion, which lowers
@@ -493,15 +506,17 @@ public struct ObjectProperties: Hashable, Sendable {
 
     public init(
         captureTime: FrameTimestamp? = nil,
+        configuration: Data? = nil,
         temporalLayer: Int? = nil,
         isSilence: Bool? = nil
     ) {
         self.captureTime = captureTime
+        self.configuration = configuration
         self.temporalLayer = temporalLayer
         self.isSilence = isSilence
     }
 
     public var isEmpty: Bool {
-        captureTime == nil && temporalLayer == nil && isSilence == nil
+        captureTime == nil && configuration == nil && temporalLayer == nil && isSilence == nil
     }
 }

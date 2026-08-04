@@ -223,7 +223,7 @@ public actor SyntheticEncoder: FrameEncoder {
                 isKeyFrame: isKeyFrame,
                 temporalLayer: temporalLayer,
                 data: Self.pattern(byte: UInt8(counter & 0xFF), count: size),
-                parameterSets: isKeyFrame ? [Data([0x00, 0x01, 0x02, 0x03])] : []
+                parameterSets: isKeyFrame ? [Self.parameterSet(for: configuration.layer.size)] : []
             )
         )
     }
@@ -239,6 +239,25 @@ public actor SyntheticEncoder: FrameEncoder {
             + Double(configuration.keyFrameInterval.components.attoseconds) / 1e18
         let rate = max(1.0, configuration.layer.frameRate)
         return max(1, Int((seconds * rate).rounded()))
+    }
+
+    /// A parameter set that depends on the geometry, as a real one does.
+    ///
+    /// A real SPS carries the picture's dimensions, so two sessions at different
+    /// sizes produce different parameter sets — and a great deal downstream turns
+    /// on that: whether a receiver notices the picture changed shape, whether it
+    /// rebuilds its format description, whether a cached group can still be
+    /// decoded. A constant here would let all of that pass tests that prove
+    /// nothing, which is what it did.
+    private static func parameterSet(for size: PixelSize) -> Data {
+        var data = Data([0x00, 0x01])
+        withUnsafeBytes(of: UInt16(clamping: size.width).bigEndian) {
+            data.append(contentsOf: $0)
+        }
+        withUnsafeBytes(of: UInt16(clamping: size.height).bigEndian) {
+            data.append(contentsOf: $0)
+        }
+        return data
     }
 
     /// Length-prefixed like a real AVCC/HVCC unit, so anything downstream that

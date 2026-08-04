@@ -573,11 +573,31 @@ final class RoomModel {
     /// to agree. A portrait camera in a landscape tile is not letterboxed, it is a small
     /// strip of picture between two black bars, and the box the SDK is told about is the
     /// tile's — so it would also ask for a rung sized for a shape nobody is sending.
+    ///
+    /// What is *arriving* wins over what is being published, because a publisher may change
+    /// the shape of its picture while the call runs and the two are then different for as
+    /// long as it takes anyone to notice. This device's own rung is the fallback, for the
+    /// moments before a first frame has been decoded.
     var seatAspect: Double {
         guard mode == .gallery else { return 1 }
-        let size = pinnedRung?.size ?? Self.defaultCaptureSize
+        let size = receivedShape ?? pinnedRung?.size ?? Self.defaultCaptureSize
         return Double(size.width) / Double(size.height)
     }
+
+    /// The size of the pictures a remote tile is decoding now.
+    ///
+    /// From the format description the decoder is using rather than from the publisher's
+    /// catalog. They agree except across a layout change, which is the one moment this is
+    /// being read for: the reshaped keyframe and the catalog version describing it travel on
+    /// separate tracks and arrive in either order.
+    var receivedShape: PixelSize?
+
+    /// How the publisher's shape has changed since this device went live.
+    ///
+    /// Counted from the receiving side, so it is evidence that the seam worked rather than
+    /// that it was attempted: a viewer only sees this when a keyframe arrives carrying a
+    /// different decoder configuration.
+    var receivedReshapes = 0
 
     /// What the camera is asked for when no rung has been pinned.
     ///
@@ -601,6 +621,65 @@ final class RoomModel {
         case .sideBySide, .others: Self.defaultCaptureSize
         case .me: PixelSize(width: 1080, height: 1920)
         }
+    }
+
+    /// Which way up the published picture is.
+    ///
+    /// Its own control rather than something read off the device's orientation, because the
+    /// question it exists to answer is what happens to *other people's* tiles when a host
+    /// changes layout mid-call. Rotating a phone to find out involves the sensor, the capture
+    /// connection and the preview all changing at once; this changes one thing.
+    enum Shape: String, CaseIterable, Identifiable, Sendable {
+        case upright = "Portrait"
+        case sideways = "Landscape"
+
+        var id: String { rawValue }
+    }
+
+    /// Upright, because that is how a phone is held. See ``defaultCaptureSize``.
+    var publishShape: Shape = .upright
+
+    /// Turn the live publication on its side, or back.
+    ///
+    /// The whole of a layout change from here: the source is asked for a different shape and
+    /// the SDK does the rest — a new encoder at the new size, the handover landing on a
+    /// keyframe that carries its own decoder configuration, the same track name throughout,
+    /// and a republished catalog for whoever joins next. Nothing is resubscribed and no
+    /// viewer is asked to do anything.
+    ///
+    /// Two paths because the sources differ in what they can be asked. A camera negotiated a
+    /// format when it opened and keeps it, so what changes is the quarter turn the capture
+    /// connection applies — free, and it swaps the delivered width and height. The test
+    /// pattern has nothing to negotiate with and simply draws a different size.
+    func setPublishShape(_ shape: Shape) async {
+        publishShape = shape
+        let size = shaped(publishSize, as: shape)
+
+        switch videoInput {
+        case .camera:
+            // Zero for landscape: the sensor's own frames are landscape already, and the
+            // quarter turn is what a portrait publication needs. See `CameraSource`.
+            camera?.rotationDegrees = shape == .upright ? 90 : 0
+        case .pattern:
+            capture?.resize(to: size)
+        case .scene:
+            // The scene's drawable is the tile it is drawn in, so its shape is the layout's
+            // and not this control's. Left alone rather than half-applied.
+            break
+        }
+    }
+
+    /// A size turned the way a shape asks for, keeping its short side.
+    ///
+    /// The short side is what the rung is named after, so holding it is what lets the track
+    /// keep its name through the change — `video/720p` is 720×1280 upright and 1280×720 on
+    /// its side, and both descriptions are true.
+    private func shaped(_ size: PixelSize, as shape: Shape) -> PixelSize {
+        let short = min(size.width, size.height)
+        let long = max(size.width, size.height)
+        return shape == .upright
+            ? PixelSize(width: short, height: long)
+            : PixelSize(width: long, height: short)
     }
 
     /// The frame rate to publish at.

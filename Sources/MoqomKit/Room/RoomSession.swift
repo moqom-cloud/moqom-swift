@@ -48,6 +48,9 @@ public actor RoomSession {
     private var catalogRefresh: Task<Void, Never>?
     private var catalogRestatement: Task<Void, Never>?
 
+    /// Watches the broadcast's shape, for as long as it is publishing.
+    private var catalogReshapes: Task<Void, Never>?
+
     /// Retries of a broadcast's writers after a reconnect, and the announcement they share.
     private var publicationRepair: Task<Void, Never>?
     private var reopenedAnnouncement: (any AnnouncementHandle)?
@@ -788,6 +791,8 @@ public actor RoomSession {
         audioAnnouncement = nil
         catalogRefresh?.cancel()
         catalogRefresh = nil
+        catalogReshapes?.cancel()
+        catalogReshapes = nil
         await catalogPublisher?.finish()
         catalogPublisher = nil
         catalogs.removeAll()
@@ -912,6 +917,18 @@ public actor RoomSession {
 
         await live.start()
 
+        // A publication whose source changes shape republishes the catalog, so a
+        // newcomer's first sight of the stream is the size it is now. Everyone
+        // already watching learns it from the keyframe that changed it and does
+        // not need this; the catalog is the joiner's path, not the switch's.
+        catalogReshapes?.cancel()
+        let reshapes = live.reshapes
+        catalogReshapes = Task { [weak self] in
+            for await _ in reshapes {
+                await self?.refreshCatalog()
+            }
+        }
+
         // Republished once the encoders have produced parameter sets, which
         // cannot happen until something has been encoded.
         catalogRefresh?.cancel()
@@ -951,15 +968,22 @@ public actor RoomSession {
         let configurations = await broadcast?.decoderConfigurations ?? [:]
         let configuration = broadcast?.configuration
             ?? BroadcastConfiguration(ladder: LayerLadder(rungs: []))
+
+        // The shape the broadcast is publishing rather than the one it was built
+        // with. They part company the moment the source changes aspect, and a
+        // catalog that still advertised the old dimensions would have every
+        // newcomer lay out a tile for a picture that is no longer that size.
+        let ladder = await broadcast?.currentLadder ?? configuration.ladder
         let catalog = Catalog.describing(
             configuration,
+            ladder: ladder,
             decoderConfigurations: configurations,
             audio: audio?.configuration,
             keyID: encryption?.sender.key.keyID,
             muted: ownMute
         )
         _ = try? await publisher.publish(catalog)
-        return configurations.count >= configuration.ladder.rungs.count
+        return configurations.count >= ladder.rungs.count
     }
 
     /// Say the catalog again, a few times, over the couple of seconds after somebody arrives.
@@ -1023,6 +1047,8 @@ public actor RoomSession {
     public func stopBroadcast() async {
         catalogRefresh?.cancel()
         catalogRefresh = nil
+        catalogReshapes?.cancel()
+        catalogReshapes = nil
         catalogRestatement?.cancel()
         catalogRestatement = nil
         await broadcast?.stop()
