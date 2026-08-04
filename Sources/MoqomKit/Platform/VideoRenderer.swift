@@ -603,6 +603,25 @@ import MoqomCore
             /// a publisher oscillating between two geometries.
             public var reshapes = 0
 
+            /// Which of the delay controller's four paths moved the delay, and how often.
+            ///
+            /// Here because the delay's value does not say how it got there, and the answer
+            /// decides what to do about it. A delay of two hundred milliseconds reached by
+            /// widening is a link whose jitter wants that much; the same figure reached by the
+            /// floor is lip sync asking for it on the voice's behalf; and the same figure with
+            /// a large ``playoutSlack`` beside it is neither — it is delay picked up from the
+            /// frames the schedule happened to anchor on, which the reclaim is supposed to give
+            /// back and evidently has not.
+            ///
+            /// Four counters rather than a log line because the interesting pattern is a
+            /// ratio over a minute: widenings far outnumbering tightenings is a controller
+            /// being driven, and reclaims that never happen with slack to spare is one that
+            /// cannot get back what it took.
+            public var widenings = 0
+            public var tightenings = 0
+            public var floorRaises = 0
+            public var reclaims = 0
+
             public init() {}
 
             /// The share of frames that reached the display layer.
@@ -809,6 +828,7 @@ import MoqomCore
             // Raised to meet a floor that moved under it — the voice's buffer grew — rather than
             // waited for, because the tightening path below only ever moves the delay down.
             if depth < floor - 0.001 {
+                drawing.floorRaises += 1
                 shift(by: floor - depth, to: .seconds(floor))
                 return
             }
@@ -880,6 +900,7 @@ import MoqomCore
                 synchroniser.setRate(Float(rate), time: synchroniser.currentTime())
                 catchUp = .now + .seconds(give / (rate - 1))
                 catchUpGive = give
+                drawing.reclaims += 1
                 return
             }
 
@@ -890,6 +911,7 @@ import MoqomCore
                 // once; repeated adjustments still reach wherever the link requires.
                 let widened = min(depth + min(margin - worst, interval * 2), ceiling)
                 if widened > depth + 0.001 {
+                    drawing.widenings += 1
                     shift(by: widened - depth, to: .seconds(widened))
                 }
                 return
@@ -912,6 +934,7 @@ import MoqomCore
             let reduced = max(depth - min(0.002, excess), floor)
             if reduced < depth - 0.0001 {
                 tightened = .now
+                drawing.tightenings += 1
                 shift(by: reduced - depth, to: .seconds(reduced))
             }
         }

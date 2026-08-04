@@ -461,6 +461,19 @@ encode rather than a namespace with no media behind it.
   the SDK cannot encode anything without a device. The degradation is real —
   the encoder will buffer to hit a bitrate — so it is reported on
   `usesLowLatencyRateControl` rather than swallowed.
+- **Encoders are held to a short-window byte cap, not just an average bitrate.**
+  `EncoderConfiguration.burstAllowance` lets a keyframe spend a quarter more than
+  the average over any half second, where hardware left alone will spend eight
+  times a delta frame's share. On a link whose capacity is near the target that
+  one object owns the wire for a fifth of a second, everything behind it queues,
+  and a receiver that sees late arrivals buys latency to cover them. Measured on
+  two phones through a relay, capping it took the arrival tail from a 116ms 99th
+  percentile to 84ms and the viewer's buffer from 38ms to 19ms on an ordinary
+  call, and on a call changing layout every eight seconds — a forced keyframe
+  each time — from 144-164ms and eleven re-anchors down to 81ms and five, which
+  is what a call with no layout changes at all used to cost. The encoder pays in
+  quality on that one picture. The average bitrate is unchanged either way: the
+  same bits, spent less unevenly.
 - **`FrameRelay` defaults to a three-frame buffer and drops the oldest.** Right
   for live media, wrong for anything with a deadline it can miss. A burst
   submitted without yielding will lose frames — which is correct, and surprised

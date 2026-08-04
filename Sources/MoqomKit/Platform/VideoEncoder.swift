@@ -194,6 +194,30 @@ import MoqomCore
                 to: bitsPerSecond as CFNumber,
                 on: session
             )
+
+            // Moved with it, or the burst limit means something different at every bitrate
+            // congestion control chooses — and it means the least exactly when the link is
+            // worst, since a limit set for the opening bitrate is generous once the target has
+            // been cut in half.
+            if let allowance = configuration.burstAllowance {
+                try? Self.set(
+                    kVTCompressionPropertyKey_DataRateLimits,
+                    to: Self.limits(bitrate: bitsPerSecond, allowance: allowance),
+                    on: session
+                )
+            }
+        }
+
+        /// The bytes-and-seconds pair VideoToolbox wants, from a bitrate and a multiple of it.
+        ///
+        /// Half a second because the window has to be long enough to hold a whole keyframe and
+        /// short enough that the limit still means something to one: over two seconds a keyframe
+        /// is a small part of the budget and the cap never binds, and over a tenth it binds on
+        /// every frame and the encoder spends the call at a quality nothing asked for.
+        private static func limits(bitrate: Int, allowance: Double) -> CFArray {
+            let window = 0.5
+            let bytes = Double(bitrate) / 8 * window * allowance
+            return [bytes as CFNumber, window as CFNumber] as CFArray
         }
 
         /// Flush and finish the output stream.
@@ -276,6 +300,20 @@ import MoqomCore
                 to: interval as CFNumber,
                 on: session
             )
+
+            // What stops a keyframe from owning the link. See
+            // ``EncoderConfiguration/burstAllowance``.
+            //
+            // Best effort, because the limit is advisory in the same way the power hint is: some
+            // hardware and some codecs decline it, and a declined burst limit is a stream that
+            // bursts, not a broadcast that fails.
+            if let allowance = configuration.burstAllowance {
+                try? set(
+                    kVTCompressionPropertyKey_DataRateLimits,
+                    to: Self.limits(bitrate: configuration.layer.bitrate, allowance: allowance),
+                    on: session
+                )
+            }
 
             if configuration.usesTemporalLayers {
                 // Half the frames become a base layer nothing else references.

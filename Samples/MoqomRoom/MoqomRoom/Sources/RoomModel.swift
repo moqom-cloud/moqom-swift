@@ -199,6 +199,13 @@ final class RoomModel {
     /// Seconds of headroom the arriving frames actually have. See ``VideoRenderer/playoutSlack``.
     var playoutSlack: Double?
 
+    /// The floor the remote tile's delay is currently being held to.
+    ///
+    /// Lip sync's demand on the picture, or the configured minimum where there is no voice. Worth
+    /// reporting beside the delay because the two are indistinguishable once they are equal, and
+    /// only one of them is something the link asked for.
+    var playoutFloorInForce: Duration = .zero
+
     /// How long this participant's voice is being held before it is heard.
     ///
     /// The video tile uses it as a floor, which is the whole of lip sync here. The two media

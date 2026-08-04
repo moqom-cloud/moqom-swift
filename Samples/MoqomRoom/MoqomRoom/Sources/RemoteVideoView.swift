@@ -304,7 +304,13 @@ final class VideoTile {
                 await MainActor.run {
                     guard let bounds = room.playoutBounds else { return }
                     let voice = room.audioDelay(of: identity) ?? .zero
-                    renderer.playoutFloor = min(max(bounds.floor, voice), bounds.ceiling)
+                    let floor = min(max(bounds.floor, voice), bounds.ceiling)
+                    renderer.playoutFloor = floor
+
+                    // Reported as well as applied, because a delay held up by its floor and a
+                    // delay driven up by jitter are the same number on screen and want
+                    // opposite responses.
+                    room.playoutFloorInForce = floor
                 }
             }
         }

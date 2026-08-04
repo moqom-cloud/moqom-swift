@@ -517,6 +517,20 @@ final class AppModel {
                             room.timing.status,
                             room.timing.needsFlush ? " needs-flush" : ""
                         )
+                        // How the delay got to where it is, which the delay itself cannot say.
+                        // Widenings mean the link's jitter asked for it; a floor means lip sync
+                        // did; and neither, with headroom to spare, means it is delay picked up
+                        // from whichever frames the schedule anchored on — which the reclaim is
+                        // meant to hand back, so a reclaim count that stays at zero while the
+                        // delay climbs is the fault rather than the symptom.
+                        + String(
+                            format: " floor=%.0fms widen=%d tighten=%d floored=%d reclaim=%d",
+                            room.playoutFloorInForce.seconds * 1000,
+                            drawn.widenings,
+                            drawn.tightenings,
+                            drawn.floorRaises,
+                            drawn.reclaims
+                        )
                 )
                 // The display pipeline's own account, which is the only one that can say a frame
                 // was accepted and then not shown.

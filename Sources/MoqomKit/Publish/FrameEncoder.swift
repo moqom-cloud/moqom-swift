@@ -82,18 +82,42 @@ public struct EncoderConfiguration: Sendable {
     /// glass-to-glass budget that is trying to stay under two frames.
     public var prefersPowerEfficiency: Bool
 
+    /// The most the encoder may spend in any half second, as a multiple of ``VideoLayer/bitrate``.
+    ///
+    /// A target bitrate is an average, and an average says nothing about a keyframe. Left
+    /// unconstrained, hardware spends whatever a keyframe needs — commonly eight or more times a
+    /// delta frame's share — and on a link whose capacity is close to the target that one object
+    /// occupies the wire for a fifth of a second while every frame behind it queues. The receiver
+    /// sees a burst of late arrivals, and a receiver that sees late arrivals buys latency to cover
+    /// them.
+    ///
+    /// Measured, that is the dominant cost of both kinds of keyframe this SDK produces. A
+    /// two-phone call over a relay reported seven freezes in a minute with four of them landing on
+    /// a keyframe, and a call changing layout every eight seconds — a forced keyframe each time —
+    /// took a viewer's buffer from forty milliseconds to nearly two hundred, which it kept.
+    ///
+    /// A quarter over the average, which lets a keyframe cost about four frames of link time
+    /// rather than eight or more. The encoder pays for it in quality on that one picture, which is
+    /// the right side of the trade: a keyframe slightly softer than its neighbours is invisible
+    /// next to a fifth of a second of delay that everybody keeps paying afterwards. Raise it on a
+    /// link with headroom to spare, and `nil` asks for no limit at all, which is what the hardware
+    /// does by default.
+    public var burstAllowance: Double?
+
     public init(
         layer: VideoLayer,
         codec: VideoCodec = .hevc,
         usesTemporalLayers: Bool = true,
         keyFrameInterval: Duration = .seconds(2),
-        prefersPowerEfficiency: Bool = true
+        prefersPowerEfficiency: Bool = true,
+        burstAllowance: Double? = 1.25
     ) {
         self.layer = layer
         self.codec = codec
         self.usesTemporalLayers = usesTemporalLayers
         self.keyFrameInterval = keyFrameInterval
         self.prefersPowerEfficiency = prefersPowerEfficiency
+        self.burstAllowance = burstAllowance
     }
 }
 
