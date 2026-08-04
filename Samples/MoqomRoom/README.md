@@ -303,6 +303,15 @@ own error bar. That last figure is the one to check first: it turns orange when 
 exceeds the median, which means the two clocks have not agreed closely enough for
 the subtraction between them to be a latency at all.
 
+A measured run also stamps the microphone's packets on the same clock, which is
+what the `SYNC` line in the log is subtracting. It states lip sync as one signed
+number of milliseconds and shows both halves it came from: the eye, being the
+network plus however long the tile held the frame, and the ear, being the network
+plus the queue in front of the speaker plus what the device says its output path
+costs. Positive is a picture behind the voice. Negative is a face that moves
+before it speaks, which is the direction people notice, and which measured about
+minus two hundred milliseconds before the playout path was pull-driven.
+
 Not currently measurable this way: MLVC. It produces no bitstream on device
 because the rANS entropy coder is not wired in, so there is nothing to send.
 

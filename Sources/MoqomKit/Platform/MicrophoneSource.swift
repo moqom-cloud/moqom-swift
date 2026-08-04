@@ -89,6 +89,12 @@ import MoqomCore
             graph.suspendMicrophone()
         }
 
+        /// Whether the input device is currently given back. See
+        /// ``AudioGraph/isMicrophoneSuspended``, and note that a mute is
+        /// enforced by the publication either way — this says whether the
+        /// hardware knows about it.
+        public var isSuspended: Bool { graph.isMicrophoneSuspended }
+
         public func resume() {
             try? graph.resumeMicrophone()
         }

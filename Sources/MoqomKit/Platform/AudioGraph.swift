@@ -367,15 +367,37 @@ import os
         ///
         /// Restarts if running, because the session category and voice
         /// processing are both fixed at the point the engine starts.
+        /// A failed change puts the previous arrangement back before it throws.
+        ///
+        /// Changing what the graph is for means stopping it and starting it
+        /// again, and the second half can fail on its own: the system declines
+        /// a category, a route moves underneath, voice processing refuses to
+        /// re-engage. Leaving the engine stopped in that case is the worst
+        /// available outcome, because playback goes with it — a force-muted
+        /// participant lost the room, which is not what a mute is, and every
+        /// counter upstream kept reporting healthy audio into a stopped engine.
         public func reconfigure(_ configuration: Configuration) throws(MoqomError) {
             lock.lock()
             let wasRunning = running
+            let previous = self.configuration
             self.configuration = configuration
             lock.unlock()
 
-            if wasRunning {
-                stop()
+            guard wasRunning else { return }
+            stop()
+
+            do {
                 try start()
+            } catch {
+                lock.lock()
+                self.configuration = previous
+                lock.unlock()
+                stop()
+                // Deliberately not reported: the caller is about to hear about
+                // the failure that matters, and a graph that cannot restart in
+                // either arrangement has a problem no return value describes.
+                try? start()
+                throw error
             }
         }
 
@@ -420,18 +442,36 @@ import os
         /// The microphone is not released, so the ``AudioRelay`` a publication
         /// is reading stays valid across the whole suspension and resuming
         /// needs no cooperation from it.
-        public func suspendMicrophone() {
+        /// - Returns: whether the input device was actually given back. `false`
+        ///   means the system refused the change and the graph is still the one
+        ///   it was, still rendering, still holding the microphone. Publishing
+        ///   has stopped either way — that is the caller's doing and it is what
+        ///   a mute guarantees — so what a `false` costs is the indicator going
+        ///   out, not audio leaving the device.
+        @discardableResult
+        public func suspendMicrophone() -> Bool {
             lock.lock()
             let purpose = configuration.purpose
             guard suspendedPurpose == nil, purpose.capturesInput else {
                 lock.unlock()
-                return
+                return false
             }
             suspendedPurpose = purpose
             let format = configuration.format
             lock.unlock()
 
-            try? reconfigure(Configuration(purpose: .listening, format: format))
+            do {
+                try reconfigure(Configuration(purpose: .listening, format: format))
+                return true
+            } catch {
+                // The flag has to come back off, or the graph believes it is
+                // suspended while the device is open and a later resume decides
+                // there is nothing to do.
+                lock.lock()
+                suspendedPurpose = nil
+                lock.unlock()
+                return false
+            }
         }
 
         /// Open the input device again, as whatever the graph was for before.
@@ -589,6 +629,18 @@ import os
 
         private func startLocked() throws(MoqomError) {
             guard !running else { return }
+
+            // Turned off before the session changes rather than after, and only
+            // when it was on. Voice processing lives on the input node, the
+            // input node is not available under a category that does not
+            // record, and an engine asked to start with the unit still engaged
+            // on a session that has taken the microphone away refuses — which
+            // is a mute that stops playback, because the engine that refused is
+            // the one every participant is being rendered through.
+            if !configuration.purpose.wantsVoiceProcessing, isCancellingEcho {
+                try? engine.inputNode.setVoiceProcessingEnabled(false)
+                isCancellingEcho = false
+            }
 
             try activateSession()
 

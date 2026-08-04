@@ -145,14 +145,28 @@ import MoqomCore
                 // permanently deeper queue. The first version did exactly that
                 // and settled at a quarter of a second on a link whose jitter
                 // never exceeded ten milliseconds.
-                if output != .silence { voiced = 12 } else if voiced > 0 { voiced -= 1 }
+                if output == .silence {
+                    quiet += 1
+                    if voiced > 0 { voiced -= 1 }
+                } else {
+                    quiet = 0
+                    voiced = 20
+                }
                 answer(voice.starved, whileSpeaking: voiced > 0)
 
                 let queued = voice.queued
                 // Trimmed above the target rather than at it, because a queue
                 // held exactly at target is a queue one late packet away from a
                 // hole, and the trimming is what would have put it there.
-                if queued > target + .milliseconds(20), output == .silence {
+                //
+                // And only in a settled quiet — half a second of it — rather
+                // than in the pause between two words. A pause is where the
+                // cushion is needed most: speech resumes into a queue that was
+                // just emptied, the first syllable arrives to a device with
+                // nothing in hand, and the depth controller reads the dropout
+                // it caused as proof the link needs a deeper queue. Half a
+                // second of quiet is past the end of a sentence.
+                if quiet >= 25, queued > target + .milliseconds(20), output == .silence {
                     playback.trimmed += 1
                     continue
                 }
@@ -172,8 +186,10 @@ import MoqomCore
             }
         }
 
-        /// Slots of speech still counted as recent, in packets. See ``play(_:)``.
+        /// Slots of speech still counted as recent, and quiet slots since the
+        /// last of them, both in packets. See ``play(_:written:)``.
         private var voiced = 0
+        private var quiet = 0
 
         /// Fold what the device has been doing into the depth being held.
         private func answer(_ starved: Int, whileSpeaking speaking: Bool) {
@@ -191,14 +207,19 @@ import MoqomCore
                 starvedBefore = starved
                 guard speaking else { return }
                 cleanPackets = 0
-                pressure = min(.milliseconds(200), pressure + .milliseconds(20))
+                pressure = min(.milliseconds(120), pressure + .milliseconds(20))
                 return
             }
 
             cleanPackets += 1
-            // Fifty packets to the second, so this is ten seconds of a device
-            // that asked for nothing it did not get.
-            guard cleanPackets >= 500, pressure > .zero else { return }
+            // Fifty packets to the second, so this is five seconds of a device
+            // that asked for nothing it did not get. Slower than the rise by a
+            // wide margin, and still fast enough that a single bad minute is
+            // not paid for until the call ends: the earlier version gave back
+            // ten milliseconds every ten seconds, which on two phones meant a
+            // queue that reached its ceiling in the first minute and was still
+            // there three minutes later, holding the picture back with it.
+            guard cleanPackets >= 250, pressure > .zero else { return }
             cleanPackets = 0
             pressure = max(.zero, pressure - .milliseconds(10))
         }

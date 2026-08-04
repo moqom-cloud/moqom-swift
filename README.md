@@ -241,7 +241,18 @@ which part.
   share, which is what makes echo cancellation possible: the canceller subtracts
   what the speaker played, so a player on a second engine is audio it cannot
   subtract. Also the audio session, voice processing, and reinstalling the tap
-  across route changes and interruptions.
+  across route changes and interruptions. Playback is a render callback pulling
+  from a ring per participant, rather than buffers scheduled onto a player node:
+  a pushed queue is as deep as the last burst left it and stays that way, which
+  put a fifth of a second between a face and its voice on two phones and, in one
+  direction, half of one.
+- `Platform/AudioPlayer.swift` — the depth that ring is held at. It follows the
+  jitter buffer's target, grows when the device asks for samples that are not
+  there, and comes back down by dropping silence once a talker has stopped —
+  which is inaudible, and is the only way the delay a burst added is ever given
+  back. Capture timestamps are quoted on the host clock, the same one the camera
+  uses, so a receiver can put a voice beside a face; `MoqomRoom` prints the
+  result as `SYNC`, signed, with both halves of the arithmetic beside it.
 - `Platform/MicrophoneSource.swift` — the `AudioSource` a publication takes,
   over the shared graph.
 - `Platform/SceneCapture.swift` — a pooled, IOSurface-backed blit from a

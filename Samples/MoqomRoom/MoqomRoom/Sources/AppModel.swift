@@ -577,8 +577,13 @@ final class AppModel {
                 // handed to a player node in an engine that never opened is counted as played.
                 #if os(iOS)
                     let session = AVAudioSession.sharedInstance()
+                    // The engine and the input device separately, because a mute is
+                    // supposed to close one and leave the other alone, and the failure
+                    // worth catching is the one where it closed both: a force-muted
+                    // participant who cannot hear the room has been removed from it.
                     Journal.shared.say(
                         "OUT engine=\(AudioGraph.shared.isRunning ? "running" : "stopped")"
+                            + " input=\(AudioGraph.shared.isMicrophoneSuspended ? "given back" : "held")"
                             + " route=\(Self.describe(session.currentRoute))"
                             // What the hardware granted, which is the thing that decides how
                             // evenly packets leave here. A request is not a setting.
