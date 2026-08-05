@@ -461,6 +461,23 @@ encode rather than a namespace with no media behind it.
   the SDK cannot encode anything without a device. The degradation is real —
   the encoder will buffer to hit a bitrate — so it is reported on
   `usesLowLatencyRateControl` rather than swallowed.
+- **The adaptive delay aims at what the display needs, not at what it last asked
+  for.** `PlayoutDelay` is separated from the renderer because this loop has been
+  wrong twice and neither time was visible outside a two-phone bench. The fault:
+  the give-back — running the clock up to 6% fast, the only graceful way to
+  return a large delay — was gated on measured headroom exceeding the delay in
+  force. Those two drift apart, because re-anchoring places the grid by whatever
+  the controller believes, so a schedule anchored on an unusually early frame
+  leaves the frames with less headroom than the delay claims. Measured, frames
+  waited 143ms while the controller believed it had asked for 196, concluded from
+  `143 < 196` that it had nothing to hand back, and left 119ms past what the
+  display needed to the two-millisecond-per-quarter-second trickle. Now the
+  target is fixed by the display and by lip sync — 18ms plus a deadband, or the
+  voice's floor — and the delay in force is set to what the give-back achieved,
+  so it stops being a fiction the next re-anchor will spend again. On two phones
+  a call changing layout every eight seconds holds a flat 24ms of buffer with two
+  give-backs and no widenings, against 57ms and climbing before; glass-to-glass
+  is 61ms, which is what a call making no layout changes at all costs.
 - **A running capture connection is never reconfigured to rotate.** Changing
   `videoRotationAngle` on a live connection stops the camera: measured on two
   phones, the sensor's own timestamps show holes of 133ms and 167ms at each

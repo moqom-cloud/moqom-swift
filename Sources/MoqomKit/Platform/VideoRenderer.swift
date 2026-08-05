@@ -449,10 +449,11 @@ import MoqomCore
         /// When the schedule last gave back the headroom it was anchored with, so it is rare.
         private var reclaimed = ContinuousClock.now
 
-        /// When the clock currently running fast should return to normal, and by how much it will
-        /// have moved by then.
+        /// When the clock currently running fast should return to normal, by how much it will
+        /// have moved by then, and the delay that leaves in force.
         private var catchUp: ContinuousClock.Instant?
         private var catchUpGive = 0.0
+        private var catchUpLanding = 0.0
 
         /// Return the clock to real time once it has given back what it set out to.
         ///
@@ -470,7 +471,18 @@ import MoqomCore
             reclaimed = .now
             for index in slack.indices { slack[index] -= catchUpGive }
             playoutSlack = playoutSlack.map { $0 - catchUpGive }
+
+            // The delay in force is now what the give-back was aimed at, and saying so is the
+            // other half of the fix. Leaving it at the old figure is not merely untidy
+            // reporting: the delay is what ``anchorSchedule(to:delay:)`` places the grid by, so
+            // a delay that still reads 196ms after the clock has handed back 119 of them will
+            // spend all 196 again at the next re-anchor — and a re-anchor is exactly what a
+            // layout change or a jittery minute produces. That is the loop that took a viewer
+            // from forty milliseconds of buffer to nearly two hundred and kept it there.
+            playoutDepth = .seconds(catchUpLanding)
+
             catchUpGive = 0
+            catchUpLanding = 0
         }
 
         /// What happened to the frames handed to this renderer.
@@ -825,114 +837,54 @@ import MoqomCore
             let ceiling = bounds.ceiling.asSeconds
             let floor = min(max(bounds.floor, playoutFloor).asSeconds, ceiling)
 
-            // Raised to meet a floor that moved under it — the voice's buffer grew — rather than
-            // waited for, because the tightening path below only ever moves the delay down.
-            if depth < floor - 0.001 {
-                drawing.floorRaises += 1
-                shift(by: floor - depth, to: .seconds(floor))
+            // What to do is decided in ``PlayoutDelay``, which has no clock and no layer and can
+            // therefore be run against a made-up link a thousand times in a test. What follows is
+            // only the doing of it.
+            let move = PlayoutDelay.adjustment(
+                headroom: worst,
+                delay: depth,
+                floor: floor,
+                ceiling: ceiling,
+                interval: interval,
+                mayGiveBack: catchUp == nil
+                    && ContinuousClock.now - reclaimed > .milliseconds(1500),
+                mayTighten: ContinuousClock.now - tightened > .milliseconds(250)
+            )
+
+            switch move {
+            case .leaveItAlone:
                 return
-            }
 
-            // Enough for everything that still has to happen to a frame after it is handed
-            // over, which is where the last version of this got it wrong. Slack is measured at
-            // enqueue, and a frame is not shown at enqueue: it is decoded — several
-            // milliseconds of hardware — and then composited on a refresh boundary, up to a
-            // whole refresh interval later. Four milliseconds of slack is a frame that misses
-            // both.
-            //
-            // Measured, that is exactly what it did. The controller drove the headroom onto
-            // its own four millisecond target and the display layer dropped a third of every
-            // frame it was given — 581 of 1740 in a minute — while every counter this side of
-            // it read a clean thirty frames a second, no lateness, nothing skipped. The
-            // unscheduled preview layer on the same screen, in the same app, dropped none of
-            // 1770, which is what said the panel was innocent and the schedule was not.
-            //
-            // Eighteen milliseconds covers a 720p decode and a sixty hertz refresh. A phone
-            // whose panel is faster spends the difference on latency, and it is a few
-            // milliseconds against a third of the picture.
-            let margin = 0.018
+            case let .raiseToTheFloor(raised):
+                drawing.floorRaises += 1
+                shift(by: raised - depth, to: .seconds(raised))
 
-            // Headroom well past anything the delay accounts for, which the grid cannot give back:
-            // it is the delay of whichever frame the schedule was anchored on, added once and then
-            // paid by every frame for the rest of the call. Measured on a relayed link it was
-            // fifteen to thirty milliseconds — a third of the glass-to-glass total, bought by an
-            // accident of timing rather than by any decision.
-            //
-            // Reclaimed by moving the timebase, because that is the only thing that moves it.
-            // Walking the grid earlier instead was tried and is worse than the problem: the queue
-            // depth falls towards zero, ordinary jitter starts tripping the schedule's own limits,
-            // and both legs of a measured call ended up re-anchoring by the thousand and dropping
-            // frames by the hundred.
-            //
-            // Moved by running the clock slightly fast rather than by re-anchoring it, which is
-            // the difference between arriving early and jumping. A re-anchor puts every frame
-            // already queued past its new deadline at once, and measured that cost about four
-            // frames each time — forty across a run, for twenty milliseconds of latency. Running
-            // fast gives the same twenty back over a second, at a speed no one can see and with
-            // nothing to drop.
-            //
-            // Over about a second whatever the size, rather than at a fixed speed. A fixed two
-            // percent is a second for the twenty milliseconds an anchor usually costs and five
-            // seconds for the hundred a jittery link produces, and five seconds is longer than
-            // the interval between the re-anchors that produce it: measured through a relay whose
-            // arrivals had a 34ms median and an 84ms 95th percentile, both legs of every call sat
-            // at 1.02 from start to finish, reported a 23-48ms delay, and made their frames wait
-            // 53-95ms the whole time. The controller was right about the delay it wanted and
-            // simply never got there.
-            //
-            // Aimed at the delay and not a millisecond under it, so that this and the widening
-            // below are one controller rather than two. Aiming at the delay less its margin was
-            // tried: it parks the headroom exactly on the widening threshold, every jitter burst
-            // then widens — quickly, as it must — and the slow tightening cannot keep pace, so
-            // the delay ratchets. Measured, it reached a hundred and sixty milliseconds on a link
-            // whose jitter wanted ten.
-            if
-                worst > depth + 0.006,
-                catchUp == nil,
-                ContinuousClock.now - reclaimed > .milliseconds(1500)
-            {
+            case let .widen(widened):
+                drawing.widenings += 1
+                shift(by: widened - depth, to: .seconds(widened))
+
+            case let .giveBack(give, landing):
                 // Capped at six percent because this timebase carries the picture and not the
                 // voice, so a fast clock is also lip sync closing at the same speed. Six percent
-                // for the second or two a large give takes is a couple of frames of it, against a
-                // reclaim that otherwise does not finish at all.
-                let give = worst - depth
+                // for the second or two a large give takes is a couple of frames of it, against
+                // a give-back that otherwise does not finish at all.
+                //
+                // Over about a second whatever the size, rather than at a fixed speed. A fixed
+                // two percent is a second for the twenty milliseconds an anchor usually costs
+                // and five seconds for the hundred a jittery link produces, and five seconds is
+                // longer than the interval between the re-anchors that produce it: measured
+                // through a relay whose arrivals had a 34ms median and an 84ms 95th percentile,
+                // both legs of every call sat at 1.02 from start to finish, reported a 23-48ms
+                // delay, and made their frames wait 53-95ms the whole time. The controller was
+                // right about the delay it wanted and simply never got there.
                 let rate = min(1.06, max(1.02, 1 + give))
                 synchroniser.setRate(Float(rate), time: synchroniser.currentTime())
                 catchUp = .now + .seconds(give / (rate - 1))
                 catchUpGive = give
+                catchUpLanding = landing
                 drawing.reclaims += 1
-                return
-            }
 
-            if worst < margin {
-                // Widened at once and by the whole shortfall, because lateness costs a frame
-                // immediately while earliness costs milliseconds nobody may notice. Capped per
-                // adjustment so one pathological arrival cannot move the picture a long way at
-                // once; repeated adjustments still reach wherever the link requires.
-                let widened = min(depth + min(margin - worst, interval * 2), ceiling)
-                if widened > depth + 0.001 {
-                    drawing.widenings += 1
-                    shift(by: widened - depth, to: .seconds(widened))
-                }
-                return
-            }
-
-            // Tightened gradually and only past a deadband, so the delay is not forever chasing
-            // the last ten seconds by a millisecond in each direction.
-            //
-            // Widening has to be immediate and tightening does not, and the gap between them is
-            // safe here only because both read the same ten seconds of history: a single burst
-            // moves a ten-second quantile very little, so the widening cannot ratchet away from
-            // a tightening that recovers eight milliseconds a second. It is not safe if that
-            // history is being thrown away — see ``advanceCatchUp``, where discarding it made
-            // this pair oscillate no matter which speeds they were given.
-            let excess = worst - margin
-            guard excess > 0.006, ContinuousClock.now - tightened > .milliseconds(250) else {
-                return
-            }
-
-            let reduced = max(depth - min(0.002, excess), floor)
-            if reduced < depth - 0.0001 {
+            case let .tighten(reduced):
                 tightened = .now
                 drawing.tightenings += 1
                 shift(by: reduced - depth, to: .seconds(reduced))
