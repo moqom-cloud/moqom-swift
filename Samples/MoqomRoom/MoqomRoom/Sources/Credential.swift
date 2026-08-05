@@ -134,4 +134,20 @@ enum TokenStore {
         item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
         SecItemAdd(item as CFDictionary, nil)
     }
+
+    /// The long-lived credential this device asks for tokens with.
+    ///
+    /// Beside the tokens and under a name of its own, because the two are secrets
+    /// of different lifetimes and losing them has different consequences. A token
+    /// expires in fifteen minutes; this one is how the phone gets the next
+    /// fifteen minutes, months from now. Both belong in the Keychain and neither
+    /// belongs in a defaults database — this one more emphatically, since a
+    /// leaked token is a problem that solves itself by lunchtime.
+    static func loadJoinCredential(for host: String) -> String? {
+        load(for: "join:" + host).map { String(decoding: $0, as: UTF8.self) }
+    }
+
+    static func saveJoinCredential(_ credential: String, for host: String) {
+        save(Data(credential.utf8), for: "join:" + host)
+    }
 }

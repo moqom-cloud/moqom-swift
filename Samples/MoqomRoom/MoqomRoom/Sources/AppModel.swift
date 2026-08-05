@@ -193,6 +193,53 @@ final class AppModel {
         set { relay.token = Data(newValue.trimmed.utf8) }
     }
 
+    /// The token service's address, as a text field sees it.
+    ///
+    /// Clearing it turns the whole mechanism off and puts the pasted token back in
+    /// charge, which is the right behaviour for a field: "no service" and "a
+    /// service whose address I have deleted" are one intention.
+    var joinHost: String {
+        get { relay.tokenService?.host ?? "" }
+        set {
+            var service = relay.tokenService ?? JoinService.development
+            service.host = newValue.trimmed
+            relay.tokenService = service
+        }
+    }
+
+    var joinPort: String {
+        get { (relay.tokenService?.port).map(String.init) ?? "8444" }
+        set {
+            var service = relay.tokenService ?? JoinService.development
+            service.port = UInt16(newValue.trimmed) ?? service.port
+            relay.tokenService = service
+        }
+    }
+
+    var joinCertificateHash: String {
+        get { relay.tokenService?.certificateHashes.first ?? "" }
+        set {
+            var service = relay.tokenService ?? JoinService.development
+            service.certificateHashes = newValue.trimmed.isEmpty ? [] : [newValue.trimmed]
+            relay.tokenService = service
+        }
+    }
+
+    /// The device's enrolment credential.
+    ///
+    /// The one field on this screen that is a durable secret. Everything else is an
+    /// address, and the pasted token above dies by lunchtime; this is what buys the
+    /// next one months from now, which is why it lives in the Keychain and why the
+    /// interface should not print it back in full.
+    var joinCredential: String {
+        get { relay.tokenService?.credential ?? "" }
+        set {
+            var service = relay.tokenService ?? JoinService.development
+            service.credential = newValue.trimmed
+            relay.tokenService = service
+        }
+    }
+
     /// A link this app was opened with, waiting for somebody to agree to it.
     ///
     /// Held rather than applied. See ``Invitation``: a URL can arrive from
@@ -231,7 +278,19 @@ final class AppModel {
             host: invitation.relay.endpoint.host,
             port: invitation.relay.endpoint.port,
             certificateHashes: invitation.relay.certificateHashes,
-            token: invitation.relay.token
+            token: invitation.relay.token,
+            // Kept only when the link names one. A link with no service in it
+            // leaves whatever this phone was already enrolled with, because
+            // scanning a code for a relay on a desk should not un-enrol a phone
+            // from the deployment it can otherwise reach.
+            tokenService: invitation.relay.tokenService.map {
+                JoinService(
+                    host: $0.endpoint.host,
+                    port: $0.endpoint.port,
+                    certificateHashes: $0.certificateHashes,
+                    credential: $0.credential
+                )
+            } ?? relay.tokenService
         )
         // A pairing code left in the field would resolve on the next Join and
         // throw all of this away for whatever is on the local network.
@@ -919,6 +978,97 @@ final class AppModel {
         }
     }
 
+    /// The key this device's tokens are bound to, by the `cnf` claim.
+    ///
+    /// A constant, and it should not be: a real client generates a key in the
+    /// Secure Enclave at install and derives this from it, which is what makes a
+    /// device ban a ban on one phone rather than on every copy of the sample. It
+    /// stays a constant because it is a constant in three places — here, in
+    /// `moqom-mint`'s default, and in the relay's own fixtures — and a token whose
+    /// thumbprint disagrees with the device its holder announces under is a
+    /// session the relay is right to refuse. Changing it means changing all three
+    /// together, which is a different piece of work from this one.
+    static let deviceThumbprint = "sample-device-key"
+
+    /// Why the last attempt to fetch a token failed, if it failed.
+    ///
+    /// Beside the join screen rather than on the failure screen, like
+    /// ``pairingProblem``: nothing has been dialled, the pasted token is still
+    /// there to fall back on, and "the token service refused this name" is a
+    /// different sentence from "the relay is unreachable".
+    private(set) var tokenProblem: String?
+
+    /// Which tenant to dial as: whichever one the token in hand was minted for.
+    ///
+    /// Read from the credential rather than configured, because a relay compares a
+    /// broadcast's namespace against the tenant in the token and refuses the pair
+    /// when they differ. Two fields that have to agree, one of them a token nobody
+    /// reads and the other a default from before this deployment existed, is a
+    /// mismatch waiting to happen — and it happened: `demo` on the screen against a
+    /// token saying `moqom`, which connects and then publishes nothing.
+    ///
+    /// ``launch`` still decides it when there is no token, which is the relay on a
+    /// desk that verifies nothing and admits the session anyway.
+    var tenant: String {
+        guard let claimed = Credential(relay.token)?.tenant, !claimed.isEmpty else {
+            return launch.tenant
+        }
+        return claimed
+    }
+
+    /// Ask for a credential, if this device is allowed to ask and needs one.
+    ///
+    /// Returns whether joining should continue. Three outcomes rather than two: a
+    /// token was fetched, no token was needed or could be asked for, or the ask
+    /// failed and the join is abandoned before anything is dialled. That last case
+    /// is the one worth stopping for — carrying on with a stale credential reaches
+    /// a relay that admits the session and permits it nothing, which is a room
+    /// that appears to work until somebody presses Go live.
+    private func fetchATokenIfNeeded() async -> Bool {
+        tokenProblem = nil
+
+        let room = roomName.trimmed
+        let name = username.trimmed
+        guard let service = relay.tokenService, service.isUsable else {
+            // No service configured, which is a legitimate setup: a relay on a desk
+            // asks for nothing, and a pasted token still works. Said out loud only
+            // when the token in hand will not do, because that combination is the
+            // one that produces a puzzling session rather than a working one.
+            if relay.host != nil, relay.needsAToken(joining: room, as: name) {
+                Journal.shared.say("TOKEN stale and no service configured")
+            }
+            return true
+        }
+        guard relay.needsAToken(joining: room, as: name) else { return true }
+
+        Journal.shared.say("TOKEN asking \(service.host):\(service.port) for \(name) in \(room)")
+        do {
+            let issued = try await service.client().token(
+                username: name,
+                room: room,
+                device: Self.deviceThumbprint
+            )
+            relay.token = issued.token
+            // What the service actually minted, which can differ from what was
+            // asked for: a username is normalised on the way in, and a phone
+            // showing what it requested while the room shows what was issued is a
+            // phone displaying the wrong person's name.
+            if !issued.username.isEmpty { username = issued.username }
+            Journal.shared.say(
+                "TOKEN got one for \(issued.username) in \(issued.room),"
+                    + " good for \(Int(issued.expiresAt.timeIntervalSinceNow))s"
+            )
+            return true
+        } catch {
+            let complaint = (error as? LocalizedError)?.errorDescription
+                ?? String(describing: error)
+            tokenProblem = complaint
+            Journal.shared.say("TOKEN FAILED \(complaint)")
+            phase = .joining
+            return false
+        }
+    }
+
     /// A clock disciplined against the same service the other device uses.
     private static func trustedClock() throws -> TrustedClock {
         TrustedClock(
@@ -953,6 +1103,12 @@ final class AppModel {
             }
         }
 
+        // Before anything is dialled, because this is the credential the dialling
+        // presents. A token lasts fifteen minutes and is checked once, at the
+        // start of the session, so the only moment worth having a fresh one is
+        // this one.
+        if !(await fetchATokenIfNeeded()) { return }
+
         remember()
 
         do {
@@ -960,7 +1116,7 @@ final class AppModel {
                 username: Username(username.trimmed),
                 // A real client derives this from the Secure Enclave key the
                 // token's `cnf` claim is bound to, at install.
-                device: DeviceID(thumbprint: "sample-device-key")
+                device: DeviceID(thumbprint: Self.deviceThumbprint)
             )
             let session = MoqomSession(
                 transport: relay.transport(),
@@ -973,7 +1129,7 @@ final class AppModel {
                     token: relay.token,
                     proofSigner: { challenge in challenge }
                 ),
-                tenant: TenantID(launch.tenant),
+                tenant: TenantID(tenant),
                 // The sample opts in, because the sample is what an integrator
                 // reads to find out that this exists. `.hashed` even here: a
                 // demo's log is the one most likely to end up in a screenshot.

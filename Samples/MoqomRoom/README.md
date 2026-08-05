@@ -389,9 +389,34 @@ below it are ever tried.
 
 A deployed relay holds the control plane's verification keys, which means it
 admits a session with no token and then permits it nothing. On the phone that
-is a room that joins and a **Go live** that appears to do nothing, so the join
-screen has a **Credential** section: paste a token into it, and it is kept in
-the Keychain against the relay it was minted for.
+is a room that joins and a **Go live** that appears to do nothing.
+
+The phone gets its own token. The join screen's **Token service** section takes
+the control plane's address, the hash of *its* certificate — not the relay's,
+which is a different machine — and a device credential, and the app fetches a
+token in the second before it dials. Fifteen minutes is a fine lifetime for
+something acquired automatically and a miserable one for something typed in.
+
+The credential and the address are what `deploy/tools/invite.sh` puts in a QR
+code, below. By hand:
+
+```sh
+gcloud secrets versions access latest --secret=moqom-dev-device-credential
+cd deploy/envs/dev && terraform output -raw join_endpoint
+```
+
+The certificate is one the deployment issued itself, which iOS refuses on its
+own account after the app has accepted it by pin — App Transport Security wants
+a chain to a root the system knows, and reports its refusal as a TLS error with
+nothing in it about trust. `project.yml` therefore carries an ATS exception for
+that one address. **Moving the join endpoint means editing that address in two
+places**: the exception, and `JoinService.development`. Getting only the second
+produces `NSURLErrorDomain -1200` and an error line that says the pin matched
+and the platform refused it anyway.
+
+**Pasting a token** into the **Credential** section still works and is the
+fallback when there is no service configured. It is kept in the Keychain against
+the relay it was minted for.
 
 ```sh
 deploy/tools/join.sh ada demo      # in the moqom repository; prints a token
@@ -419,11 +444,11 @@ it to a phone. The alternative is a QR code:
 deploy/tools/invite.sh ada demo    # prints the code, and opens it as a PNG
 ```
 
-That carries all three things a device cannot be told by hand — the relay's
-address, the hash of the certificate to pin, and the credential — as a
-`moqom://join?...` link. Point the Camera app at it and MOQOM opens with a
-**Scanned link** section at the top of the join screen, naming the address
-first and what the credential claims second.
+That carries what a device cannot be told by hand — the relay's address, the
+hash of the certificate to pin, the token service beside it and the credential
+to spend there — as a `moqom://join?...` link. Point the Camera app at it and
+MOQOM opens with a **Scanned link** section at the top of the join screen,
+naming the address first and what it enrols the device for second.
 
 It stops there. Agreeing fills the fields in and **Join** still has to be
 pressed, because a link chooses which relay this device trusts and which
@@ -431,14 +456,19 @@ credential it presents, and a URL can arrive from a message or a web page as
 easily as from a code somebody printed. `RelayInvitation` in the SDK parses;
 consent is the application's.
 
-The name and the room come out of the token rather than from the link's own
-fields, so the two cannot contradict each other — the contradiction being a
-relay that admits the session and refuses every track, which on the phone is a
-Join that works and a **Go live** that does nothing.
+The tenant comes out of the token rather than from a field, so the two cannot
+contradict each other — the contradiction being a relay that admits the session
+and refuses every track, which on the phone is a Join that works and a **Go
+live** that does nothing.
 
-Putting a bearer credential in something people photograph is only reasonable
-because of the fifteen minutes: the code is worth exactly the time left on it.
-It is not a way to distribute long-lived access, and there isn't one here.
+What a code is worth has changed, and it is worth reading before printing one.
+It used to carry a token, which made it good for fifteen minutes: reassuring,
+and useless in practice, because codes were routinely stale by the time somebody
+held a phone up to one. It now carries the enrolment credential, so the phone
+fetches its own token every time and the code keeps working — for whoever
+photographs it, too, until the credential is rotated. What bounds it is what the
+credential can buy: joining rooms in one tenant, never moderation and never
+ownership, refused at the endpoint whatever is asked for.
 
 Los Angeles rather than Oregon on measurement: mean round trip from this desk
 was 21.8ms against 47.5ms, which is most of a frame at sixty. A recent

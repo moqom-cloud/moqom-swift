@@ -81,6 +81,30 @@ targets:
         # so a pairing code would simply never be found.
         NSBonjourServices:
           - _moqom-relay._udp
+        # The token service, and nothing else on the internet.
+        #
+        # Its certificate is one this deployment issued itself, and App Transport
+        # Security refuses a certificate that chains to no root the system knows —
+        # separately from, and after, the application's own decision. So a pinned
+        # connection whose pin matches still fails, as `NSURLErrorDomain -1200`,
+        # with a message about TLS and nothing about trust. Two days of dev builds
+        # have died on that, once with the certificate reissued for a name it did
+        # not need, because the error says the same thing whatever the cause.
+        #
+        # Named as one address rather than lifted globally. `NSAllowsArbitraryLoads`
+        # would also fix it and would turn off ATS for every host this app ever
+        # talks to, which in a sample is the version other people copy. What is
+        # given up here is the platform's opinion about one address; what still
+        # holds there is the stronger check — `TokenService` pins the exact
+        # certificate, so this exception admits one certificate rather than any.
+        #
+        # An address and not a name because dev has no DNS for this endpoint. A
+        # deployment with a name and a public certificate needs none of this.
+        NSAppTransportSecurity:
+          NSExceptionDomains:
+            35.197.36.243:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: false
         # Required for Picture in Picture, and not optional in the way the name
         # suggests: without it the system refuses to start the window, and the
         # refusal arrives as a delegate error rather than as a build failure.

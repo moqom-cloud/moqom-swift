@@ -20,6 +20,75 @@ import MoqomCore
 import MoqomKit
 import MoqomLoopback
 
+/// Where this device asks for a credential, and what it asks with.
+///
+/// Separate from the relay's address because it is a different machine: the relay
+/// is a load balancer in front of a media fleet, and this is one route on the
+/// control plane. They have different addresses and different certificates, and
+/// conflating them produced exactly the confusion it sounds like.
+struct JoinService: Hashable {
+    var host: String
+    var port: UInt16
+
+    /// The hash to pin, as the deployment prints it. Empty means platform trust.
+    ///
+    /// Pinned more urgently than the relay's. A relay reached through somebody
+    /// else's certificate is an eavesdropper on a broadcast; this endpoint is
+    /// handed the device's long-lived credential in a header, so the wrong
+    /// certificate here gives that away.
+    var certificateHashes: [String]
+
+    /// The credential this device holds. Empty means it cannot ask.
+    var credential: String
+
+    /// The dev deployment's join listener.
+    ///
+    /// The address is `terraform output join_endpoint` and the hash is the control
+    /// plane's own certificate, which is not the relay's: pinning the relay's here
+    /// produces a connection that closes without a reason anybody can read. Both
+    /// change when the deployment is rebuilt, and the pasted token below is what
+    /// keeps working while they are stale.
+    ///
+    /// Never a credential, though. A credential compiled into a sample is a
+    /// credential in everybody's checkout, and this one does not expire on its own,
+    /// so it arrives by invitation or by hand.
+    static let development = JoinService(
+        host: "35.197.36.243",
+        port: 8444,
+        certificateHashes: ["90RDQl2ZuFuJpYVHCwYbuHO3gcCNNqIHgoRuAxr+qqg="],
+        credential: ""
+    )
+
+    /// Whether this is enough to ask with.
+    var isUsable: Bool { !host.isEmpty && !credential.isEmpty }
+
+    /// The SDK client for these settings.
+    ///
+    /// The tenant defaults to empty, which asks for the credential's own rather than
+    /// naming one. A credential belongs to exactly one tenant, so a tenant in the
+    /// request can only be redundant or wrong — and wrong is a refusal that reads
+    /// "account device is scoped to tenant moqom" on a screen whose tenant field
+    /// says `demo` because that is what a sample's default has always been.
+    func client(tenant: String = "") -> TokenService {
+        TokenService(
+            endpoint: RelayEndpoint(host: host, port: port),
+            certificateHashes: certificateHashes,
+            credential: credential,
+            tenant: tenant
+        )
+    }
+
+    /// What to show on the join screen, so a screenshot says which of the two
+    /// paths a run was on.
+    var summary: String {
+        guard !host.isEmpty else { return "none — a token has to be pasted" }
+        let trust = certificateHashes.isEmpty ? "system trust" : "pinned"
+        return credential.isEmpty
+            ? "\(host):\(port), \(trust), no credential"
+            : "\(host):\(port), \(trust), enrolled"
+    }
+}
+
 struct RelayConfiguration {
     /// The relay's hostname or address. `nil` means run on the loopback.
     var host: String?
@@ -45,6 +114,20 @@ struct RelayConfiguration {
     /// no tracks. That second case is the one worth recognising from a screenshot, so the
     /// summary below says which of the two this is.
     var token: Data
+
+    /// Where to ask for a token, when this device is allowed to ask.
+    ///
+    /// The answer to the field above rather than a companion to it. A token is
+    /// capped at fifteen minutes because it is a bearer credential, which makes it
+    /// the wrong kind of thing to configure a phone with: every run began by
+    /// putting a fresh one on two devices and most of them ended with at least one
+    /// having gone stale mid-session. With a service configured the phone fetches
+    /// its own, seconds before it dials, and the pasted field above becomes the
+    /// fallback rather than the mechanism.
+    ///
+    /// Nil is still a working configuration — a relay on a desk holds no
+    /// verification keys and asks for nothing.
+    var tokenService: JoinService?
 
     /// The relay this project is developed against.
     ///
@@ -73,7 +156,12 @@ struct RelayConfiguration {
         host: "35.235.101.37",
         port: 443,
         certificateHashes: ["polQTlHHCA5xpWTb02GZUdgIJoX5b0rUh0sy+VNWUto="],
-        token: Data()
+        token: Data(),
+        // The address is compiled in and the credential is not, which is the split
+        // that matters: where to ask is a deployment detail worth having by
+        // default, and what to ask with is a secret. Filled in by a scanned link,
+        // by a launch argument, or by hand.
+        tokenService: JoinService.development
     )
 
     /// Read from launch arguments first, then the defaults database, then ``development``.
@@ -88,6 +176,10 @@ struct RelayConfiguration {
         var port: UInt16?
         var hashes: [String] = []
         var token: Data?
+        var joinHost: String?
+        var joinPort: UInt16?
+        var joinHashes: [String] = []
+        var joinCredential: String?
 
         var index = 0
         while index < arguments.count {
@@ -98,6 +190,10 @@ struct RelayConfiguration {
             case "--relay-port": port = value.flatMap(UInt16.init)
             case "--relay-cert-hash": value.map { hashes.append($0) }
             case "--relay-token": token = value.flatMap { $0.data(using: .utf8) }
+            case "--join-host": joinHost = value
+            case "--join-port": joinPort = value.flatMap(UInt16.init)
+            case "--join-cert-hash": value.map { joinHashes.append($0) }
+            case "--join-credential": joinCredential = value
             default: break
             }
             index += 1
@@ -113,7 +209,8 @@ struct RelayConfiguration {
                 host: defaults.string(forKey: "relayHost").flatMap { $0.isEmpty ? nil : $0 },
                 port: UInt16(defaults.integer(forKey: "relayPort")).nonZero ?? 443,
                 certificateHashes: defaults.stringArray(forKey: "relayCertificateHashes") ?? [],
-                token: Data()
+                token: Data(),
+                tokenService: rememberedService(defaults)
             )
 
         // Kept, like the address, and for the stronger version of the same reason: an address
@@ -127,11 +224,40 @@ struct RelayConfiguration {
         // expiry so the interface can say a token is stale rather than leaving somebody to
         // find out by joining.
         let dialling = host ?? remembered.host
+
+        // The service, assembled the same way and from the same three sources. Its
+        // credential comes out of the Keychain under the service's own host rather
+        // than the relay's, because they are different machines and a phone that
+        // files one under the other is a phone that loses its enrolment the first
+        // time somebody changes relays.
+        var service = remembered.tokenService ?? JoinService.development
+        joinHost.map { service.host = $0 }
+        joinPort.map { service.port = $0 }
+        if !joinHashes.isEmpty { service.certificateHashes = joinHashes }
+        service.credential = joinCredential
+            ?? (service.host.isEmpty ? "" : TokenStore.loadJoinCredential(for: service.host))
+            ?? ""
+
         return RelayConfiguration(
             host: dialling,
             port: port ?? remembered.port,
             certificateHashes: hashes.isEmpty ? remembered.certificateHashes : hashes,
-            token: token ?? dialling.flatMap { TokenStore.load(for: $0) } ?? Data()
+            token: token ?? dialling.flatMap { TokenStore.load(for: $0) } ?? Data(),
+            tokenService: service
+        )
+    }
+
+    /// The service settings last saved, or nothing if none ever were.
+    private static func rememberedService(_ defaults: UserDefaults) -> JoinService? {
+        guard let host = defaults.string(forKey: "joinHost") else { return nil }
+        return JoinService(
+            host: host,
+            port: UInt16(defaults.integer(forKey: "joinPort")).nonZero ?? 8444,
+            certificateHashes: defaults.stringArray(forKey: "joinCertificateHashes") ?? [],
+            // Filled in by the caller, from the Keychain. Not here, so that there is
+            // one place a credential is read and it is not inside a function whose
+            // job is reading a defaults database.
+            credential: ""
         )
     }
 
@@ -148,6 +274,26 @@ struct RelayConfiguration {
         // belongs to. See ``TokenStore``. Nothing is saved for the loopback, which asks for
         // no credential and would otherwise file one under the absence of a host.
         if let host { TokenStore.save(token, for: host) }
+
+        if let service = tokenService, !service.host.isEmpty {
+            defaults.set(service.host, forKey: "joinHost")
+            defaults.set(Int(service.port), forKey: "joinPort")
+            defaults.set(service.certificateHashes, forKey: "joinCertificateHashes")
+            TokenStore.saveJoinCredential(service.credential, for: service.host)
+        }
+    }
+
+    /// Whether the token in hand will do for this join, or a fresh one is needed.
+    ///
+    /// The margin is the point. A token that is valid when this is asked and
+    /// expired when the relay verifies it fails in the least legible way there is:
+    /// the connection succeeds, the session is admitted as nobody, and the phone
+    /// shows a room it cannot publish into. A minute covers the walk from here to
+    /// a relay on the other side of the country.
+    func needsAToken(joining room: String, as username: String) -> Bool {
+        guard let held = credential else { return true }
+        if held.expires.timeIntervalSinceNow < 60 { return true }
+        return held.complaint(joining: room, as: username) != nil
     }
 
     /// What the token says about itself, or nothing when there is no token to ask.

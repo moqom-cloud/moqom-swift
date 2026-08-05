@@ -87,6 +87,46 @@ struct RelayInvitationTests {
         #expect(read.url(scheme: "moqom")?.absoluteString.contains("token") == false)
     }
 
+    @Test("a link can enrol a device rather than hand it one credential")
+    func carriesAService() throws {
+        let invitation = RelayInvitation(
+            endpoint: RelayEndpoint(host: "35.235.101.37", port: 443),
+            certificateHashes: [hash],
+            tokenService: TokenService(
+                endpoint: RelayEndpoint(host: "34.94.176.34", port: 8444),
+                certificateHashes: ["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="],
+                credential: "0f1e2d3c"
+            )
+        )
+
+        let url = try #require(invitation.url(scheme: "moqom"))
+        let read = try #require(RelayInvitation(url))
+        let service = try #require(read.tokenService)
+
+        #expect(service.endpoint.host == "34.94.176.34")
+        #expect(service.endpoint.port == 8444)
+        #expect(service.credential == "0f1e2d3c")
+        // The two hashes stay apart. They are certificates on different machines,
+        // and a link that crossed them would pin each connection to the other's —
+        // two failures with nothing wrong on screen.
+        #expect(service.certificateHashes == ["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="])
+        #expect(read.certificateHashes == [hash])
+    }
+
+    @Test("a service that is named has to parse")
+    func badService() {
+        // Refused rather than read as "no service", because a link that mentions
+        // one and is quietly read as having none produces a phone that asks nobody
+        // for a token and then joins as nobody.
+        #expect(RelayInvitation(URL(string: "moqom://join?relay=r.example&join=c.example:https")!) == nil)
+    }
+
+    @Test("a service with no port named gets the join listener's own")
+    func serviceDefaultPort() throws {
+        let read = try #require(RelayInvitation(URL(string: "moqom://join?relay=r.example&join=c.example")!))
+        #expect(read.tokenService?.endpoint.port == 8444)
+    }
+
     @Test("the scheme is the application's to choose, not the framework's")
     func anyScheme() throws {
         let read = try #require(RelayInvitation(URL(string: "https://moqom.cloud/j?relay=r.example:8443")!))

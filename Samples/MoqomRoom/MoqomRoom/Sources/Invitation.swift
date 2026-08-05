@@ -49,6 +49,14 @@ struct Invitation {
 
     /// What the credential in the link would make this phone, if it carries one.
     var identification: String {
+        // The service first, because it is the stronger fact: a phone that can
+        // fetch its own tokens does not care what token this link came with, and
+        // saying "expires in twelve minutes" about a link that never expires is
+        // the wrong thing to put in front of somebody deciding.
+        if let service = relay.tokenService, !service.credential.isEmpty {
+            return "Enrols this phone with \(service.endpoint.host), which will issue it a"
+                + " credential each time it joins."
+        }
         guard let credential else {
             return relay.token.isEmpty
                 ? "No credential, so this would join as nobody."
@@ -57,11 +65,17 @@ struct Invitation {
         return credential.summary
     }
 
+    /// Whether this link enrols the device rather than handing it one credential.
+    var enrols: Bool { relay.tokenService?.credential.isEmpty == false }
+
     /// Whether taking this is pointless because the credential has already died.
     ///
     /// Worth saying before rather than after. A QR code photographed twenty
     /// minutes ago looks exactly like one printed a moment ago, and the failure
     /// it produces — admitted to the relay, permitted nothing — is the one this
     /// whole path exists to stop people debugging.
-    var isStale: Bool { credential?.hasExpired ?? false }
+    ///
+    /// A link that enrols is never stale, which is the point of it: the token in
+    /// it, if there even is one, is about to be replaced by a fresh one.
+    var isStale: Bool { !enrols && (credential?.hasExpired ?? false) }
 }
