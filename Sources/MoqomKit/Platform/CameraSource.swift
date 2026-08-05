@@ -132,10 +132,24 @@ import MoqomCore
         /// How far to rotate the delivered frames, in degrees counter-clockwise.
         ///
         /// A phone held upright still captures landscape: the sensor's long axis is
-        /// across the device, so a portrait publication needs a quarter turn. Doing it
-        /// here, at the connection, is the only place it is free — the capture pipeline
-        /// applies it before the buffer is ever handed over, whereas rotating afterwards
-        /// means touching every pixel of every frame on the CPU.
+        /// across the device, so a portrait publication needs a quarter turn. Asked of
+        /// the connection before the camera starts, that turn is free: the capture
+        /// pipeline applies it on the way out and no buffer is ever touched twice.
+        ///
+        /// Asked of a *running* connection it is not free, and what it costs is the
+        /// reason this is worth reading. Measured on two phones, changing the angle on a
+        /// live connection stops the camera for three to five frames — the gaps are exact
+        /// multiples of the frame interval in the sensor's own timestamps, so the device
+        /// genuinely stopped rather than anything downstream falling behind. A host
+        /// switching layout mid-call did it every time and paid a visible freeze for it.
+        ///
+        /// So this only reconfigures the connection while the camera is stopped. Changed
+        /// while running, the turn moves to ``VTPixelRotationSession`` instead, which is
+        /// hardware, keeps the surface type the encoder wants, and costs one pass per
+        /// frame for as long as the published shape differs from the angle the connection
+        /// was given. That is the trade, and it is the right way round: a pass per frame
+        /// is a few milliseconds of silicon nobody sees, and a stopped camera is four
+        /// missing frames everybody does.
         ///
         /// Note this changes the size of the delivered frames, swapping width and height
         /// for an odd multiple of 90. It does not change ``captureFormat``, which is what
@@ -468,7 +482,7 @@ import MoqomCore
                 // Again, once frames are actually flowing. A connection's properties are
                 // reset by anything that rebuilds it, and a running session is the only
                 // state in which the answer to "will you turn this?" is the final one.
-                self?.applyRotation()
+                self?.applyRotation(asTheCameraStarts: true)
             }
         }
 
@@ -598,10 +612,22 @@ import MoqomCore
         }
 
         /// Always called on the capture queue, for the same reason as ``applyMirroring``.
-        private func applyRotation() {
+        ///
+        /// - Parameter starting: Whether the camera has only just been told to run, which is
+        ///   the one moment the connection may be reconfigured freely. It costs the same
+        ///   three to five frames as it would later, and here they are frames before the
+        ///   first one anybody sees. Every other caller leaves a delivering connection
+        ///   alone — see ``rotationDegrees``.
+        private func applyRotation(asTheCameraStarts starting: Bool = false) {
             guard let connection = output.connection(with: .video) else { return }
             let wanted = lock.withLock { rotation }
             guard connection.videoRotationAngle != wanted else { return }
+
+            // ``upright(_:)`` picks a change up from the next frame's shape without the
+            // camera noticing. Gated on the session's own state rather than on a flag of
+            // ours, because that state is what a suspend for a force-mute and a camera
+            // swap both move, and either one is a chance to have the turn back for free.
+            guard starting || !box.session.isRunning else { return }
             guard connection.isVideoRotationAngleSupported(wanted) else {
                 // Said out loud because of what it costs silently. Everything downstream was
                 // sized from ``captureFormat``: the encoder is configured for portrait, the
@@ -698,13 +724,19 @@ import MoqomCore
 
         /// Turn a frame the capture connection did not, or `nil` when none is needed.
         ///
-        /// A fallback that should never run, kept because the alternative to it is what
-        /// actually happened: one of two phones on the same build set `videoRotationAngle`
-        /// to ninety, reported ninety back, and went on delivering landscape frames. The
-        /// property is a request, its getter echoes the request rather than the outcome, and
-        /// there is no third thing to ask. So the shape of the buffer is the only honest
-        /// answer, and it is checked on every frame — cheaply, because the check is two
-        /// integer reads and the work only happens when they disagree with the promise.
+        /// Two things arrive here, and neither is a fault. A layout change while the camera
+        /// runs is the deliberate one: the connection is left delivering because
+        /// reconfiguring it stops the camera for three to five frames, so the turn happens
+        /// here instead — see ``rotationDegrees``.
+        ///
+        /// The other is a connection that said yes and meant no, which is why this is
+        /// driven by the buffer's shape rather than by what was asked for. One of two
+        /// phones on the same build set `videoRotationAngle` to ninety, reported ninety
+        /// back, and went on delivering landscape frames. The property is a request, its
+        /// getter echoes the request rather than the outcome, and there is no third thing
+        /// to ask. So the shape of the buffer is the only honest answer, and it is checked
+        /// on every frame — cheaply, because the check is two integer reads and the work
+        /// only happens when they disagree with the promise.
         ///
         /// `VTPixelRotationSession` rather than anything of ours: it is hardware, it keeps
         /// the frame in the same surface type the encoder wants, and a rotation on the CPU
@@ -829,9 +861,15 @@ import MoqomCore
                 &pool
             ) == kCVReturnSuccess else { return nil }
 
-            logger.warning(.media, "rotating frames in software; the camera would not", [
+            // Not a warning any more, and the difference matters to whoever reads the log.
+            // This is the ordinary path for a layout change now: the connection is left
+            // delivering and the turn happens here, deliberately. It is still worth a line,
+            // because it is also what a connection that refused the angle looks like, and
+            // the two are told apart by whether the camera was running at the time.
+            logger.info(.media, "turning frames after capture", [
                 LogField("width", .number(width)),
                 LogField("height", .number(height)),
+                LogField("turn", .text(turn == .clockwise ? "clockwise" : "anticlockwise")),
             ])
 
             rotation90 = created
