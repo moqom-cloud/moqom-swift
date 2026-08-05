@@ -33,11 +33,35 @@ struct RemoteVideoView: View {
                     // objects stopping. Without the catalog saying so, this tile
                     // would show a frozen last frame and no way to tell it from a
                     // stalled uplink.
-                    Image(systemName: "video.slash.fill")
-                        .font(.largeTitle)
-                        .foregroundStyle(.secondary)
+                    stopped
                 }
             }
+    }
+
+    /// Why this tile is not moving.
+    ///
+    /// Two icons rather than one, because the two cases ask different things of
+    /// whoever is watching. A camera somebody turned off is settled and needs no
+    /// response; a camera their phone took away is temporary, usually resolves
+    /// by itself, and — the case this was built for — is invisible to the person
+    /// it is happening to, who is looking at another app.
+    @ViewBuilder
+    private var stopped: some View {
+        if participant.mute.reason(for: .video) == .interrupted {
+            VStack(spacing: 6) {
+                Image(systemName: "video.badge.ellipsis")
+                    .font(.largeTitle)
+                Text(isSelf ? "Your camera was interrupted" : "Camera interrupted")
+                    .font(.caption2)
+                    .multilineTextAlignment(.center)
+            }
+            .foregroundStyle(.orange)
+            .padding(6)
+        } else {
+            Image(systemName: "video.slash.fill")
+                .font(.largeTitle)
+                .foregroundStyle(.secondary)
+        }
     }
 
     /// The scene itself for a device publishing one, and decoded frames for everything else.

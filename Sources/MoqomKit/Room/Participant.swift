@@ -89,21 +89,36 @@ public struct MuteState: Hashable, Sendable {
     /// instant because there is nothing to ask.
     public var localToMe: MediaKind
 
+    /// Taken away by the participant's operating system rather than by anybody
+    /// in the room.
+    ///
+    /// The one entry here that nobody decided. A phone in Picture in Picture,
+    /// beside a second foreground app, or on a telephone call loses its camera
+    /// or microphone while the session carries on perfectly — and until this
+    /// existed, what the room saw was a tile that had simply stopped moving,
+    /// which is also what a dead uplink and a wedged encoder look like.
+    ///
+    /// Reported by the publisher about itself; see ``Catalog/interrupted``.
+    public var interrupted: MediaKind
+
     public init(
         selfMuted: MediaKind = [],
         forcedForEveryone: MediaKind = [],
         forcedForAudience: MediaKind = [],
-        localToMe: MediaKind = []
+        localToMe: MediaKind = [],
+        interrupted: MediaKind = []
     ) {
         self.selfMuted = selfMuted
         self.forcedForEveryone = forcedForEveryone
         self.forcedForAudience = forcedForAudience
         self.localToMe = localToMe
+        self.interrupted = interrupted
     }
 
     /// Everything this viewer will not receive, whatever the reason.
     public var effective: MediaKind {
-        [selfMuted, forcedForEveryone, localToMe].reduce(into: MediaKind()) { $0.formUnion($1) }
+        [selfMuted, forcedForEveryone, localToMe, interrupted]
+            .reduce(into: MediaKind()) { $0.formUnion($1) }
     }
 
     /// The reason to show, most authoritative first.
@@ -111,10 +126,18 @@ public struct MuteState: Hashable, Sendable {
     /// Self-muted, moderator-muted, and locally-muted-by-me are three different
     /// things to a viewer, and a force-muted cohost needs to know they were
     /// muted rather than assuming a hardware fault.
+    ///
+    /// An interruption ranks below every deliberate choice and above nothing,
+    /// which is the order a viewer reads them in: if this person muted
+    /// themselves, that is why their camera is off, whatever their phone has
+    /// since done with the hardware. It only ever answers a question the other
+    /// four leave unanswered — and that question, before it was here, was
+    /// answered with a still frame and no caption.
     public func reason(for kind: MediaKind) -> MuteReason? {
         if forcedForEveryone.contains(kind) { return .moderator }
         if selfMuted.contains(kind) { return .selfChosen }
         if localToMe.contains(kind) { return .localToMe }
+        if interrupted.contains(kind) { return .interrupted }
         if forcedForAudience.contains(kind) { return .audienceOnly }
         return nil
     }
@@ -126,6 +149,10 @@ public enum MuteReason: String, Hashable, Sendable {
     case moderator
     case audienceOnly
     case localToMe
+
+    /// Nobody's decision: the publisher's own system took the camera or
+    /// microphone away. See ``MuteState/interrupted``.
+    case interrupted
 }
 
 /// Someone on stage or backstage.

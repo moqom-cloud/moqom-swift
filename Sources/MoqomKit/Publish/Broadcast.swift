@@ -63,6 +63,20 @@ public struct BroadcastConfiguration: Sendable {
     /// ``Broadcast/reshape(toAspectOf:)``.
     public var followsCaptureShape: Bool
 
+    /// How long capture may produce nothing before the room is told it has
+    /// stopped. See ``Broadcast/captureStalls``.
+    ///
+    /// A second suits anything running at a normal frame rate: the largest gap
+    /// measured on a healthy call was 130ms, and real interruptions measured on
+    /// the same phones ran from four seconds to a hundred and four, so the
+    /// boundary sits in empty space where a threshold wants to be.
+    ///
+    /// Raise it for a source that is meant to be slow. A screen share sending
+    /// two frames a second is silent for half a second at a time by design, and
+    /// a stall detector calibrated for a camera would keep announcing that the
+    /// presenter's capture had failed.
+    public var stallReportedAfter: Duration
+
     public init(
         ladder: LayerLadder = .defaultCamera(),
         codec: VideoCodec = .hevc,
@@ -71,6 +85,7 @@ public struct BroadcastConfiguration: Sendable {
         stopsUnwatchedLayers: Bool = false,
         prefersPowerEfficiency: Bool = true,
         followsCaptureShape: Bool = true,
+        stallReportedAfter: Duration = .seconds(1),
         encoderFactory: @escaping EncoderFactory = defaultEncoderFactory
     ) {
         self.ladder = ladder
@@ -80,6 +95,7 @@ public struct BroadcastConfiguration: Sendable {
         self.stopsUnwatchedLayers = stopsUnwatchedLayers
         self.prefersPowerEfficiency = prefersPowerEfficiency
         self.followsCaptureShape = followsCaptureShape
+        self.stallReportedAfter = stallReportedAfter
         self.encoderFactory = encoderFactory
     }
 }
@@ -127,6 +143,21 @@ public struct BroadcastStatistics: Hashable, Sendable {
     /// something upstream is oscillating between two aspect ratios, which costs a
     /// keyframe and a doubled encode every time it happens.
     public var reshapes = 0
+
+    /// Whether capture is currently producing nothing, unasked.
+    ///
+    /// See ``BroadcastConfiguration/stallReportedAfter``. A publication that is
+    /// muted or restricted is never described this way: the silence there was
+    /// requested.
+    public var captureStalled = false
+
+    /// How many times that has happened since the broadcast started.
+    ///
+    /// Worth a count and not only a flag, because the interesting version of
+    /// this fault is the one that keeps happening — a phone whose camera is
+    /// taken every time a notification arrives reports a healthy frame rate
+    /// between outages and a tile nobody can watch.
+    public var captureStalls = 0
 
     /// Changes of shape given up on, the previous shape being restored.
     ///
@@ -359,6 +390,12 @@ public actor Broadcast {
     private var statistics = BroadcastStatistics()
     private var pump: Task<Void, Never>?
 
+    /// When the last frame arrived from capture, and the task that notices when
+    /// none has for a while. See ``judgeTheSilence()``.
+    private var lastFrame: ContinuousClock.Instant?
+    private var watchdog: Task<Void, Never>?
+    private let stalls = Stalls()
+
     /// Whether ``setMuted(_:)`` is currently holding frames back.
     public private(set) var isMuted = false
 
@@ -416,6 +453,15 @@ public actor Broadcast {
     public nonisolated var reshapes: AsyncStream<LayerLadder> { reshaped.stream }
 
     private let reshaped = Reshapes()
+
+    /// True when capture has gone silent without being asked to, false when it
+    /// comes back.
+    ///
+    /// For whoever owns the description of this publisher — the session, which
+    /// puts it in the catalog so the room can say why a tile has stopped moving.
+    /// Only the latest value is kept, since an outage that has already ended is
+    /// nothing anybody needs to be told about late.
+    public nonisolated var captureStalls: AsyncStream<Bool> { stalls.stream }
 
     /// The decoder configuration each rung has produced so far.
     ///
@@ -489,6 +535,35 @@ public actor Broadcast {
                 await self?.consume(frame)
             }
         }
+
+        // Checked several times within the threshold, so that most of the delay
+        // in noticing is the threshold rather than the polling.
+        let interval = min(.milliseconds(250), configuration.stallReportedAfter / 4)
+        watchdog = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: interval)
+                if Task.isCancelled { return }
+                await self?.judgeTheSilence()
+            }
+        }
+    }
+
+    /// Has capture gone quiet without anybody asking it to?
+    ///
+    /// Only ever asked about a broadcast that ought to be producing frames. A
+    /// mute stops them on purpose and says so through its own channel, and a
+    /// force-mute closes the hardware deliberately; reporting either as an
+    /// interruption would tell the room a second, wrong reason for a silence it
+    /// has already been given the right one for.
+    private func judgeTheSilence() {
+        guard !isMuted, !isRestricted, let last = lastFrame else { return }
+
+        let quiet = ContinuousClock.now - last > configuration.stallReportedAfter
+        guard quiet != statistics.captureStalled else { return }
+
+        statistics.captureStalled = quiet
+        if quiet { statistics.captureStalls += 1 }
+        stalls.announce(quiet)
     }
 
     /// Route one encoder's output onto its track, tagged with which session it is.
@@ -604,6 +679,8 @@ public actor Broadcast {
     public func stop() async {
         pump?.cancel()
         pump = nil
+        watchdog?.cancel()
+        watchdog = nil
         source.stop()
         for pipe in taps { pipe.tap.stop() }
         taps.removeAll()
@@ -638,6 +715,17 @@ public actor Broadcast {
     /// wrong object number to the wrong bytes.
     private func consume(_ frame: VideoFrame) async {
         statistics.framesSubmitted += 1
+
+        // Recovery is announced from here rather than left to the watchdog,
+        // because the room has been showing a caption over this person for as
+        // long as the outage lasted and a quarter of a second of it after the
+        // picture comes back is a quarter of a second of the app being wrong
+        // about something the viewer can see.
+        lastFrame = .now
+        if statistics.captureStalled {
+            statistics.captureStalled = false
+            stalls.announce(false)
+        }
 
         // Before the encoders, and synchronously. A tap that ran after encoding
         // would deliver frames reordered and late; a tap that awaited anything
@@ -1115,6 +1203,26 @@ private final class Reshapes: Sendable {
     deinit { continuation.finish() }
 
     func announce(_ ladder: LayerLadder) { continuation.yield(ladder) }
+}
+
+/// Whether capture is producing anything, as that changes.
+///
+/// Separate from the actor for the same reason as ``Reshapes``: a stored
+/// continuation cannot be handed out from an actor's non-isolated property.
+private final class Stalls: Sendable {
+    let stream: AsyncStream<Bool>
+    private let continuation: AsyncStream<Bool>.Continuation
+
+    init() {
+        (stream, continuation) = AsyncStream.makeStream(
+            of: Bool.self,
+            bufferingPolicy: .bufferingNewest(1)
+        )
+    }
+
+    deinit { continuation.finish() }
+
+    func announce(_ stalled: Bool) { continuation.yield(stalled) }
 }
 
 /// Where the next object on a track goes.

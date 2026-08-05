@@ -216,6 +216,25 @@ Neither can be driven from a UI test: the window belongs to the system, and the
 simulator will not background the app on request. The UI test covers the part
 that can break silently, which is the cast reaching `RoomSession`.
 
+**And the camera you lose on the way out.** Backgrounding is also when iOS takes
+the camera away. Picture in Picture starting counts as another app in the
+foreground, so capture stops while the session, the subscriptions and the
+microphone all carry on — measured on two phones as 104 seconds of a frozen tile
+with nothing on either screen saying why.
+
+The publication notices its own source has gone quiet for a second and the
+session puts it in the catalog, next to the mute and deliberately not folded
+into it: `Catalog.interrupted`, arriving as `MuteState.interrupted` and
+`MuteReason.interrupted`. Tiles then draw an orange `video.badge.ellipsis` and
+"Camera interrupted" rather than the grey `video.slash.fill` that means somebody
+chose this. A mute or a force-mute is never reported this way — the frames
+stopped because they were stopped, and the room has already been told the true
+reason.
+
+To see it, run the two-phone bench and open any other app on the publisher.
+The far phone captions the tile within a second, and clears it on the first
+frame back.
+
 ## Where things are
 
 | File | What to read it for |
@@ -365,6 +384,61 @@ per phone, at the end of the run. Leave the **Pairing code** field empty when
 connecting by hand: it is a Bonjour lookup for a relay on the LAN, and with
 nothing advertising the code the connection fails before the host and hash
 below it are ever tried.
+
+### The credential
+
+A deployed relay holds the control plane's verification keys, which means it
+admits a session with no token and then permits it nothing. On the phone that
+is a room that joins and a **Go live** that appears to do nothing, so the join
+screen has a **Credential** section: paste a token into it, and it is kept in
+the Keychain against the relay it was minted for.
+
+```sh
+deploy/tools/join.sh ada demo      # in the moqom repository; prints a token
+```
+
+Filed per host, so pairing with a relay on the desk does not throw away the one
+for Los Angeles, and so a credential is never offered to a relay it does not
+belong to — a relay with keys refuses a token it cannot verify outright, rather
+than falling back to admitting the session anonymously.
+
+The screen reads the token's claims back to you: who it names, which room, and
+when it expires. Nothing checks the signature and nothing could — the phone
+holds no key — so this is display only. It is there because the control plane
+caps a token at fifteen minutes, and a saved credential that has gone stale is
+otherwise indistinguishable on screen from a good one. It will also say when
+the token names a different room or person than the fields above it, which is
+the mismatch that costs the most time to find by any other means.
+
+### Scanning a way in
+
+Pasting a token still needs a Mac and a way to get four hundred characters from
+it to a phone. The alternative is a QR code:
+
+```sh
+deploy/tools/invite.sh ada demo    # prints the code, and opens it as a PNG
+```
+
+That carries all three things a device cannot be told by hand — the relay's
+address, the hash of the certificate to pin, and the credential — as a
+`moqom://join?...` link. Point the Camera app at it and MOQOM opens with a
+**Scanned link** section at the top of the join screen, naming the address
+first and what the credential claims second.
+
+It stops there. Agreeing fills the fields in and **Join** still has to be
+pressed, because a link chooses which relay this device trusts and which
+credential it presents, and a URL can arrive from a message or a web page as
+easily as from a code somebody printed. `RelayInvitation` in the SDK parses;
+consent is the application's.
+
+The name and the room come out of the token rather than from the link's own
+fields, so the two cannot contradict each other — the contradiction being a
+relay that admits the session and refuses every track, which on the phone is a
+Join that works and a **Go live** that does nothing.
+
+Putting a bearer credential in something people photograph is only reasonable
+because of the fifteen minutes: the code is worth exactly the time left on it.
+It is not a way to distribute long-lived access, and there isn't one here.
 
 Los Angeles rather than Oregon on measurement: mean round trip from this desk
 was 21.8ms against 47.5ms, which is most of a frame at sixty. A recent

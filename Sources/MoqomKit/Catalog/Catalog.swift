@@ -169,26 +169,49 @@ public struct Catalog: Hashable, Sendable, Codable {
     /// the same reason a participant is trusted to stop talking.
     public let muted: MediaKind
 
+    /// What the publisher's hardware has stopped producing, against their will.
+    ///
+    /// Beside ``muted`` rather than folded into it, because the two are the same
+    /// silence for opposite reasons and a viewer should not be told the wrong
+    /// one. A phone that goes into Picture in Picture, takes a call, or sits
+    /// beside a second app in the foreground has its camera taken away by the
+    /// operating system while the session, the subscription and the audio all
+    /// carry on. Measured on two phones: 104 seconds of a frozen tile with
+    /// nothing on either screen to say why, and the publisher's own counters
+    /// reporting it the whole time.
+    ///
+    /// Detected from the absence of frames — the only signal a capture stall
+    /// has — but detected *by the publisher*, about its own capture, which is
+    /// the difference that matters. A receiver inferring this from a timeout
+    /// would be guessing across a network that has its own reasons for a gap;
+    /// a publisher knows it is not muted and knows nothing has arrived from its
+    /// own camera, and that is a fact rather than an inference.
+    public let interrupted: MediaKind
+
     public static let currentVersion = 1
 
     public init(
         version: Int = Catalog.currentVersion,
         keyID: UInt64? = nil,
         muted: MediaKind = [],
+        interrupted: MediaKind = [],
         tracks: [CatalogTrack]
     ) {
         self.version = version
         self.keyID = keyID
         self.muted = muted
+        self.interrupted = interrupted
         self.tracks = tracks
     }
 
     // Hand-written so that `muted` may be absent. A catalog published by a
     // build from before this field existed is not malformed, it is a publisher
     // who has muted nothing, and refusing to decode it would take the whole
-    // participant off the stage over a missing key.
+    // participant off the stage over a missing key. The same now goes for
+    // `interrupted`, which an older publisher never sends and whose absence
+    // means a camera nobody has taken away.
     private enum CodingKeys: String, CodingKey {
-        case version, keyID, muted, tracks
+        case version, keyID, muted, interrupted, tracks
     }
 
     public init(from decoder: any Decoder) throws {
@@ -196,6 +219,7 @@ public struct Catalog: Hashable, Sendable, Codable {
         version = try container.decode(Int.self, forKey: .version)
         keyID = try container.decodeIfPresent(UInt64.self, forKey: .keyID)
         muted = try container.decodeIfPresent(MediaKind.self, forKey: .muted) ?? []
+        interrupted = try container.decodeIfPresent(MediaKind.self, forKey: .interrupted) ?? []
         tracks = try container.decode([CatalogTrack].self, forKey: .tracks)
     }
 

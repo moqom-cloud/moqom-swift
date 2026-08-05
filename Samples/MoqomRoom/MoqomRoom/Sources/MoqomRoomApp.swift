@@ -25,6 +25,8 @@ struct MoqomRoomApp: App {
                 }
             }
             .task { await model.joinOnLaunch() }
+            // A scanned QR code arrives here. Read and held; see `AppModel.offer`.
+            .onOpenURL { model.offer($0) }
         }
     }
 }
@@ -34,6 +36,10 @@ struct JoinScreen: View {
 
     var body: some View {
         Form {
+            if let invitation = model.offered {
+                InvitationSection(invitation: invitation, model: model)
+            }
+
             Section("You") {
                 TextField("Username", text: $model.username)
                     .textContentType(.username)
@@ -106,6 +112,43 @@ struct JoinScreen: View {
                 }
             }
 
+            // Its own section, because it is the one setting here that authorises rather than
+            // addresses, and because it is the one people arrive without. A deployed relay
+            // admits a session with no token and then permits it nothing, which looks from
+            // the phone like a room that joins and a Go live that does nothing.
+            Section {
+                TextField("Token", text: $model.relayToken, axis: .vertical)
+                    #if os(iOS)
+                        .textInputAutocapitalization(.never)
+                    #endif
+                    .autocorrectionDisabled()
+                    .lineLimit(1 ... 3)
+                    .font(.caption.monospaced())
+            } header: {
+                Text("Credential")
+            } footer: {
+                // What the token says about itself, read out of it and never checked — the
+                // phone holds no key and could not verify this if it wanted to. It is here
+                // because a stale token and a good one are the same four hundred characters
+                // on screen and behave nothing alike.
+                VStack(alignment: .leading, spacing: 4) {
+                    if let complaint = model.credentialComplaint {
+                        Text(complaint).foregroundStyle(.orange)
+                    }
+                    if let credential = model.credential {
+                        Text(credential.summary)
+                    } else if model.relayToken.isEmpty {
+                        Text(
+                            "Without one, a deployed relay admits this device and lets it "
+                                + "publish nothing. Mint one with deploy/tools/join.sh and "
+                                + "paste it here; it is kept for this relay and this phone."
+                        )
+                    } else {
+                        Text("That does not read as a token.").foregroundStyle(.orange)
+                    }
+                }
+            }
+
             Section {
                 // Deliberately next to Join rather than inside the room: it changes what
                 // gets published and which clock stamps it, and both are settled before the
@@ -130,6 +173,38 @@ struct JoinScreen: View {
             }
         }
         .navigationTitle("MOQOM")
+    }
+}
+
+/// What a scanned link is offering, and the two answers to it.
+///
+/// A section at the top of the form rather than an alert, because an alert
+/// interrupts and then disappears: somebody who dismisses one has no way back to
+/// the link, and the fields it would have filled are exactly the ones they
+/// cannot type. This waits.
+struct InvitationSection: View {
+    let invitation: Invitation
+    let model: AppModel
+
+    var body: some View {
+        Section {
+            Button("Use this relay") { model.acceptOffer() }
+            Button("Ignore", role: .cancel) { model.declineOffer() }
+        } header: {
+            Text("Scanned link")
+        } footer: {
+            VStack(alignment: .leading, spacing: 4) {
+                // The address first and in bold, because it is the part being
+                // trusted. A link naming a familiar room and an unfamiliar host
+                // is one people accept having read only the familiar half.
+                Text("Would connect to \(invitation.destination).").bold()
+                Text(invitation.identification)
+                if invitation.isStale {
+                    Text("Its credential has already expired — ask for a fresh link.")
+                        .foregroundStyle(.orange)
+                }
+            }
+        }
     }
 }
 

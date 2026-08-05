@@ -89,6 +89,20 @@ targets:
           - audio
         # Lets the app start a Live Activity at all.
         NSSupportsLiveActivities: true
+        # How a phone with no Mac attached gets a relay address, a certificate
+        # hash and a credential: `deploy/tools/invite.sh` prints a QR code
+        # holding a `moqom://join?...`, and the Camera app opens it here. See
+        # `Invitation.swift` and `RelayInvitation` in the SDK.
+        #
+        # A custom scheme rather than a universal link, which would be the right
+        # answer for a shipping app: a universal link needs a domain serving an
+        # apple-app-site-association file, and it cannot be claimed by another
+        # app the way a scheme can. This is a sample, and the thing being
+        # demonstrated is what the app does with the link once it has it.
+        CFBundleURLTypes:
+          - CFBundleURLName: cloud.moqom.room.invitation
+            CFBundleURLSchemes:
+              - moqom
         # Not set: NSSupportsLiveActivitiesFrequentUpdates. The throttle in
         # `BroadcastActivityThrottle` is built to live inside the ordinary
         # budget, and asking for the larger one would hide whether it does.

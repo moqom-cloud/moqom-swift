@@ -97,10 +97,6 @@ struct RelayConfiguration {
             case "--relay-host": host = value
             case "--relay-port": port = value.flatMap(UInt16.init)
             case "--relay-cert-hash": value.map { hashes.append($0) }
-            // An argument and not a saved setting: a token lasts an hour, and one
-            // remembered across launches would be a puzzle rather than a convenience —
-            // the app would work in the morning and stop by lunchtime with no change to
-            // anything a person could see.
             case "--relay-token": token = value.flatMap { $0.data(using: .utf8) }
             default: break
             }
@@ -120,11 +116,22 @@ struct RelayConfiguration {
                 token: Data()
             )
 
+        // Kept, like the address, and for the stronger version of the same reason: an address
+        // can at least be typed from memory, whereas a token is four hundred characters
+        // nobody can produce without a Mac and a port-forward into the cluster. Not keeping
+        // it meant a phone picked up on its own reached a deployed relay, was admitted as
+        // nobody, and was permitted nothing — a session that connects, carries no media, and
+        // explains itself nowhere.
+        //
+        // Safe to remember only because it is shown: see ``Credential``, which reads the
+        // expiry so the interface can say a token is stale rather than leaving somebody to
+        // find out by joining.
+        let dialling = host ?? remembered.host
         return RelayConfiguration(
-            host: host ?? remembered.host,
+            host: dialling,
             port: port ?? remembered.port,
             certificateHashes: hashes.isEmpty ? remembered.certificateHashes : hashes,
-            token: token ?? Data()
+            token: token ?? dialling.flatMap { TokenStore.load(for: $0) } ?? Data()
         )
     }
 
@@ -137,7 +144,14 @@ struct RelayConfiguration {
         defaults.set(host ?? "", forKey: "relayHost")
         defaults.set(Int(port), forKey: "relayPort")
         defaults.set(certificateHashes, forKey: "relayCertificateHashes")
+        // Somewhere else entirely, because this one is a credential, and under the host it
+        // belongs to. See ``TokenStore``. Nothing is saved for the loopback, which asks for
+        // no credential and would otherwise file one under the absence of a host.
+        if let host { TokenStore.save(token, for: host) }
     }
+
+    /// What the token says about itself, or nothing when there is no token to ask.
+    var credential: Credential? { token.isEmpty ? nil : Credential(token) }
 
     /// A transport that dials this relay, or the loopback where there is none.
     func transport() -> any Transport {
@@ -169,7 +183,13 @@ struct RelayConfiguration {
         // token connects to a relay that verifies and then carries nothing, and the two
         // failures — cannot reach the relay, and reached it with no credential — look
         // identical from the outside.
-        let credential = token.isEmpty ? "no token" : "token"
+        // Three states rather than two. A stale token and a fresh one look identical in a
+        // screenshot and behave nothing alike, and this string is what the journal records
+        // for every join, so it is the line a failed run gets read back from.
+        let credential = switch self.credential {
+        case nil: token.isEmpty ? "no token" : "unreadable token"
+        case let held?: held.hasExpired ? "expired token" : "token"
+        }
         return "\(host):\(port), \(trust), \(credential)"
     }
 }

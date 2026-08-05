@@ -73,7 +73,7 @@ struct SelfMuteTests {
 
         submit(source, count: 4)
         _ = await eventually { await broadcast.stats.framesEncoded > 0 }
-        let encodedBefore = await broadcast.stats.framesEncoded
+        let encodedBefore = await framesEncodedOnceSettled(broadcast)
 
         await room.setSelfMuted(.video)
         submit(source, count: 6, from: 4)

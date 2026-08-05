@@ -775,6 +775,10 @@ final class RoomModel {
     var cameraTurnsInSoftware: Bool { camera?.softwareTurns ?? false }
 
     /// How often the system has taken the camera away, and what it said the last time.
+    /// What each participant was last reported as having lost, so a change can
+    /// be told from a repeat. See the `.muteChanged` case in ``handle(_:)``.
+    private var interruptions: [ParticipantIdentity: MediaKind] = [:]
+
     var cameraInterruptions: Int { camera?.interruptions ?? 0 }
     var lastCameraInterruption: String? { camera?.lastInterruption }
 
@@ -951,8 +955,21 @@ final class RoomModel {
                 "MUTE held=\(held.rawValue) resumable=\(resumable.rawValue)"
             )
             await refresh()
+        case let .muteChanged(who, mute):
+            // Journalled only for the reason nobody chose. The others are all
+            // somebody pressing a button and are legible from the interface;
+            // this one is a phone taking the camera away, it happens while its
+            // owner is looking at a different app, and the two logs either side
+            // of it are how a run gets reconstructed afterwards.
+            if mute.interrupted != interruptions[who] {
+                interruptions[who] = mute.interrupted
+                Journal.shared.say(
+                    "CAPTURE \(who.username.value) interrupted=\(mute.interrupted.rawValue)"
+                )
+            }
+            await refresh()
         case .participantJoined, .presenceChanged,
-             .muteChanged, .grantsChanged, .spotlightChanged:
+             .grantsChanged, .spotlightChanged:
             await refresh()
         case .terminated:
             await leave()

@@ -167,7 +167,8 @@ public extension Catalog {
         decoderConfigurations: [LayerID: Data] = [:],
         audio: AudioPublicationConfiguration? = nil,
         keyID: UInt64? = nil,
-        muted: MediaKind = []
+        muted: MediaKind = [],
+        interrupted: MediaKind = []
     ) -> Catalog {
         // The live ladder when there is one, because a publication's geometry can
         // move after it starts: the rungs keep their names and their short sides,
@@ -203,7 +204,7 @@ public extension Catalog {
             )
         }
 
-        return Catalog(keyID: keyID, muted: muted, tracks: tracks)
+        return Catalog(keyID: keyID, muted: muted, interrupted: interrupted, tracks: tracks)
     }
 }
 

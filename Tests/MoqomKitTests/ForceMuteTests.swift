@@ -137,7 +137,7 @@ struct ForceMuteTests {
 
         camera.submit(4)
         _ = await eventually { await broadcast.stats.framesEncoded > 0 }
-        let encodedBefore = await broadcast.stats.framesEncoded
+        let encodedBefore = await framesEncodedOnceSettled(broadcast)
 
         try await enforce(
             ParticipantPolicy(mutedForEveryone: .video),

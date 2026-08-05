@@ -19,6 +19,26 @@ func eventually(
     return await condition()
 }
 
+/// How many frames a publication has encoded, once it has stopped encoding.
+///
+/// For the tests that mute something and then claim nothing more was encoded.
+/// Reading the count the moment the first frame appears measures a pipeline in
+/// flight: a submission puts several frames in the source, the pump takes them
+/// one at a time, and the encoder holds each for a while. Frames submitted
+/// before the mute are still on their way through all of that, and they land
+/// afterwards — so the assertion failed on a busy machine and passed on an idle
+/// one, while the behaviour under test was identical in both.
+func framesEncodedOnceSettled(_ broadcast: Broadcast) async -> Int {
+    var last = await broadcast.stats.framesEncoded
+    for _ in 0 ..< 100 {
+        try? await Task.sleep(for: .milliseconds(20))
+        let now = await broadcast.stats.framesEncoded
+        if now == last { return now }
+        last = now
+    }
+    return last
+}
+
 func credentials(_ name: String, device: String = "iphone-0001") -> DeviceCredentials {
     DeviceCredentials(
         identity: identity(name, device: device),

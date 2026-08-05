@@ -51,6 +51,9 @@ public actor RoomSession {
     /// Watches the broadcast's shape, for as long as it is publishing.
     private var catalogReshapes: Task<Void, Never>?
 
+    /// Watches whether the broadcast is producing anything at all.
+    private var catalogStalls: Task<Void, Never>?
+
     /// Retries of a broadcast's writers after a reconnect, and the announcement they share.
     private var publicationRepair: Task<Void, Never>?
     private var reopenedAnnouncement: (any AnnouncementHandle)?
@@ -72,6 +75,13 @@ public actor RoomSession {
     /// rebuilt — on a reconnect, on a rejoin — while the user's choice about
     /// their own microphone has not changed and must not be quietly discarded.
     private var ownMute: MediaKind = []
+
+    /// What this device's own hardware has stopped producing, unasked.
+    ///
+    /// Kept beside ``ownMute`` and never merged into it. They are published in
+    /// the same document and they mean opposite things about the person: one is
+    /// a choice they made and the other is a choice made for them.
+    private var ownInterruption: MediaKind = []
 
     /// What the relay is holding down on this device, as it last said.
     ///
@@ -793,6 +803,8 @@ public actor RoomSession {
         catalogRefresh = nil
         catalogReshapes?.cancel()
         catalogReshapes = nil
+        catalogStalls?.cancel()
+        catalogStalls = nil
         await catalogPublisher?.finish()
         catalogPublisher = nil
         catalogs.removeAll()
@@ -929,6 +941,17 @@ public actor RoomSession {
             }
         }
 
+        // The other thing a publication can do that the room has to be told
+        // about: stop producing anything, because the phone's own system took
+        // the camera away. See ``Catalog/interrupted``.
+        catalogStalls?.cancel()
+        let stalls = live.captureStalls
+        catalogStalls = Task { [weak self] in
+            for await stalled in stalls {
+                await self?.reportCapture(stalled: stalled)
+            }
+        }
+
         // Republished once the encoders have produced parameter sets, which
         // cannot happen until something has been encoded.
         catalogRefresh?.cancel()
@@ -980,7 +1003,8 @@ public actor RoomSession {
             decoderConfigurations: configurations,
             audio: audio?.configuration,
             keyID: encryption?.sender.key.keyID,
-            muted: ownMute
+            muted: ownMute,
+            interrupted: ownInterruption
         )
         _ = try? await publisher.publish(catalog)
         return configurations.count >= ladder.rungs.count
@@ -1049,10 +1073,23 @@ public actor RoomSession {
         catalogRefresh = nil
         catalogReshapes?.cancel()
         catalogReshapes = nil
+        catalogStalls?.cancel()
+        catalogStalls = nil
         catalogRestatement?.cancel()
         catalogRestatement = nil
         await broadcast?.stop()
         broadcast = nil
+
+        // Cleared with the publication that observed it. Someone who stops
+        // broadcasting while their camera happens to be taken is not
+        // interrupted, they have stopped, and leaving the flag set would caption
+        // their absence with the last thing that went wrong before it.
+        ownInterruption = []
+        if var participant = state.roster[identity] {
+            participant.mute.interrupted = []
+            state.roster[identity] = participant
+        }
+
         await catalogPublisher?.finish()
         catalogPublisher = nil
     }
@@ -1458,6 +1495,37 @@ public actor RoomSession {
             LogField("audio", .flag(kinds.contains(.audio))),
             LogField("video", .flag(kinds.contains(.video))),
         ])
+        if let participant = state.roster[identity] {
+            eventContinuation.yield(.muteChanged(identity, participant.mute))
+        }
+    }
+
+    /// Say that this device's capture has stopped, or started again.
+    ///
+    /// The counterpart to ``setSelfMuted(_:)`` for the silences nobody chose,
+    /// and it goes out by the same route: the catalog, which everyone already
+    /// reads and which a late joiner reads on arrival. Driven by the
+    /// publication noticing its own source has gone quiet — see
+    /// ``Broadcast/captureStalls`` — rather than by the application, because an
+    /// application that has to remember to report this is an application that
+    /// will report it for the case it thought of and no other.
+    ///
+    /// The media is not touched. Nothing is muted, no group is restarted and no
+    /// subscription changes: the frames stopped on their own, and they will
+    /// resume on their own. All that happens here is that the room is told.
+    private func reportCapture(stalled: Bool) async {
+        let interrupted: MediaKind = stalled ? .video : []
+        guard ownInterruption != interrupted else { return }
+        ownInterruption = interrupted
+
+        if var participant = state.roster[identity] {
+            participant.mute.interrupted = interrupted
+            state.roster[identity] = participant
+        }
+
+        _ = await refreshCatalog()
+
+        logger.info(.media, stalled ? "capture interrupted" : "capture resumed", [])
         if let participant = state.roster[identity] {
             eventContinuation.yield(.muteChanged(identity, participant.mute))
         }
@@ -2678,9 +2746,25 @@ public actor RoomSession {
         // whether to stay subscribed. Applied in the other order, a participant
         // muting themselves would be acted on one catalog late.
         adoptSelfMute(catalog.muted, of: who)
+        adoptInterruption(catalog.interrupted, of: who)
 
         await followAudio(of: who, in: catalog)
         eventContinuation.yield(.catalogChanged(who, catalog))
+    }
+
+    /// Take what a participant says their own hardware has stopped giving them.
+    ///
+    /// Trusted on the same terms as their mute, and with less at stake: a
+    /// participant who lies about this makes their own tile say their camera
+    /// was interrupted while they carry on publishing, which is a way of
+    /// slandering nobody but themselves.
+    private func adoptInterruption(_ interrupted: MediaKind, of who: ParticipantIdentity) {
+        guard var participant = state.roster[who], participant.mute.interrupted != interrupted
+        else { return }
+
+        participant.mute.interrupted = interrupted
+        state.roster[who] = participant
+        eventContinuation.yield(.muteChanged(who, participant.mute))
     }
 
     /// Take a participant's own mute from the catalog they published.

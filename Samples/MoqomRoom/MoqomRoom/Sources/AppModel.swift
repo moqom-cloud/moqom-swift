@@ -27,8 +27,13 @@ final class AppModel {
 
     private(set) var phase: Phase = .joining
 
-    var username: String = ""
-    var roomName: String = "demo"
+    /// Both remembered, like the relay's address and for the same reason.
+    ///
+    /// They are also half of what a token is minted against, so a phone that forgets them is
+    /// a phone that dials a real relay holding a credential for somebody else in another
+    /// room. Set in ``init``, saved on joining.
+    var username: String
+    var roomName: String
 
     /// Where the relay is, and therefore whether this is a real broadcast.
     ///
@@ -76,10 +81,19 @@ final class AppModel {
     /// selection.
     var measure: Bool
 
-    init() {
+    init(defaults: UserDefaults = .standard) {
         Journal.shared.begin()
         measure = true
         pairingCode = launch.pairingCode ?? ""
+        username = defaults.string(forKey: "username") ?? ""
+        roomName = defaults.string(forKey: "roomName") ?? "demo"
+    }
+
+    /// Everything the join screen asked for, kept for the next launch.
+    private func remember(to defaults: UserDefaults = .standard) {
+        defaults.set(username, forKey: "username")
+        defaults.set(roomName, forKey: "roomName")
+        relay.save(to: defaults)
     }
 
     /// Guarded because SwiftUI may run a `task` more than once for the same view, and
@@ -168,6 +182,75 @@ final class AppModel {
         set {
             relay.certificateHashes = newValue.trimmed.isEmpty ? [] : [newValue.trimmed]
         }
+    }
+
+    /// The token as a text field sees it: something to paste, and blank for none.
+    ///
+    /// A field at all because there was no way to put a credential on a phone without a Mac
+    /// attached to it, which made the deployed relays reachable only from a script.
+    var relayToken: String {
+        get { String(decoding: relay.token, as: UTF8.self) }
+        set { relay.token = Data(newValue.trimmed.utf8) }
+    }
+
+    /// A link this app was opened with, waiting for somebody to agree to it.
+    ///
+    /// Held rather than applied. See ``Invitation``: a URL can arrive from
+    /// anywhere, and this one names the relay to trust and the credential to
+    /// present.
+    var offered: Invitation?
+
+    /// Read a `moqom://join?...` the app was opened with.
+    ///
+    /// Kept even while a room is up, and shown when the join screen next
+    /// appears. Applying it mid-call would swap the relay under a live session,
+    /// and discarding it would mean a link scanned a moment too early is a link
+    /// that silently did nothing.
+    func offer(_ url: URL) {
+        guard let invitation = Invitation(url) else {
+            Journal.shared.say("INVITE unreadable \(url.absoluteString.prefix(60))")
+            return
+        }
+        Journal.shared.say("INVITE \(invitation.destination)")
+        offered = invitation
+    }
+
+    /// Take the link that arrived: address, trust, credential, and who it says
+    /// this phone is.
+    ///
+    /// The name and the room come out of the token rather than from the link's
+    /// own fields, so the two cannot contradict each other. That contradiction
+    /// is not hypothetical — a token minted for one room against a screen
+    /// showing another is a relay refusing every track, which on the phone is a
+    /// Join that works and a Go live that does nothing.
+    func acceptOffer() {
+        guard let invitation = offered else { return }
+        offered = nil
+
+        relay = RelayConfiguration(
+            host: invitation.relay.endpoint.host,
+            port: invitation.relay.endpoint.port,
+            certificateHashes: invitation.relay.certificateHashes,
+            token: invitation.relay.token
+        )
+        // A pairing code left in the field would resolve on the next Join and
+        // throw all of this away for whatever is on the local network.
+        pairingCode = ""
+
+        if let credential = invitation.credential {
+            if !credential.subject.isEmpty { username = credential.subject }
+            if !credential.room.isEmpty { roomName = credential.room }
+        }
+        remember()
+    }
+
+    func declineOffer() { offered = nil }
+
+    /// What the token in hand says about itself, and whether it suits this join.
+    var credential: Credential? { relay.credential }
+
+    var credentialComplaint: String? {
+        credential?.complaint(joining: roomName.trimmed, as: username.trimmed)
     }
 
     /// Join on the settings a script supplied, if it supplied any.
@@ -870,7 +953,7 @@ final class AppModel {
             }
         }
 
-        relay.save()
+        remember()
 
         do {
             let identity = try ParticipantIdentity(
