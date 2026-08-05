@@ -1368,6 +1368,11 @@ final class RoomModel {
             #endif
             await refresh()
         } catch {
+            // Written here as well as shown, because the alert is only seen by whoever is
+            // holding the phone and the journal is the only account of a session nobody
+            // scripted. Going live failing used to leave no trace at all: an empty log, a
+            // button that did not change, and nothing to read afterwards.
+            Journal.shared.say("GO LIVE FAILED source=\(videoInput.rawValue) \(error)")
             lastError = error
             source.stop()
             capture = nil

@@ -176,11 +176,19 @@ final class AppModel {
     /// outcome legible from the Mac. Whether a phone can reach a relay at all is the first
     /// question of a two-device run and the console is where it gets answered.
     func joinOnLaunch() async {
+        // Filled in whether or not this launch joins by itself, because the name and the room
+        // are half of what a token is minted against. A launch that supplies a token and no
+        // autojoin used to leave the fields at their defaults, so the person tapping Join
+        // reached room `demo` as nobody, holding a credential naming somebody in another room
+        // — which the relay is right to refuse and which looks, on the phone, like a button
+        // that does nothing.
+        username = launch.username ?? username
+        roomName = launch.room ?? roomName
+
         guard launch.autojoin, !joinedOnLaunch else { return }
         joinedOnLaunch = true
 
-        username = launch.username ?? "device"
-        roomName = launch.room ?? roomName
+        if username.isEmpty { username = "device" }
         Journal.shared.say("JOINING relay=\(relay.summary) room=\(roomName) as=\(username)")
 
         await join()
