@@ -461,6 +461,20 @@ encode rather than a namespace with no media behind it.
   the SDK cannot encode anything without a device. The degradation is real —
   the encoder will buffer to hit a bitrate — so it is reported on
   `usesLowLatencyRateControl` rather than swallowed.
+- **A running capture connection is never reconfigured to rotate.** Changing
+  `videoRotationAngle` on a live connection stops the camera: measured on two
+  phones, the sensor's own timestamps show holes of 133ms and 167ms at each
+  layout change, which are exact multiples of the frame interval, so the device
+  dropped three to five frames rather than anything downstream falling behind. So
+  `CameraSource.rotationDegrees` reconfigures the connection only while the
+  session is stopped — at start, at resume from a suspend, and across a camera
+  swap — and a change while running goes to `VTPixelRotationSession` instead,
+  which is hardware and hands the encoder the surface type it already wanted. The
+  cost moves from a stall at every layout change to one pass per frame while the
+  published shape differs from the angle the connection was given. With this and
+  the burst cap, a call changing layout every eight seconds holds a flat 33.3ms
+  capture cadence, an 87ms worst arrival against 203-267ms before, and no freezes
+  at all.
 - **Encoders are held to a short-window byte cap, not just an average bitrate.**
   `EncoderConfiguration.burstAllowance` lets a keyframe spend a quarter more than
   the average over any half second, where hardware left alone will spend eight
