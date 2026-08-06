@@ -245,6 +245,27 @@ final class LatencyMeter: @unchecked Sendable {
     /// however far apart they are.
     private var impossible = 0
 
+    /// Frames whose capture time was too far in the past to be a latency.
+    ///
+    /// The same fault as ``impossible`` with the other sign, and it needs the same
+    /// treatment for the same reason. A publisher's timeline can step — an interruption,
+    /// a re-anchor after one — and a frame stamped either side of the step measures the
+    /// step rather than the link. One such sample ruins every percentile above the
+    /// median: a run whose p50 was a healthy 43.9ms reported a p95 of thirteen and a half
+    /// hours, which is not a latency anybody can act on and sits in the same line as
+    /// figures that are.
+    ///
+    /// Counted and named rather than dropped in silence, because a run producing them is
+    /// a run whose clocks are not agreed, and the median beside them is only as
+    /// trustworthy as that.
+    private var beyondBelief = 0
+
+    /// Past this, a sample is describing a clock rather than a network.
+    ///
+    /// Ten seconds: far beyond any link this is used on, and far short of the hours a
+    /// stepped timeline produces, so nothing a bad network can do lands here.
+    private static let believable = 10_000.0
+
     func record(capturedAt captured: FrameTimestamp, receivedAt received: Timecode) {
         // In doubles rather than integers because the two are differently signed, and the
         // subtraction that matters is the one that can legitimately come out negative.
@@ -258,6 +279,8 @@ final class LatencyMeter: @unchecked Sendable {
             uncertainty = max(uncertainty, bound)
             if milliseconds < 0 {
                 impossible += 1
+            } else if milliseconds > Self.believable {
+                beyondBelief += 1
             } else {
                 worstEver = max(worstEver, milliseconds)
                 if samples.count < Self.window {
@@ -294,13 +317,19 @@ final class LatencyMeter: @unchecked Sendable {
         /// Frames that arrived before they were captured, which cannot happen.
         var impossible: Int
 
-        var isUsable: Bool { frames > 0 && impossible == 0 }
+        /// Frames whose measured latency was hours rather than milliseconds.
+        var beyondBelief: Int
+
+        var isUsable: Bool { frames > 0 && impossible == 0 && beyondBelief == 0 }
     }
 
     /// The figures so far, or `nil` while nothing has arrived to measure.
     func reading() -> Reading? {
-        let (sorted, frames, uncertainty, impossible, worstEver) = lock.withLock {
-            (samples.sorted(), self.frames, self.uncertainty, self.impossible, self.worstEver)
+        let (sorted, frames, uncertainty, impossible, beyondBelief, worstEver) = lock.withLock {
+            (
+                samples.sorted(), self.frames, self.uncertainty,
+                self.impossible, self.beyondBelief, self.worstEver
+            )
         }
         guard !sorted.isEmpty else {
             guard frames > 0 else { return nil }
@@ -308,7 +337,8 @@ final class LatencyMeter: @unchecked Sendable {
                 frames: frames,
                 median: 0, p95: 0, p99: 0, worst: 0,
                 uncertainty: uncertainty,
-                impossible: impossible
+                impossible: impossible,
+                beyondBelief: beyondBelief
             )
         }
 
@@ -323,7 +353,8 @@ final class LatencyMeter: @unchecked Sendable {
             p99: percentile(0.99),
             worst: worstEver,
             uncertainty: uncertainty,
-            impossible: impossible
+            impossible: impossible,
+            beyondBelief: beyondBelief
         )
     }
 
@@ -349,6 +380,11 @@ final class LatencyMeter: @unchecked Sendable {
             reading.uncertainty
         )
         if reading.impossible > 0 { line += " (\(reading.impossible) before capture)" }
+        // Named as a stepped clock rather than left to be read as a slow link, which is
+        // what a count of discarded hours next to a healthy median otherwise looks like.
+        if reading.beyondBelief > 0 {
+            line += " (\(reading.beyondBelief) discarded, publisher's clock stepped)"
+        }
         return line
     }
 }

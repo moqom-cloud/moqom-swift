@@ -680,12 +680,28 @@ struct BroadcastControls: View {
             // itself.
             ScrollView(.horizontal) {
                 HStack(spacing: 8) {
+                    // Both media, because that is what going live means to the person
+                    // pressing it. Video alone was the previous behaviour and the voice
+                    // was the button beside this one: a run went out silent, the far end
+                    // heard nothing, and every counter on both phones agreed the call was
+                    // healthy — because it was, and it had no audio in it. The separate
+                    // button stays for ending the voice while the picture continues,
+                    // which is a thing somebody means to do rather than a thing they
+                    // forget.
+                    //
+                    // The launched path is deliberately not routed through here. A
+                    // benchmark that publishes a voice nobody asked for is measuring a
+                    // different link; see ``AppModel``, where absent `--audio` is silence.
                     Button {
                         Task {
                             if room.isBroadcasting {
                                 await room.stopBroadcast()
+                                await room.stopAudio()
                             } else {
                                 await room.startBroadcast()
+                                if room.isBroadcasting, !room.forceMuted.contains(.audio) {
+                                    await room.startAudio()
+                                }
                             }
                         }
                     } label: {
@@ -738,6 +754,26 @@ struct BroadcastControls: View {
                     // silently fails is worse than one that is plainly out of
                     // reach. The banner above says who took it away.
                     .disabled(!room.isPublishingAudio || room.forceMuted.contains(.audio))
+                    .controlCapsule()
+
+                    // What the microphone is being asked for, rather than how loud it is. The
+                    // default chain holds a voice at a steady level and quiets what is not
+                    // one, so a snap near the phone arrives flattened while the same snap
+                    // across the room arrives whole. This asks for the sound as it was, and
+                    // gives up the echo canceller to get it.
+                    Button {
+                        room.capturesEverythingItHears.toggle()
+                    } label: {
+                        Label(
+                            room.capturesEverythingItHears ? "Full range" : "Voice",
+                            systemImage: room.capturesEverythingItHears
+                                ? "waveform.badge.plus"
+                                : "person.wave.2"
+                        )
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(room.capturesEverythingItHears ? .orange : nil)
+                    .disabled(!room.isPublishingAudio || room.audioInput != .microphone)
                     .controlCapsule()
 
                     Button {
@@ -878,6 +914,16 @@ struct BroadcastControls: View {
 
             if room.isPublishingAudio, room.audioInput == .microphone {
                 CaptureReadout(meter: room.meter, isCancellingEcho: room.isCancellingEcho)
+            }
+
+            // Said where the levels would be, because that is where somebody looks to
+            // check they are being heard and an absence there reads as quiet rather than
+            // as nothing being sent. A picture going out with no voice behind it is
+            // otherwise indistinguishable from a working call until the far end says so.
+            if room.isBroadcasting, !room.isPublishingAudio {
+                Label("no voice — publishing picture only", systemImage: "waveform.slash")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
             }
 
             LinkReadout(link: room.link, quality: room.quality)
@@ -1035,6 +1081,12 @@ struct GlassReadout: View {
                 // total that is mostly wait is a total somebody can do something about.
                 Text(String(format: "· link %.0f + hold %.0f", reading.median, held))
                     .foregroundStyle(.tertiary)
+
+                // Said rather than subtracted. See ``held``.
+                if wait < 0 {
+                    Text(String(format: "· %.0f late", -wait * 1000))
+                        .foregroundStyle(.orange)
+                }
             } else {
                 Text("waiting for the other device")
             }
@@ -1049,7 +1101,17 @@ struct GlassReadout: View {
         }
     }
 
-    private var held: Double { wait * 1000 }
+    /// The hold, in milliseconds, and never less than none of it.
+    ///
+    /// ``VideoRenderer/playoutSlack`` is signed: negative means that share of
+    /// frames missed their deadline. Added to the link as it stands, that is a
+    /// glass-to-glass total *below* the time the frames spent in flight, and on a
+    /// bad enough stretch below zero — a figure that says light travelled
+    /// backwards. A frame that misses its deadline is shown as soon as it lands,
+    /// so what it waits is nothing, not a negative amount, and the lateness it
+    /// does represent is worth its own words beside the total rather than being
+    /// quietly netted off it.
+    private var held: Double { max(0, wait * 1000) }
 }
 
 /// The network half of ``GlassReadout``, with the error bar on the measurement.

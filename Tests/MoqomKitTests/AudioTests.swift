@@ -264,7 +264,11 @@ struct JitterBufferTests {
         // cannot carry it is more useful than hiding it.
         var buffer = JitterBuffer(minimumDelay: .milliseconds(20), maximumDelay: .milliseconds(100))
         for index in UInt64(0) ..< 100 {
-            let wobble = index.isMultiple(of: 2) ? 400 : -400
+            // Under the step threshold on purpose. Wobbling by more than a quarter
+            // of a second is read as an interruption and re-anchored, so a test
+            // that used one would drive the target nowhere near the ceiling and
+            // still pass the assertion below, having tested nothing.
+            let wobble = index.isMultiple(of: 2) ? 100 : -100
             buffer.insert(
                 sequence: index,
                 packet(index),
@@ -272,6 +276,53 @@ struct JitterBufferTests {
             )
         }
         #expect(buffer.stats.targetDelay <= .milliseconds(100))
+    }
+
+    @Test("an interruption is re-anchored rather than charged to the link")
+    func aStepIsNotJitter() {
+        // What backgrounding an app looks like from here: a steady link, nothing
+        // arriving for two seconds because this end was not running, then the
+        // backlog at once and a steady link again. The buffer should be sized for
+        // the link it can see, not for the pause in the middle of it.
+        var buffer = JitterBuffer(minimumDelay: .milliseconds(20))
+        for index in UInt64(0) ..< 25 {
+            buffer.insert(sequence: index, packet(index), at: arrival(index))
+        }
+        for index in UInt64(25) ..< 50 {
+            buffer.insert(
+                sequence: index,
+                packet(index),
+                at: .milliseconds(Int(index) * 20 + 2000)
+            )
+        }
+
+        #expect(buffer.stats.discontinuities == 1)
+        #expect(buffer.stats.targetDelay == .milliseconds(20))
+    }
+
+    @Test("the depth comes back down without waiting for anyone to stop talking")
+    func depthRelaxesDuringSpeech() {
+        // The failure this exists for: a target driven up by one bad stretch and
+        // held there for the rest of a call, because coming down needed silence
+        // and the publisher's room had a fan in it. Measured at 227ms of buffer
+        // on a link with 5.4ms of jitter, with the picture held back to match.
+        var buffer = JitterBuffer(minimumDelay: .milliseconds(20))
+        for index in UInt64(0) ..< 50 {
+            let wobble = index.isMultiple(of: 2) ? 60 : -60
+            buffer.insert(
+                sequence: index,
+                packet(index),
+                at: .milliseconds(Int(index) * 20 + wobble)
+            )
+        }
+        let grown = buffer.stats.targetDelay
+        #expect(grown > .milliseconds(100))
+
+        // Ten seconds of an even link and not one silent packet in it.
+        for index in UInt64(50) ..< 550 {
+            buffer.insert(sequence: index, packet(index), at: arrival(index))
+        }
+        #expect(buffer.stats.targetDelay < grown)
     }
 
     @Test("a reset forgets a stream that no longer exists")

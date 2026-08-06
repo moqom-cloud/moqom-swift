@@ -386,6 +386,12 @@ import MoqomCore
             slackCursor = 0
             playoutSlack = nil
             catchUp = nil
+
+            // Unlike a re-anchor, which keeps it. This is a new stream and possibly a new
+            // publisher, so the ratio between the two clocks is no longer the one that was
+            // learnt — and a correction carried onto a clock it was not measured against is
+            // worse than none.
+            tracking.forget()
             playoutDepth = playoutBounds.map { min(max($0.floor, playoutFloor), $0.ceiling) }
                 ?? playoutDelay
                 ?? .zero
@@ -455,6 +461,39 @@ import MoqomCore
         private var catchUpGive = 0.0
         private var catchUpLanding = 0.0
 
+        /// Keeps this schedule level with the clock that stamped the frames. See
+        /// ``ScheduleTracking``.
+        private var tracking = ScheduleTracking()
+
+        /// When the correction was last revised, so it is revised on a schedule rather than
+        /// once per frame.
+        private var tracked = ContinuousClock.now
+
+        /// Run the presentation clock at a rate, keeping the timeline continuous across it.
+        private func run(at rate: Double) {
+            synchroniser.setRate(Float(rate), time: synchroniser.currentTime())
+        }
+
+        /// Hold the schedule level with the publisher's clock.
+        ///
+        /// Called with every frame and acting four times a second, which is slow next to the
+        /// thing it corrects — parts per million, a millisecond every few seconds — and fast
+        /// enough that the error never reaches anything visible.
+        private func track(depth: Double, wanted: Double) {
+            // Not while the clock is already running fast on purpose. A give-back is a large
+            // one-off correction with a known end; this is the small permanent one, and both
+            // driving the rate at once means neither knows what it achieved.
+            guard catchUp == nil else { return }
+
+            let now = ContinuousClock.now
+            guard now - tracked >= .milliseconds(250) else { return }
+            tracked = now
+
+            guard let rate = tracking.correction(depth: depth, wanted: wanted) else { return }
+            drawing.trim = tracking.standing * 1_000_000
+            run(at: 1 + rate)
+        }
+
         /// Return the clock to real time once it has given back what it set out to.
         ///
         /// The window of remembered headroom is corrected by what the clock made up rather than
@@ -466,7 +505,11 @@ import MoqomCore
         /// several times faster than the link it was supposedly tracking.
         private func advanceCatchUp() {
             guard let end = catchUp, ContinuousClock.now >= end else { return }
-            synchroniser.setRate(1, time: synchroniser.currentTime())
+            // Back to the standing correction rather than to one exactly, because the drift the
+            // correction answers did not pause while the give-back ran. Returning to a flat 1
+            // means starting the slide again from whatever the give-back left, and the loop
+            // then spends its first seconds rediscovering a number it already knew.
+            run(at: 1 + tracking.resuming())
             catchUp = nil
             reclaimed = .now
             for index in slack.indices { slack[index] -= catchUpGive }
@@ -598,6 +641,16 @@ import MoqomCore
             /// One at the start of a stream is the schedule beginning. More than that is it
             /// losing hold, and each one moves the timebase under everything already queued.
             public var reanchors = 0
+
+            /// The standing rate correction holding this schedule against the publisher's clock,
+            /// in parts per million.
+            ///
+            /// Reported because it is the measurement nothing else here makes: the difference
+            /// between two devices' idea of a second, which is otherwise only ever seen through
+            /// its consequences. A few tens of it is two ordinary crystals. Sitting against its
+            /// limit is the loop saying the thing it is being asked to track is not crystal
+            /// drift at all.
+            public var trim = 0.0
 
             /// Times the even presentation grid was restarted.
             ///
@@ -940,6 +993,24 @@ import MoqomCore
         /// two crystals disagree — and a viewer that never re-anchors either accumulates delay
         /// for the whole call or slowly runs ahead of the stream and shows every frame late.
         private func anchorSchedule(to presentation: CMTime, delay: Duration) {
+            var delay = delay
+
+            // A give-back caught in flight by a re-anchor. Abandoning it — which is what
+            // dropping ``catchUp`` below amounts to on its own — is the more expensive of the
+            // two ways to be wrong: the clock has already handed back part of the delay while
+            // ``playoutDepth`` still names the figure before it, and the grid placed just below
+            // is placed by that figure. The delay comes straight back, in full, at the very
+            // moment the schedule had a free hand to be rid of it.
+            //
+            // Settled at the landing the controller chose instead. A re-anchor places the grid
+            // wherever it is told, so there is no cost to telling it the right thing.
+            if catchUp != nil {
+                playoutDepth = .seconds(catchUpLanding)
+                catchUpGive = 0
+                catchUpLanding = 0
+                if playoutBounds != nil { delay = playoutDepth }
+            }
+
             let seconds = Double(delay.components.seconds)
                 + Double(delay.components.attoseconds) / 1e18
             let start = presentation - CMTime(seconds: seconds, preferredTimescale: 90000)
@@ -974,7 +1045,12 @@ import MoqomCore
 
             anchor = start
             catchUp = nil
-            synchroniser.setRate(1, time: start)
+
+            // Carried across, because the two crystals disagree by the same amount either side
+            // of a re-anchor. Dropping to a flat rate here would make every re-anchor a fresh
+            // start for the tracking loop, and the loop's whole value is that it does not have
+            // to be relearned.
+            synchroniser.setRate(Float(1 + tracking.resuming()), time: start)
         }
 
         /// Keep the schedule within reach of the stream, re-anchoring when it is not.
@@ -1008,7 +1084,14 @@ import MoqomCore
             let allowance = max(interval ?? 0, 0.02)
             if depth < -allowance || depth > seconds + 0.15 {
                 anchorSchedule(to: newest, delay: delay)
+                return
             }
+
+            // Inside the bounds, which is where this belongs: re-anchoring is what happens when
+            // the schedule has already lost the stream, and tracking is what keeps it from
+            // getting there. Before this existed the first was the only mechanism, so the
+            // ordinary state of a call was a slow slide into a lurch.
+            track(depth: depth, wanted: seconds)
         }
 
         private func apply(mirroring: Bool) {

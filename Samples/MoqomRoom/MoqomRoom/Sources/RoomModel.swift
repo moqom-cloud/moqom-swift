@@ -1008,10 +1008,25 @@ final class RoomModel {
     /// is fixed when the engine starts and changing it restarts the engine. A
     /// speaker toggling their microphone stays on a recording session; leaving the
     /// stage entirely is what moves them off it.
+    /// Capture everything the microphone hears, rather than tuning it for a voice.
+    ///
+    /// The system's voice processing is a chain, and only its gain control can be declined
+    /// piece by piece — the suppressor underneath judges how speech-like a sound is and quiets
+    /// what fails. That is right for a conference call and wrong for everything else: a snap,
+    /// a guitar, a room. Turning this on trades the echo canceller for the sound as it was,
+    /// which is why it is a choice somebody makes rather than a default.
+    var capturesEverythingItHears = false {
+        didSet { applyAudioPurpose() }
+    }
+
     private func applyAudioPurpose(publishing: Bool? = nil) {
         let purpose: AudioGraph.Purpose
         if publishing ?? (isPublishingAudio || isBroadcasting) {
-            purpose = mode == .audioRoom ? .voiceCall : .videoCall
+            if capturesEverythingItHears {
+                purpose = .music
+            } else {
+                purpose = mode == .audioRoom ? .voiceCall : .videoCall
+            }
         } else {
             purpose = .listening
         }

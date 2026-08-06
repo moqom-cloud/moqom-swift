@@ -667,6 +667,11 @@ final class AppModel {
                             room.timing.status,
                             room.timing.needsFlush ? " needs-flush" : ""
                         )
+                        // How far apart the two devices' clocks run, in parts per million, as
+                        // measured by what it takes to stay level with the publisher. Tens of
+                        // it is two ordinary crystals; a figure against the limit is the loop
+                        // saying the drift is coming from somewhere other than the hardware.
+                        + String(format: " trim=%.0fppm", drawn.trim)
                         // How the delay got to where it is, which the delay itself cannot say.
                         // Widenings mean the link's jitter asked for it; a floor means lip sync
                         // did; and neither, with headroom to spare, means it is delay picked up
@@ -819,7 +824,7 @@ final class AppModel {
                     Journal.shared.say(
                         String(
                             format: "HEAR %@ received=%d played=%d late=%d duplicate=%d gaps=%d"
-                                + " target=%.0fms jitter=%.1fms",
+                                + " target=%.0fms jitter=%.1fms interrupted=%d",
                             String(describing: who.username),
                             heard.packetsReceived,
                             heard.packetsPlayed,
@@ -827,7 +832,8 @@ final class AppModel {
                             heard.packetsDuplicate,
                             heard.gaps,
                             heard.targetDelay.seconds * 1000,
-                            heard.jitter.seconds * 1000
+                            heard.jitter.seconds * 1000,
+                            heard.discontinuities
                         )
                     )
 

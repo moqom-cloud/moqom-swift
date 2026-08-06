@@ -652,6 +652,21 @@ import os
                 do {
                     try engine.inputNode.setVoiceProcessingEnabled(true)
                     isCancellingEcho = true
+
+                    // Cancellation without the compressor in front of it, which is the one
+                    // part of this chain that can be declined separately. The unit's gain
+                    // control is built to hold a voice at a constant level, so anything loud
+                    // and close that is not a voice gets pulled down to where a voice would
+                    // be: a finger snapped a foot from the phone arrives flattened and dull,
+                    // and the same snap from across the room arrives intact, which is the
+                    // wrong way round and the giveaway that it is being processed rather
+                    // than clipped. Speech does not need it — the encoder is fed a level the
+                    // capture chain already sets — and conversation is easier to follow with
+                    // the dynamics somebody actually produced.
+                    //
+                    // The suppressor is not separately switchable and stays. For sound that
+                    // is not speech at all, see ``Purpose/music``.
+                    engine.inputNode.isVoiceProcessingAGCEnabled = false
                 } catch {
                     // Not fatal, and not silent either. Capture without
                     // cancellation is better than no capture, but a caller that

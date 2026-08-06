@@ -70,6 +70,15 @@ public struct JitterBufferStatistics: Hashable, Sendable {
 
     /// The jitter estimate the target is derived from.
     public var jitter: Duration = .zero
+
+    /// Steps in transit time that were re-anchored rather than measured.
+    ///
+    /// Each one is an interruption at this end -- a background, a lock, a capture
+    /// stall -- and they are counted because the alternative reading is that the
+    /// link went bad and recovered. A call with a handful of these and a low
+    /// jitter figure was interrupted; a call with none and a high one is on a bad
+    /// network, and the two want opposite responses.
+    public var discontinuities: Int = 0
 }
 
 /// Reorders, de-duplicates, and paces audio packets.
@@ -254,6 +263,27 @@ public struct JitterBuffer: Sendable {
         guard let previous = lastTransit else { return }
 
         let difference = abs(transit - previous)
+
+        // A step, not jitter. Transit time moves by this much when the receiving
+        // application was not running: backgrounded, screen locked, or held
+        // through a capture interruption. Everything queues, then arrives at once,
+        // and the first packet afterwards is late by however long the excursion
+        // lasted -- which this filter, whose whole purpose is to notice packets
+        // arriving at uneven times, reads as the link having become wildly
+        // unreliable. It then sizes the buffer for that and, because the way back
+        // down needs the far end to fall silent, holds it there for the rest of
+        // the call. A quarter of a second is far more than scheduling or a bad
+        // route ever accounts for, and it is the same threshold the video
+        // timeline re-anchors on, for the same reason.
+        //
+        // Re-anchored rather than clamped: `lastTransit` has already been updated
+        // by the `defer` above, so the next packet is measured against the new
+        // baseline and the estimator carries on describing the link.
+        guard difference < Self.aStepRatherThanJitter else {
+            statistics.discontinuities += 1
+            return
+        }
+
         jitterEstimate += (difference - jitterEstimate) / 16
 
         // Three times the jitter estimate covers the great majority of a
@@ -265,14 +295,54 @@ public struct JitterBuffer: Sendable {
         statistics.jitter = .seconds(jitterEstimate)
 
         // Growth is immediate because being too shallow is actively losing
-        // audio right now. Shrinking waits for silence.
+        // audio right now.
         if clamped > target {
             target = clamped
             statistics.targetDelay = target
+            packetsWantingLess = 0
         } else {
             pendingTarget = clamped
+            relax(towards: clamped)
         }
     }
+
+    /// A change in transit time past this is an interruption rather than jitter.
+    private static let aStepRatherThanJitter = 0.25
+
+    /// Let the target down when the link has not justified it for a while.
+    ///
+    /// Silence is the free moment to change depth and used to be the only one, on
+    /// the reasoning that shortening a pause is inaudible and shortening a word is
+    /// not. That is true and it is not enough: the pauses have to arrive, and
+    /// whether they do is the *publisher's* voice detector's business, not this
+    /// link's. A room with a fan in it sends no silence at all, so a target that
+    /// went up during one bad second stayed up for the whole call -- measured at
+    /// 227ms against a link whose jitter was 5.4ms, which is fourteen times what
+    /// the formula asks for, with the picture held back to match it.
+    ///
+    /// So the depth also comes down on evidence, slowly, whether or not anybody
+    /// stops talking. Slowly matters twice over: the target falling does not by
+    /// itself drop a sample -- it lets the queue drain through the paths that
+    /// already exist -- and a target that chased the estimate downwards would
+    /// undo the growth that a genuinely bursty link needs.
+    private mutating func relax(towards wanted: Duration) {
+        guard wanted < target else {
+            packetsWantingLess = 0
+            return
+        }
+        packetsWantingLess += 1
+
+        // Fifty packets to the second, so this is two seconds of a link that has
+        // not needed the depth it is holding, and five milliseconds off it each
+        // time: a quarter of a second of excess unwinds in about a minute and a
+        // half of speech. Faster than the call, slower than a gust.
+        guard packetsWantingLess >= 100 else { return }
+        packetsWantingLess = 0
+        target = max(wanted, target - .milliseconds(5))
+        statistics.targetDelay = target
+    }
+
+    private var packetsWantingLess = 0
 
     private var pendingTarget: Duration?
 
