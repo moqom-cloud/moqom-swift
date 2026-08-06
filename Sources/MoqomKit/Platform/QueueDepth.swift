@@ -134,4 +134,61 @@ struct QueueDepth: Sendable {
     /// link's unevenness and the feed's pauses are two views of the same packets arriving, so
     /// adding them would pay for the same delay twice.
     var target: Duration { max(aim, covering) + pressure }
+
+    // MARK: - What lip sync should align to
+
+    /// How deep the queue is actually running, smoothed.
+    ///
+    /// Deliberately not ``target``, which the picture used to be aligned to, and which is the
+    /// wrong figure twice over.
+    ///
+    /// It is an intention rather than a measurement. The two come apart: a viewer measured
+    /// holding 228ms of voice in front of the speaker while its target read 84ms had its
+    /// picture aligned to the 84, which puts the face about 140ms ahead of the words — the
+    /// original complaint on this call, arrived at by aligning to a number that described what
+    /// the queue meant to do rather than what it was doing.
+    ///
+    /// And ``covering`` makes it spiky on purpose, because a queue that wants to survive the
+    /// worst pause must react to one immediately. That is right for deciding when to drop audio
+    /// and wrong for the picture: measured, a single 200ms pause raised the target to 151ms,
+    /// the video floor followed it to 159ms within the same second, and a transient nobody
+    /// heard became a lasting delay everybody saw.
+    ///
+    /// So: measured rather than intended, and a median rather than an average.
+    ///
+    /// The median is the whole trick, and an exponential average was tried first and cannot do
+    /// this job. Averaging has one time constant to serve two opposite requirements — ignore a
+    /// one-second excursion, follow a lasting change within a few seconds — and it splits the
+    /// difference badly: tuned to a three-second constant, a single second at 200ms still moved
+    /// the figure 57ms, and tuning it slow enough to ignore that put it thirteen seconds behind
+    /// a link that had really changed.
+    ///
+    /// A median over five seconds satisfies both exactly rather than approximately. An
+    /// excursion shorter than half the window cannot move it at all, however extreme, because
+    /// the middle sample is still an ordinary one; a change that lasts longer than half the
+    /// window moves it the whole way. There is no tuning to get wrong.
+    private var held: [Double] = []
+    private var heldCursor = 0
+
+    /// Five seconds at fifty packets a second, so a pause of up to two and a half seconds is
+    /// ignored and anything longer is followed.
+    static let longEnoughToIgnoreAPause = 250
+
+    mutating func holding(_ queued: Duration) {
+        let seconds = Double(queued.components.seconds)
+            + Double(queued.components.attoseconds) / 1e18
+        if held.count < Self.longEnoughToIgnoreAPause {
+            held.append(seconds)
+        } else {
+            held[heldCursor] = seconds
+            heldCursor = (heldCursor + 1) % Self.longEnoughToIgnoreAPause
+        }
+    }
+
+    /// The depth the picture should be aligned to. See ``holding(_:)``.
+    var settled: Duration {
+        guard !held.isEmpty else { return .zero }
+        let sorted = held.sorted()
+        return .seconds(sorted[sorted.count / 2])
+    }
 }

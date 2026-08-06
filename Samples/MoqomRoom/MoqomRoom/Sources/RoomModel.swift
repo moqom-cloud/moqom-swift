@@ -224,7 +224,10 @@ final class RoomModel {
     /// which is why a face on a phone ran a fifth of a second ahead of its voice.
     func audioDelay(of who: ParticipantIdentity) -> Duration? {
         guard let jitter = statistics?.participants[who]?.audio?.targetDelay else { return nil }
-        return (heard[who]?.target ?? jitter) + outputLatency
+        // What the queue is actually holding, not what it is aiming at. See
+        // `Playback.settled`: the two diverge by more than a hundred milliseconds on a bursty
+        // link, and aligning to the aim is what put the face ahead of the words.
+        return (heard[who]?.settled ?? jitter) + outputLatency
     }
 
     /// Everything between the jitter buffer letting a packet go and a listener hearing it.
@@ -233,7 +236,7 @@ final class RoomModel {
     /// counterpart of the playout delay on the video side, and the figure the picture is
     /// aligned to.
     var earDelay: Duration {
-        let held = heard.values.map(\.target).max() ?? .zero
+        let held = heard.values.map(\.settled).max() ?? .zero
         return held + outputLatency
     }
 

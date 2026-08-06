@@ -238,6 +238,14 @@ import MoqomCore
             /// bunches. See ``QueueDepth/pacing``.
             public var pacing: Duration = .zero
 
+            /// The depth to align the picture to: how deep this queue is actually running,
+            /// smoothed. See ``QueueDepth/settled``.
+            ///
+            /// Use this and not ``target`` for lip sync. ``target`` is what the queue intends
+            /// and moves abruptly by design, and a picture following it both mistimes the voice
+            /// and inherits every transient the link produces.
+            public var settled: Duration = .zero
+
             /// Frames the ring refused because it was full.
             public var refused = 0
 
@@ -253,6 +261,7 @@ import MoqomCore
             reading.target = target
             reading.covering = depth.covering
             reading.pacing = depth.pacing.typical
+            reading.settled = depth.settled
             playback.peak = 0
             return reading
         }
@@ -293,6 +302,10 @@ import MoqomCore
             let taken = voice.write(samples)
             let offered = samples.count / format.channels
             if taken < offered { playback.refused += offered - taken }
+
+            // Read after the write, so the figure the picture is aligned to includes what was
+            // just handed over rather than describing the queue as it was a packet ago.
+            depth.holding(voice.queued)
         }
     }
 #endif

@@ -86,6 +86,49 @@ struct QueueDepthTests {
         #expect(bunching.pacing.typical <= .milliseconds(2))
     }
 
+    @Test("what the picture is aligned to follows the depth actually held")
+    func settlesOnTheRealDepth() {
+        var depth = QueueDepth()
+        for _ in 0 ..< 1000 { depth.holding(.milliseconds(120)) }
+
+        // The truth, which is what lip sync needs: the aim could read anything at all while the
+        // queue really holds this.
+        #expect(depth.settled == .milliseconds(120))
+    }
+
+    @Test("a transient nobody heard does not become a delay everybody sees")
+    func ignoresASinglePause() {
+        // The measured failure: one 200ms pause raised the target to 151ms, the video floor
+        // followed it within the same second, and the picture kept the delay long after the
+        // pause was over.
+        var depth = QueueDepth()
+        for _ in 0 ..< 1000 { depth.holding(.milliseconds(60)) }
+        let before = depth.settled
+
+        // A pause arrives, and for the second it lasts the queue really is deeper.
+        for _ in 0 ..< 50 { depth.holding(.milliseconds(260)) }
+
+        // The picture should not have noticed at all. Fifty samples of a two-hundred-and-fifty
+        // sample window cannot reach the middle of it, so the excursion is not merely damped,
+        // it is invisible — which is the property an average could not give at any tuning.
+        #expect(depth.settled == before)
+
+        // And the conservative figure, which exists to react at once, must still have done so.
+        depth.fed(at: .zero)
+        depth.fed(at: .milliseconds(200))
+        #expect(depth.target >= .milliseconds(150))
+    }
+
+    @Test("a link that has genuinely changed is followed")
+    func followsALastingChange() {
+        var depth = QueueDepth()
+        for _ in 0 ..< 1000 { depth.holding(.milliseconds(60)) }
+        // Half the window at the new depth is enough, and is where the two requirements meet:
+        // any excursion longer than this deserves following, and any shorter one does not.
+        for _ in 0 ..< 130 { depth.holding(.milliseconds(160)) }
+        #expect(depth.settled == .milliseconds(160))
+    }
+
     @Test("one pause does not buy an unbounded queue")
     func capsWhatItWillCover() {
         var depth = QueueDepth()
