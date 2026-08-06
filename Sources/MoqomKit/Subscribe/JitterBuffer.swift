@@ -79,6 +79,11 @@ public struct JitterBufferStatistics: Hashable, Sendable {
     /// jitter figure was interrupted; a call with none and a high one is on a bad
     /// network, and the two want opposite responses.
     public var discontinuities: Int = 0
+
+    /// The longest gap between two arrivals over the last five seconds, in seconds, as seen at
+    /// the buffer rather than at the speaker. Compare with the player's figure over the same
+    /// window: the difference is time spent inside this application rather than on the link.
+    public var worstSpacing: Double = 0
 }
 
 /// Reorders, de-duplicates, and paces audio packets.
@@ -112,6 +117,9 @@ public struct JitterBuffer: Sendable {
     private var target: Duration
     private var jitterEstimate: Double = 0
     private var lastTransit: Double?
+    private var lastFed: Double?
+    private var spacings: [(at: Double, gap: Double)] = []
+    private static let spacingWindow = 5.0
     private var isFilling = true
     private var consecutiveSilences = 0
     private var statistics = JitterBufferStatistics()
@@ -258,6 +266,28 @@ public struct JitterBuffer: Sendable {
             + Double(arrival.components.attoseconds) / 1e18
         let sentSeconds = Double(sent.nanoseconds) / 1e9
         let transit = arrivalSeconds - sentSeconds
+
+        // The longest this buffer went unfed, measured here rather than where the samples are
+        // finally played.
+        //
+        // The player measures the same quantity at the far end of a decoder and two actor
+        // hops, so a pause it sees is either the link stalling or this application stalling,
+        // and those want opposite fixes. Measured at the two points at once, the difference
+        // between them is the part that is ours. It matters: a run showing repeated
+        // two-hundred-millisecond pauses at the player, with the link reporting no loss at
+        // all, is fully explained either by a network delivering in fits or by an actor busy
+        // elsewhere, and nothing in that run distinguished them.
+        // Over the same five seconds the player uses, because the whole value of the figure is
+        // that the two can be set side by side. An all-time maximum cannot be: the first
+        // comparison run had this reading 773ms against the player's 200ms, all of it a single
+        // arrival during startup, which answers nothing about the pauses happening now.
+        if let last = lastFed {
+            let gap = arrivalSeconds - last
+            if gap > 0 { spacings.append((at: arrivalSeconds, gap: gap)) }
+        }
+        lastFed = arrivalSeconds
+        spacings.removeAll { arrivalSeconds - $0.at > Self.spacingWindow }
+        statistics.worstSpacing = spacings.map(\.gap).max() ?? 0
 
         defer { lastTransit = transit }
         guard let previous = lastTransit else { return }

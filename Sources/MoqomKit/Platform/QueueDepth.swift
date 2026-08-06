@@ -55,6 +55,23 @@ struct QueueDepth: Sendable {
     /// the long one starves on the long one, which is the only case anybody can hear.
     var covering: Duration { quiets.map(\.gap).max() ?? .zero }
 
+    /// The shape of the arrivals, not just their worst case.
+    ///
+    /// ``covering`` says how long the worst pause was and deliberately nothing else, which is
+    /// all a queue needs and not enough to fix anything upstream. Two very different links
+    /// produce the same figure: one delivering an even packet every twenty milliseconds and
+    /// stalling once, and one delivering four at a time and resting between. The first wants
+    /// the stall explained; the second is not stalling at all, it is being paced that way, and
+    /// no amount of buffering addresses the cause.
+    ///
+    /// The median separates them at a glance. A median near the packet cadence is an even feed;
+    /// a median near zero with a large ``covering`` is a feed arriving in bunches.
+    var pacing: (typical: Duration, worst: Duration, samples: Int) {
+        let gaps = quiets.map(\.gap).sorted()
+        guard !gaps.isEmpty else { return (.zero, .zero, 0) }
+        return (gaps[gaps.count / 2], gaps[gaps.count - 1], gaps.count)
+    }
+
     /// Note that the pipeline was fed.
     ///
     /// - Parameter now: Time on any steadily running clock; only differences are read.

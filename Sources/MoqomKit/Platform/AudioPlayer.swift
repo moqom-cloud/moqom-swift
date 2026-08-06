@@ -233,6 +233,11 @@ import MoqomCore
             /// answers, and until they were separated the second was being used for both.
             public var covering: Duration = .zero
 
+            /// The typical gap between arrivals. Read beside ``covering``: near the packet
+            /// cadence means an even feed that stalled, near zero means a feed arriving in
+            /// bunches. See ``QueueDepth/pacing``.
+            public var pacing: Duration = .zero
+
             /// Frames the ring refused because it was full.
             public var refused = 0
 
@@ -247,6 +252,7 @@ import MoqomCore
             reading.starved = voice.starved
             reading.target = target
             reading.covering = depth.covering
+            reading.pacing = depth.pacing.typical
             playback.peak = 0
             return reading
         }

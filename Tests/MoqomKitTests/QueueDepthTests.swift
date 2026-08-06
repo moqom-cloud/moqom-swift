@@ -62,6 +62,30 @@ struct QueueDepthTests {
         #expect(depth.target == .milliseconds(40))
     }
 
+    @Test("an even feed and a bunched one are told apart")
+    func pacingSeparatesAStallFromABurst() {
+        // The same worst pause, arrived at two ways, and the fix for one is no use against the
+        // other: a stall wants explaining, while a link that is simply paced in bunches is not
+        // malfunctioning at all and no amount of buffering addresses it.
+        var stalling = QueueDepth()
+        evenly(&stalling, seconds: 2)
+        stalling.fed(at: .milliseconds(2100))
+
+        var bunching = QueueDepth()
+        for burst in 0 ..< 20 {
+            for packet in 0 ..< 5 {
+                bunching.fed(at: .milliseconds(burst * 100 + packet))
+            }
+        }
+
+        #expect(stalling.covering >= .milliseconds(100))
+        #expect(bunching.covering >= .milliseconds(90))
+
+        // Which is the whole point: identical worst cases, opposite typical ones.
+        #expect(stalling.pacing.typical == .milliseconds(20))
+        #expect(bunching.pacing.typical <= .milliseconds(2))
+    }
+
     @Test("one pause does not buy an unbounded queue")
     func capsWhatItWillCover() {
         var depth = QueueDepth()

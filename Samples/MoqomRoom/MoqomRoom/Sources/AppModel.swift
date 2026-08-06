@@ -831,7 +831,7 @@ final class AppModel {
                     Journal.shared.say(
                         String(
                             format: "HEAR %@ received=%d played=%d late=%d duplicate=%d gaps=%d"
-                                + " target=%.0fms jitter=%.1fms interrupted=%d",
+                                + " target=%.0fms jitter=%.1fms interrupted=%d spacing=%.0fms",
                             String(describing: who.username),
                             heard.packetsReceived,
                             heard.packetsPlayed,
@@ -840,7 +840,8 @@ final class AppModel {
                             heard.gaps,
                             heard.targetDelay.seconds * 1000,
                             heard.jitter.seconds * 1000,
-                            heard.discontinuities
+                            heard.discontinuities,
+                    heard.worstSpacing * 1000
                         )
                     )
 
@@ -851,7 +852,7 @@ final class AppModel {
                             String(
                                 format: "  SPKR %@ buffers=%d silent=%d peak=%.3f"
                                     + " decoded=%d failed=%d gaps=%d silences=%d"
-                                    + " queued=%.0fms target=%.0fms covering=%.0fms"
+                                    + " queued=%.0fms target=%.0fms covering=%.0fms pace=%.0fms"
                                     + " trimmed=%d dropped=%d starved=%d",
                                 String(describing: who.username),
                                 played.buffers,
@@ -864,6 +865,7 @@ final class AppModel {
                                 played.queued.seconds * 1000,
                                 played.target.seconds * 1000,
                                 played.covering.seconds * 1000,
+                                played.pacing.seconds * 1000,
                                 played.trimmed,
                                 played.dropped,
                                 played.starved
