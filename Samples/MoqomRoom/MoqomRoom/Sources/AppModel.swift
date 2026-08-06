@@ -667,6 +667,13 @@ final class AppModel {
                             room.timing.status,
                             room.timing.needsFlush ? " needs-flush" : ""
                         )
+                        // The figure the delay is actually chosen from, which is the worst few
+                        // arrivals rather than the typical one. Read it beside `ahead`: a wide
+                        // gap between them is a link delivering in bursts, and a buffer sized
+                        // for the tail while the median sits far inside it.
+                        + (room.timing.headroom.map {
+                            String(format: " headroom=%.0fms", $0 * 1000)
+                        } ?? "")
                         // How far apart the two devices' clocks run, in parts per million, as
                         // measured by what it takes to stay level with the publisher. Tens of
                         // it is two ordinary crystals; a figure against the limit is the loop

@@ -581,6 +581,19 @@ import MoqomCore
             /// seconds. Negative means frames are being scheduled into the past.
             public var ahead: Double = 0
 
+            /// The headroom the delay is actually chosen from: how much earlier than its
+            /// deadline all but the tolerated share of recent frames arrived. See
+            /// ``playoutSlack``.
+            ///
+            /// Worth having beside ``ahead``, and not the same question. ``ahead`` is the
+            /// newest frame, so it describes the typical arrival; this is a low quantile, so it
+            /// describes the worst few. On a link that delivers in bursts they disagree
+            /// completely — measured, a viewer whose frames sat 216ms ahead was holding a
+            /// quarter-second buffer, which looks like a controller ignoring its own
+            /// measurement until you can see that the measurement it reads was a different
+            /// number entirely. Until this was reported, it was not visible anywhere.
+            public var headroom: Double?
+
             /// `AVQueuedSampleBufferRenderingStatus`. Two is failed.
             public var status: Int = 0
 
@@ -596,6 +609,7 @@ import MoqomCore
             if newest.isValid {
                 timing.ahead = (newest - synchroniser.currentTime()).seconds
             }
+            timing.headroom = playoutSlack
             let renderer = layer.sampleBufferRenderer
             timing.status = renderer.status.rawValue
             timing.needsFlush = renderer.requiresFlushToResumeDecoding
