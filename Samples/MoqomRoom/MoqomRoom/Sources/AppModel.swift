@@ -674,6 +674,10 @@ final class AppModel {
                         + (room.timing.headroom.map {
                             String(format: " headroom=%.0fms", $0 * 1000)
                         } ?? "")
+                        // Delivery pauses, and the arrivals not charged to the link because of
+                        // them. Widenings that track the pauses are a call paying permanent
+                        // latency for transient interruptions.
+                        + String(format: " pauses=%d dismissed=%d", drawn.pauses, drawn.dismissed)
                         // How far apart the two devices' clocks run, in parts per million, as
                         // measured by what it takes to stay level with the publisher. Tens of
                         // it is two ordinary crystals; a figure against the limit is the loop

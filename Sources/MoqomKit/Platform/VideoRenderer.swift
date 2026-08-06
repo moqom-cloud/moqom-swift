@@ -385,6 +385,10 @@ import MoqomCore
             slack = []
             slackCursor = 0
             playoutSlack = nil
+            // The next arrival follows a stream change rather than a pause, so the gap before it
+            // means nothing and must not be read as one.
+            arrived = nil
+            evidence.restart()
             catchUp = nil
 
             // Unlike a re-anchor, which keeps it. This is a new stream and possibly a new
@@ -445,9 +449,18 @@ import MoqomCore
         private var previousStamp: CMTime = .invalid
 
         /// How much slack each recent frame arrived with, in seconds, for sizing the delay.
+        ///
+        /// Six hundred samples, which at thirty frames a second is twenty seconds — the reason
+        /// ``ArrivalEvidence`` exists. A sample that does not describe the link stays here for
+        /// twenty seconds, and with a one percent tolerance the sixth-worst of them decides the
+        /// delay, so six frames of one interruption are enough to set it for that whole time.
         private var slack: [Double] = []
         private var slackCursor = 0
         private static let slackWindow = 600
+
+        /// When the previous frame was enqueued, for telling a pause from ordinary unevenness.
+        private var arrived: ContinuousClock.Instant?
+        private var evidence = ArrivalEvidence()
 
         /// When the delay was last tightened, so tightening happens gradually.
         private var tightened = ContinuousClock.now
@@ -700,6 +713,16 @@ import MoqomCore
             public var tightenings = 0
             public var floorRaises = 0
             public var reclaims = 0
+
+            /// Delivery pauses noticed, and arrivals not charged to the link because of them.
+            /// See ``ArrivalEvidence``.
+            ///
+            /// Read beside the widenings above. Widenings with no pauses is a link that is
+            /// genuinely uneven and a delay that is correctly answering it; widenings that
+            /// track the pauses are a call paying permanent latency for transient
+            /// interruptions, which is what these were added to tell apart.
+            public var pauses = 0
+            public var dismissed = 0
 
             public init() {}
 
@@ -1253,7 +1276,21 @@ import MoqomCore
             // Measured after the schedule is known to be running, because slack against a
             // timebase that has not started is not slack, it is the distance to a clock at zero.
             guard let bounds = playoutBounds, let cadence, catchUp == nil else { return }
-            record(slack: (presentation - synchroniser.currentTime()).seconds)
+
+            // A frame that arrived after a delivery pause is late because of the pause, and
+            // sizing the delay from it buys a quarter second of permanent latency to cover six
+            // frames that were already late. See ``ArrivalEvidence``.
+            let now = ContinuousClock.now
+            let gap = arrived.map { (now - $0).asSeconds } ?? cadence
+            arrived = now
+            drawing.pauses = evidence.pauses
+            drawing.dismissed = evidence.dismissed
+
+            // Only the recording is skipped, not the decision. A dismissed arrival is one fewer
+            // piece of evidence, not a reason to stop acting on the evidence already held.
+            if evidence.admits(gap: gap, interval: cadence) {
+                record(slack: (presentation - synchroniser.currentTime()).seconds)
+            }
             if drawing.enqueued % 30 == 0 { resize(interval: cadence, bounds: bounds) }
         }
 

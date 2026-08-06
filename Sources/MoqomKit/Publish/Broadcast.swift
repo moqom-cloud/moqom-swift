@@ -34,9 +34,16 @@ public struct BroadcastConfiguration: Sendable {
 
     /// Stop encoding a layer nobody is subscribed to.
     ///
-    /// Needs hysteresis and a fresh keyframe on resume, and needs to be honest
-    /// about the ramp-up gap when a viewer asks for a layer that is not
-    /// currently being produced — so it is opt-in rather than the default.
+    /// Opt-in, and the reason is not caution about the hysteresis or the keyframe on resume —
+    /// ``Broadcast/setDemandedLayers(_:pinned:)`` handles both. It is that **this SDK does not
+    /// know who is watching**, and cannot supply the demand set itself.
+    ///
+    /// Which subscriptions exist is the relay's knowledge, and no signal carries it back to the
+    /// publisher. So the application has to work it out and say so, and until something calls
+    /// `setDemandedLayers` every rung stays active and this switch changes nothing at all. That
+    /// is worth stating plainly, because a power control that silently does nothing is worse
+    /// than an absent one: with a four-rung ``LayerLadder/defaultCamera()``, a caller who sets
+    /// this and believes it is encoding four streams of every frame regardless.
     public var stopsUnwatchedLayers: Bool
 
     /// Where encoders come from.
@@ -613,11 +620,67 @@ public actor Broadcast {
         statistics.activeLayers = Set(writers.keys)
     }
 
-    /// Restrict production to the layers someone is actually watching, plus
-    /// whatever watchdogs have pinned.
+    /// Restrict production to the layers someone is actually watching, plus whatever watchdogs
+    /// have pinned.
+    ///
+    /// Has no effect unless ``BroadcastConfiguration/stopsUnwatchedLayers`` is set, and nothing
+    /// in this SDK calls it: the demand set is the application's to supply, because which
+    /// subscriptions exist is the relay's knowledge and no signal carries it here.
+    ///
+    /// Two things are handled here rather than left to the caller, since getting either wrong
+    /// produces a fault a viewer sees rather than a number an operator reads.
+    ///
+    /// A rung is not dropped the moment its last viewer leaves. Changing rung is an unsubscribe
+    /// followed by a subscribe, so a viewer stepping from 720p to 360p momentarily demands
+    /// neither, and a broadcast that acted on the instant would tear down an encoder and stand
+    /// it back up within a frame or two of the same switch — paying a full restart and a
+    /// keyframe for something nobody asked for. It lingers instead. See ``lingersUnwatched``.
+    ///
+    /// And a rung returning from dormancy opens with a keyframe. Its last object was some
+    /// arbitrary delta frame, so without one the arriving viewer has nothing decodable until the
+    /// encoder's own interval comes round — two seconds by default, which is a black tile for
+    /// two seconds after a subscription that appeared to succeed.
     public func setDemandedLayers(_ demanded: Set<LayerID>, pinned: Set<LayerID>) {
         guard configuration.stopsUnwatchedLayers else { return }
-        statistics.activeLayers = demanded.union(pinned)
+        let wanted = demanded.union(pinned)
+        let now = clock.now
+
+        for rung in configuration.ladder.rungs where wanted.contains(rung.id) {
+            // Dormant, as opposed to merely on its way out: a rung still inside its linger has
+            // been encoding all along and owes nobody a keyframe.
+            if !isActive(rung.id) { owedAKeyFrame.insert(rung.id) }
+            leftAt.removeValue(forKey: rung.id)
+        }
+
+        for rung in configuration.ladder.rungs where !wanted.contains(rung.id) {
+            if leftAt[rung.id] == nil { leftAt[rung.id] = now }
+        }
+
+        demandedLayers = wanted
+        refreshActiveLayers()
+    }
+
+    /// How long a rung goes on being encoded after the last viewer leaves it. See
+    /// ``setDemandedLayers(_:pinned:)``.
+    ///
+    /// Long enough to cover a rung change, which is the common reason a layer briefly has no
+    /// audience, and short enough that a viewer genuinely leaving stops costing an encode within
+    /// a few frames of leaving.
+    static let lingersUnwatched = Duration.seconds(3)
+
+    /// What the application last said was wanted. Empty means nobody has said.
+    private var demandedLayers: Set<LayerID>?
+
+    /// When each rung last dropped out of demand, for the linger above.
+    private var leftAt: [LayerID: ContinuousClock.Instant] = [:]
+
+    /// Rungs whose next encode must be a keyframe because they are resuming.
+    private var owedAKeyFrame: Set<LayerID> = []
+
+    private func refreshActiveLayers() {
+        statistics.activeLayers = Set(
+            configuration.ladder.rungs.map(\.id).filter { isActive($0) }
+        )
     }
 
     /// Stop encoding, without taking the publication down.
@@ -816,10 +879,17 @@ public actor Broadcast {
             }
         }
 
+        // Recomputed here because a linger expires with the passage of time rather than with a
+        // call, so this is the only place that notices.
+        if configuration.stopsUnwatchedLayers { refreshActiveLayers() }
+
         for layer in configuration.ladder.rungs where isActive(layer.id) {
             guard let encoder = encoders[layer.id] else { continue }
+            // A rung coming back from dormancy opens with a keyframe, whatever the frame itself
+            // asked for. See `setDemandedLayers(_:pinned:)`.
+            let resuming = owedAKeyFrame.remove(layer.id) != nil
             do {
-                try await encoder.encode(frame, forcingKeyFrame: forcesKeyFrame)
+                try await encoder.encode(frame, forcingKeyFrame: forcesKeyFrame || resuming)
                 refusals[layer.id] = nil
             } catch {
                 // A rejected frame is a dropped frame, not a failed broadcast.
@@ -1166,8 +1236,20 @@ public actor Broadcast {
         statistics.framesEncoded += 1
     }
 
+    /// Whether this rung is being produced.
+    ///
+    /// Derived rather than stored, so a linger expires on its own without anything having to be
+    /// called again. The previous version read `statistics.activeLayers`, which meant the answer
+    /// depended on a set that only ``setDemandedLayers(_:pinned:)`` ever wrote — and since
+    /// nothing calls that, the set held every rung and this returned true forever.
     private func isActive(_ layer: LayerID) -> Bool {
-        !configuration.stopsUnwatchedLayers || statistics.activeLayers.contains(layer)
+        guard configuration.stopsUnwatchedLayers else { return true }
+        // Nobody has said what is wanted, so everything is. A publisher whose application does
+        // not supply demand must keep publishing; going dark would be the worse failure.
+        guard let demandedLayers else { return true }
+        if demandedLayers.contains(layer) { return true }
+        guard let left = leftAt[layer] else { return true }
+        return clock.now - left < Self.lingersUnwatched
     }
 
     /// Enhancement layers sit numerically above the base so the relay sheds
