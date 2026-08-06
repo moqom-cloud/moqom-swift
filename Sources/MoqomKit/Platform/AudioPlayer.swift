@@ -77,43 +77,28 @@ import MoqomCore
             voice = graph.attach(format: playback)
         }
 
-        /// How much audio this player is willing to have waiting for the
-        /// speaker.
+        /// How much audio this player is willing to have waiting for the speaker, and what
+        /// decides it. See ``QueueDepth``.
         ///
-        /// The listener's half of mouth-to-ear, and the number lip sync is
-        /// aligned to. It has to cover the link's jitter, because past the
-        /// jitter buffer's filling phase this queue is the only thing between a
-        /// late packet and a hole in the speech, so ``RoomSession`` keeps it in
-        /// step with what that buffer has learned about the link.
-        ///
-        /// Held rather than merely aimed at: audio arrives at the sender's rate
-        /// and leaves at the listener's, and the difference — a burst, a stall,
-        /// two crystals disagreeing by a hundredth of a percent — accumulates
-        /// in front of the speaker with nothing to remove it. Left alone it
-        /// only grows, which is a voice that falls further behind its face for
-        /// as long as the call lasts.
-        public private(set) var aim: Duration = .milliseconds(60)
+        /// The listener's half of mouth-to-ear, and the number lip sync is aligned to. Held
+        /// rather than merely aimed at: audio arrives at the sender's rate and leaves at the
+        /// listener's, and the difference — a burst, a stall, two crystals disagreeing by a
+        /// hundredth of a percent — accumulates in front of the speaker with nothing to remove
+        /// it. Left alone it only grows, which is a voice that falls further behind its face
+        /// for as long as the call lasts.
+        private var depth = QueueDepth()
 
-        public func aim(at delay: Duration) {
-            aim = max(.milliseconds(40), min(delay, .milliseconds(400)))
-        }
+        public var aim: Duration { depth.aim }
 
-        /// What the aim turned out not to cover, added to it.
-        ///
-        /// The jitter buffer's estimate is of the link, and the queue also has
-        /// to survive this device: a thermal throttle, a route change, the
-        /// decoder waiting on an actor. Those show up only as a device asking
-        /// for samples that are not there, so that is what this listens to.
-        /// Up quickly, because the evidence is a dropout somebody heard, and
-        /// down slowly, because the absence of dropouts is not evidence that
-        /// the next one will not happen.
-        private var pressure: Duration = .zero
-        private var starvedBefore = 0
-        private var cleanPackets = 0
-        private var primed = false
+        public func aim(at delay: Duration) { depth.aim(at: delay) }
 
-        /// The depth actually being held. See ``aim`` and ``Playback/queued``.
-        public var target: Duration { aim + pressure }
+        /// The depth actually being held. See ``QueueDepth/target`` and ``Playback/queued``.
+        public var target: Duration { depth.target }
+
+        /// Where this schedule's own idea of elapsed time comes from. Only differences are
+        /// read, so any steadily running clock will do.
+        private let started = ContinuousClock.now
+        private var sinceStarting: Duration { ContinuousClock.now - started }
 
         /// Consume a room's audio stream until it ends.
         ///
@@ -138,6 +123,13 @@ import MoqomCore
         ) async throws(MoqomError) {
             try start()
             for await output in outputs {
+                // Before anything decides what to do with this slot, and deliberately not in
+                // ``write(_:)``: what is being measured is how often the pipeline is fed, and
+                // a slot dropped by the rules below is still a slot that arrived. Measured
+                // after them, a queue that started dropping would read its own drops as the
+                // feed going quiet and hold itself deeper for them.
+                depth.fed(at: sinceStarting)
+
                 // Quiet slots do not count as speech for this, and the
                 // distinction is the whole of it: a ring that empties while
                 // nobody is talking has cost the listener nothing, and treating
@@ -152,7 +144,7 @@ import MoqomCore
                     quiet = 0
                     voiced = 20
                 }
-                answer(voice.starved, whileSpeaking: voiced > 0)
+                depth.answer(starved: voice.starved, whileSpeaking: voiced > 0)
 
                 let queued = voice.queued
                 // Trimmed above the target rather than at it, because a queue
@@ -190,39 +182,6 @@ import MoqomCore
         /// last of them, both in packets. See ``play(_:written:)``.
         private var voiced = 0
         private var quiet = 0
-
-        /// Fold what the device has been doing into the depth being held.
-        private func answer(_ starved: Int, whileSpeaking speaking: Bool) {
-            // The device asks for samples from the moment the engine runs, and
-            // the first ones arrive whenever the room gets round to sending
-            // them. Everything before the first packet is a device waiting to
-            // be joined, not a queue that was too shallow.
-            guard primed else {
-                primed = true
-                starvedBefore = starved
-                return
-            }
-
-            if starved > starvedBefore {
-                starvedBefore = starved
-                guard speaking else { return }
-                cleanPackets = 0
-                pressure = min(.milliseconds(120), pressure + .milliseconds(20))
-                return
-            }
-
-            cleanPackets += 1
-            // Fifty packets to the second, so this is five seconds of a device
-            // that asked for nothing it did not get. Slower than the rise by a
-            // wide margin, and still fast enough that a single bad minute is
-            // not paid for until the call ends: the earlier version gave back
-            // ten milliseconds every ten seconds, which on two phones meant a
-            // queue that reached its ceiling in the first minute and was still
-            // there three minutes later, holding the picture back with it.
-            guard cleanPackets >= 250, pressure > .zero else { return }
-            cleanPackets = 0
-            pressure = max(.zero, pressure - .milliseconds(10))
-        }
 
         /// What this player has actually put into the mix.
         ///
@@ -266,6 +225,14 @@ import MoqomCore
             /// itself all call.
             public var target: Duration = .zero
 
+            /// The longest pause between arrivals lately, which is what the queue is sized to
+            /// play through. See ``Playing/covering``.
+            ///
+            /// Worth reading beside ``target``: a target held up by this is a queue covering a
+            /// bursty feed, and a target above it is one covering the link. They want different
+            /// answers, and until they were separated the second was being used for both.
+            public var covering: Duration = .zero
+
             /// Frames the ring refused because it was full.
             public var refused = 0
 
@@ -279,6 +246,7 @@ import MoqomCore
             reading.queued = voice.queued
             reading.starved = voice.starved
             reading.target = target
+            reading.covering = depth.covering
             playback.peak = 0
             return reading
         }

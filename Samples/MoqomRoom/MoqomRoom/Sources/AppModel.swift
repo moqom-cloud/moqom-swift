@@ -844,7 +844,7 @@ final class AppModel {
                             String(
                                 format: "  SPKR %@ buffers=%d silent=%d peak=%.3f"
                                     + " decoded=%d failed=%d gaps=%d silences=%d"
-                                    + " queued=%.0fms target=%.0fms"
+                                    + " queued=%.0fms target=%.0fms covering=%.0fms"
                                     + " trimmed=%d dropped=%d starved=%d",
                                 String(describing: who.username),
                                 played.buffers,
@@ -856,6 +856,7 @@ final class AppModel {
                                 played.decoding.silences,
                                 played.queued.seconds * 1000,
                                 played.target.seconds * 1000,
+                                played.covering.seconds * 1000,
                                 played.trimmed,
                                 played.dropped,
                                 played.starved

@@ -1,0 +1,116 @@
+import Testing
+
+@testable import MoqomKit
+
+/// What decides how much audio waits in front of the speaker.
+@Suite("Queue depth")
+struct QueueDepthTests {
+    /// Packets arriving evenly, one every twenty milliseconds. In whole milliseconds, so the
+    /// cadence is exactly the cadence and an assertion about it is not an assertion about
+    /// accumulated floating-point error.
+    private func evenly(_ depth: inout QueueDepth, seconds: Int, from: Int = 0) {
+        for at in stride(from: from * 1000, to: (from + seconds) * 1000, by: 20) {
+            depth.fed(at: .milliseconds(at))
+        }
+    }
+
+    @Test("an even feed asks for nothing beyond the link")
+    func anEvenFeedCostsNothing() {
+        var depth = QueueDepth()
+        depth.aim(at: .milliseconds(40))
+        evenly(&depth, seconds: 2)
+
+        // Twenty milliseconds between arrivals is the packet cadence itself, well under the
+        // forty the link already asked for, so the feed adds nothing.
+        #expect(depth.covering <= .milliseconds(20))
+        #expect(depth.target == .milliseconds(40))
+    }
+
+    @Test("a bursty feed is covered even when the link looks perfect")
+    func coversTheGapsBetweenBursts() {
+        // The measured failure: 4.1ms of link jitter, so the aim sat at its 40ms minimum,
+        // while arrivals bunched into bursts 120ms apart. A queue sized at 40ms cannot play
+        // through a 120ms silence, and it starved five hundred times trying.
+        var depth = QueueDepth()
+        depth.aim(at: .milliseconds(40))
+
+        for burst in 0 ..< 20 {
+            let start = Double(burst) * 0.12
+            for packet in 0 ..< 6 {
+                depth.fed(at: .seconds(start + Double(packet) * 0.001))
+            }
+        }
+
+        #expect(depth.covering >= .milliseconds(100))
+        #expect(depth.target >= .milliseconds(100))
+    }
+
+    @Test("a feed that settles gives the depth back")
+    func forgetsABurstOnceItPasses() {
+        var depth = QueueDepth()
+        depth.aim(at: .milliseconds(40))
+
+        depth.fed(at: .zero)
+        depth.fed(at: .milliseconds(150))
+        #expect(depth.covering >= .milliseconds(100))
+
+        // Past the window, and the pause it was covering is no longer a fact about this link.
+        // Fed evenly throughout rather than jumped over, because a jump is itself a pause and
+        // would be covered, correctly, as one.
+        evenly(&depth, seconds: 7, from: 1)
+        #expect(depth.covering <= .milliseconds(20))
+        #expect(depth.target == .milliseconds(40))
+    }
+
+    @Test("one pause does not buy an unbounded queue")
+    func capsWhatItWillCover() {
+        var depth = QueueDepth()
+        depth.fed(at: .zero)
+        depth.fed(at: .seconds(2))
+        #expect(depth.covering == QueueDepth.longestPauseWorthCovering)
+    }
+
+    @Test("the two measurements are not paid for twice")
+    func takesTheLargerRatherThanTheSum() {
+        // Both describe the same packets arriving, seen two ways. A queue holding their sum
+        // would be holding the same delay twice over, which is latency for nothing.
+        var depth = QueueDepth()
+        depth.aim(at: .milliseconds(120))
+        depth.fed(at: .zero)
+        depth.fed(at: .milliseconds(80))
+
+        #expect(depth.covering == .milliseconds(80))
+        #expect(depth.target == .milliseconds(120))
+    }
+
+    @Test("a device that runs dry is answered whatever the network says")
+    func pressureAnswersTheDeviceAlone() {
+        var depth = QueueDepth()
+        depth.aim(at: .milliseconds(40))
+        evenly(&depth, seconds: 2)
+        #expect(depth.target == .milliseconds(40))
+
+        // Priming: the device asks for samples before the room sends any, and that is not a
+        // queue that was too shallow.
+        depth.answer(starved: 4, whileSpeaking: true)
+        #expect(depth.target == .milliseconds(40))
+
+        for starved in 5 ... 8 {
+            depth.answer(starved: starved, whileSpeaking: true)
+        }
+        #expect(depth.target > .milliseconds(40))
+    }
+
+    @Test("running dry in a silence is not evidence of anything")
+    func silenceDoesNotDeepenTheQueue() {
+        // A ring that empties while nobody is talking has cost the listener nothing, and
+        // buying insurance against it means a permanently deeper queue for a pause.
+        var depth = QueueDepth()
+        depth.aim(at: .milliseconds(40))
+        depth.answer(starved: 1, whileSpeaking: false)
+        for starved in 2 ... 20 {
+            depth.answer(starved: starved, whileSpeaking: false)
+        }
+        #expect(depth.target == .milliseconds(40))
+    }
+}
