@@ -362,6 +362,17 @@ import MoqomCore
         /// is waiting for a reply; raise it for conversation, where the opposite holds.
         public var playoutTolerance = 0.01
 
+        /// How often the panel this is drawing on refreshes, in seconds.
+        ///
+        /// Part of the delay, and the part nothing about the link decides: a frame handed over
+        /// between two refreshes waits for the next one, so the schedule has to hold enough margin
+        /// to cover a boundary it cannot see. How much is ``PlayoutDelay/margin(refresh:)``.
+        ///
+        /// Defaults to sixty hertz, which is the safe answer rather than the common one — a phone
+        /// is usually faster, and being wrong in that direction costs latency while being wrong in
+        /// the other drops frames. Whoever owns the view knows the screen and should say.
+        public var displayRefresh = PlayoutDelay.sixtyHertz
+
         /// The delay actually in force, which is ``playoutDelay`` unless ``playoutBounds`` is set.
         ///
         /// Worth showing to a person: it is the latency they are paying for smoothness, and it is
@@ -969,7 +980,8 @@ import MoqomCore
                 interval: interval,
                 mayGiveBack: catchUp == nil
                     && ContinuousClock.now - reclaimed > .milliseconds(1500),
-                mayTighten: ContinuousClock.now - tightened > .milliseconds(250)
+                mayTighten: ContinuousClock.now - tightened > .milliseconds(250),
+                display: PlayoutDelay.margin(refresh: displayRefresh)
             )
 
             switch move {
@@ -1051,6 +1063,15 @@ import MoqomCore
             // that same amount.
             for index in slack.indices { slack[index] += seconds }
             playoutSlack = playoutSlack.map { $0 + seconds }
+
+            // The hold moves with them, for the reason the two figures above move: it is read
+            // from the same window and it is only recomputed once a second, so between one
+            // recomputation and the next it describes a grid that has moved out from under it.
+            // Left behind, it reported nothing at all — a leg holding a hundred and fifty
+            // milliseconds published a wait of zero, because the stale median had gone negative
+            // against the new grid and a negative wait is clamped away. That is the same
+            // dishonesty ``playoutHold`` was introduced to remove, arriving by a different route.
+            playoutHold = playoutHold.map { max(0, $0 + seconds) }
         }
 
         /// Put the presented timeline where the arriving frames are.
@@ -1129,6 +1150,7 @@ import MoqomCore
                     let most = seconds + (latched ?? 1.0 / 30)
                     for index in slack.indices { slack[index] = min(slack[index] + moved, most) }
                     playoutSlack = playoutSlack.map { min($0 + moved, most) }
+                    playoutHold = playoutHold.map { max(0, min($0 + moved, most)) }
                 }
             }
 

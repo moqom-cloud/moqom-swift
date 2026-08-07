@@ -16,13 +16,13 @@ struct LipSyncTests {
 
     @Test("Past the allowance the picture follows the voice, less the allowance")
     func aDeepVoiceDragsThePictureWithIt() {
-        #expect(LipSync.floor(voice: .milliseconds(109), bounds: bounds) == .milliseconds(49))
-        #expect(LipSync.floor(voice: .milliseconds(200), bounds: bounds) == .milliseconds(140))
+        #expect(LipSync.floor(voice: .milliseconds(109), bounds: bounds) == .milliseconds(9))
+        #expect(LipSync.floor(voice: .milliseconds(200), bounds: bounds) == .milliseconds(100))
     }
 
     /// The measurement that prompted this: a leg holding 109ms of voice was making its picture
     /// wait the same 109ms, and the picture's own arrivals only ever needed about 21ms.
-    @Test("The measured call would have been sixty milliseconds faster")
+    @Test("The measured call is faster by the whole allowance")
     func theMeasuredCall() {
         let was = Duration.milliseconds(109)
         let now = LipSync.floor(voice: was, bounds: bounds)
@@ -34,7 +34,7 @@ struct LipSyncTests {
         let asked = (floor: Duration.milliseconds(80), ceiling: Duration.milliseconds(500))
         #expect(LipSync.floor(voice: .zero, bounds: asked) == .milliseconds(80))
         #expect(LipSync.floor(voice: .milliseconds(100), bounds: asked) == .milliseconds(80))
-        #expect(LipSync.floor(voice: .milliseconds(300), bounds: asked) == .milliseconds(240))
+        #expect(LipSync.floor(voice: .milliseconds(300), bounds: asked) == .milliseconds(200))
     }
 
     /// A voice buffer this deep means the link is in trouble. Following it would put the same

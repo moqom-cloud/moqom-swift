@@ -217,6 +217,15 @@ final class VideoTile {
         renderer.playoutBounds = await room.playoutBounds
         renderer.playoutTolerance = await room.playoutTolerance
 
+        // The panel, because the schedule holds margin for a refresh boundary and the default is
+        // the slowest one worth assuming. Both phones this is measured on run at a hundred and
+        // twenty hertz, so they were each holding about six milliseconds against a wait they do
+        // not have. The view is where this is known: the renderer has a layer, not a screen.
+        #if os(iOS)
+            let hertz = UIScreen.main.maximumFramesPerSecond
+            if hertz > 0 { renderer.displayRefresh = 1 / Double(hertz) }
+        #endif
+
         if let codec = await room.codec(of: identity) {
             renderer.setCodec(codec)
         }

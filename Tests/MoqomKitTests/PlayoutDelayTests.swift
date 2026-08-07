@@ -253,4 +253,43 @@ struct PlayoutDelayTests {
 
         #expect(move == .tighten(to: 0.098))
     }
+
+    @Test("a sixty hertz panel is charged what was measured on one")
+    func sixtyHertzIsUnchanged() {
+        #expect(PlayoutDelay.margin(refresh: PlayoutDelay.sixtyHertz) == PlayoutDelay.margin)
+    }
+
+    @Test("a faster panel keeps the refresh it does not wait for")
+    func aFasterPanelPaysLess() {
+        let fast = PlayoutDelay.margin(refresh: 1.0 / 120)
+        #expect(fast < PlayoutDelay.margin)
+        #expect(fast >= PlayoutDelay.leastMargin)
+    }
+
+    /// The credit stops while there is still room for a decode beside the refresh, because the
+    /// failure it guards against is a third of the picture rather than a few milliseconds.
+    @Test("the credit stops at a margin that still covers a refresh and a decode")
+    func theCreditHasAFloor() {
+        #expect(PlayoutDelay.margin(refresh: 1.0 / 240) == PlayoutDelay.leastMargin)
+        #expect(PlayoutDelay.margin(refresh: 0) == PlayoutDelay.leastMargin)
+        #expect(PlayoutDelay.leastMargin > 1.0 / 120)
+    }
+
+    @Test("a slower panel is not charged more than what was measured")
+    func aSlowerPanelIsNotPunished() {
+        #expect(PlayoutDelay.margin(refresh: 1.0 / 30) == PlayoutDelay.margin)
+    }
+
+    /// The point of the whole exercise: on a faster panel the delay settles lower, because the
+    /// target it is aiming at is what the display needs and the display needs less.
+    @Test("a faster panel settles the delay lower")
+    func aFasterPanelSettlesLower() {
+        let slow = PlayoutDelay.target(floor: 0, ceiling: 0.25, display: PlayoutDelay.margin)
+        let fast = PlayoutDelay.target(
+            floor: 0,
+            ceiling: 0.25,
+            display: PlayoutDelay.margin(refresh: 1.0 / 120)
+        )
+        #expect(fast < slow)
+    }
 }

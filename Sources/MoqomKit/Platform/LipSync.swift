@@ -18,12 +18,16 @@ public enum LipSync {
     /// So the picture is allowed to lead and is never allowed to lag. Making the delay symmetric
     /// costs real latency to correct an error in the direction nobody perceives.
     ///
-    /// Sixty rather than the hundred-and-some the detection threshold would permit, because this
-    /// is a standing offset and the measured one wanders on top of it: across a fourteen minute
-    /// call the two legs moved over a range of about eighty milliseconds on their own. Sixty
-    /// standing plus that wander stays inside the threshold at its worst, and the last forty
-    /// milliseconds are worth much less than the certainty.
-    public static let pictureMayLead = Duration.milliseconds(60)
+    /// A hundred, against a detection threshold for this direction of about a hundred and
+    /// twenty-five. This was sixty, held back on the grounds that the offset wanders and the
+    /// wander would add to the lead. It does not: this figure sets a *floor* under the picture's
+    /// delay, so the picture leads by this much only when it is sitting exactly on that floor,
+    /// and every millisecond the buffer spends above the floor is a millisecond of lead given
+    /// back. Wander can only ever reduce it — which is what ``LipSyncTests/onlyOneDirection``
+    /// asserts — so the standing figure is the worst case rather than a starting point, and there
+    /// is no reason to hold two thirds of the allowance in reserve against something that cannot
+    /// happen.
+    public static let pictureMayLead = Duration.milliseconds(100)
 
     /// The least delay the picture may be held at, given what the voice is holding.
     ///

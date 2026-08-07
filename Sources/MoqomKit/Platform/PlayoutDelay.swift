@@ -26,6 +26,33 @@ enum PlayoutDelay {
     /// of the picture.
     static let margin = 0.018
 
+    /// The refresh interval ``margin`` was measured against.
+    static let sixtyHertz = 1.0 / 60
+
+    /// The least margin worth holding whatever the panel does.
+    ///
+    /// One refresh of a hundred-and-twenty hertz panel is 8.3ms, so this leaves about 3.7ms for
+    /// the decode beside it. The stop exists because the cost of being wrong here is not a few
+    /// milliseconds of latency, it is a third of the picture: an earlier controller drove the
+    /// headroom onto a four millisecond target and the display layer silently dropped 581 frames
+    /// of 1740. How long a hardware decode actually takes is not something this codebase measures
+    /// yet, so the credit below stops while there is still room for one.
+    static let leastMargin = 0.012
+
+    /// What the display needs, on a panel that refreshes every `refresh` seconds.
+    ///
+    /// ``margin`` covers a decode and one refresh of a sixty hertz panel, and a phone with a
+    /// faster panel waits less for its refresh boundary than that figure charges it for. Both
+    /// phones this is measured on run at a hundred and twenty hertz and were paying for a
+    /// boundary they do not have.
+    ///
+    /// Only ever a credit, never a charge. A panel slower than sixty hertz keeps the measured
+    /// figure rather than inflating it, because eighteen milliseconds is what was shown to stop
+    /// the display layer dropping frames and nothing here has measured a slower one.
+    static func margin(refresh: Double) -> Double {
+        max(leastMargin, margin - max(0, sixtyHertz - refresh))
+    }
+
     /// How far past a threshold a reading must be before it is acted on.
     ///
     /// Both directions have one, and for the same reason: the figure being read is a low
@@ -45,8 +72,8 @@ enum PlayoutDelay {
     /// it had nothing to give back. A hundred and nineteen milliseconds past what the display
     /// needed sat there for the rest of the call, with only the two-millisecond trickle below
     /// working on it.
-    static func target(floor: Double, ceiling: Double) -> Double {
-        min(max(floor, margin + deadband), ceiling)
+    static func target(floor: Double, ceiling: Double, display: Double = margin) -> Double {
+        min(max(floor, display + deadband), ceiling)
     }
 
     /// One move, or none.
@@ -61,6 +88,8 @@ enum PlayoutDelay {
     ///   - mayGiveBack: Whether the clock is free to run fast — no catch-up in flight, and long
     ///     enough since the last one.
     ///   - mayTighten: Whether enough time has passed for another millimetre of trickle.
+    ///   - display: What the display needs, which is a property of the panel. See
+    ///     ``margin(refresh:)``.
     static func adjustment(
         headroom: Double,
         delay: Double,
@@ -68,7 +97,8 @@ enum PlayoutDelay {
         ceiling: Double,
         interval: Double,
         mayGiveBack: Bool,
-        mayTighten: Bool
+        mayTighten: Bool,
+        display: Double = margin
     ) -> Adjustment {
         // Raised to meet a floor that moved under it — the voice's buffer grew — rather than
         // waited for, because every other path here only ever moves the delay down.
@@ -84,8 +114,8 @@ enum PlayoutDelay {
         // Safe to be this abrupt only because the shortfall is read from a low quantile of
         // twenty seconds. A single burst barely moves that, so this fires when the link has
         // genuinely changed rather than when it has hiccuped.
-        if headroom < margin {
-            let widened = min(delay + min(margin - headroom, interval * 2), ceiling)
+        if headroom < display {
+            let widened = min(delay + min(display - headroom, interval * 2), ceiling)
             guard widened > delay + 0.001 else { return .leaveItAlone }
             return .widen(to: widened)
         }
@@ -97,7 +127,7 @@ enum PlayoutDelay {
         // re-anchoring by the thousand and dropping frames by the hundred. A re-anchor puts
         // every frame already queued past its new deadline at once, and measured that cost about
         // four frames each time.
-        let target = target(floor: floor, ceiling: ceiling)
+        let target = target(floor: floor, ceiling: ceiling, display: display)
         if headroom > target + deadband, mayGiveBack {
             return .giveBack(seconds: headroom - target, landingOn: target)
         }
