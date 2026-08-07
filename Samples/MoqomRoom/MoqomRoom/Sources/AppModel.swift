@@ -1164,7 +1164,7 @@ final class AppModel {
                         // every subscribe and every object, and a file on a phone cannot.
                         Journal.Sink(minimum: .warning),
                     ]),
-                    minimum: .debug
+                    minimum: launch.quietLogs ? .warning : .debug
                 )
             )
             try await session.connect(to: relay.endpoint)

@@ -470,6 +470,16 @@ struct LaunchOptions {
     /// timer, both logs bracket it.
     var reshapeEverySeconds: Double?
 
+    /// Log warnings and worse, rather than every object.
+    ///
+    /// The sample logs at debug so that an integrator reading it can see every subscribe and
+    /// every object go past, which is the right default for something people read to learn from.
+    /// It is the wrong default for something people measure with: video and audio together are
+    /// about eighty objects a second, and each one is an interpolated string and a
+    /// privacy-hashed write to the unified log. A run that is trying to find out what a call
+    /// costs should not be paying that on top of the call.
+    var quietLogs = false
+
     static func current(
         arguments: [String] = ProcessInfo.processInfo.arguments
     ) -> LaunchOptions {
@@ -498,6 +508,7 @@ struct LaunchOptions {
             case "--bubbles": options.bubbles = true
             case "--pop-every": options.popEverySeconds = value.flatMap(Double.init)
             case "--reshape-every": options.reshapeEverySeconds = value.flatMap(Double.init)
+            case "--quiet-logs": options.quietLogs = true
             default: break
             }
             index += 1
