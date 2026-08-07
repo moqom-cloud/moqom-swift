@@ -935,7 +935,9 @@ struct BroadcastControls: View {
                 // Above the parts it is made of, because it is the one somebody came to read.
                 GlassReadout(
                     meter: room.latency,
-                    wait: room.playoutSlack ?? room.playoutDepth.seconds,
+                    // The hold, not the headroom. See ``VideoRenderer/playoutHold``.
+                    wait: room.playoutHold ?? room.playoutDepth.seconds,
+                    margin: room.playoutSlack,
                     measured: room.trustedStamp != nil
                 )
 
@@ -1049,8 +1051,13 @@ struct LinkReadout: View {
 struct GlassReadout: View {
     let meter: LatencyMeter
 
-    /// Seconds a frame waits at the far end before it is shown.
+    /// Seconds the middle frame waits before it is shown. See ``VideoRenderer/playoutHold``.
     let wait: Double
+
+    /// Seconds of headroom the unluckiest frames have, negative when that share missed. Only for
+    /// the marker beside the total: it is the wrong number to add to a latency, which is what it
+    /// used to be doing here. See ``VideoRenderer/playoutSlack``.
+    let margin: Double?
 
     /// Whether the two devices have agreed a clock, without which there is no total.
     ///
@@ -1082,9 +1089,11 @@ struct GlassReadout: View {
                 Text(String(format: "· link %.0f + hold %.0f", reading.median, held))
                     .foregroundStyle(.tertiary)
 
-                // Said rather than subtracted. See ``held``.
-                if wait < 0 {
-                    Text(String(format: "· %.0f late", -wait * 1000))
+                // Said rather than subtracted, and now beside a total that no longer collapses
+                // when it happens: a receiver whose worst frames are late is holding more than
+                // one whose are not, and it used to be the one that read fastest.
+                if let margin, margin < 0 {
+                    Text(String(format: "· %.0f late", -margin * 1000))
                         .foregroundStyle(.orange)
                 }
             } else {

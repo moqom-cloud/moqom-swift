@@ -562,11 +562,11 @@ final class AppModel {
                 // and the encoder cost; the buffer is what smoothness cost; the sum is what a
                 // person waiting for a reply actually experiences.
                 if let link = room.latency.reading(), link.frames > 0 {
-                    // The wait charged is the headroom the frames actually have, not the delay
-                    // that was asked for: a frame sits in the schedule until it is due, and how
-                    // long that is depends on where the schedule was anchored as much as on the
-                    // setting. Falling back to the setting only before there is a measurement.
-                    let wait = (room.playoutSlack ?? room.playoutDepth.seconds) * 1000
+                    // The wait charged is what the frames actually wait, not the delay that was
+                    // asked for: a frame sits in the schedule until it is due, and how long that
+                    // is depends on where the schedule was anchored as much as on the setting.
+                    // Falling back to the setting only before there is a measurement.
+                    let wait = (room.playoutHold ?? room.playoutDepth.seconds) * 1000
                     Journal.shared.say(
                         String(
                             format: "GLASS p50=%.0fms p95=%.0fms (link %.0f/%.0f + wait %.0f)",
@@ -592,7 +592,7 @@ final class AppModel {
                 // this stack did by a fifth of a second while every counter looked healthy.
                 if let picture = room.latency.reading(), picture.frames > 0,
                    let voice = room.voiceLatency.reading(), voice.frames > 0 {
-                    let eye = picture.median + (room.playoutSlack ?? room.playoutDepth.seconds) * 1000
+                    let eye = picture.median + (room.playoutHold ?? room.playoutDepth.seconds) * 1000
                     let ear = voice.median + room.earDelay.seconds * 1000
                     Journal.shared.say(
                         String(

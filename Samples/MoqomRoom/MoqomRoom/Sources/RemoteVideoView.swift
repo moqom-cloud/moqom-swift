@@ -302,6 +302,7 @@ final class VideoTile {
                 room.drawing = renderer.drawing
                 room.playoutDepth = renderer.playoutDepth
                 room.playoutSlack = renderer.playoutSlack
+                room.playoutHold = renderer.playoutHold
                 room.tileIsOnScreen = renderer.isOnScreen
                 room.tileSize = renderer.drawnSize
                 room.tileCount = VideoTile.live

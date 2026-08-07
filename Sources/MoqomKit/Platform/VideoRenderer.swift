@@ -378,6 +378,21 @@ import MoqomCore
         /// of headroom is holding twenty, and the difference is latency nobody asked for.
         public private(set) var playoutSlack: Double?
 
+        /// How long the frame in the middle waits between arriving and being shown, in seconds.
+        ///
+        /// The hold, and the honest half of a glass-to-glass figure. ``playoutSlack`` is the
+        /// wrong number for that and reads plausibly enough to be believed: it is a low quantile,
+        /// so it describes the margin of the unluckiest frames rather than the wait of a typical
+        /// one, and on a link in trouble it goes *negative* while the delay in force is at its
+        /// ceiling. Clamped at zero it then reports a struggling receiver as having no hold at
+        /// all — measured on two phones, one holding 250ms showed forty and the other holding
+        /// 155ms showed a hundred and twenty, so the worse leg read three times better.
+        ///
+        /// Clamped for the same reason ``playoutSlack`` is not: a frame that arrives after its
+        /// deadline is shown when it can be, and a negative wait is not a thing that happens to
+        /// it. Frames that missed are counted in ``Drawing/late`` where they can be seen.
+        public private(set) var playoutHold: Double?
+
         private func restartSchedule() {
             anchor = nil
             synchroniser.setRate(0, time: .invalid)
@@ -385,6 +400,7 @@ import MoqomCore
             slack = []
             slackCursor = 0
             playoutSlack = nil
+            playoutHold = nil
             // The next arrival follows a stream change rather than a pause, so the gap before it
             // means nothing and must not be read as one.
             arrived = nil
@@ -936,6 +952,7 @@ import MoqomCore
             // is not a quieter answer, it is the floor.
             guard slack.count >= 60, let worst = slackQuantile(playoutTolerance) else { return }
             playoutSlack = worst
+            playoutHold = slackQuantile(0.5).map { max(0, $0) }
 
             let depth = playoutDepth.asSeconds
             let ceiling = bounds.ceiling.asSeconds

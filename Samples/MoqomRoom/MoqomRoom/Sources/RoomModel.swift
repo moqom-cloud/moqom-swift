@@ -199,6 +199,9 @@ final class RoomModel {
     /// Seconds of headroom the arriving frames actually have. See ``VideoRenderer/playoutSlack``.
     var playoutSlack: Double?
 
+    /// Seconds the middle frame waits before it is shown. See ``VideoRenderer/playoutHold``.
+    var playoutHold: Double?
+
     /// The floor the remote tile's delay is currently being held to.
     ///
     /// Lip sync's demand on the picture, or the configured minimum where there is no voice. Worth
