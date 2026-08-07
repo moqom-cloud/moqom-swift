@@ -146,30 +146,21 @@ import MoqomCore
                 }
                 depth.answer(starved: voice.starved, whileSpeaking: voiced > 0)
 
-                let queued = voice.queued
-                // Trimmed above the target rather than at it, because a queue
-                // held exactly at target is a queue one late packet away from a
-                // hole, and the trimming is what would have put it there.
-                //
-                // And only in a settled quiet — half a second of it — rather
-                // than in the pause between two words. A pause is where the
-                // cushion is needed most: speech resumes into a queue that was
-                // just emptied, the first syllable arrives to a device with
-                // nothing in hand, and the depth controller reads the dropout
-                // it caused as proof the link needs a deeper queue. Half a
-                // second of quiet is past the end of a sentence.
-                if quiet >= 25, queued > target + .milliseconds(20), output == .silence {
+                // What the depth costs and what removing it costs, weighed in ``Trim``.
+                switch Trim.decide(
+                    queued: voice.queued,
+                    target: target,
+                    quiet: quiet,
+                    silent: output == .silence
+                ) {
+                case .dropSilence:
                     playback.trimmed += 1
                     continue
-                }
-
-                // Speech, and still too deep: the queue is past anything the
-                // link's jitter justifies and the excess is pure delay. Losing
-                // a packet is audible and losing the argument with the delay is
-                // audible for the rest of the call.
-                if queued > target + .milliseconds(200) {
+                case .dropSpeech:
                     playback.dropped += 1
                     continue
+                case .play:
+                    break
                 }
 
                 let samples = await decoder.decode(output)
