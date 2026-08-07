@@ -305,7 +305,7 @@ import MoqomCore
 
             // Read after the write, so the figure the picture is aligned to includes what was
             // just handed over rather than describing the queue as it was a packet ago.
-            depth.holding(voice.queued)
+            depth.holding(voice.queued, at: sinceStarting)
         }
     }
 #endif

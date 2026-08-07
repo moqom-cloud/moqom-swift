@@ -167,28 +167,47 @@ struct QueueDepth: Sendable {
     /// excursion shorter than half the window cannot move it at all, however extreme, because
     /// the middle sample is still an ordinary one; a change that lasts longer than half the
     /// window moves it the whole way. There is no tuning to get wrong.
-    private var held: [Double] = []
-    private var heldCursor = 0
+    private var held: [(at: Duration, depth: Double)] = []
+    private var lastHeld: Duration?
 
-    /// Five seconds at fifty packets a second, so a pause of up to two and a half seconds is
-    /// ignored and anything longer is followed.
-    static let longEnoughToIgnoreAPause = 250
+    /// How far back the depth is remembered.
+    static let longEnoughToIgnoreAPause = Duration.seconds(5)
 
-    mutating func holding(_ queued: Duration) {
+    /// How often a sample is taken, and the reason this is timed rather than counted.
+    ///
+    /// This used to keep the last two hundred and fifty samples and call that five seconds, on
+    /// the grounds that packets arrive fifty a second. They do not, and the exception is exactly
+    /// the event the median exists to survive: in a burst they arrive as fast as they can be
+    /// read, so two hundred and fifty of them can span well under a second and the burst fills
+    /// the whole window. Measured on a phone, ``settled`` tracked the instantaneous queue almost
+    /// exactly — 260ms when the queue hit 260 — and because the picture's floor follows this for
+    /// lip sync, the video buffer swung with it between 80ms and 250ms.
+    ///
+    /// Windowing by time alone does not fix it either: a burst still contributes more samples
+    /// than the quiet around it and still carries the median. One sample per slice does, because
+    /// then every sample stands for the same amount of time and the median is a median over the
+    /// five seconds rather than over the packets.
+    static let often = Duration.milliseconds(20)
+
+    /// Note the depth the queue is holding.
+    ///
+    /// - Parameters:
+    ///   - queued: What is in the ring now.
+    ///   - now: Time on any steadily running clock; only differences are read.
+    mutating func holding(_ queued: Duration, at now: Duration) {
+        if let lastHeld, now - lastHeld < Self.often { return }
+        lastHeld = now
+
         let seconds = Double(queued.components.seconds)
             + Double(queued.components.attoseconds) / 1e18
-        if held.count < Self.longEnoughToIgnoreAPause {
-            held.append(seconds)
-        } else {
-            held[heldCursor] = seconds
-            heldCursor = (heldCursor + 1) % Self.longEnoughToIgnoreAPause
-        }
+        held.removeAll { now - $0.at > Self.longEnoughToIgnoreAPause }
+        held.append((at: now, depth: seconds))
     }
 
-    /// The depth the picture should be aligned to. See ``holding(_:)``.
+    /// The depth the picture should be aligned to. See ``holding(_:at:)``.
     var settled: Duration {
         guard !held.isEmpty else { return .zero }
-        let sorted = held.sorted()
+        let sorted = held.map(\.depth).sorted()
         return .seconds(sorted[sorted.count / 2])
     }
 }

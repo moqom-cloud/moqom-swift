@@ -86,10 +86,28 @@ struct QueueDepthTests {
         #expect(bunching.pacing.typical <= .milliseconds(2))
     }
 
+    /// Hold a depth for a stretch of time, at a packet cadence, returning the time reached.
+    @discardableResult
+    private func hold(
+        _ depth: inout QueueDepth,
+        _ queued: Duration,
+        for span: Duration,
+        from start: Duration = .zero,
+        every cadence: Duration = .milliseconds(20)
+    ) -> Duration {
+        var now = start
+        let end = start + span
+        while now < end {
+            depth.holding(queued, at: now)
+            now += cadence
+        }
+        return now
+    }
+
     @Test("what the picture is aligned to follows the depth actually held")
     func settlesOnTheRealDepth() {
         var depth = QueueDepth()
-        for _ in 0 ..< 1000 { depth.holding(.milliseconds(120)) }
+        hold(&depth, .milliseconds(120), for: .seconds(10))
 
         // The truth, which is what lip sync needs: the aim could read anything at all while the
         // queue really holds this.
@@ -102,15 +120,15 @@ struct QueueDepthTests {
         // followed it within the same second, and the picture kept the delay long after the
         // pause was over.
         var depth = QueueDepth()
-        for _ in 0 ..< 1000 { depth.holding(.milliseconds(60)) }
+        let after = hold(&depth, .milliseconds(60), for: .seconds(10))
         let before = depth.settled
 
         // A pause arrives, and for the second it lasts the queue really is deeper.
-        for _ in 0 ..< 50 { depth.holding(.milliseconds(260)) }
+        hold(&depth, .milliseconds(260), for: .seconds(1), from: after)
 
-        // The picture should not have noticed at all. Fifty samples of a two-hundred-and-fifty
-        // sample window cannot reach the middle of it, so the excursion is not merely damped,
-        // it is invisible — which is the property an average could not give at any tuning.
+        // The picture should not have noticed at all. One second of a five second window cannot
+        // reach the middle of it, so the excursion is not merely damped, it is invisible — which
+        // is the property an average could not give at any tuning.
         #expect(depth.settled == before)
 
         // And the conservative figure, which exists to react at once, must still have done so.
@@ -119,13 +137,37 @@ struct QueueDepthTests {
         #expect(depth.target >= .milliseconds(150))
     }
 
+    @Test("a burst cannot fill the window by arriving quickly")
+    func aBurstCannotFloodTheWindow() {
+        // The defect this replaced, and the reason the window is timed rather than counted. The
+        // window was the last two hundred and fifty samples, called five seconds on the grounds
+        // that packets arrive fifty a second — but in a burst they arrive as fast as they can be
+        // read, so two hundred and fifty of them spanned a fraction of a second and the burst
+        // became the whole window. Measured on a phone, `settled` read 260ms the moment the
+        // queue hit 260, the picture's floor followed it for lip sync, and the video buffer
+        // swung between 80ms and 250ms with it.
+        var depth = QueueDepth()
+        let after = hold(&depth, .milliseconds(60), for: .seconds(10))
+        let before = depth.settled
+
+        // Three hundred packets inside two hundred milliseconds of wall time. Under a counted
+        // window that is more than the window holds; under a timed one it is a fiftieth of it.
+        var now = after
+        for _ in 0 ..< 300 {
+            depth.holding(.milliseconds(260), at: now)
+            now += .microseconds(666)
+        }
+
+        #expect(depth.settled == before)
+    }
+
     @Test("a link that has genuinely changed is followed")
     func followsALastingChange() {
         var depth = QueueDepth()
-        for _ in 0 ..< 1000 { depth.holding(.milliseconds(60)) }
-        // Half the window at the new depth is enough, and is where the two requirements meet:
+        let after = hold(&depth, .milliseconds(60), for: .seconds(10))
+        // More than half the window at the new depth, which is where the two requirements meet:
         // any excursion longer than this deserves following, and any shorter one does not.
-        for _ in 0 ..< 130 { depth.holding(.milliseconds(160)) }
+        hold(&depth, .milliseconds(160), for: .seconds(3), from: after)
         #expect(depth.settled == .milliseconds(160))
     }
 
