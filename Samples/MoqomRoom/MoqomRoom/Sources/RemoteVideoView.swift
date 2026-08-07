@@ -316,20 +316,13 @@ final class VideoTile {
             }
 
             // Lip sync, re-read at the same interval because the voice's buffer resizes itself
-            // as the link changes. One direction only: the picture waits for the voice, never
-            // the other way round. Audio is a twentieth of the bitrate and every packet stands
-            // alone, so it arrives when video cannot — holding it back to match a picture that
-            // is struggling would throw away the one part of the call still working.
-            //
-            // Bounded by the same ceiling as everything else. A voice buffer that has grown to
-            // half a second is describing a link in trouble, and following it there would add
-            // half a second to the picture as well; past the ceiling the two drift apart, which
-            // is the better failure.
+            // as the link changes. What the two delays have to be for the call to look right is
+            // ``LipSync``'s to decide.
             if drawn % 30 == 0 {
                 await MainActor.run {
                     guard let bounds = room.playoutBounds else { return }
                     let voice = room.audioDelay(of: identity) ?? .zero
-                    let floor = min(max(bounds.floor, voice), bounds.ceiling)
+                    let floor = LipSync.floor(voice: voice, bounds: bounds)
                     renderer.playoutFloor = floor
 
                     // Reported as well as applied, because a delay held up by its floor and a
