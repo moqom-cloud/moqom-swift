@@ -1103,11 +1103,32 @@ import MoqomCore
                 // The correction is the same in kind as a grid shift: the newest frame had
                 // whatever headroom it had, and after this it has exactly `delay`, so every
                 // remembered sample moves by that difference.
+                //
+                // Bounded above, because that reasoning holds for a shift and only approximately
+                // here. A shift moves one grid by one amount, so every sample measured against it
+                // moves by that amount exactly. A re-anchor that follows a drift is not one move:
+                // the grid was sliding while those samples were being taken, so displacing all of
+                // them by the final, worst displacement overstates every one of them.
+                //
+                // Measured on two phones, a re-anchor arriving after the schedule had fallen a few
+                // hundred milliseconds behind put that whole distance onto six hundred samples at
+                // once. The median hold — which is the figure a glass-to-glass reading is built
+                // from — then read between three hundred and nine hundred milliseconds for the
+                // twenty seconds the window took to turn over, while the delay in force was
+                // twenty-nine milliseconds, the newest frame sat fifty milliseconds ahead and
+                // nothing was ever held for anything like that long. Between re-anchors the same
+                // figure tracked the delay to within a few milliseconds, which is what said the
+                // spikes were the correction rather than the link.
+                //
+                // The ceiling is what the new grid can actually produce: frames are placed `delay`
+                // ahead, and anchoring on one frame's arrival can add about its own interval on
+                // top of that. Anything past it did not happen to a frame.
                 if newest.isValid {
                     let was = (newest - synchroniser.currentTime()).seconds
                     let moved = seconds - was
-                    for index in slack.indices { slack[index] += moved }
-                    playoutSlack = playoutSlack.map { $0 + moved }
+                    let most = seconds + (latched ?? 1.0 / 30)
+                    for index in slack.indices { slack[index] = min(slack[index] + moved, most) }
+                    playoutSlack = playoutSlack.map { min($0 + moved, most) }
                 }
             }
 
