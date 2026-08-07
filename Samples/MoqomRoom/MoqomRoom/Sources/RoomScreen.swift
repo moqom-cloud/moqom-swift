@@ -1081,19 +1081,23 @@ struct GlassReadout: View {
                 Text(String(format: "%.0f ms", reading.median + held))
                     .font(.caption.bold().monospacedDigit())
                     .foregroundStyle(.primary)
-                Text(String(format: "glass · p95 %.0f", reading.p95 + held))
+                Text(String(format: "glass · p95 %.0f ms", reading.p95 + held))
 
                 // Broken out because the two halves answer to different things: the link is
                 // the network and the encoder, and the wait is a policy this app chose. A
                 // total that is mostly wait is a total somebody can do something about.
-                Text(String(format: "· link %.0f + hold %.0f", reading.median, held))
+                Text(String(format: "· link %.0f + hold %.0f ms", reading.median, held))
                     .foregroundStyle(.tertiary)
 
                 // Said rather than subtracted, and now beside a total that no longer collapses
                 // when it happens: a receiver whose worst frames are late is holding more than
                 // one whose are not, and it used to be the one that read fastest.
+                //
+                // Carrying its unit, because every other figure on this line is milliseconds and
+                // a bare number beside them reads as a count of frames. It was showing "8125
+                // late" — which is eight seconds, and looked like eight thousand frames.
                 if let margin, margin < 0 {
-                    Text(String(format: "· %.0f late", -margin * 1000))
+                    Text(String(format: "· %.0f ms late", -margin * 1000))
                         .foregroundStyle(.orange)
                 }
             } else {
@@ -1143,8 +1147,8 @@ struct LatencyReadout: View {
             Image(systemName: "timer")
             if let reading, reading.worst > 0 {
                 Text(String(format: "%.0f ms", reading.median))
-                Text(String(format: "· p95 %.0f", reading.p95))
-                Text(String(format: "· ±%.0f clock", reading.uncertainty))
+                Text(String(format: "· p95 %.0f ms", reading.p95))
+                Text(String(format: "· ±%.0f ms clock", reading.uncertainty))
                     .foregroundStyle(reading.uncertainty > reading.median ? .orange : .secondary)
                 if reading.impossible > 0 {
                     // Not a slow link: a pair of clocks that have not agreed yet. Said

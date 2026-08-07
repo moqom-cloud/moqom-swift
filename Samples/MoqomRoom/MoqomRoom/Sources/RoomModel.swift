@@ -169,11 +169,23 @@ final class RoomModel {
     /// the figure being measured was the setting. Zero declines to guess. What the delay settles
     /// at is then set by the link — the renderer keeps a few milliseconds of margin so a frame is
     /// not at the mercy of the next refresh, and adds to it only as far as the jitter demands.
-    /// The ceiling is generous because it is only reached while the link is misbehaving, and a
-    /// quarter second of delay is much better than the alternative during that.
+    ///
+    /// The ceiling is fifty milliseconds, and it is a promise rather than an estimate. It was a
+    /// quarter of a second, on the reasoning that the ceiling is only reached while the link is
+    /// misbehaving and a deep buffer beats the alternative during that. Measured, the link
+    /// misbehaves often enough for that to be the experience rather than the exception: arrivals
+    /// through Los Angeles hold a 40ms median for minutes and then put a 124ms 95th percentile on
+    /// top of it, the delay follows all the way up, and a conversation that reads 58ms most of the
+    /// time reads 258ms during it.
+    ///
+    /// Fifty because the sum is what a person notices and the other half of it is the link: a 40ms
+    /// median arrival plus fifty is ninety, so this is what makes "under ninety" a property of the
+    /// build rather than a hope about the network. What it costs is the frames out in the tail
+    /// during those minutes, which arrive too late to be shown on time whatever this says — the
+    /// choice is between showing them late and not showing them, not between having them and not.
     var playoutBounds: (floor: Duration, ceiling: Duration)? = (
         floor: .zero,
-        ceiling: .milliseconds(250)
+        ceiling: .milliseconds(50)
     )
 
     /// The delay currently in force on a remote tile, for display. See

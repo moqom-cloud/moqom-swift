@@ -402,6 +402,11 @@ import MoqomCore
         /// Clamped for the same reason ``playoutSlack`` is not: a frame that arrives after its
         /// deadline is shown when it can be, and a negative wait is not a thing that happens to
         /// it. Frames that missed are counted in ``Drawing/late`` where they can be seen.
+        ///
+        /// Read from the schedule rather than from the arrival window — see ``held`` — because the
+        /// arrival window has to be displaced every time the grid moves, and this figure was got
+        /// wrong twice that way: once reading half a second on a leg holding twenty-nine
+        /// milliseconds, and once reading zero on a leg holding fifty.
         public private(set) var playoutHold: Double?
 
         private func restartSchedule() {
@@ -410,6 +415,8 @@ import MoqomCore
             grid = nil
             slack = []
             slackCursor = 0
+            held = []
+            heldCursor = 0
             playoutSlack = nil
             playoutHold = nil
             // The next arrival follows a stream change rather than a pause, so the gap before it
@@ -484,6 +491,22 @@ import MoqomCore
         private var slack: [Double] = []
         private var slackCursor = 0
         private static let slackWindow = 600
+
+        /// How long the queued frames were actually waiting, in seconds.
+        ///
+        /// Kept apart from ``slack`` and deliberately not corrected the way it is. A slack sample
+        /// says how much headroom a frame arrived with against the grid of the moment, so when the
+        /// grid moves every sample has to be displaced with it — and each displacement is another
+        /// chance to be wrong about a figure a person reads. Twice now it has been: once when a
+        /// re-anchor put its whole drift onto six hundred samples, and once when the hold was left
+        /// behind by a shift and clamped to zero.
+        ///
+        /// This is read straight off the schedule on every frame, against the grid in force at
+        /// that moment. It is never stale, never needs adjusting, and answers the question the
+        /// glass-to-glass figure is actually asking: how long does a frame wait.
+        private var held: [Double] = []
+        private var heldCursor = 0
+        private static let heldWindow = 300
 
         /// When the previous frame was enqueued, for telling a pause from ordinary unevenness.
         private var arrived: ContinuousClock.Instant?
@@ -963,7 +986,7 @@ import MoqomCore
             // is not a quieter answer, it is the floor.
             guard slack.count >= 60, let worst = slackQuantile(playoutTolerance) else { return }
             playoutSlack = worst
-            playoutHold = slackQuantile(0.5).map { max(0, $0) }
+            playoutHold = heldMedian()
 
             let depth = playoutDepth.asSeconds
             let ceiling = bounds.ceiling.asSeconds
@@ -1036,6 +1059,23 @@ import MoqomCore
             return sorted[index]
         }
 
+        /// Remember how long the schedule is currently making frames wait.
+        private func record(held seconds: Double) {
+            if held.count < Self.heldWindow {
+                held.append(seconds)
+            } else {
+                held[heldCursor] = seconds
+                heldCursor = (heldCursor + 1) % Self.heldWindow
+            }
+        }
+
+        /// The wait the middle frame of the recent window had.
+        private func heldMedian() -> Double? {
+            guard !held.isEmpty else { return nil }
+            let sorted = held.sorted()
+            return max(0, sorted[(sorted.count - 1) / 2])
+        }
+
         /// Remember how much slack a frame arrived with.
         private func record(slack seconds: Double) {
             if slack.count < Self.slackWindow {
@@ -1063,15 +1103,6 @@ import MoqomCore
             // that same amount.
             for index in slack.indices { slack[index] += seconds }
             playoutSlack = playoutSlack.map { $0 + seconds }
-
-            // The hold moves with them, for the reason the two figures above move: it is read
-            // from the same window and it is only recomputed once a second, so between one
-            // recomputation and the next it describes a grid that has moved out from under it.
-            // Left behind, it reported nothing at all — a leg holding a hundred and fifty
-            // milliseconds published a wait of zero, because the stale median had gone negative
-            // against the new grid and a negative wait is clamped away. That is the same
-            // dishonesty ``playoutHold`` was introduced to remove, arriving by a different route.
-            playoutHold = playoutHold.map { max(0, $0 + seconds) }
         }
 
         /// Put the presented timeline where the arriving frames are.
@@ -1150,7 +1181,6 @@ import MoqomCore
                     let most = seconds + (latched ?? 1.0 / 30)
                     for index in slack.indices { slack[index] = min(slack[index] + moved, most) }
                     playoutSlack = playoutSlack.map { min($0 + moved, most) }
-                    playoutHold = playoutHold.map { max(0, min($0 + moved, most)) }
                 }
             }
 
@@ -1175,6 +1205,10 @@ import MoqomCore
                 + Double(delay.components.attoseconds) / 1e18
             let depth = (newest - synchroniser.currentTime()).seconds
 
+            // Recorded before any of the corrections below, and against the grid that produced it,
+            // which is the whole point of keeping this separately from the slack window.
+            record(held: depth)
+
             // Behind means frames are being scheduled for a moment that has already passed, and
             // every one of them is shown late; far ahead means the delay has grown well past
             // what was asked for and the latency is no longer the one the caller chose.
@@ -1193,10 +1227,29 @@ import MoqomCore
             // hundred times in fifty seconds, which cleared the headroom history on each one and
             // left the adaptation with nothing to decide on.
             let allowance = max(interval ?? 0, 0.02)
+
+            // Far enough out in either direction that the schedule has lost the stream rather
+            // than drifted within it, and a re-anchor is the only thing that recovers it.
             if depth < -allowance || depth > seconds + 0.15 {
                 anchorSchedule(to: newest, delay: delay)
                 return
             }
+
+            // Correcting an excess here, from the schedule's own position, was tried and is a
+            // mistake worth leaving a note about. The excess is real — the schedule is anchored
+            // on one frame's arrival, so that frame's headroom is paid by every frame after it,
+            // and ``track(depth:wanted:)`` closes it at half a millisecond per frame — but a
+            // shift is the wrong instrument for it from in here.
+            //
+            // Two reasons, both measured. ``shift(by:to:)`` displaces every remembered slack
+            // sample, which is right when it happens once a second from ``resize(interval:)`` and
+            // ruinous at thirty times a second: the window is driven down faster than arrivals
+            // refill it, and both phones ended up reporting eight seconds of negative headroom.
+            // And it steers on schedule position while ``PlayoutDelay`` steers on headroom, so
+            // the two pull against each other with no arbiter.
+            //
+            // Whatever bounds this belongs inside the controller, which already has a ceiling and
+            // already owns the grid.
 
             // Inside the bounds, which is where this belongs: re-anchoring is what happens when
             // the schedule has already lost the stream, and tracking is what keeps it from
