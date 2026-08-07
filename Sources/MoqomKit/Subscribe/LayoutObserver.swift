@@ -37,6 +37,19 @@ import MoqomCore
         /// What the planner was last told, for diagnostics.
         public private(set) var lastReported: [ParticipantIdentity: RenderBox] = [:]
 
+        /// Called when a layout pass has settled, with the boxes the planner was told about.
+        ///
+        /// For a publisher rather than a subscriber, which is the part that is not obvious. The
+        /// sizes collected here decide what this device *subscribes* to, and they are also the
+        /// only description anywhere of how big a picture actually needs to be. A call whose
+        /// two ends run the same layout can read its own tiles to know the box its own picture
+        /// lands in at the far end, and publish for that box instead of for the largest one it
+        /// might ever have landed in.
+        ///
+        /// Deliberately not the same thing as observing ``lastReported``: this fires once per
+        /// settled pass, after the coalescing, so a nine-tile grid rotating calls it once.
+        public var onReport: (@MainActor ([ParticipantIdentity: RenderBox]) -> Void)?
+
         /// A layout that replaces the view hierarchy's, or `nil` when the
         /// hierarchy is in charge.
         public private(set) var takenOver: [ParticipantIdentity: RenderBox]?
@@ -150,6 +163,7 @@ import MoqomCore
             guard let room else { return }
             let snapshot = takenOver ?? boxes
             lastReported = snapshot
+            onReport?(snapshot)
             _ = await room.updateLayout(snapshot, linkBitrate: linkBitrate)
         }
     }

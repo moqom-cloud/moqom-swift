@@ -590,7 +590,7 @@ final class RoomModel {
     /// moments before a first frame has been decoded.
     var seatAspect: Double {
         guard mode == .gallery else { return 1 }
-        let size = receivedShape ?? pinnedRung?.size ?? Self.defaultCaptureSize
+        let size = receivedShape ?? pinnedRung?.size ?? publishSize
         return Double(size.width) / Double(size.height)
     }
 
@@ -627,10 +627,76 @@ final class RoomModel {
     /// somebody rotates their phone is a keyframe and a stall for a difference nobody can see,
     /// and 720p already has pixels to spare for half a phone screen at 3×.
     var publishSize: PixelSize {
-        switch screen {
-        case .sideBySide, .others: Self.defaultCaptureSize
-        case .me: PixelSize(width: 1080, height: 1920)
-        }
+        shaped(PixelSize(width: shortSideForLayout, height: shortSideForLayout * 16 / 9),
+               as: publishShape)
+    }
+
+    /// The short side to publish, taken from the box the picture actually lands in.
+    ///
+    /// This is the whole of the sizing decision. The stage this device is showing does not
+    /// answer it — a stage says how many tiles there are, not how big they came out on the
+    /// far end's screen — and a constant answers it only by being large enough for the worst
+    /// case and wrong for every other one. Measured side by side on two phones, the tiles were
+    /// 320×480 device pixels and the publication was 720×1280: six times the pixels that had
+    /// anywhere to go, and by ``publishBitrate`` four times the bitrate, spent on detail that
+    /// was scaled away before anybody saw it.
+    ///
+    /// Read from this device's own tiles, which is honest here for the reason the comment on
+    /// ``RoomSession/setFollowsPublisher(_:)`` gives: both ends run the same layout, so the box
+    /// holding somebody else's picture here is the box holding this device's picture there. The
+    /// largest of them, because one publication has to serve every viewer and the smallest tile
+    /// can scale down while the largest cannot invent detail.
+    ///
+    /// Snapped to a step rather than fitted to the pixel, and the snapping is what keeps this
+    /// quiet: a box has to cross a boundary before anything is republished, so the ordinary
+    /// business of a tile gaining a few pixels changes nothing at all. Which step, and why it may
+    /// land slightly under the box, is ``PublishSizing``.
+    var shortSideForLayout: Int {
+        // Nothing has been drawn yet, so there is no box to size for and no reason to think the
+        // first one will be small. The default is the safe answer and it is only ever the answer
+        // before the first layout pass.
+        guard let largest = largestTileShortSide else { return Self.defaultShortSide }
+        return PublishSizing.shortSide(for: largest)
+    }
+
+    /// The short side of the biggest tile this device is drawing for somebody else.
+    private var largestTileShortSide: Int? {
+        layout.lastReported.values
+            .map { min($0.pixelSize.width, $0.pixelSize.height) }
+            .filter { $0 > 0 }
+            .max()
+    }
+
+    /// What to publish before any tile has been measured. See ``shortSideForLayout``.
+    static let defaultShortSide = 720
+
+    /// The short side currently being published, so a layout pass can tell whether it changed.
+    private(set) var publishedShortSide: Int?
+
+    /// Republish at the size the layout just asked for, if that is not the size already going out.
+    ///
+    /// Called once per settled layout pass. Almost every call decides to do nothing, which is
+    /// the intent: ``shortSideForLayout`` snaps to a step, so a tile has to cross a boundary
+    /// before this reshapes anything, and scrolling a grid or gaining a few pixels does not.
+    ///
+    /// A reshape and not a restart. The track keeps its name, the new format arrives in band on
+    /// a keyframe carrying its own decoder configuration, and the old size keeps going out until
+    /// that keyframe lands — so nobody resubscribes and no viewer sees a gap. The benchmark's
+    /// pin is honoured by leaving early: a measured run is comparing figures across devices and
+    /// a size that moves on its own would spoil the comparison.
+    func followLayout() {
+        guard pinnedRung == nil, let broadcast, isBroadcasting else { return }
+        let wanted = shortSideForLayout
+        guard wanted != publishedShortSide else { return }
+
+        publishedShortSide = wanted
+        let rung = rungForLayout()
+        Task { await broadcast.reshape(to: LayerLadder(rungs: [rung])) }
+
+        // The source has to be asked for the new size too, or the encoder is handed the old one
+        // and scales it — which costs the pixels without saving the bitrate. A camera keeps the
+        // format it negotiated, so this only applies to the sources that can be asked.
+        if case .pattern = videoInput { capture?.resize(to: rung.size) }
     }
 
     /// Which way up the published picture is.
@@ -716,11 +782,22 @@ final class RoomModel {
         return max(300_000, Int(base.rounded()))
     }
 
+    /// The name of the one track this device publishes.
+    ///
+    /// Not named after its size, which is the convention everywhere else and is wrong here. The
+    /// size now follows the layout, and ``Broadcast/reshape(to:)`` changes a rung's format in
+    /// band only for a rung it already has an encoder for — so a name carrying the size would
+    /// make every step of ``shortSideForLayout`` a different track, and a different track means
+    /// unsubscribe, resubscribe, and a gap where the picture was. Holding the name is what buys
+    /// the seamless change: the geometry travels on the keyframe and in the republished catalog,
+    /// where it can be read rather than parsed out of a string.
+    static let trackName = LayerID("video/camera")
+
     /// The one rung this device publishes.
     func rungForLayout() -> VideoLayer {
         let size = publishSize
         return VideoLayer(
-            id: LayerID("video/\(min(size.width, size.height))p"),
+            id: Self.trackName,
             size: size,
             frameRate: publishFrameRate,
             bitrate: publishBitrate,
@@ -815,6 +892,10 @@ final class RoomModel {
         self.identity = identity
         self.statisticsInterval = statisticsInterval
         layout.bind(to: room)
+
+        // The layout decides what this device publishes, not just what it subscribes to.
+        // See ``shortSideForLayout``.
+        layout.onReport = { [weak self] _ in self?.followLayout() }
         #if os(iOS)
             pictureInPicture = MoqomPictureInPicture(room: room, layout: layout)
             pictureInPicture?.onFailure = { [weak self] error in
@@ -1087,8 +1168,10 @@ final class RoomModel {
     /// on screen, changing as the grid changes.
     func fetching(_ who: ParticipantIdentity) -> (rung: String, box: PixelSize)? {
         guard let box = layout.lastReported[who]?.pixelSize else { return nil }
-        let rung = statistics?.participants[who]?.layer?.value
-        return (rung.map { $0.replacingOccurrences(of: "video/", with: "") } ?? "—", box)
+        // The size that arrived rather than the track's name, which no longer carries one.
+        // See ``trackName``.
+        let rung = receivedShape.map { "\(min($0.width, $0.height))p" }
+        return (rung ?? "—", box)
     }
 
     /// Decodable frames for one participant.
@@ -1268,8 +1351,12 @@ final class RoomModel {
         // One rung, decided here. A measured run brings its own — the point of a benchmark is
         // that both ends agree on a figure that does not move — and any other run publishes
         // what the layout on screen is going to draw. See ``rungForLayout``.
+        //
+        // Not written back to ``pinnedRung``, which it used to be. Latching the first answer
+        // there made the size permanent for the session and meant nothing after this line could
+        // change it: the pin is the benchmark's override and only that.
         let rung = pinnedRung ?? rungForLayout()
-        pinnedRung = rung
+        publishedShortSide = min(rung.size.width, rung.size.height)
 
         // Capture what the rung says it publishes. A capture format chosen independently of the
         // ladder is how a run claims sixty frames while the camera hands over thirty.

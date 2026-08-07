@@ -373,12 +373,13 @@ final class AppModel {
                 )
             }
 
+            let live = room.pinnedRung ?? room.rungForLayout()
             Journal.shared.say(
-                "LIVE rung=" + (room.pinnedRung?.id.value ?? "video/720p")
-                    + (room.pinnedRung.map {
-                        " \($0.size.width)x\($0.size.height)@\(Int($0.frameRate))"
-                            + " \($0.bitrate / 1000)kbps layers=\($0.temporalLayers)"
-                    } ?? "")
+                // The rung as it is now rather than as it was pinned, because the size follows
+                // the layout and the pin is only the benchmark's. See ``RoomModel/followLayout``.
+                "LIVE rung=\(live.id.value)"
+                    + " \(live.size.width)x\(live.size.height)@\(Int(live.frameRate))"
+                    + " \(live.bitrate / 1000)kbps layers=\(live.temporalLayers)"
                     + " codec=hevc source=\(room.videoInput.rawValue)"
                     + " fps=\(Int(launch.frameRate ?? 30))"
                     + " playout=\(launch.playoutMilliseconds.map { "\($0)ms fixed" } ?? "adaptive")"

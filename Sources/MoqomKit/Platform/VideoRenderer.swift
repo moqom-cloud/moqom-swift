@@ -920,7 +920,21 @@ import MoqomCore
             // three percent and two seconds it was the fourth-worst of a hundred and twenty,
             // which moves tens of milliseconds between one reading and the next on a link that
             // has not changed at all.
-            guard slack.count >= 300, let worst = slackQuantile(playoutTolerance) else { return }
+            // Sixty samples, which is two seconds, and this figure only ever describes a cold
+            // start: the window never shrinks once filled, so from the first fill onwards the
+            // count is far above any threshold this could name. It was three hundred, and three
+            // hundred frames is ten seconds of running at whatever the floor happens to be
+            // before the delay is allowed to be anything else.
+            //
+            // Measured from a cold start on two phones, that floor was zero — the application
+            // asks for none and the audio floor is zero until a voice has arrived — so the
+            // schedule spent ten seconds with frames missing their deadlines, drew its evidence
+            // entirely from a depth nobody would choose, then leapt to its ceiling in one step
+            // and spent forty seconds handing it back at the full rate cap.
+            //
+            // Two seconds is a noisier quantile and a much better answer, because the alternative
+            // is not a quieter answer, it is the floor.
+            guard slack.count >= 60, let worst = slackQuantile(playoutTolerance) else { return }
             playoutSlack = worst
 
             let depth = playoutDepth.asSeconds
