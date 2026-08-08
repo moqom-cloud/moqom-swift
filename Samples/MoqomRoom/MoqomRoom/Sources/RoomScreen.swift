@@ -942,10 +942,6 @@ struct BroadcastControls: View {
                     presentation: room.presentation
                 )
 
-                if room.trustedStamp != nil {
-                    LatencyReadout(meter: room.latency)
-                }
-
                 CadenceReadout(meter: room.cadence)
             }
 
@@ -1055,10 +1051,11 @@ struct LinkReadout: View {
 /// own capture stamp, so every frame that reaches the screen has the same glass-to-glass — a
 /// p95 of it described a delay nothing was ever shown at. What varies is arrival, and a frame
 /// that arrives outside the window it was placed in does not arrive late, it is dropped. So
-/// the spread is reported as the link's, where it belongs, and what it costs is reported here
-/// as picture: measured on two phones, a fixed twenty-millisecond hold held glass-to-glass
-/// between 54 and 59ms while the link's own 95th percentile swung from 45 to 97, and the whole
-/// of that swing was three percent of frames rather than sixty milliseconds of delay.
+/// what the spread costs is shown here as picture, and the spread itself — a fact about the
+/// link, not about what anybody saw — stays in the log line: measured on two phones, a fixed
+/// twenty-millisecond hold held glass-to-glass between 54 and 59ms while the link's own 95th
+/// percentile swung from 45 to 97, and the whole of that swing was three percent of frames
+/// rather than sixty milliseconds of delay.
 struct GlassReadout: View {
     let meter: LatencyMeter
 
@@ -1107,9 +1104,9 @@ struct GlassReadout: View {
                 // this used to show and which no frame is ever shown at. The schedule places
                 // every frame at the same offset from its capture, so glass-to-glass for
                 // anything that reaches the screen is one number, not a distribution. A frame
-                // in the arrival tail misses the slot it was placed in and is dropped; the
-                // spread belongs to the link, where it is reported, and what it costs here is
-                // picture rather than time.
+                // in the arrival tail misses the slot it was placed in and is dropped, so what
+                // the spread costs is picture rather than time, and that is what is shown. The
+                // spread itself is a fact about the link and is reported in the log line.
                 Text("glass")
                 if let missed, missed >= 0.005 {
                     Text(String(format: "· %.0f%% dropped", missed * 100))
@@ -1131,6 +1128,23 @@ struct GlassReadout: View {
                 // late" — which is eight seconds, and looked like eight thousand frames.
                 if let margin, margin < 0 {
                     Text(String(format: "· %.0f ms late", -margin * 1000))
+                        .foregroundStyle(.orange)
+                }
+
+                // Here rather than beside the link, because this is the figure it invalidates.
+                // Half of the total is stamped on each phone, so a pair of clocks that have
+                // not agreed does not make the link look slow — it makes the whole number
+                // wrong, and by an amount nothing on screen can show.
+                //
+                // The only clock figure that survived, and the reason it did is that it
+                // measures rather than estimates: frames stamped as arriving before they were
+                // captured cannot happen, so they are proof the clocks are apart rather than a
+                // bound on how far apart they might be. The bound was the other thing here,
+                // and it was a high-water mark carrying a time service's root distance that
+                // cancels between two phones disciplined against the same authority — ±27ms
+                // beside a 36ms median, on a reading that was sound.
+                if reading.impossible > 0 {
+                    Text("· clocks disagree")
                         .foregroundStyle(.orange)
                 }
             } else {
@@ -1166,52 +1180,6 @@ struct GlassReadout: View {
     /// does represent is worth its own words beside the total rather than being
     /// quietly netted off it.
     private var held: Double { max(0, wait * 1000) }
-}
-
-/// The network half of ``GlassReadout``, with the error bar on the measurement.
-///
-/// Half of it is measured on each device, so it only means anything because both stamp frames
-/// on a clock disciplined against the same service — and the error bar on that clock belongs
-/// on screen next to the result rather than tucked into a log line. A median of 60ms taken on
-/// a clock that could be 40ms out is not a latency measurement.
-///
-/// Polled rather than observed, because the meter is written from the frame pump on every
-/// frame and publishing that into SwiftUI would invalidate this view thirty times a second to
-/// move a digit.
-struct LatencyReadout: View {
-    let meter: LatencyMeter
-
-    @State private var reading: LatencyMeter.Reading?
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "timer")
-            if let reading, reading.worst > 0 {
-                Text(String(format: "%.0f ms", reading.median))
-                Text(String(format: "· p95 %.0f ms", reading.p95))
-                Text(String(format: "· ±%.0f ms clock", reading.uncertainty))
-                    .foregroundStyle(reading.uncertainty > reading.median ? .orange : .secondary)
-                if reading.impossible > 0 {
-                    // Not a slow link: a pair of clocks that have not agreed yet. Said
-                    // plainly, because the latencies alongside it are understated by
-                    // however far apart they are.
-                    Text("· clocks disagree")
-                        .foregroundStyle(.orange)
-                }
-            } else {
-                Text("waiting for the other device")
-            }
-        }
-        .font(.caption2.monospacedDigit())
-        .foregroundStyle(.secondary)
-        .task {
-            // A second is faster than anyone reads and slow enough to cost nothing.
-            while !Task.isCancelled {
-                reading = meter.reading()
-                try? await Task.sleep(for: .seconds(1))
-            }
-        }
-    }
 }
 
 /// Frame rate, evenness, and stalls, on the phone that is watching.
