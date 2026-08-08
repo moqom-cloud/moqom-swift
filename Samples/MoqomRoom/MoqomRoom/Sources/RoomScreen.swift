@@ -938,7 +938,8 @@ struct BroadcastControls: View {
                     // The hold, not the headroom. See ``VideoRenderer/playoutHold``.
                     wait: room.playoutHold ?? room.playoutDepth.seconds,
                     margin: room.playoutSlack,
-                    measured: room.trustedStamp != nil
+                    measured: room.trustedStamp != nil,
+                    presentation: room.presentation
                 )
 
                 if room.trustedStamp != nil {
@@ -1048,6 +1049,16 @@ struct LinkReadout: View {
 /// Worth the space it takes because it is the number a person actually experiences and the
 /// only one they can check against the room: hold a hand up, watch it arrive on the other
 /// phone. Everything below this line explains the total; this is the total.
+///
+/// One figure, not a distribution, and the reason is worth stating because this line used to
+/// carry a p95 beside the median. The schedule places every frame at the same offset from its
+/// own capture stamp, so every frame that reaches the screen has the same glass-to-glass — a
+/// p95 of it described a delay nothing was ever shown at. What varies is arrival, and a frame
+/// that arrives outside the window it was placed in does not arrive late, it is dropped. So
+/// the spread is reported as the link's, where it belongs, and what it costs is reported here
+/// as picture: measured on two phones, a fixed twenty-millisecond hold held glass-to-glass
+/// between 54 and 59ms while the link's own 95th percentile swung from 45 to 97, and the whole
+/// of that swing was three percent of frames rather than sixty milliseconds of delay.
 struct GlassReadout: View {
     let meter: LatencyMeter
 
@@ -1066,7 +1077,18 @@ struct GlassReadout: View {
     /// total assembled from two unsynchronised clocks says something false.
     let measured: Bool
 
+    /// What the display layer showed and did not, which is where the arrival tail goes.
+    let presentation: VideoRenderer.Presentation?
+
     @State private var reading: LatencyMeter.Reading?
+
+    /// The previous sample, so the share shown is the one happening now.
+    ///
+    /// A total over the whole run cannot answer the question anyone asks of it: a tenth of the
+    /// frames dropped reads as a broken pipeline, and a tenth dropped during the first two
+    /// seconds and none since reads as a schedule settling.
+    @State private var before: VideoRenderer.Presentation?
+    @State private var missed: Double?
 
     var body: some View {
         HStack(spacing: 8) {
@@ -1081,7 +1103,18 @@ struct GlassReadout: View {
                 Text(String(format: "%.0f ms", reading.median + held))
                     .font(.caption.bold().monospacedDigit())
                     .foregroundStyle(.primary)
-                Text(String(format: "glass · p95 %.0f ms", reading.p95 + held))
+                // What the tail costs, rather than a p95 of the total — which is the figure
+                // this used to show and which no frame is ever shown at. The schedule places
+                // every frame at the same offset from its capture, so glass-to-glass for
+                // anything that reaches the screen is one number, not a distribution. A frame
+                // in the arrival tail misses the slot it was placed in and is dropped; the
+                // spread belongs to the link, where it is reported, and what it costs here is
+                // picture rather than time.
+                Text("glass")
+                if let missed, missed >= 0.005 {
+                    Text(String(format: "· %.0f%% dropped", missed * 100))
+                        .foregroundStyle(missed >= 0.05 ? .orange : .secondary)
+                }
 
                 // Broken out because the two halves answer to different things: the link is
                 // the network and the encoder, and the wait is a policy this app chose. A
@@ -1109,6 +1142,14 @@ struct GlassReadout: View {
         .task {
             while !Task.isCancelled {
                 reading = meter.reading()
+
+                if let now = presentation {
+                    let shown = now.total - (before?.total ?? 0)
+                    let lost = now.dropped - (before?.dropped ?? 0)
+                    if shown > 0 { missed = Double(lost) / Double(shown + lost) }
+                    before = now
+                }
+
                 try? await Task.sleep(for: .seconds(1))
             }
         }
