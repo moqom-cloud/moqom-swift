@@ -992,6 +992,28 @@ import MoqomCore
             let ceiling = bounds.ceiling.asSeconds
             let floor = min(max(bounds.floor, playoutFloor).asSeconds, ceiling)
 
+            // What a person waits is the hold, and the hold can sit well above the delay that was
+            // asked for. The schedule is anchored on one frame's arrival, so whatever headroom
+            // that frame happened to carry is paid by every frame after it, and none of the paths
+            // below can see it: they reason about the request, and ``track(depth:wanted:)`` closes
+            // the difference at half a millisecond per frame.
+            //
+            // A ceiling that governs only the request is not a promise about latency. Measured on
+            // two phones with the ceiling at fifty milliseconds, one leg held sixty-eight at the
+            // median and a hundred and fifty-eight at worst, and broke ninety glass-to-glass on
+            // ninety of a hundred and thirty-nine samples while every figure it published about
+            // itself was inside its bounds.
+            //
+            // Here rather than in ``maintainSchedule(delay:interval:)``, which was tried: a shift
+            // displaces every remembered slack sample, which is correct at this rate and empties
+            // the window at thirty times a second. Bounded to one frame per adjustment, so a large
+            // excess converges over a second or two rather than arriving as a jump.
+            if let hold = playoutHold, hold > ceiling + PlayoutDelay.deadband {
+                drawing.regrids += 1
+                shift(by: -min(hold - ceiling, interval), to: playoutDepth)
+                return
+            }
+
             // What to do is decided in ``PlayoutDelay``, which has no clock and no layer and can
             // therefore be run against a made-up link a thousand times in a test. What follows is
             // only the doing of it.

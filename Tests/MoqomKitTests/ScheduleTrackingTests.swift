@@ -31,6 +31,9 @@ struct ScheduleTrackingTests {
 
         var standing: Double { tracking.standing }
 
+        /// The rate the loop is actually running at, which is what the drain tests are about.
+        var applied: Double { rate }
+
         /// A quarter of a second, which is how often the renderer revises the correction.
         mutating func quarterOfASecond() {
             depth += (drift - rate) * 0.25
@@ -130,6 +133,70 @@ struct ScheduleTrackingTests {
         link.depth = link.wanted
         link.run(seconds: 60)
         #expect(abs(link.depth - link.wanted) < 0.005)
+    }
+
+    @Test("delay above what was asked for is drained in seconds, not minutes")
+    func drainsAnExcessPromptly() {
+        // The fault this answers, measured on a phone: a leg holding a hundred milliseconds more
+        // than it asked for commanded one percent of rate, which needs ten seconds — and the next
+        // burst refilled it long before then, so the excess was permanent rather than slowly
+        // corrected. Its hold sat at sixty-four milliseconds against a fifty-millisecond ceiling
+        // while every figure it published about itself was inside its bounds.
+        var link = Link(drift: 0)
+        link.depth = link.wanted + 0.1
+
+        link.run(seconds: 4)
+
+        // Down to jitter, which is where the gentle loop takes over. The old gain left almost the
+        // whole hundred milliseconds still sitting there at this point.
+        #expect(link.depth - link.wanted < ScheduleTracking.anExcessWorthDraining + 0.005)
+    }
+
+    @Test("a schedule short of its delay is filled with the old caution")
+    func fillsCautiously() {
+        // The asymmetry, which is the whole design: running fast moves towards the publisher's
+        // clock and can at worst empty the queue, while running slow adds the delay this exists
+        // to remove. Only the first gets the extra authority.
+        var link = Link(drift: 0)
+        link.depth = link.wanted - 0.1
+
+        var slowest = 0.0
+        for _ in 0 ..< 40 {
+            link.quarterOfASecond()
+            slowest = min(slowest, link.applied)
+        }
+
+        #expect(slowest >= -ScheduleTracking.mostTrimWorthApplying)
+        #expect(slowest < -0.001)
+    }
+
+    @Test("a depth that drops in one step is not drained on a stale estimate")
+    func stopsDrainingWhatIsGone() {
+        // A re-anchor moves the depth in a single step while the loop's estimate of it takes about
+        // two seconds to follow. Draining on the estimate alone means running five percent fast
+        // across those two seconds against a queue that no longer holds the surplus — a further
+        // hundred milliseconds taken out of it, and the frames that should have filled it shown
+        // late. The gate is the live reading, which is not fooled.
+        var tracking = ScheduleTracking()
+        let wanted = 0.05
+
+        for _ in 0 ..< 8 { _ = tracking.correction(depth: wanted + 0.15, wanted: wanted) }
+        let afterTheReanchor = tracking.correction(depth: wanted, wanted: wanted) ?? 0
+
+        #expect(afterTheReanchor <= ScheduleTracking.mostTrimWorthApplying)
+    }
+
+    @Test("draining an excess teaches the loop nothing about crystals")
+    func drainingIsNotDriftEvidence() {
+        // Why the history is still gated on the tracking clamp rather than whichever one is in
+        // force. A drain is not evidence about crystals, and recording it as such would leave the
+        // loop running fast for the rest of the call with nothing left to correct.
+        var link = Link(drift: 0)
+        link.depth = link.wanted + 0.2
+
+        link.run(seconds: 6)
+
+        #expect(abs(link.standing) < 0.001)
     }
 
     @Test("what was learnt survives a re-anchor")

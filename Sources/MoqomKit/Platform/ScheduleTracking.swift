@@ -54,6 +54,33 @@ struct ScheduleTracking: Sendable, Equatable {
     static let leanOnTheError = 0.1
     static let leanOnItsHistory = 0.000625
 
+    /// What the loop may do when the schedule is holding more delay than was asked for.
+    ///
+    /// Draining an excess and tracking two crystals are different jobs sharing one loop, and
+    /// every figure above is tuned for the second. Drift is tens of parts per million and moves
+    /// over minutes, so a gain of a tenth and a clamp of two percent are generous for it — and
+    /// glacial for the first. Measured on a phone holding a hundred milliseconds more than it
+    /// asked for: the error commanded one percent, which needs ten seconds to drain, and the next
+    /// burst arrived long before that. The excess was not slowly corrected, it was permanent, and
+    /// the leg sat at sixty-four milliseconds of hold against a fifty-millisecond ceiling.
+    ///
+    /// Asymmetric, because the two directions do not carry the same risk. Running fast moves the
+    /// picture towards the publisher's clock, so it closes lip sync rather than opening it, and
+    /// the worst it can do is empty the queue — bounded, and answered by the schedule's own
+    /// re-anchor. Running slow adds delay, which is the thing being drained. So the authority
+    /// goes to the drain direction and the caution stays with the other.
+    ///
+    /// Five percent of a talking head is not visible; ten seconds of avoidable delay is.
+    static let mostDrainWorthApplying = 0.05
+    static let leanOnAnExcess = 1.0
+
+    /// How much more than was asked for counts as an excess rather than jitter.
+    ///
+    /// A frame's worth at thirty a second. Below this the reading is the ordinary unevenness of
+    /// live arrivals, and answering it with the authority above is how a loop ends up wobbling
+    /// the picture's speed in time with the network.
+    static let anExcessWorthDraining = 0.02
+
     /// How much of a new depth reading to believe, against the running estimate.
     ///
     /// An eighth per reading, four readings a second: a couple of seconds of smoothing, which
@@ -96,21 +123,37 @@ struct ScheduleTracking: Sendable, Equatable {
         settled = smoothed
 
         let error = smoothed - wanted
-        let proposed = Self.leanOnTheError * error + standing
+
+        // Draining, or tracking. The distinction is only ever this: whether there is more delay
+        // in the schedule than the caller asked to pay for.
+        //
+        // Both the estimate and the reading in front of it have to agree, because the estimate
+        // takes about two seconds to follow a change and a re-anchor moves the depth in one step.
+        // Without the second condition the loop spends those two seconds draining a surplus that
+        // is already gone — at five percent, which is a further hundred milliseconds off a queue
+        // that no longer has it, and the frames that should have filled it are shown late.
+        let draining = error > Self.anExcessWorthDraining
+            && depth - wanted > Self.anExcessWorthDraining
+        let lean = draining ? Self.leanOnAnExcess : Self.leanOnTheError
+        let most = draining ? Self.mostDrainWorthApplying : Self.mostTrimWorthApplying
+
+        let proposed = lean * error + standing
 
         // The history only accumulates while the correction is one this loop can actually
         // apply. Past the clamp the rate no longer follows the error, so continuing to add it
         // up records authority the loop does not have, and it then spends seconds unwinding
         // that record before it can respond to anything at all. Whatever produces an error that
         // large is not crystal drift.
+        // Against the tracking clamp rather than whichever one is in force, deliberately. This
+        // record is the loop's estimate of how far apart the two crystals are, and a drain is not
+        // evidence about crystals: letting an excess accumulate here would teach the loop a
+        // standing correction for something that has already been drained away, and it would
+        // then run fast for the rest of the call with nothing left to correct.
         if abs(proposed) < Self.mostTrimWorthApplying {
             standing += Self.leanOnItsHistory * error
         }
 
-        let rate = min(
-            Self.mostTrimWorthApplying,
-            max(-Self.mostTrimWorthApplying, Self.leanOnTheError * error + standing)
-        )
+        let rate = min(most, max(-Self.mostTrimWorthApplying, proposed))
 
         guard abs(rate - applied) > Self.worthApplying else { return nil }
         applied = rate
