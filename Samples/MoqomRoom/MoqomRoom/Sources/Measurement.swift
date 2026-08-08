@@ -238,6 +238,19 @@ final class LatencyMeter: @unchecked Sendable {
     /// bound over the whole run and not whatever the clock happened to think at the end.
     private var uncertainty = 0.0
 
+    /// What the clock is worth now, as opposed to the worst it has ever been worth.
+    ///
+    /// Both, because on their own each one misleads. The worst is a high-water mark that never
+    /// comes down: one wide exchange early in a run — and the exchanges early in a run are the
+    /// wide ones, before the clock has collected a sample with a short round trip — stamps that
+    /// figure on every reading for the next hour. Quoted alone it says a measurement is far less
+    /// trustworthy than it is.
+    ///
+    /// Measured, that is exactly what happened: a run reported ±30ms beside a median of 45ms,
+    /// which reads as a figure not worth acting on, while the clock in force had long since
+    /// found a better exchange and narrowed.
+    private var latest = 0.0
+
     /// Frames whose capture time was in the receiver's future.
     ///
     /// Impossible, and therefore worth counting rather than clamping: it means the two
@@ -277,6 +290,7 @@ final class LatencyMeter: @unchecked Sendable {
         lock.withLock {
             frames += 1
             uncertainty = max(uncertainty, bound)
+            latest = bound
             if milliseconds < 0 {
                 impossible += 1
             } else if milliseconds > Self.believable {
@@ -314,6 +328,9 @@ final class LatencyMeter: @unchecked Sendable {
         /// is not a measurement of latency at all.
         var uncertainty: Double
 
+        /// The same bound as the clock stands behind now. See ``LatencyMeter/latest``.
+        var currentUncertainty: Double
+
         /// Frames that arrived before they were captured, which cannot happen.
         var impossible: Int
 
@@ -325,18 +342,20 @@ final class LatencyMeter: @unchecked Sendable {
 
     /// The figures so far, or `nil` while nothing has arrived to measure.
     func reading() -> Reading? {
-        let (sorted, frames, uncertainty, impossible, beyondBelief, worstEver) = lock.withLock {
-            (
-                samples.sorted(), self.frames, self.uncertainty,
-                self.impossible, self.beyondBelief, self.worstEver
-            )
-        }
+        let (sorted, frames, uncertainty, latest, impossible, beyondBelief, worstEver) = lock
+            .withLock {
+                (
+                    samples.sorted(), self.frames, self.uncertainty, self.latest,
+                    self.impossible, self.beyondBelief, self.worstEver
+                )
+            }
         guard !sorted.isEmpty else {
             guard frames > 0 else { return nil }
             return Reading(
                 frames: frames,
                 median: 0, p95: 0, p99: 0, worst: 0,
                 uncertainty: uncertainty,
+                currentUncertainty: latest,
                 impossible: impossible,
                 beyondBelief: beyondBelief
             )
@@ -353,6 +372,7 @@ final class LatencyMeter: @unchecked Sendable {
             p99: percentile(0.99),
             worst: worstEver,
             uncertainty: uncertainty,
+            currentUncertainty: latest,
             impossible: impossible,
             beyondBelief: beyondBelief
         )
@@ -371,13 +391,14 @@ final class LatencyMeter: @unchecked Sendable {
         }
 
         var line = String(
-            format: "latency frames=%d p50=%.1f p95=%.1f p99=%.1f max=%.1f ms ±%.1f",
+            format: "latency frames=%d p50=%.1f p95=%.1f p99=%.1f max=%.1f ms ±%.1f now±%.1f",
             reading.frames,
             reading.median,
             reading.p95,
             reading.p99,
             reading.worst,
-            reading.uncertainty
+            reading.uncertainty,
+            reading.currentUncertainty
         )
         if reading.impossible > 0 { line += " (\(reading.impossible) before capture)" }
         // Named as a stepped clock rather than left to be read as a slow link, which is
