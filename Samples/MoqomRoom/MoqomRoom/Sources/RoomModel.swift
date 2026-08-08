@@ -869,6 +869,12 @@ final class RoomModel {
     /// Whether that turn is being done in software because the connection would not.
     var cameraTurnsInSoftware: Bool { camera?.softwareTurns ?? false }
 
+    /// What the camera costs before a frame is anybody's to encode.
+    ///
+    /// Part of the sensor-to-arrival figure and charged to the link by it, which is how a
+    /// device cost comes to be read as a network one.
+    var cameraDelivery: StageLatency? { camera?.deliveryLatency }
+
     /// How often the system has taken the camera away, and what it said the last time.
     /// What each participant was last reported as having lost, so a change can
     /// be told from a repeat. See the `.muteChanged` case in ``handle(_:)``.

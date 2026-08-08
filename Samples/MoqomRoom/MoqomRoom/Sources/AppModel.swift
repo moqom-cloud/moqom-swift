@@ -731,6 +731,17 @@ final class AppModel {
                     )
                 }
 
+                // Hoisted rather than inlined below: the chain it belongs to is long enough
+                // that adding one more term puts the type-checker past its own budget.
+                let delivered = room.cameraDelivery.map {
+                    String(
+                        format: " deliver p50=%.1f p95=%.1f max=%.1f ms",
+                        $0.median,
+                        $0.p95,
+                        $0.worst
+                    )
+                } ?? ""
+
                 Journal.shared.say(
                     "GRAB \(room.captureCadence.report())"
                         // What is in those frames, not just how many. Near zero is a black
@@ -744,6 +755,10 @@ final class AppModel {
                         // and were half a turn apart, so a run where the phones disagree about
                         // which way up they are is a run where this line disagrees too.
                         + (room.cameraTurnsInSoftware ? "(sw)" : "")
+                        // What the camera cost before the encoder saw the frame, which the
+                        // sensor-to-arrival figure charges to the link because it happens
+                        // between the stamp and the first thing this code runs.
+                        + delivered
                         // Whether the freezes in the cadence beside this are the system taking
                         // the camera away. They are not the same problem as a slow queue and
                         // they are indistinguishable from one downstream.

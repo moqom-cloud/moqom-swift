@@ -85,6 +85,23 @@ import MoqomCore
         /// The last frame's sensor stamp, on the capture queue only. See ``captureOutput``.
         private var lastCaptureStamp: CMTime?
 
+        /// How long the system held a frame the sensor had already stamped.
+        ///
+        /// The one stage of the capture path nothing measured, and it is charged to the network
+        /// by every figure that does. A sample buffer's stamp is written when the sensor read the
+        /// row; this callback runs after readout and after whatever the image pipeline does in
+        /// between, and none of that is free — but it lands inside the sensor-to-arrival figure
+        /// alongside the encoder and the radio, where it looks like transport cost.
+        ///
+        /// Worth measuring because of the size of the hole. On two phones the whole path was
+        /// observed at 29ms and is currently costing 47ms, of which the network accounts for 15
+        /// and the encoder for 7. The remaining 25 were attributed to nothing at all, and this is
+        /// the larger of the two places they can be.
+        private var delivery = StageMeter()
+
+        /// What the sensor's stamp to this callback costs, in milliseconds.
+        public var deliveryLatency: StageLatency { lock.withLock { delivery.summary } }
+
         /// Guards ``position`` and ``publishesMirrored``, which are read from
         /// whatever thread the interface runs on and written from there too,
         /// while the capture queue reads them to configure the session.
@@ -705,6 +722,17 @@ import MoqomCore
                 }
             }
             lastCaptureStamp = timestamp
+
+            // Against the host clock, because that is the clock capture stamps are on. Bounded
+            // before it is recorded: a stamp from a session that has just restarted can sit on
+            // the far side of a discontinuity, and one such sample is a percentile nobody can
+            // act on sitting in the same line as figures they can.
+            let handed = CMTimeGetSeconds(
+                CMTimeSubtract(CMClockGetTime(CMClockGetHostTimeClock()), timestamp)
+            )
+            if handed > 0, handed < 1 {
+                lock.withLock { delivery.record(.seconds(handed)) }
+            }
 
             let turned = upright(captured)
             let buffer = turned ?? captured
