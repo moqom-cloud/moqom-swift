@@ -689,10 +689,16 @@ final class CadenceMeter: @unchecked Sendable {
         }
     }
 
+    /// What each figure here describes, since they do not all describe the same thing.
+    ///
+    /// ``rate``, ``median``, ``p95`` and ``worst`` are taken over the recent window and answer
+    /// "how is it going now". ``frames``, ``freezes``, ``frozen`` and ``period`` are totals for
+    /// the session and answer "what has happened so far". Mixing the two silently is what made
+    /// the frame rate misreport; keeping the split explicit is what stops it happening again.
     struct Reading: Sendable {
         var frames: Int
 
-        /// Frames per second, over the whole run.
+        /// Frames per second, over the recent window rather than the session.
         var rate: Double
 
         /// Milliseconds between one arrival and the next.
@@ -744,10 +750,31 @@ final class CadenceMeter: @unchecked Sendable {
             }
             let span = Double((last - first).components.seconds)
                 + Double((last - first).components.attoseconds) / 1e18
+
+            // Over the same window as the gaps, because the two are read side by side and a
+            // session average beside a moving percentile is a readout that contradicts itself.
+            //
+            // Dividing every frame ever seen by the whole elapsed session was not wrong so much
+            // as answering a different question from the one being asked. It opens wild, since
+            // the first arrivals set it outright and a buffer draining at connect can put two
+            // of them a millisecond apart - the crash-looping logs read 168fps beside a median
+            // gap of 0.1ms. Then it converges on the average for the session as a whole, which
+            // is the one number nobody watching wants: a stream idle or stalled for half its
+            // life reads half rate while running perfectly, next to a 17ms gap saying sixty,
+            // and no amount of good behaviour afterwards moves it while the dead time stays in
+            // the denominator.
+            //
+            // Summing the intervals rather than counting against the clock, so the window is
+            // exactly the set of samples the percentiles come from - about fifteen seconds at
+            // sixty frames a second, and proportionally longer when the stream is slower, which
+            // is the right way round for a figure that has to settle before it can be read. A
+            // stall now shows up and then leaves: ten seconds of nothing reads about 36fps
+            // until it ages out of the window, rather than marking the session permanently.
+            let elapsed = gaps.reduce(0, +) / 1000
             return (
                 gaps.sorted(),
                 frames,
-                span > 0 ? Double(frames) / span : 0,
+                elapsed > 0 ? Double(gaps.count) / elapsed : 0,
                 freezes,
                 span > 0 ? (frozen / 1000) / span : 0,
                 freezesOnKeyFrame,
