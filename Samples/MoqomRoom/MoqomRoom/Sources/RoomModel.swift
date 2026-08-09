@@ -199,6 +199,20 @@ final class RoomModel {
     /// margin, and it is the number to revisit first if frames start disappearing between the
     /// renderer and the glass.
     ///
+    /// Measured at twenty over another twenty minutes, that fit held: the hold came down from 44
+    /// and 50 to 22 and 20, and the display layer refused nothing at all — zero skipped frames of
+    /// seventy-two thousand, delivery 99.8% and 100%, no freezes, and no change in loss. The
+    /// controller also calmed down on its own, widening twenty-two times against seventy-five,
+    /// because most of what it was doing before was climbing into room that existed. Worth being
+    /// careful about the headline: glass read 64 and 69 against 90 and 93, but the link was
+    /// friendlier that run too — a 51.6ms 95th percentile against 97.3 — so about twenty of that
+    /// twenty-five is this ceiling and the rest was the network. The hold is the honest measure of
+    /// what changed here, and it is measured directly.
+    ///
+    /// Left standing: the hold still overshoots to nearly four times this, 76 to 78ms, and
+    /// ``VideoRenderer``'s correction for it fires about nine hundred times in twenty minutes.
+    /// Lowering the ceiling did not touch that, and it is the next thing wrong in this area.
+    ///
     /// What it costs is still the frames out in the tail, which arrive too late to be shown on
     /// time whatever this says — the choice is between showing them late and not showing them, not
     /// between having them and not. The cumulative tail is real, a 154ms 99th percentile and a
