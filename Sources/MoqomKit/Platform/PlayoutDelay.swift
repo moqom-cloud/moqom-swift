@@ -76,6 +76,35 @@ enum PlayoutDelay {
         min(max(floor, display + deadband), ceiling)
     }
 
+    /// How far to move the grid down when the frames are waiting longer than the ceiling allows.
+    ///
+    /// Separate from ``adjustment(headroom:delay:floor:ceiling:interval:mayGiveBack:mayTighten:display:)``
+    /// because it answers a different question. That one steers on headroom — how much margin
+    /// arrivals have — and this one on the hold, which is what a person actually waits. The two
+    /// disagree whenever the schedule is anchored on a late frame, and the ceiling is a promise
+    /// about the second.
+    ///
+    /// The whole excess, capped at a frame. Handing back a fifth of it instead was tried, on the
+    /// reasoning that the hold is a median over five seconds and this runs twice a second, so
+    /// correcting all of a measurement that stale applies the correction five times before it can
+    /// be seen to have worked — gain against lag, and a simulation of exactly that arrangement
+    /// produced the sawtooth two phones were showing, then sat still when the gain came down.
+    /// On device it changed nothing: the correction still fired 0.77 times a second against 1.1,
+    /// the hold median moved 29 to 27 on one phone and 29 to 31 on the other, and glass-to-glass
+    /// did not move at all. So the gain is not what is driving this, and the reason is visible in
+    /// the same stats line — `floor=20ms` beside a 20ms ceiling. Lip sync had raised the floor to
+    /// meet the ceiling, leaving the delay controller a range of zero and no move it is allowed
+    /// to make, which is why it decided four times in six minutes while this fired 276. With the
+    /// controller unable to act, this is the only thing enforcing the ceiling, and slowing it
+    /// down only makes the ceiling later.
+    ///
+    /// - Returns: The seconds to move the grid down by, or `nil` when the hold is within the
+    ///   ceiling and there is nothing to hand back.
+    static func ceilingCorrection(hold: Double, ceiling: Double, interval: Double) -> Double? {
+        guard hold > ceiling + deadband else { return nil }
+        return min(hold - ceiling, interval)
+    }
+
     /// One move, or none.
     ///
     /// - Parameters:

@@ -736,6 +736,19 @@ import MoqomCore
             /// frame rate, and the smoothing it provides is not being had.
             public var regrids = 0
 
+            /// Times the grid was moved down to bring the hold back under the ceiling.
+            ///
+            /// Counted apart from ``regrids``, which it shared until the conflation hid a fault
+            /// for the length of an investigation: four hundred of these beside two decisions by
+            /// the delay controller reads as a grid restarting for no reason, and was in fact the
+            /// ceiling being enforced twice a second. Different events, different causes, and
+            /// only one of them is about the source's timeline.
+            ///
+            /// Occasional is the design — the hold drifts above the ceiling and is walked back.
+            /// About one a second is this correcting faster than it can measure, and the hold
+            /// underneath it is a sawtooth rather than a setting.
+            public var handbacks = 0
+
             /// Times the publisher changed the shape of the picture.
             ///
             /// A host switching layout, and expected to be occasional and deliberate. Worth
@@ -1008,9 +1021,15 @@ import MoqomCore
             // displaces every remembered slack sample, which is correct at this rate and empties
             // the window at thirty times a second. Bounded to one frame per adjustment, so a large
             // excess converges over a second or two rather than arriving as a jump.
-            if let hold = playoutHold, hold > ceiling + PlayoutDelay.deadband {
-                drawing.regrids += 1
-                shift(by: -min(hold - ceiling, interval), to: playoutDepth)
+            if let hold = playoutHold,
+               let handBack = PlayoutDelay.ceilingCorrection(
+                   hold: hold,
+                   ceiling: ceiling,
+                   interval: interval
+               )
+            {
+                drawing.handbacks += 1
+                shift(by: -handBack, to: playoutDepth)
                 return
             }
 

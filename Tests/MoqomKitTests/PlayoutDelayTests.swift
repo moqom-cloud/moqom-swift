@@ -280,6 +280,37 @@ struct PlayoutDelayTests {
         #expect(PlayoutDelay.margin(refresh: 1.0 / 30) == PlayoutDelay.margin)
     }
 
+    /// A hold inside the ceiling is not something to correct, and the deadband is what stops the
+    /// grid being nudged by the last digit of a median.
+    @Test("a hold within the ceiling is left alone")
+    func nothingToHandBack() {
+        #expect(PlayoutDelay.ceilingCorrection(hold: 0.020, ceiling: 0.020, interval: 1.0 / 60)
+            == nil)
+        #expect(PlayoutDelay.ceilingCorrection(hold: 0.024, ceiling: 0.020, interval: 1.0 / 60)
+            == nil)
+    }
+
+    /// An excess above the ceiling is handed back in full, because with lip sync holding the floor
+    /// at the ceiling this is the only thing left that can enforce it.
+    @Test("an excess above the ceiling is handed back")
+    func handsBackTheExcess() {
+        let correction = PlayoutDelay.ceilingCorrection(
+            hold: 0.030,
+            ceiling: 0.020,
+            interval: 1.0 / 60
+        )
+        #expect(correction.map { abs($0 - 0.010) < 1e-9 } == true)
+    }
+
+    /// The cap survives, because a large excess arriving as one jump is a visible lurch whatever
+    /// the gain says.
+    @Test("no single pass moves the picture more than a frame")
+    func neverMoreThanAFrame() {
+        let interval = 1.0 / 60
+        #expect(PlayoutDelay.ceilingCorrection(hold: 2.0, ceiling: 0.020, interval: interval)
+            == interval)
+    }
+
     /// The point of the whole exercise: on a faster panel the delay settles lower, because the
     /// target it is aiming at is what the display needs and the display needs less.
     @Test("a faster panel settles the delay lower")

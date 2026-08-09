@@ -655,9 +655,10 @@ final class AppModel {
                         // changed shape while the tile did not is a reshape the receiver
                         // took and the interface ignored, which reads as letterboxing.
                         + String(
-                            format: " shape=%@ reshapes=%d",
+                            format: " shape=%@ reshapes=%d handbacks=%d",
                             room.receivedShape.map { "\($0.width)x\($0.height)" } ?? "unknown",
-                            drawn.reshapes
+                            drawn.reshapes,
+                            drawn.handbacks
                         )
                         // And whether anything is presenting them. A rate of zero is a queue
                         // filling up behind a clock that never started, which every count above
