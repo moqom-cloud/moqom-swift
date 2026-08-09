@@ -300,13 +300,18 @@ struct RelayConfiguration {
     var credential: Credential? { token.isEmpty ? nil : Credential(token) }
 
     /// A transport that dials this relay, or the loopback where there is none.
-    func transport() -> any Transport {
+    ///
+    /// - Parameter bestEffort: leaves the connection unmarked, as it was before
+    ///   the radio was asked for an interactive queue. Here to measure the
+    ///   difference rather than to argue about it.
+    func transport(bestEffort: Bool = false) -> any Transport {
         #if canImport(Network)
             guard host != nil else { return LoopbackTransport() }
             return MoqtTransport.network(
                 trust: certificateHashes.isEmpty
                     ? .system
-                    : .pinned(base64CertificateHashes: certificateHashes)
+                    : .pinned(base64CertificateHashes: certificateHashes),
+                serviceClass: bestEffort ? .bestEffort : NetworkQUICCarrier.serviceClass
             )
         #else
             return LoopbackTransport()
@@ -424,6 +429,13 @@ struct LaunchOptions {
     /// either of them from the volume buttons while the session is a call.
     var mediaVolume = false
 
+    /// Dial the relay unmarked, in the queue a background download would get.
+    ///
+    /// See ``NetworkQUICCarrier/serviceClass``. The A side of that measurement: the shipping
+    /// default asks the radio for an interactive queue, and the only way to know what that
+    /// bought is to run the same build without it.
+    var bestEffort = false
+
     /// What to give the encoder, overriding what the frame rate would imply.
     ///
     /// A separate knob because bitrate and frame rate are separate questions, and
@@ -515,6 +527,7 @@ struct LaunchOptions {
             case "--eager-encoding": options.eagerEncoding = true
             case "--plain-capture": options.plainCapture = true
             case "--media-volume": options.mediaVolume = true
+            case "--best-effort": options.bestEffort = true
             case "--fps": options.frameRate = value.flatMap(Double.init)
             case "--kbps": options.kilobitsPerSecond = value.flatMap(Int.init)
             case "--stats-ms": options.statisticsMilliseconds = value.flatMap(Int.init)

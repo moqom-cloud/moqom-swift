@@ -386,6 +386,7 @@ final class AppModel {
                     + " layers=\(launch.flatLayers ? "flat" : "temporal")"
                     + " encode=\(launch.eagerEncoding ? "eager" : "efficient")"
                     + " audio=\(room.isPublishingAudio ? (launch.audio ?? "on") : "off")"
+                    + " queue=\(launch.bestEffort ? "best-effort" : "interactive-video")"
             )
 
             if let every = launch.reshapeEverySeconds {
@@ -1162,7 +1163,7 @@ final class AppModel {
                 device: DeviceID(thumbprint: Self.deviceThumbprint)
             )
             let session = MoqomSession(
-                transport: relay.transport(),
+                transport: relay.transport(bestEffort: launch.bestEffort),
                 credentials: DeviceCredentials(
                     identity: identity,
                     // Minted by whatever stands in for this application's server: the

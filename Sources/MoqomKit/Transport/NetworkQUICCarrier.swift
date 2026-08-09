@@ -64,6 +64,28 @@
         /// dial again — so the cost of being wrong here is one more attempt.
         public static let defaultHandshakeTimeout: Duration = .seconds(8)
 
+        /// Which queue the radio should put this connection's packets in.
+        ///
+        /// Unmarked traffic is `bestEffort`, which on Wi-Fi means the same WMM
+        /// access category and the same contention backoff as a background
+        /// download. That is the wrong queue for media, and on a real network
+        /// it is the dominant cost: measured against the access point, the
+        /// local hop ran at a 12.7ms mean against its own 2.7ms floor, and
+        /// carried 20.5 of the path's 23.2ms of deviation — nearly all of the
+        /// jitter, on the one hop each frame crosses twice.
+        ///
+        /// Interactive video rather than interactive voice. Voice contends
+        /// slightly sooner but is granted a much shorter transmit opportunity,
+        /// which is sized for a 20ms speech packet and not for a video frame;
+        /// a frame that does not fit waits for the next opportunity, so the
+        /// higher priority would buy latency on the small packets and lose
+        /// more of it on the large ones.
+        ///
+        /// This is a request, not a guarantee. An access point that ignores
+        /// WMM, or one saturated by other clients, will schedule this the same
+        /// as anything else.
+        public static let serviceClass: NWParameters.ServiceClass = .interactiveVideo
+
         /// Dial a relay.
         ///
         /// - Parameter alpn: offered in preference order. Version negotiation
@@ -80,16 +102,25 @@
             alpn: [String],
             trust: RelayTrust = .system,
             idleTimeout: Duration = NetworkQUICCarrier.defaultIdleTimeout,
-            handshakeTimeout: Duration = NetworkQUICCarrier.defaultHandshakeTimeout
+            handshakeTimeout: Duration = NetworkQUICCarrier.defaultHandshakeTimeout,
+            serviceClass: NWParameters.ServiceClass = NetworkQUICCarrier.serviceClass
         ) async throws(MoqomError) -> NetworkQUICCarrier {
             guard let port = NWEndpoint.Port(rawValue: port) else {
                 throw MoqomError.transport(.unreachable)
             }
             let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: port)
 
-            let connection = NetworkConnection(to: endpoint) {
-                Self.quic(alpn: alpn, trust: trust, idleTimeout: idleTimeout)
-            }.start()
+            // The service class belongs to the parameters rather than to the
+            // protocol stack, which is why this is not another line inside
+            // `quic(alpn:trust:idleTimeout:)`.
+            let connection = NetworkConnection(
+                to: endpoint,
+                using: NWParametersBuilder
+                    .parameters {
+                        Self.quic(alpn: alpn, trust: trust, idleTimeout: idleTimeout)
+                    }
+                    .serviceClass(serviceClass)
+            ).start()
 
             // Made before the handshake is awaited, because the state handler
             // that resolves readiness is also the one that reports a later
@@ -545,9 +576,15 @@
         /// - Parameter trust: leave at ``RelayTrust/system`` unless the relay's
         ///   certificate is one the platform has no way to validate — a
         ///   development relay, or a self-hosted deployment behind a private CA.
+        /// - Parameter serviceClass: which queue the radio should use. Leave at
+        ///   ``NetworkQUICCarrier/serviceClass`` for anything a person is
+        ///   watching live; `background` suits a transport that only carries
+        ///   recordings, and yields to interactive traffic instead of
+        ///   competing with it.
         static func network(
             trust: RelayTrust = .system,
-            idleTimeout: Duration = NetworkQUICCarrier.defaultIdleTimeout
+            idleTimeout: Duration = NetworkQUICCarrier.defaultIdleTimeout,
+            serviceClass: NWParameters.ServiceClass = NetworkQUICCarrier.serviceClass
         ) -> MoqtTransport {
             MoqtTransport { endpoint, _ in
                 try await NetworkQUICCarrier.connect(
@@ -555,7 +592,8 @@
                     port: endpoint.port,
                     alpn: endpoint.alpn,
                     trust: trust,
-                    idleTimeout: idleTimeout
+                    idleTimeout: idleTimeout,
+                    serviceClass: serviceClass
                 )
             }
         }
