@@ -173,22 +173,40 @@ final class RoomModel {
     /// at is then set by the link — the renderer keeps a few milliseconds of margin so a frame is
     /// not at the mercy of the next refresh, and adds to it only as far as the jitter demands.
     ///
-    /// The ceiling is fifty milliseconds, and it is a promise rather than an estimate. It was a
-    /// quarter of a second, on the reasoning that the ceiling is only reached while the link is
+    /// The ceiling is a promise rather than an estimate, which is why it keeps coming down. It was
+    /// a quarter of a second, on the reasoning that the ceiling is only reached while the link is
     /// misbehaving and a deep buffer beats the alternative during that. Measured, the link
     /// misbehaves often enough for that to be the experience rather than the exception: arrivals
     /// through Los Angeles hold a 40ms median for minutes and then put a 124ms 95th percentile on
     /// top of it, the delay follows all the way up, and a conversation that reads 58ms most of the
-    /// time reads 258ms during it.
+    /// time reads 258ms during it. So it became fifty, on the arithmetic that a 40ms median arrival
+    /// plus fifty is ninety.
     ///
-    /// Fifty because the sum is what a person notices and the other half of it is the link: a 40ms
-    /// median arrival plus fifty is ninety, so this is what makes "under ninety" a property of the
-    /// build rather than a hope about the network. What it costs is the frames out in the tail
-    /// during those minutes, which arrive too late to be shown on time whatever this says — the
-    /// choice is between showing them late and not showing them, not between having them and not.
+    /// Now twenty, because fifty turned out to be the answer rather than the bound in the same way
+    /// the floor once was. Twenty minutes on two phones with adaptation left alone: the requested
+    /// depth sat at fifty, its ceiling, for the whole run — not hunting, pinned — with the floor
+    /// reading zero in two hundred and eleven of two hundred and forty samples, so nothing about
+    /// lip sync was holding it up. It widened seventy-five times and tightened eight, which is the
+    /// mechanism: the controller sizes from the fifth percentile of headroom, so it provisions for
+    /// a one-in-twenty event, and it gives that provision back grudgingly. Glass-to-glass read 90
+    /// to 93ms against 65 to 66ms for the same link with the delay pinned at twenty, and what the
+    /// extra twenty-six milliseconds bought was six frames of seventy-one thousand.
+    ///
+    /// Twenty is not arbitrary and is not much room: ``PlayoutDelay/margin(refresh:)`` resolves to
+    /// twelve milliseconds on the 120Hz panels this is measured on, and starving that is what
+    /// silently dropped 581 frames of 1740 once, so eight milliseconds of this is all there is for
+    /// jitter. Eight is what the recent-window arrival spread measured. That is a fit, not a
+    /// margin, and it is the number to revisit first if frames start disappearing between the
+    /// renderer and the glass.
+    ///
+    /// What it costs is still the frames out in the tail, which arrive too late to be shown on
+    /// time whatever this says — the choice is between showing them late and not showing them, not
+    /// between having them and not. The cumulative tail is real, a 154ms 99th percentile and a
+    /// 1.9s worst, and nothing here claims that a deep buffer never earns its keep. It claims that
+    /// it did not earn twenty-six milliseconds on two runs of two hundred and thirty-four samples.
     var playoutBounds: (floor: Duration, ceiling: Duration)? = (
         floor: .zero,
-        ceiling: .milliseconds(50)
+        ceiling: .milliseconds(20)
     )
 
     /// The delay currently in force on a remote tile, for display. See
