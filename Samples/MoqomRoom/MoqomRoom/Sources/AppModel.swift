@@ -1111,7 +1111,7 @@ final class AppModel {
     /// A clock disciplined against the same service the other device uses.
     private static func trustedClock() throws -> TrustedClock {
         TrustedClock(
-            authority: NTPAuthority(exchange: try UDPExchange.cloudflare())
+            authority: NTPAuthority(exchange: try UDPExchange.apple())
         )
     }
 

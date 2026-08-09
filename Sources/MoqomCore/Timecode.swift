@@ -30,7 +30,7 @@
 //
 // # On leap seconds
 //
-// The reference is `time.cloudflare.com`, which does not smear: it forwards the
+// The reference is `time.apple.com`, which does not smear: it forwards the
 // leap indicator and lets the kernel step, so UTC really does repeat a second.
 // The smearing alternative — Google and AWS spread the second over 24 hours —
 // keeps the clock continuous at the cost of being knowingly up to half a second

@@ -220,7 +220,7 @@ public actor TrustedClock {
         guard anchor.disciplined, uncertainty <= trustCeiling else { return .fallback() }
 
         return Timecode(
-            nanoseconds: anchor.trusted &+ elapsed.wholeNanoseconds,
+            nanoseconds: anchor.projected(after: elapsed),
             uncertainty: uncertainty,
             trust: .synchronised
         )
@@ -302,9 +302,13 @@ public actor TrustedClock {
             )
         )
 
+        let drift = anchors.last?.drift ?? .unmeasured
         logger.debug(.session, "time exchange", [
             LogField("roundTripMs", .number(Int(roundTrip.wholeNanoseconds / 1_000_000))),
             LogField("disciplined", .flag(reading.isDisciplined)),
+            LogField("driftPpm", .number(Int((drift.rate * 1_000_000).rounded()))),
+            LogField("driftBoundPpm", .number(Int((drift.bound * 1_000_000).rounded()))),
+            LogField("anchors", .number(anchors.count)),
         ])
         announceTrust()
         return true
@@ -358,7 +362,7 @@ public actor TrustedClock {
         }
 
         let elapsed = candidate.continuous - best.continuous
-        let projected = best.trusted &+ elapsed.wholeNanoseconds
+        let projected = best.projected(after: elapsed)
         let disagreement = Duration.nanoseconds((candidate.trusted &- projected).magnitude)
         let tolerated = max(
             (best.uncertainty(after: elapsed) + candidate.measurement) * 4,
@@ -396,7 +400,7 @@ public actor TrustedClock {
         let previous = quarantine[quarantine.count - 2]
         let latest = quarantine[quarantine.count - 1]
         let elapsed = latest.continuous - previous.continuous
-        let projected = previous.trusted &+ elapsed.wholeNanoseconds
+        let projected = previous.projected(after: elapsed)
         let disagreement = Duration.nanoseconds((latest.trusted &- projected).magnitude)
         return disagreement <= max(
             (previous.uncertainty(after: elapsed) + latest.measurement) * 4,
@@ -407,7 +411,35 @@ public actor TrustedClock {
     private func trim() {
         if anchors.count > Self.window { anchors.removeFirst(anchors.count - Self.window) }
         if quarantine.count > Self.window { quarantine.removeFirst(quarantine.count - Self.window) }
+        remeasureDrift()
         published.store(mostInformative(at: continuous()))
+    }
+
+    /// Refit the local oscillator's rate across the anchors that are left.
+    ///
+    /// Every anchor gets the same estimate, including the old ones. They were
+    /// taken by the same crystal, so a rate measured now is the best available
+    /// description of what they have been doing since — and ``mostInformative``
+    /// compares them by a projection that needs it.
+    private func remeasureDrift() {
+        guard let reference = anchors.first else { return }
+        let drift = ClockDrift.estimate(
+            from: anchors.map { anchor in
+                let seconds = Double(
+                    (anchor.continuous - reference.continuous).wholeNanoseconds
+                ) / 1_000_000_000
+                let accumulated = Double(
+                    (anchor.trusted &- reference.trusted)
+                        &- (anchor.continuous - reference.continuous).wholeNanoseconds
+                ) / 1_000_000_000
+                return ClockDrift.Observation(
+                    seconds: seconds,
+                    error: accumulated,
+                    measurement: Double(anchor.measurement.wholeNanoseconds) / 1_000_000_000
+                )
+            }
+        )
+        for index in anchors.indices { anchors[index].drift = drift }
     }
 
     /// The chosen anchor, behind a lock so ``stamp`` can read it off the actor.
@@ -557,16 +589,37 @@ public actor TrustedClock {
         /// straight after the boundary rather than waiting for the next poll.
         let leapAt: Int64?
 
+        /// The local oscillator's rate error as last measured.
+        ///
+        /// Carried on the anchor rather than read from the actor so that
+        /// ``TrustedClock/timecode(from:at:)`` stays a pure function of its
+        /// inputs, which is what lets ``TrustedClock/stamp`` run it off the
+        /// actor against a published copy. Every anchor in the window is
+        /// restamped when a new exchange improves the estimate.
+        var drift: ClockDrift = .unmeasured
+
+        /// Where this anchor says trusted time is, some time later.
+        ///
+        /// The rate correction is the difference between a clock that assumes
+        /// the local crystal is perfect and one that has measured it. Without
+        /// it the error is real but merely admitted to; with it the projection
+        /// is right and the admission shrinks to what the measurement missed.
+        func projected(after elapsed: Duration) -> Int64 {
+            let nanoseconds = max(.zero, elapsed).wholeNanoseconds
+            let correction = drift.correction(after: Double(nanoseconds) / 1_000_000_000)
+            return trusted &+ nanoseconds &+ Int64(correction * 1_000_000_000)
+        }
+
         /// What this anchor is worth after some time has passed.
         func uncertainty(after elapsed: Duration) -> Duration {
             let seconds = Double(max(.zero, elapsed).wholeNanoseconds) / 1_000_000_000
-            let drift = Duration.nanoseconds(
-                Int64(seconds * TrustedClock.maximumDrift * 1_000_000_000)
+            let grown = Duration.nanoseconds(
+                Int64(drift.uncertainty(after: seconds) * 1_000_000_000)
             )
             guard let leapAt, trusted &+ max(.zero, elapsed).wholeNanoseconds >= leapAt else {
-                return measurement + drift
+                return measurement + grown
             }
-            return measurement + drift + TrustedClock.leapWindow
+            return measurement + grown + TrustedClock.leapWindow
         }
 
         /// Whether this anchor has been projected across a leap boundary.

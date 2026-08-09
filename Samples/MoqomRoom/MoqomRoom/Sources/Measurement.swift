@@ -66,7 +66,42 @@ import MoqomKit
 /// The correction is taken once, when the offset settles, rather than tracked. A floor that
 /// improved later would otherwise walk the timestamps forward a fraction of a millisecond at a
 /// time, which is exactly the per-frame noise this design exists to avoid.
+///
+/// # Why the offset itself cannot be a constant
+///
+/// It was one, for the whole run, and that is a rate error dressed up as a simplification. The
+/// capture time comes off `CMClockGetHostTimeClock` and the shared time comes off the trusted
+/// clock; those are different oscillators, so their difference is a line with a slope, not a
+/// number. Freezing it means the published timestamps drift at whatever that slope is, forever.
+///
+/// Twenty minutes of two phones in a room is what it takes to see: the receiving end's latency
+/// climbed 1.29ms a minute in a straight line, R² of 0.96, twenty-two milliseconds by the end and
+/// still going. That is 21.6 parts per million — a crystal, not a queue, and a queue was the
+/// theory until the line turned out to be straight. It only showed on one direction because the
+/// two phones' crystals differ, and it never tripped the quarter-second re-anchor below because
+/// at that slope the guard needs three and a half hours. The same mismatch is what the receiver
+/// reports as the publisher's clock having stepped: before the clock learned its own rate it
+/// re-anchored in jumps, and a frozen offset turns each one into a step on the wire.
+///
+/// So the offset tracks, but slowly. The target is a rolling minimum rather than the latest
+/// reading, for the same reason the settling phase takes a minimum — the clock difference is the
+/// same every frame and the delivery that reveals it is not. Moving toward it is capped at
+/// ``slewLimit``, which is the whole trick: fast enough to absorb any rate error an oscillator can
+/// produce, slow enough that the correction per frame is a few microseconds and the sensor's
+/// spacing survives intact. Judder needs milliseconds. This cannot reach one.
 struct TimedSource: FrameSource {
+    /// How fast the offset may be corrected, as a fraction of elapsed time.
+    ///
+    /// Two hundred parts per million: twice the widest rate error ``TrustedClock`` will admit
+    /// between two clocks, so there is margin to track the worst pairing and still converge, and
+    /// two hundred microseconds a second is three microseconds across a frame at sixty.
+    static let slewLimit = 200.0 / 1_000_000.0
+
+    /// How much history the rolling minimum is taken over.
+    ///
+    /// Long enough that a run of slow deliveries cannot drag the target with it, short enough to
+    /// follow a real change within a couple of seconds.
+    static let windowSeconds = 4.0
     private let wrapped: any FrameSource
     private let stamp: @Sendable () -> Timecode
     private let floor: @Sendable () -> Double?
@@ -97,6 +132,7 @@ struct TimedSource: FrameSource {
                 // those the reading per frame is all there is.
                 var offset: Int64?
                 var settling = 0
+                var tracker = OffsetTracker()
 
                 // What the offset absorbed of the capture path, taken once when the offset stops
                 // moving and held for the run. Zero until then, and zero for good on a source
@@ -121,6 +157,7 @@ struct TimedSource: FrameSource {
                         // every frame in the run.
                         case let .some(current) where settling < 60:
                             offset = min(current, candidate)
+                            tracker.observe(candidate, at: captured)
 
                         // Re-anchored on a gross discrepancy and only then. A quarter of a second
                         // is far more than scheduling ever accounts for and far less than a clock
@@ -130,7 +167,13 @@ struct TimedSource: FrameSource {
                         // measured before the check existed — three and a half seconds of
                         // unreadable video and a latency figure eleven hours out.
                         case let .some(current):
-                            if abs(candidate - current) > 250_000_000 { offset = candidate }
+                            if abs(candidate - current) > 250_000_000 {
+                                offset = candidate
+                                tracker.reset()
+                            } else {
+                                tracker.observe(candidate, at: captured)
+                                offset = tracker.slewed(current, to: captured)
+                            }
                         }
                         settling += 1
 
@@ -175,6 +218,55 @@ struct TimedSource: FrameSource {
     func resume() { wrapped.resume() }
 }
 
+/// Follows the gap between two clocks, at a pace no single frame can hurry.
+///
+/// Two jobs that pull against each other. The gap has to be tracked, because it is a line with a
+/// slope and pinning it to one reading lets the error run away — twenty-two milliseconds over
+/// twenty minutes, measured. And it has to not be tracked *quickly*, because the per-frame reading
+/// is the gap plus however long that particular frame took to arrive, and following that would put
+/// the pipeline's jitter into the timestamps and the jitter back out as judder.
+///
+/// The minimum over a window separates the two: delivery delay is always positive, so the quickest
+/// arrival in a few seconds is the closest look at the gap that the window contains. Slewing
+/// toward it caps how fast the answer can move regardless of what the window says, which is what
+/// makes a bad window survivable rather than something to defend against.
+struct OffsetTracker {
+    private var buckets: [(second: Int64, minimum: Int64)] = []
+    private var last: Int64?
+
+    /// Note one frame's view of the gap, `captured` being its time on the capture clock.
+    mutating func observe(_ candidate: Int64, at captured: Int64) {
+        let second = captured / 1_000_000_000
+        if let latest = buckets.last, latest.second == second {
+            buckets[buckets.count - 1].minimum = min(latest.minimum, candidate)
+        } else {
+            buckets.append((second: second, minimum: candidate))
+        }
+        let oldest = second - Int64(TimedSource.windowSeconds)
+        buckets.removeAll { $0.second < oldest }
+    }
+
+    /// Where `current` should move to by `captured`, given everything observed.
+    ///
+    /// Bounded by the time since the last frame rather than by a fixed step, so the rate is the
+    /// same whatever the frame rate is and a gap in delivery cannot bank a large correction.
+    mutating func slewed(_ current: Int64, to captured: Int64) -> Int64 {
+        defer { last = captured }
+        guard let target = buckets.map(\.minimum).min(), let previous = last else { return current }
+
+        let elapsed = Double(max(0, captured - previous)) / 1_000_000_000
+        let limit = Int64(elapsed * TimedSource.slewLimit * 1_000_000_000)
+        return min(max(target, current - limit), current + limit)
+    }
+
+    /// Forget everything, for when the offset was re-anchored and the window describes the clock
+    /// it used to be.
+    mutating func reset() {
+        buckets.removeAll()
+        last = nil
+    }
+}
+
 /// The same trick for audio, and it has to be the same trick.
 ///
 /// A run measures latency by comparing a stamp made here against a clock read there, which
@@ -200,16 +292,23 @@ struct TimedAudioSource: AudioSource {
         let stamp = stamp
         return AsyncStream { continuation in
             let pump = Task {
-                // One offset for the whole run, taken as the smallest of the first second's
-                // worth, exactly as the video side takes it: the difference between the two
-                // clocks is constant and the delay in observing it is not. Audio packets are
-                // continuous by construction — the capture timeline advances by a packet's
-                // duration whatever the thread was doing — so re-anchoring on a discrepancy
-                // is not wanted here. A jump would be a clock moving under a live call, and
-                // moving the audio timeline in the middle of a sentence is worse than the
-                // error it would correct.
+                // Anchored as the smallest of the first second's worth, exactly as the video
+                // side takes it, and then tracked at the same bounded pace for the same
+                // reason: the two clocks are separate oscillators and the gap between them
+                // has a slope. Audio has to follow whatever video does here whether or not it
+                // needs to on its own, because the receiver lines the two up on this timeline
+                // — correcting one and freezing the other would pull them apart at the very
+                // rate this exists to remove, which is worse than both being wrong together.
+                //
+                // What audio does not take is the video side's re-anchor on a gross
+                // discrepancy. Packets are continuous by construction, the capture timeline
+                // advancing by a packet's duration whatever the thread was doing, so a jump
+                // would be a clock moving under a live call — and moving the audio timeline
+                // in the middle of a sentence is worse than the error it would correct. The
+                // slew reaches the same place without the discontinuity.
                 var offset: Int64?
                 var settling = 0
+                var tracker = OffsetTracker()
 
                 for await frame in upstream {
                     let captured = Int64(bitPattern: frame.timestamp.nanoseconds)
@@ -217,8 +316,9 @@ struct TimedAudioSource: AudioSource {
 
                     if captured > 0 {
                         let candidate = now - captured
+                        tracker.observe(candidate, at: captured)
                         if let current = offset, settling >= 50 {
-                            offset = current
+                            offset = tracker.slewed(current, to: captured)
                         } else if let current = offset {
                             offset = min(current, candidate)
                         } else {

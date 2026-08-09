@@ -1,12 +1,40 @@
 // Where global time comes from.
 //
-// `time.cloudflare.com`, anycast from a few hundred locations, which is the
-// property that matters more than the accuracy: every client and every server
-// reaches a *nearby* instance of the same logical clock, so a phone in Lagos
-// and a relay in Frankfurt land on one timeline without either of them being
-// the authority for the other. We are not in the business of telling anyone
-// what time it is, which is one fewer service to run and one fewer thing to be
-// wrong.
+// `time.apple.com`, anycast, which gives the property that matters most here:
+// every client and every server reaches a *nearby* instance of the same logical
+// clock, so a phone in Lagos and a relay in Frankfurt land on one timeline
+// without either of them being the authority for the other. We are not in the
+// business of telling anyone what time it is, which is one fewer service to run
+// and one fewer thing to be wrong.
+//
+// # Why not the obvious anycast choice
+//
+// This was `time.cloudflare.com` on exactly that reasoning, and the reasoning
+// was right about anycast and wrong about what it would cost, because it only
+// counted the network. A server states how far it is from a real reference as
+// its root distance — half its root delay plus its dispersion — and
+// ``TrustedClock`` adds that to half the round trip, because a reading cannot
+// be better than the clock it came from. Cloudflare's instances answer at
+// stratum 3 with a root delay near 35ms, so they declare about 18ms before a
+// single packet of ours crosses the network. Measured from one network, five
+// samples each: Cloudflare 18.2ms, `time.apple.com` 0.2ms, `time.google.com`
+// 0.1ms. Those are stratum 1 and it is not close.
+//
+// Eighteen milliseconds was, at the time of the switch, the largest term in
+// this device's uncertainty — larger than the round trip, and around four times
+// the drift between polls. It bought nothing: Cloudflare's *actual* offset from
+// UTC measured well under a millisecond, and the 18ms is a bound it is being
+// honest about rather than error it is committing. But an honest bound is still
+// the number every consumer has to plan against, and a cross-device latency
+// figure carries two of them.
+//
+// Apple over Google by a tenth of a millisecond that does not matter, for two
+// reasons that do. It is the platform's own service, so on the devices this SDK
+// runs on the traffic is unremarkable and reachability is as good as the OS's
+// own. And Google smears leap seconds, which is a fine policy and the wrong one
+// to adopt silently: it would put every client on a timeline that leaves UTC by
+// up to half a second and disagrees with any peer that did not make the same
+// choice. See ``AuthorityReading/leapSecondPending``.
 //
 // # Being a good guest
 //
@@ -42,7 +70,13 @@ public protocol DatagramExchange: Sendable {
 
 /// A ``TimeAuthority`` backed by an NTP server.
 public actor NTPAuthority: TimeAuthority {
-    /// Cloudflare's anycast time service.
+    /// Apple's anycast time service, answering at stratum 1.
+    public static let apple = "time.apple.com"
+
+    @available(*, deprecated, renamed: "apple", message: """
+    Cloudflare answers at stratum 3 and declares about 18ms of root distance, \
+    which lands in every reading taken from it. Prefer `apple`.
+    """)
     public static let cloudflare = "time.cloudflare.com"
 
     public static let port: UInt16 = 123

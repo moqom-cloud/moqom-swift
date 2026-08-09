@@ -34,9 +34,9 @@
             endpoint = .hostPort(host: NWEndpoint.Host(host), port: port)
         }
 
-        /// A socket to Cloudflare's anycast time service.
-        public static func cloudflare() throws(MoqomError) -> UDPExchange {
-            try UDPExchange(host: NTPAuthority.cloudflare, port: NTPAuthority.port)
+        /// A socket to Apple's anycast time service.
+        public static func apple() throws(MoqomError) -> UDPExchange {
+            try UDPExchange(host: NTPAuthority.apple, port: NTPAuthority.port)
         }
 
         public func exchange(_ request: Data, timeout: Duration) async throws(MoqomError) -> Data {
@@ -83,15 +83,15 @@
     }
 
     public extension TrustedClock {
-        /// A clock disciplined by Cloudflare's public time service.
+        /// A clock disciplined by Apple's public time service.
         ///
         /// The default for a client, and the reason there is no time endpoint
         /// on our own control plane: a global anycast reference that both the
         /// devices and the servers use puts everyone on one timeline without
         /// us running a service or being trusted to run it honestly.
-        static func cloudflare(logger: MoqomLogger = .silent) throws(MoqomError) -> TrustedClock {
+        static func apple(logger: MoqomLogger = .silent) throws(MoqomError) -> TrustedClock {
             TrustedClock(
-                authority: NTPAuthority(exchange: try UDPExchange.cloudflare(), logger: logger),
+                authority: NTPAuthority(exchange: try UDPExchange.apple(), logger: logger),
                 logger: logger
             )
         }
