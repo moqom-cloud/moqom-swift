@@ -145,6 +145,64 @@ struct BandwidthEstimatorTests {
         #expect(estimator.objectsReceived == 5)
     }
 
+    @Test("a group replayed alongside the live edge is not loss")
+    func joiningIsNotLoss() {
+        // What a subscription actually looks like from here, and what this counter used to make
+        // of it. The relay replays the current group from its start so the subscriber has a
+        // keyframe, while the live edge keeps arriving, so the two interleave: 0, 58, 1, 59, 2,
+        // 60. Read as one sequence, every other arrival looks 57 objects short. On device that
+        // came to about 2,900 objects reported lost in the first five seconds of a session where
+        // every frame was accounted for and nothing froze — and it never moved again afterwards,
+        // because the replay catches up and the interleaving stops.
+        var estimator = BandwidthEstimator()
+        var arrival = 0
+        for index in 0 ..< 50 {
+            for object in [index, index + 58] {
+                arrival += 8
+                estimator.record(
+                    frame(object, sentAtMilliseconds: object * 16),
+                    at: .milliseconds(arrival)
+                )
+            }
+        }
+        #expect(
+            estimator.objectsLost == 0,
+            "a replayed group read as \(estimator.objectsLost) lost objects"
+        )
+    }
+
+    @Test("loss after the sequence is established is still counted")
+    func lossAfterJoiningIsCounted() {
+        // The other half of the previous test: declining to count during the join must not
+        // become declining to count at all. Five objects to establish the numbering, then a
+        // hole of three.
+        var estimator = BandwidthEstimator()
+        for index in [0, 1, 2, 3, 4, 8] {
+            estimator.record(
+                frame(index, sentAtMilliseconds: index * 33),
+                at: .milliseconds(index * 33)
+            )
+        }
+        #expect(estimator.objectsLost == 3)
+    }
+
+    @Test("an object arriving behind the high-water mark is not loss")
+    func reorderingIsNotLoss() {
+        // A reorder is one object early and one object late, and the late one is not missing —
+        // it is in hand. Counting against the last object seen would call the step back down a
+        // hole and then charge for climbing out of it twice.
+        var estimator = BandwidthEstimator()
+        for index in [0, 1, 2, 3, 6, 4, 5, 7] {
+            estimator.record(
+                frame(index, sentAtMilliseconds: index * 33),
+                at: .milliseconds(index * 33)
+            )
+        }
+        // Objects 4 and 5 were late rather than absent, but nothing here can know that at the
+        // moment 6 arrives, so the two are charged once and not again when they turn up.
+        #expect(estimator.objectsLost == 2)
+    }
+
     @Test("the estimate stays inside its bounds")
     func boundsAreRespected() {
         var estimator = BandwidthEstimator(

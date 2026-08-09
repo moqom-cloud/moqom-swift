@@ -82,7 +82,13 @@ public struct BandwidthEstimator: Sendable {
     private var sampleIndex: Double = 0
 
     // Loss detection, per track.
-    private var highestObject: [UInt64: (group: UInt64, object: UInt64)] = [:]
+    //
+    // `following` is whether this track's numbering has been seen to advance by exactly one,
+    // which is the only state in which a gap means anything. A subscription does not begin at
+    // the live edge: the relay replays the current group from its start so the subscriber has a
+    // keyframe, and those objects arrive interleaved with the live ones. Until the two are told
+    // apart, an arriving object ID says nothing about what is missing.
+    private var highestObject: [UInt64: (group: UInt64, object: UInt64, following: Bool)] = [:]
 
     private var lastChange: Duration?
 
@@ -155,12 +161,47 @@ public struct BandwidthEstimator: Sendable {
 
     // MARK: - Loss
 
+    /// Count what is missing in front of this object, where that can be known.
+    ///
+    /// Against the highest object seen rather than the last one, and only once the numbering has
+    /// been seen to step by one. Both halves of that were learned from a measurement that was
+    /// wrong for a whole afternoon.
+    ///
+    /// Comparing against the *last* object assumes a track arrives in one ordered sequence, and
+    /// at the start of a subscription it does not. The relay replays the current group from its
+    /// beginning so the subscriber has a keyframe to decode from, while the live edge keeps
+    /// arriving, and the two interleave: object 0, then 58, then 1, then 59, then 2, then 60.
+    /// Read as one sequence that is 57 objects short on every other arrival, and the counter
+    /// reported about 2,900 objects lost in the first five seconds of a session in which every
+    /// single frame was accounted for, nothing froze, and 99.8 percent was delivered. It then
+    /// never moved again, because the interleaving stops once the replay catches up. Against the
+    /// highest, a replayed object is simply not news and passes without comment.
+    ///
+    /// That alone leaves one spurious gap - the first step from the replay to the live edge,
+    /// which is indistinguishable from real loss on the evidence of two object IDs. Hence
+    /// `following`: until a track has been observed advancing by exactly one, there is no
+    /// established sequence to be missing from, so nothing is counted. The cost is that genuine
+    /// loss in the first moments of a subscription goes unreported, which is the right way to be
+    /// wrong for a figure whose whole purpose is to say when a link is in trouble.
     private mutating func recordLoss(_ object: TrackObject, trackAlias: UInt64) {
-        defer { highestObject[trackAlias] = (object.group, object.object) }
-        guard let previous = highestObject[trackAlias] else { return }
-        guard object.group == previous.group else { return }
-        guard object.object > previous.object + 1 else { return }
-        objectsLost += Int(object.object - previous.object - 1)
+        guard let previous = highestObject[trackAlias], object.group == previous.group else {
+            highestObject[trackAlias] = (object.group, object.object, false)
+            return
+        }
+
+        // Behind the high-water mark: a replay, or a reorder. Neither is evidence of loss, and
+        // neither moves the mark.
+        guard object.object > previous.object else { return }
+
+        if object.object == previous.object + 1 {
+            highestObject[trackAlias] = (object.group, object.object, true)
+            return
+        }
+
+        if previous.following {
+            objectsLost += Int(object.object - previous.object - 1)
+        }
+        highestObject[trackAlias] = (object.group, object.object, previous.following)
     }
 
     // MARK: - Delay gradient
