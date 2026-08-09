@@ -56,6 +56,11 @@ import MoqomCore
         public let captureFormat: CaptureFormat
         private let logger: MoqomLogger
 
+        /// Kept because a camera switch has to make the same request of the new device, whose
+        /// formats are its own — a front camera that offers no doubled mode says nothing about
+        /// the back one.
+        private let oversampling: CaptureOversampling
+
         private let box = CaptureSessionBox()
         private let output = AVCaptureVideoDataOutput()
         private let queue = DispatchQueue(label: "moqom.camera", qos: .userInteractive)
@@ -97,10 +102,26 @@ import MoqomCore
         /// observed at 29ms and is currently costing 47ms, of which the network accounts for 15
         /// and the encoder for 7. The remaining 25 were attributed to nothing at all, and this is
         /// the larger of the two places they can be.
+        ///
+        /// It is also the figure ``CaptureOversampling`` moves, and the only one that will say
+        /// whether it worked: a faster sensor shortens readout and nothing else in the pipeline
+        /// can tell the difference. Recorded for the frames that are published rather than for
+        /// every frame captured, since a discarded one costs the publication nothing.
         private var delivery = StageMeter()
 
         /// What the sensor's stamp to this callback costs, in milliseconds.
         public var deliveryLatency: StageLatency { lock.withLock { delivery.summary } }
+
+        /// The sensor rate and the discard cadence that turns it back into the publication rate.
+        private var cadence: CaptureCadence
+
+        /// What the device was asked to run at, which is not always what it was asked to publish.
+        ///
+        /// Equal to `captureFormat.frameRate` unless ``CaptureOversampling`` found a faster mode
+        /// worth taking — see there. Worth surfacing because the two rates are indistinguishable
+        /// downstream: every counter in the publish path sees the published rate, so a device
+        /// that quietly declined the faster mode looks exactly like one that took it.
+        public var sensorFrameRate: Double { lock.withLock { cadence.sensorRate } }
 
         /// Guards ``position`` and ``publishesMirrored``, which are read from
         /// whatever thread the interface runs on and written from there too,
@@ -179,18 +200,34 @@ import MoqomCore
             }
         }
 
-        /// - Parameter logger: Where a capture format that cannot be honoured is reported.
-        ///   Worth passing: a device that will not give the requested frame rate keeps
-        ///   delivering at its own, and the difference is invisible until somebody counts.
+        /// - Parameters:
+        ///   - oversampling: Whether to run the sensor faster than the publication to shorten
+        ///     readout, which is worth about eight milliseconds for twice the sensor and
+        ///     image-pipeline work. See ``CaptureOversampling``.
+        ///   - logger: Where a capture format that cannot be honoured is reported.
+        ///     Worth passing: a device that will not give the requested frame rate keeps
+        ///     delivering at its own, and the difference is invisible until somebody counts.
+        ///
+        /// > Note: `oversampling` is settled here and not revisited. Changing it later means a
+        /// > new active format, and swapping the active format of a running session costs the
+        /// > same three to five dropped frames that ``rotationDegrees`` goes to some length to
+        /// > avoid — so a caller that wants to give the eight milliseconds back under thermal
+        /// > pressure should build a source that never took them.
         public init(
             format: CaptureFormat,
             position: CameraPosition = .front,
+            oversampling: CaptureOversampling = .automatic,
             logger: MoqomLogger = .silent
         ) throws {
             captureFormat = format
             relay = FrameRelay(format: format)
             current = position
             self.logger = logger
+            self.oversampling = oversampling
+            cadence = CaptureCadence(
+                publishing: format.frameRate,
+                sensor: format.frameRate
+            )
 
             guard let device = Self.device(for: position) else {
                 throw MoqomError.platform(api: "AVCaptureDevice.default", status: -1)
@@ -243,7 +280,15 @@ import MoqomCore
             // identical code: the two ship different default formats, one of which happened
             // to allow the turn. The failure is silent and total. The encoder is built from
             // the rung, so it is expecting portrait, and landscape frames arrive into it.
-            Self.adopt(format, on: device, logger: logger)
+            cadence = CaptureCadence(
+                publishing: format.frameRate,
+                sensor: Self.adopt(
+                    format,
+                    on: device,
+                    oversampling: oversampling,
+                    logger: logger
+                )
+            )
             session.commitConfiguration()
 
             applyMirroring()
@@ -356,11 +401,16 @@ import MoqomCore
         /// across devices, so picking the first plausible entry gets a 4K format for a 720p
         /// request on some phones and burns the power budget on pixels that are about to be
         /// scaled away.
+        /// - Returns: The rate the sensor was actually asked for, which is the publication rate
+        ///   unless a faster whole multiple was available for the same pixels. The caller needs
+        ///   it to know how many captured frames make one published one.
+        @discardableResult
         private static func adopt(
             _ format: CaptureFormat,
             on device: AVCaptureDevice,
+            oversampling: CaptureOversampling,
             logger: MoqomLogger
-        ) {
+        ) -> Double {
             // Compared against the sensor's own orientation, which is always landscape. The
             // frames are turned afterwards, at the connection, so a portrait request of
             // 720×1280 is a 1280×720 sensor mode and not the 4K one that is the smallest
@@ -390,16 +440,43 @@ import MoqomCore
                 }
             #endif
 
-            let candidates = device.formats.filter { candidate in
+            // Size settled first, and the rate chosen among what is left, because the two
+            // questions are not independent: the fastest format a device has is always some
+            // small high-speed mode, so asking which rate is reachable before narrowing by
+            // size turns the frame-rate decision into a resolution one.
+            let sized = device.formats.filter { candidate in
                 let dimensions = CMVideoFormatDescriptionGetDimensions(
                     candidate.formatDescription
                 )
-                guard dimensions.width >= Int32(wanted.width),
-                      dimensions.height >= Int32(wanted.height)
-                else { return false }
-                return candidate.videoSupportedFrameRateRanges.contains { range in
-                    range.maxFrameRate + 0.01 >= rate && range.minFrameRate - 0.01 <= rate
+                return dimensions.width >= Int32(wanted.width)
+                    && dimensions.height >= Int32(wanted.height)
+            }
+
+            func matching(_ wantedRate: Double) -> [AVCaptureDevice.Format] {
+                sized.filter { candidate in
+                    candidate.videoSupportedFrameRateRanges.contains { range in
+                        range.maxFrameRate + 0.01 >= wantedRate
+                            && range.minFrameRate - 0.01 <= wantedRate
+                    }
                 }
+            }
+
+            var sensorRate = CaptureCadence.sensorRate(
+                publishing: rate,
+                from: sized.map(Self.offer),
+                limit: oversampling.limit(publishing: rate)
+            )
+            var candidates = matching(sensorRate)
+
+            // Belt and braces, because the rate was chosen from each format's outermost range
+            // bounds while the list is filtered range by range. A device whose supported rates
+            // have a hole in them could answer yes to the first question and no to the second,
+            // and the cost of not noticing is not a slower camera — it is no format adopted at
+            // all, leaving the session on a default that is neither the size nor the rate
+            // anything downstream was built for.
+            if candidates.isEmpty, sensorRate != rate {
+                sensorRate = rate
+                candidates = matching(rate)
             }
 
             // The smallest that will do, measured in pixels, so a 720p60 request does not
@@ -423,7 +500,7 @@ import MoqomCore
                     LogField("height", .number(wanted.height)),
                     LogField("frameRate", .number(Int(rate))),
                 ])
-                return
+                return rate
             }
 
             do {
@@ -432,7 +509,7 @@ import MoqomCore
                 logger.warning(.media, "could not configure the camera", [
                     LogField("error", .text(String(describing: error))),
                 ])
-                return
+                return rate
             }
             defer { device.unlockForConfiguration() }
 
@@ -442,7 +519,14 @@ import MoqomCore
             // to drop to its lowest supported rate in dim light — which is the correct
             // photographic answer and the wrong one for a call, where a frame rate that
             // halves when someone turns a lamp off reads as a network fault.
-            let duration = CMTime(value: 1, timescale: CMTimeScale(rate.rounded()))
+            //
+            // Pinned to the sensor rate rather than the published one. A device left free to
+            // run slower than it was asked would break the discard cadence rather than merely
+            // slow it: the survivors are chosen on their stamps, so a sensor that quietly
+            // halves its rate has every frame clear the threshold and the publication carries
+            // on at the right rate from a camera producing exactly enough frames to feed it,
+            // with the eight milliseconds silently given back.
+            let duration = CMTime(value: 1, timescale: CMTimeScale(sensorRate.rounded()))
             device.activeVideoMinFrameDuration = duration
             device.activeVideoMaxFrameDuration = duration
 
@@ -464,6 +548,34 @@ import MoqomCore
             if best.supportedColorSpaces.contains(.sRGB) {
                 device.activeColorSpace = .sRGB
             }
+
+            // Said out loud, because this is the one decision here that a caller might want
+            // reversed and cannot otherwise observe. Both outcomes are worth a line: taking
+            // the faster mode is a power cost somebody may be hunting, and declining it is
+            // why a phone that should have gained eight milliseconds did not.
+            if sensorRate > rate {
+                logger.info(.media, "capturing faster than the publication", [
+                    LogField("sensor", .number(Int(sensorRate.rounded()))),
+                    LogField("publish", .number(Int(rate.rounded()))),
+                ])
+            } else if oversampling != .off {
+                logger.info(.media, "no faster capture mode worth taking", [
+                    LogField("publish", .number(Int(rate.rounded()))),
+                ])
+            }
+
+            return sensorRate
+        }
+
+        /// A device format reduced to what the rate decision needs from it.
+        private static func offer(_ format: AVCaptureDevice.Format) -> CaptureCadence.Option {
+            let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            let ranges = format.videoSupportedFrameRateRanges
+            return CaptureCadence.Option(
+                pixels: Int(dimensions.width) * Int(dimensions.height),
+                lowestFrameRate: ranges.map(\.minFrameRate).min() ?? 0,
+                highestFrameRate: ranges.map(\.maxFrameRate).max() ?? 0
+            )
         }
 
         /// Whether a format's pixels are eight bits per component.
@@ -541,12 +653,27 @@ import MoqomCore
             // The new device has its own default active format, so the request has to be made
             // again. Otherwise flipping to the back camera mid-call silently halves the frame
             // rate of everything after it.
-            Self.adopt(captureFormat, on: device, logger: logger)
+            let sensorRate = Self.adopt(
+                captureFormat,
+                on: device,
+                oversampling: oversampling,
+                logger: logger
+            )
 
             let swap = InputBox(previous: lock.withLock { input }, replacement: replacement)
             lock.withLock {
                 current = position
                 input = replacement
+
+                // The answer can differ between the two cameras of one phone, so the cadence
+                // travels with the device rather than with the source. A front camera with no
+                // doubled mode and a back camera with one is an ordinary configuration, and
+                // keeping the old cadence across the switch would discard half the frames of
+                // a sensor that is no longer producing spares.
+                cadence = CaptureCadence(
+                    publishing: captureFormat.frameRate,
+                    sensor: sensorRate
+                )
             }
 
             queue.async { [weak self, box] in
@@ -722,6 +849,15 @@ import MoqomCore
                 }
             }
             lastCaptureStamp = timestamp
+
+            // Every frame is counted above and only some are published, because the two
+            // questions are different: the camera stopping is a fact about the device, while
+            // this is a choice of ours. Discarding before the rotation and the meter rather
+            // than after is the point of discarding at all — a frame nobody will encode should
+            // not be turned first, and at twice the rate that pass is charged twice.
+            guard lock.withLock({ cadence.delivers(at: CMTimeGetSeconds(timestamp)) }) else {
+                return
+            }
 
             // Against the host clock, because that is the clock capture stamps are on. Bounded
             // before it is recorded: a stamp from a session that has just restarted can sit on

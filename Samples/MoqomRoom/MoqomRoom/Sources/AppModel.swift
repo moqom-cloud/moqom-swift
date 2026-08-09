@@ -733,14 +733,15 @@ final class AppModel {
 
                 // Hoisted rather than inlined below: the chain it belongs to is long enough
                 // that adding one more term puts the type-checker past its own budget.
-                let delivered = room.cameraDelivery.map {
+                let delivered = (room.cameraDelivery.map {
                     String(
                         format: " deliver p50=%.1f p95=%.1f max=%.1f ms",
                         $0.median,
                         $0.p95,
                         $0.worst
                     )
-                } ?? ""
+                } ?? "")
+                    + (room.cameraSensorRate.map { String(format: " sensor=%.0f", $0) } ?? "")
 
                 Journal.shared.say(
                     "GRAB \(room.captureCadence.report())"
@@ -1193,6 +1194,7 @@ final class AppModel {
             )
             model.flatLayers = launch.flatLayers
             model.encodesEagerly = launch.eagerEncoding
+            model.capturesPlainly = launch.plainCapture
 
             // A figure given on the command line is a figure to be obeyed, so it turns the
             // adaptation off: the point of passing one is to see what that exact delay does.

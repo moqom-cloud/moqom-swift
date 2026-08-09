@@ -153,6 +153,9 @@ final class RoomModel {
     /// Ask the encoder for speed rather than power. See ``LaunchOptions/eagerEncoding``.
     var encodesEagerly = false
 
+    /// Run the sensor at the publication rate. See ``LaunchOptions/plainCapture``.
+    var capturesPlainly = false
+
     /// How often to sample the SDK's statistics.
     private let statisticsInterval: Duration
 
@@ -875,6 +878,14 @@ final class RoomModel {
     /// device cost comes to be read as a network one.
     var cameraDelivery: StageLatency? { camera?.deliveryLatency }
 
+    /// What the sensor is running at, which is not always what is being published.
+    ///
+    /// Reported next to the delivery figure because it is the explanation for it. Oversampling
+    /// is the one thing that moves that number and it engages or declines per device — see
+    /// ``CaptureOversampling`` — so a run where the two phones disagree needs to say which of
+    /// them took the faster mode rather than leaving it to be inferred from the result.
+    var cameraSensorRate: Double? { camera?.sensorFrameRate }
+
     /// How often the system has taken the camera away, and what it said the last time.
     /// What each participant was last reported as having lost, so a change can
     /// be told from a repeat. See the `.muteChanged` case in ``handle(_:)``.
@@ -1402,6 +1413,7 @@ final class RoomModel {
                 let device = try CameraSource(
                     format: format,
                     position: cameraPosition,
+                    oversampling: capturesPlainly ? .off : .automatic,
                     logger: MoqomLogger(
                         sink: SystemLogSink(subsystem: "cloud.moqom.sample", privacy: .hashed),
                         minimum: .debug

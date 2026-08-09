@@ -408,6 +408,15 @@ struct LaunchOptions {
     /// claiming sixty.
     var frameRate: Double?
 
+    /// Run the sensor at the publication rate rather than faster than it.
+    ///
+    /// Here so that the two halves of the trade can be measured on one build in one sitting.
+    /// Comparing a run against a figure from a previous build is how the sensor rate gets
+    /// credited with a difference that belongs to the weather, the room, or the phone being
+    /// four degrees warmer — and this particular measurement is delicate enough to deserve the
+    /// care: the whole effect being looked for is eight milliseconds.
+    var plainCapture = false
+
     /// What to give the encoder, overriding what the frame rate would imply.
     ///
     /// A separate knob because bitrate and frame rate are separate questions, and
@@ -497,6 +506,7 @@ struct LaunchOptions {
             case "--live": options.live = true
             case "--flat-layers": options.flatLayers = true
             case "--eager-encoding": options.eagerEncoding = true
+            case "--plain-capture": options.plainCapture = true
             case "--fps": options.frameRate = value.flatMap(Double.init)
             case "--kbps": options.kilobitsPerSecond = value.flatMap(Int.init)
             case "--stats-ms": options.statisticsMilliseconds = value.flatMap(Int.init)
