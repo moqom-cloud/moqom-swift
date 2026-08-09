@@ -9,7 +9,34 @@
 import Foundation
 import Testing
 
+@testable import MoqomCore
 @testable import MoqomKit
+
+@Suite("What a stage costs at its best")
+struct StageFloorTests {
+    @Test("the floor is the quickest in the window, not the quickest ever")
+    func reportsTheFloor() {
+        // Load-bearing for the latency figure rather than a curiosity. A clock offset taken as
+        // the smallest sensor-to-delivery gap subtracts exactly this much from every latency
+        // reported, so it is the number that puts the capture stage back into the total — and
+        // it has to describe the same window the offset was derived from, or the correction is
+        // for a frame that is no longer representative.
+        var meter = StageMeter()
+        for milliseconds in [19.0, 15.5, 22.0, 16.0, 40.0] {
+            meter.record(.milliseconds(Int(milliseconds)))
+        }
+
+        let summary = meter.summary
+        #expect(summary.best == 15.0)
+        #expect(summary.worst == 40.0)
+        #expect(summary.samples == 5)
+    }
+
+    @Test("a stage with nothing recorded claims nothing")
+    func emptyIsZero() {
+        #expect(StageMeter().summary.best == 0)
+    }
+}
 
 @Suite("Capture cadence")
 struct CaptureCadenceTests {
@@ -70,24 +97,31 @@ struct CaptureCadenceTests {
 
     @Test("declining oversampling asks for the publication rate")
     func offMeansOff() {
+        #expect(CaptureOversampling.off.limit == 1)
         #expect(
             CaptureCadence.sensorRate(
                 publishing: 30,
                 from: [base, doubled],
-                limit: CaptureOversampling.off.limit(publishing: 30)
+                limit: CaptureOversampling.off.limit
             ) == 30
         )
     }
 
-    @Test("the faster sensor is taken where it was measured to be worth something")
-    func engagesOnlyWhereItPays() {
-        // Four milliseconds at thirty frames and four tenths at sixty, because the cost is a
-        // floor plus a fraction of the interval rather than the interval itself. Doubling the
-        // sensor for four tenths of a millisecond is a power regression with a rounding error
-        // attached, so the automatic setting declines it.
-        #expect(CaptureOversampling.automatic.limit(publishing: 30) == 2)
-        #expect(CaptureOversampling.automatic.limit(publishing: 24) == 2)
-        #expect(CaptureOversampling.automatic.limit(publishing: 60) == 1)
+    @Test("the faster sensor is taken at every publication rate")
+    func doesNotJudgeOnRate() {
+        // Deliberately not conditioned on the rate, though the obvious model says it should
+        // be. What decides is whether a device has already reached its image pipeline's floor,
+        // and the two phones measured disagree at the same sixty frames a second: the Air
+        // gains four milliseconds going to a 120fps sensor and the Pro gains none. Nothing
+        // available before the camera is open tells the two apart.
+        #expect(CaptureOversampling.automatic.limit == 2)
+        #expect(
+            CaptureCadence.sensorRate(
+                publishing: 60,
+                from: [base, doubled],
+                limit: CaptureOversampling.automatic.limit
+            ) == 120
+        )
     }
 
     @Test("a sensor at the publication rate discards nothing")

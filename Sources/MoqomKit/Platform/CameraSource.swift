@@ -464,7 +464,7 @@ import MoqomCore
             var sensorRate = CaptureCadence.sensorRate(
                 publishing: rate,
                 from: sized.map(Self.offer),
-                limit: oversampling.limit(publishing: rate)
+                limit: oversampling.limit
             )
             var candidates = matching(sensorRate)
 

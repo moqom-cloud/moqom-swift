@@ -31,47 +31,48 @@ public enum CaptureOversampling: Sendable, Hashable {
     /// milliseconds, and what it buys back is half the sensor and image-pipeline work.
     case off
 
-    /// Run the sensor at a whole multiple of the publication rate, up to twice, when the
-    /// device offers one that costs no extra pixels and the publication is slow enough for it
-    /// to be worth anything.
+    /// Run the sensor at a whole multiple of the publication rate, up to twice, wherever the
+    /// device offers one that costs no extra pixels.
     ///
-    /// The first two conditions are about what the device can do. A whole multiple is what
-    /// makes the discard cadence exact — at ninety frames into sixty, every third frame is
-    /// dropped and the survivors are unevenly spaced, which is worse to watch than the
-    /// milliseconds are to wait. The pixel budget is what stops the faster mode being a bigger
-    /// one: a device reaching a hundred and twenty only at 4K would spend the entire power
-    /// saving of the capture ladder to buy a few milliseconds.
+    /// Both conditions are about what the device can do. A whole multiple is what makes the
+    /// discard cadence exact — at ninety frames into sixty, every third frame is dropped and
+    /// the survivors are unevenly spaced, which is worse to watch than the milliseconds are to
+    /// wait. The pixel budget is what stops the faster mode being a bigger one: a device
+    /// reaching a hundred and twenty only at 4K would spend the entire power saving of the
+    /// capture ladder to buy a few milliseconds.
     ///
-    /// The third condition is about what there is left to win, and it is the one the
-    /// measurement changed. Sensor-to-callback is not the frame interval; on an iPhone 15 Pro
-    /// it is a floor of about 15.5ms plus roughly a fifth of the interval, and only that
-    /// second part is the sensor's to give back. Doubling the rate is therefore worth a great
-    /// deal less than halving the interval suggests:
+    /// There is deliberately no condition on the publication rate, and that is the part worth
+    /// explaining, because the obvious model says there should be. Sensor-to-callback is not
+    /// the frame interval: it is a floor of about 15.5ms plus a rate-dependent term, and only
+    /// the second part is the sensor's to give back. That reads as an argument for declining
+    /// at high rates, and on one phone it is. Measured at sixty frames published, both ways,
+    /// two runs each, cool:
     ///
-    ///     publish 30, sensor  30    19.6ms        publish 60, sensor  60    16.0ms
-    ///     publish 30, sensor  60    15.9ms        publish 60, sensor 120    15.6ms
+    ///     iPhone Air       sensor  60  19.3ms     sensor 120  15.3ms     -4.0ms
+    ///     iPhone 15 Pro    sensor  60  15.9ms     sensor 120  15.8ms     -0.1ms
     ///
-    /// Four milliseconds at thirty and four tenths at sixty, each the mean of four runs,
-    /// alternated and repeated after a cooldown because the whole effect is smaller than the
-    /// drift from a warming phone. So this declines above thirty frames a second rather than
-    /// spending twice the sensor and image-pipeline power for a result inside the noise —
-    /// which on a device already reporting serious thermal pressure is worse than nothing,
-    /// since throttling costs frames and frames cost far more than four tenths of a
-    /// millisecond.
+    /// The two land in the same place. 15.5ms looks like a property of the platform rather
+    /// than of either device, the Pro's pipeline already reaches it at sixty, and the Air's
+    /// entire four-millisecond disadvantage is the rate-dependent term — which the faster
+    /// sensor erases. So the question is not what rate is being published but whether this
+    /// particular device has already hit its floor, and nothing available before opening the
+    /// camera answers that.
     ///
-    /// > Note: One phone. The floor is a property of a particular image pipeline and the
-    /// > threshold follows from it, so a device whose floor is lower has more to gain here
-    /// > than this will take.
+    /// Taken by default because it is never worse: the losing case costs power for no latency,
+    /// and the winning case is four milliseconds out of a budget aiming at forty. A caller
+    /// that knows its device is already at the floor, or that would rather have the power,
+    /// says ``off``.
+    ///
+    /// > Note: Two phones. An earlier version of this declined above thirty frames a second on
+    /// > the strength of the Pro's numbers alone, which would have given up every millisecond
+    /// > of the Air's.
     case automatic
 
-    /// The largest multiple worth asking for when publishing at this rate.
-    ///
-    /// A rate rather than a constant because the answer depends on it — see ``automatic``, and
-    /// the measurement quoted there for where the threshold comes from.
-    func limit(publishing rate: Double) -> Int {
+    /// The largest multiple of the publication rate worth asking for.
+    var limit: Int {
         switch self {
         case .off: 1
-        case .automatic: rate <= 30.01 ? 2 : 1
+        case .automatic: 2
         }
     }
 }

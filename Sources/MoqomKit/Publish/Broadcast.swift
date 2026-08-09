@@ -275,11 +275,27 @@ public struct StageLatency: Sendable, Hashable {
     public var p95: Double
     public var worst: Double
 
-    public init(samples: Int = 0, median: Double = 0, p95: Double = 0, worst: Double = 0) {
+    /// The quickest this stage was observed to be.
+    ///
+    /// Reported because a floor is the part of a stage that no scheduling explains: the median
+    /// and the tail of a capture path move with load, and what is left underneath them is the
+    /// cost of the path itself. It is also the figure a measurement anchored on a minimum has
+    /// silently subtracted — see the sample's `TimedSource`, where a clock offset taken as the
+    /// smallest sensor-to-delivery gap removes exactly this much from every latency it reports.
+    public var best: Double
+
+    public init(
+        samples: Int = 0,
+        median: Double = 0,
+        p95: Double = 0,
+        worst: Double = 0,
+        best: Double = 0
+    ) {
         self.samples = samples
         self.median = median
         self.p95 = p95
         self.worst = worst
+        self.best = best
     }
 }
 
@@ -316,7 +332,12 @@ struct StageMeter {
             samples: count,
             median: percentile(0.5),
             p95: percentile(0.95),
-            worst: worst
+            worst: worst,
+            // Over the window rather than the run, unlike the worst above it, because the
+            // floor is being used to correct a clock offset that is itself re-derived from a
+            // window — and a run-long minimum would keep a single lucky frame from an hour ago
+            // as the answer.
+            best: sorted[0]
         )
     }
 }

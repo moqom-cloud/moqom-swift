@@ -43,18 +43,46 @@ import MoqomKit
 /// timeline is a constant — two readings of the same host clock, one of them corrected for the
 /// network's idea of the time.
 ///
-/// It does cost one thing the per-frame reading gave away for free: however long the capture
-/// pipeline held the frame before delivery is no longer inside the measurement, because the
-/// offset is anchored on the first frame's delivery and every frame after it is measured from
-/// the sensor. The latency reported is therefore sensor-to-arrival with the first frame's
-/// pipeline delay folded in as a constant, which is the honest description of it.
+/// It costs one thing the per-frame reading gave away for free, and the cost turned out to be
+/// larger than the sentence describing it. However long the capture pipeline holds a frame the
+/// sensor has already stamped is not inside the measurement, because the offset is anchored on
+/// delivery and every frame after it is measured from the sensor — so the offset *is* the
+/// clock difference plus one camera delivery, and subtracting it removes the camera from every
+/// latency reported downstream.
+///
+/// That is about fifteen milliseconds on the phones this runs on, and it is invisible in the
+/// worst way: not noise, but a constant understatement of the headline number, in the one stage
+/// nothing else measures. It also makes the figure blind to any improvement in that stage, which
+/// is how a change that took four milliseconds off an iPhone Air's capture path showed up as one
+/// — the frames arrived four milliseconds earlier and the offset shrank by nearly as much, so
+/// the two cancelled.
+///
+/// So the floor is put back. The source reports the quickest it has been observed to hand a
+/// frame over, that much is taken out of the offset, and what goes on the wire is the sensor's
+/// own instant on the shared timeline. Everything the offset was for survives: it is still one
+/// constant for the run rather than a reading per frame, so the sensor's spacing is untouched
+/// and no judder is reintroduced.
+///
+/// The correction is taken once, when the offset settles, rather than tracked. A floor that
+/// improved later would otherwise walk the timestamps forward a fraction of a millisecond at a
+/// time, which is exactly the per-frame noise this design exists to avoid.
 struct TimedSource: FrameSource {
     private let wrapped: any FrameSource
     private let stamp: @Sendable () -> Timecode
+    private let floor: @Sendable () -> Double?
 
-    init(_ wrapped: any FrameSource, stamp: @escaping @Sendable () -> Timecode) {
+    /// - Parameter floor: The quickest the source has been seen to hand over a frame the sensor
+    ///   had already stamped, in milliseconds, or `nil` for a source with no such cost. Taking
+    ///   the offset as a minimum subtracts exactly this from every latency reported downstream,
+    ///   so without it the whole capture stage is missing from the number — see below.
+    init(
+        _ wrapped: any FrameSource,
+        stamp: @escaping @Sendable () -> Timecode,
+        floor: @escaping @Sendable () -> Double? = { nil }
+    ) {
         self.wrapped = wrapped
         self.stamp = stamp
+        self.floor = floor
     }
 
     var captureFormat: CaptureFormat { wrapped.captureFormat }
@@ -69,6 +97,12 @@ struct TimedSource: FrameSource {
                 // those the reading per frame is all there is.
                 var offset: Int64?
                 var settling = 0
+
+                // What the offset absorbed of the capture path, taken once when the offset stops
+                // moving and held for the run. Zero until then, and zero for good on a source
+                // with no such cost to report.
+                var floorNanoseconds: Int64 = 0
+                var floorTaken = false
 
                 for await frame in upstream {
                     let captured = Int64(bitPattern: frame.timestamp.nanoseconds)
@@ -99,9 +133,18 @@ struct TimedSource: FrameSource {
                             if abs(candidate - current) > 250_000_000 { offset = candidate }
                         }
                         settling += 1
+
+                        // Read at the moment the offset stops being revised, so the two are
+                        // minima over the same window and describe the same frames. Read
+                        // earlier it would be a floor from three frames; read continuously it
+                        // would move the timestamps around.
+                        if !floorTaken, settling >= 60 {
+                            floorTaken = true
+                            floorNanoseconds = floor().map { Int64($0 * 1_000_000) } ?? 0
+                        }
                     }
 
-                    let shared = offset.map { captured + $0 } ?? now
+                    let shared = offset.map { captured + $0 - floorNanoseconds } ?? now
 
                     continuation.yield(
                         VideoFrame(

@@ -1473,7 +1473,16 @@ final class RoomModel {
 
         do {
             let ladder = LayerLadder(rungs: [rung])
-            let published = trustedStamp.map { TimedSource(source, stamp: $0) } ?? source
+            // The camera's own floor goes with the source, so the clock offset can put back
+            // the capture stage it would otherwise subtract. Held weakly and read per call
+            // rather than captured as a number: the floor is not known when this is built,
+            // only after the first second of frames.
+            let device = camera
+            let published = trustedStamp.map {
+                TimedSource(source, stamp: $0, floor: { [weak device] in
+                    device.map { $0.deliveryLatency.best }
+                })
+            } ?? source
             var encoders: EncoderFactory = defaultEncoderFactory
             if flatLayers {
                 encoders = { configuration in
