@@ -776,6 +776,29 @@ struct BroadcastControls: View {
                     .disabled(!room.isPublishingAudio || room.audioInput != .microphone)
                     .controlCapsule()
 
+                    // Which volume the far side plays on. A call runs on the in-call volume,
+                    // which stops short of silence on purpose so that a call cannot be muted by
+                    // accident — right for a conversation and wrong for an audience, where
+                    // somebody monitoring on headphones or testing two phones on one desk wants
+                    // the others off entirely. Media volume goes to zero and costs the canceller.
+                    Button {
+                        room.broadcastsToAnAudience.toggle()
+                    } label: {
+                        Label(
+                            room.broadcastsToAnAudience ? "Media volume" : "Call volume",
+                            systemImage: room.broadcastsToAnAudience
+                                ? "speaker.wave.2"
+                                : "phone.arrow.up.right"
+                        )
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(room.broadcastsToAnAudience ? .orange : nil)
+                    // Same reasoning as the mute above: while nothing is being published the
+                    // session is already a playback one, already on the media volume, and this
+                    // would toggle a setting with nothing to apply it to.
+                    .disabled(!room.isPublishingAudio && !room.isBroadcasting)
+                    .controlCapsule()
+
                     Button {
                         Task { await room.setCameraMuted(!room.isCameraMuted) }
                     } label: {

@@ -63,15 +63,54 @@ struct AudioGraphPurposeTests {
         }
     #endif
 
+    @Test("a broadcast keeps the voice capture and gives up the canceller")
+    func broadcastTradesCancellationForVolume() {
+        // The trade is not optional and not two decisions. Voice processing is
+        // what puts a session on the in-call volume, and the in-call volume is
+        // the one with a floor, so an output somebody can silence costs exactly
+        // the canceller and nothing less.
+        #expect(AudioGraph.Purpose.broadcast.capturesInput)
+        #expect(!AudioGraph.Purpose.broadcast.wantsVoiceProcessing)
+
+        // Still a voice, though, which is the difference from music: a host
+        // wearing earbuds should be heard through them.
+        #expect(AudioGraph.Purpose.broadcast.prefersHeadsetInput)
+        #expect(AudioGraph.Purpose.broadcast.prefersSpeaker)
+    }
+
     @Test("every purpose that captures a voice asks for a headset microphone")
     func headsetInputFollowsVoice() {
+        // Written against `wantsVoiceProcessing` until `broadcast` existed, on
+        // the assumption that the two were the same question. They are not:
+        // a broadcast captures a voice and declines the processing, so the
+        // proxy quietly asserted that a host's earbuds should be ignored.
+        // What is actually meant is every capturing purpose except music.
         for purpose in AudioGraph.Purpose.allCases {
+            let capturesAVoice = purpose.capturesInput && purpose != .music
             #expect(
-                purpose.prefersHeadsetInput == purpose.wantsVoiceProcessing,
+                purpose.prefersHeadsetInput == capturesAVoice,
                 "\(purpose) disagrees with itself about whether it is capturing a voice"
             )
         }
     }
+
+    #if os(iOS) || os(visionOS) || os(tvOS)
+        @Test("only the chat modes take the in-call volume")
+        func mediaVolumeFollowsTheMode() {
+            // The property the broadcast case exists for, pinned where it is
+            // decided. Everything on a chat mode is a call as far as iOS is
+            // concerned, and a call's output will not go to zero.
+            for purpose in AudioGraph.Purpose.allCases {
+                let isCall = purpose.mode == .voiceChat || purpose.mode == .videoChat
+                #expect(
+                    isCall == purpose.wantsVoiceProcessing,
+                    "\(purpose) asks for one of the canceller and the call volume without the other"
+                )
+            }
+            #expect(AudioGraph.Purpose.broadcast.mode == .default)
+            #expect(AudioGraph.Purpose.broadcast.category == .playAndRecord)
+        }
+    #endif
 
     @Test("the microphone can be taken again after it is given back")
     func theMicrophoneComesBack() throws {

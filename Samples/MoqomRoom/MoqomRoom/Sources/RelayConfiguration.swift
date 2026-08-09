@@ -417,6 +417,13 @@ struct LaunchOptions {
     /// care: the whole effect being looked for is eight milliseconds.
     var plainCapture = false
 
+    /// Publish on the media volume rather than the in-call one.
+    ///
+    /// See ``RoomModel/broadcastsToAnAudience``. Here as a flag because it is the setting a
+    /// scripted run wants: two phones on one desk, both publishing, and no way to silence
+    /// either of them from the volume buttons while the session is a call.
+    var mediaVolume = false
+
     /// What to give the encoder, overriding what the frame rate would imply.
     ///
     /// A separate knob because bitrate and frame rate are separate questions, and
@@ -507,6 +514,7 @@ struct LaunchOptions {
             case "--flat-layers": options.flatLayers = true
             case "--eager-encoding": options.eagerEncoding = true
             case "--plain-capture": options.plainCapture = true
+            case "--media-volume": options.mediaVolume = true
             case "--fps": options.frameRate = value.flatMap(Double.init)
             case "--kbps": options.kilobitsPerSecond = value.flatMap(Int.init)
             case "--stats-ms": options.statisticsMilliseconds = value.flatMap(Int.init)

@@ -842,6 +842,10 @@ final class AppModel {
                                 AudioGraph.shared.capturedLate.seconds * 1000
                             )
                             + " volume=\(String(format: "%.2f", session.outputVolume))"
+                            // Which volume that figure is on, which decides whether it can
+                            // reach zero at all: a chat mode is a call as far as iOS is
+                            // concerned, and a call's output stops short of silence.
+                            + " mode=\(session.mode.rawValue.replacingOccurrences(of: "AVAudioSessionMode", with: ""))"
                             + " mic=\(AVAudioApplication.shared.recordPermission == .granted ? "granted" : "not granted")"
                             + (room.lastError.map { " error=\($0)" } ?? "")
                     )
@@ -1195,6 +1199,7 @@ final class AppModel {
             model.flatLayers = launch.flatLayers
             model.encodesEagerly = launch.eagerEncoding
             model.capturesPlainly = launch.plainCapture
+            model.broadcastsToAnAudience = launch.mediaVolume
 
             // A figure given on the command line is a figure to be obeyed, so it turns the
             // adaptation off: the point of passing one is to see what that exact delay does.

@@ -1135,11 +1135,31 @@ final class RoomModel {
         didSet { applyAudioPurpose() }
     }
 
+    /// Put playback on the media volume, at the cost of the echo canceller.
+    ///
+    /// For talking *to* an audience rather than with one. iOS runs anything using voice
+    /// processing on the in-call volume, which is a separate slider from media and will not go
+    /// to zero — so a host monitoring on headphones, or two devices on one desk, cannot turn the
+    /// far side off. The floor is deliberate on Apple's part and there is no way to ask for the
+    /// one without the other, so this is the trade stated plainly rather than worked around.
+    ///
+    /// Off by default because the default room is interactive, and there the loop this gives up
+    /// cancelling is real: a device on its loudspeaker with the microphone open in the same room
+    /// will howl.
+    var broadcastsToAnAudience = false {
+        didSet { applyAudioPurpose() }
+    }
+
     private func applyAudioPurpose(publishing: Bool? = nil) {
         let purpose: AudioGraph.Purpose
         if publishing ?? (isPublishingAudio || isBroadcasting) {
             if capturesEverythingItHears {
+                // Already on the media volume and already without the canceller, so there is
+                // nothing the broadcast case would add — it is the same session by a different
+                // name, chosen for the capture instead of the output.
                 purpose = .music
+            } else if broadcastsToAnAudience {
+                purpose = .broadcast
             } else {
                 purpose = mode == .audioRoom ? .voiceCall : .videoCall
             }

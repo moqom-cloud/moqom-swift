@@ -77,6 +77,41 @@ import os
             /// like a phone call.
             case music
 
+            /// Speaking to an audience rather than with them.
+            ///
+            /// The same capture as ``videoCall`` and a different output, because
+            /// what the two need from the system is not the same thing. A call
+            /// takes the voice-processing path, and iOS treats anything on that
+            /// path as a call: output goes to the in-call volume, which is a
+            /// separate slider from media and — by design, so that a call cannot
+            /// be silenced by accident — will not go to zero. There is a floor,
+            /// and a broadcast is exactly the case where somebody legitimately
+            /// wants the far side inaudible: monitoring on headphones, two
+            /// devices on one desk, a host who wants to hear the room and not
+            /// themselves.
+            ///
+            /// So this runs on the media volume, which costs the system echo
+            /// canceller — the two are the same switch, not two switches. That
+            /// is the whole trade and it is the right way round here: a
+            /// broadcaster's audience is not in the room with them, so there is
+            /// no loop to cancel, and a broadcast that cannot be turned down is
+            /// a worse failure than an echo that never happens. An interactive
+            /// room should stay on ``voiceCall`` or ``videoCall`` and keep the
+            /// canceller, because there the loop is real.
+            ///
+            /// The canceller is not the only thing it costs, which is worth
+            /// knowing before reaching for this on a latency budget. Measured on
+            /// an iPhone 15 Pro and an iPhone Air, two runs each way, statistics
+            /// every three seconds: output latency goes from 9.0ms to 15.5ms and
+            /// input from 1.0ms to 2.0ms, so about seven and a half milliseconds
+            /// of mouth-to-ear. The call path runs a tighter buffer than the
+            /// media path and this gives that up along with everything else.
+            ///
+            /// > Note: with no canceller, a device broadcasting on its
+            /// > loudspeaker while receiving audio from the same room will howl.
+            /// > That is the configuration this case is unsuitable for.
+            case broadcast
+
             /// Receiving only, publishing nothing. The audience of an audio room.
             ///
             /// The distinction is the microphone. Every other case records, and a
@@ -108,7 +143,17 @@ import os
             /// Nothing to cancel without capture, and asking for it anyway on a
             /// playback session takes the input device -- which is the thing this
             /// case exists to avoid.
-            public var wantsVoiceProcessing: Bool { self != .music && capturesInput }
+            ///
+            /// Off for ``broadcast`` as well, and not as a side effect: engaging
+            /// the voice-processing unit is what puts the session on the in-call
+            /// volume, so a broadcast that wants a silenceable output cannot
+            /// have the canceller too.
+            public var wantsVoiceProcessing: Bool {
+                switch self {
+                case .voiceCall, .videoCall: true
+                case .music, .broadcast, .listening: false
+                }
+            }
         }
 
         public struct Configuration: Sendable, Hashable {
@@ -893,11 +938,14 @@ import os
                 capturesInput ? .playAndRecord : .playback
             }
 
+            // The chat modes are what move a session onto the in-call volume, so
+            // `default` is not "nothing special here" for a broadcast — it is the
+            // setting being asked for.
             var mode: AVAudioSession.Mode {
                 switch self {
                 case .voiceCall: .voiceChat
                 case .videoCall: .videoChat
-                case .music, .listening: .default
+                case .music, .broadcast, .listening: .default
                 }
             }
 
