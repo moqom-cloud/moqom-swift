@@ -383,6 +383,86 @@ import os
         private let engine = AVAudioEngine()
         private let lock = NSLock()
         private var voices: [Voice] = []
+
+        /// How loud the room is played back, `0` to `1`, independent of the system's volume.
+        ///
+        /// Here because the system's volume cannot be relied on to reach silence. Which of the
+        /// several volumes an iPhone keeps is being adjusted depends on the session: measured on
+        /// a device publishing into a room, ``Purpose/videoCall`` reports an output volume of
+        /// 0.05 and will not go below it, because that is the in-call volume and the system will
+        /// not let a call be silenced, while ``Purpose/broadcast`` reports 0.15 on the same
+        /// device at the same moment — a different number for a different bus, which is the
+        /// proof the category switch works. What neither gives is a listener who wants the room
+        /// off: the in-call bus has a floor, and the media bus is shared with everything else the
+        /// phone plays.
+        ///
+        /// On the main mixer rather than on each ``Voice``, so it is one multiply for the whole
+        /// mix and so a participant who joins mid-call arrives already at the right level. The
+        /// capture sink hangs off the input node and not the mixer, so this silences what is
+        /// heard without touching what is sent.
+        ///
+        /// Reapplied on start, because the engine is stopped and restarted whenever the purpose
+        /// changes and a mixer that has been rebuilt is back at unity.
+        public var playbackVolume: Float {
+            get {
+                lock.lock()
+                defer { lock.unlock() }
+                return playback
+            }
+            set {
+                lock.lock()
+                defer { lock.unlock() }
+                playback = max(0, min(1, newValue))
+                if running { engine.mainMixerNode.outputVolume = playback }
+            }
+        }
+
+        private var playback: Float = 1
+
+        /// What the mix is actually sending to the device, in dBFS.
+        ///
+        /// ``AudioMeter/level``'s counterpart for the other direction, and the only reading that
+        /// can tell a caller the difference between a room that is quiet and a room that is not
+        /// being played. Everything upstream can look perfect while this sits at silence: voices
+        /// attach, packets arrive, ``Voice`` renders them, and a gain of zero anywhere in the
+        /// chain makes all of it inaudible without moving a single counter.
+        ///
+        /// Off unless asked for, because it is a tap on the mixer and the shipping path should
+        /// not carry one for a number nobody reads.
+        public private(set) var outputLevel = VoiceActivity.silent
+
+        private var monitorsOutput = false
+
+        /// Watch what the mix is sending, from the next start onwards.
+        public func monitorOutput() {
+            lock.lock()
+            let already = running
+            monitorsOutput = true
+            if already { installMonitorLocked() }
+            lock.unlock()
+        }
+
+        private func installMonitorLocked() {
+            let mixer = engine.mainMixerNode
+            mixer.removeTap(onBus: 0)
+            mixer.installTap(onBus: 0, bufferSize: 1024, format: nil) { [weak self] buffer, _ in
+                guard let self, let data = buffer.floatChannelData else { return }
+                let frames = Int(buffer.frameLength)
+                guard frames > 0 else { return }
+
+                var sum = 0.0
+                for channel in 0 ..< Int(buffer.format.channelCount) {
+                    let samples = data[channel]
+                    for frame in 0 ..< frames { sum += Double(samples[frame] * samples[frame]) }
+                }
+                let mean = sum / Double(frames * Int(buffer.format.channelCount))
+                let level = mean > 0 ? 10 * log10(mean) : VoiceActivity.silent
+
+                lock.lock()
+                outputLevel = max(VoiceActivity.silent, level)
+                lock.unlock()
+            }
+        }
         private var capture: Capture?
         private var sink: AVAudioSinkNode?
         private var running = false
@@ -738,6 +818,8 @@ import os
             } catch {
                 throw MoqomError.platform(api: "AVAudioEngine.start", status: -1)
             }
+            engine.mainMixerNode.outputVolume = playback
+            if monitorsOutput { installMonitorLocked() }
             running = true
         }
 

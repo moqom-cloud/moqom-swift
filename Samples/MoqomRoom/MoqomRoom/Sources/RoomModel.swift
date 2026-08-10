@@ -77,6 +77,16 @@ final class RoomModel {
         set { AudioGraph.shared.isBypassingVoiceProcessing = newValue }
     }
 
+    /// Silence the room without silencing the phone.
+    ///
+    /// The system's volume cannot do this. While publishing it is the in-call volume, which has a
+    /// floor of 0.05 and no way past it, and switching to the media volume only moves the problem
+    /// to a control shared with everything else the device plays. This is the graph's own gain,
+    /// and it reaches zero.
+    var isPlaybackMuted = false {
+        didSet { AudioGraph.shared.playbackVolume = isPlaybackMuted ? 0 : 1 }
+    }
+
     enum AudioInput: String, CaseIterable, Identifiable, Sendable {
         case tone = "Tone"
         case microphone = "Microphone"

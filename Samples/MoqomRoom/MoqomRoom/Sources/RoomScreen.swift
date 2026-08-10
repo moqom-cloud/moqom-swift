@@ -797,6 +797,25 @@ struct BroadcastControls: View {
                     // session is already a playback one, already on the media volume, and this
                     // would toggle a setting with nothing to apply it to.
                     .disabled(!room.isPublishingAudio && !room.isBroadcasting)
+
+                    // What the button above cannot do. Whichever volume the session is on, the
+                    // hardware buttons move a control the system owns: in a call it stops at
+                    // 0.05, and on media it is the same control everything else on the phone
+                    // uses. This one belongs to the mix and goes to nothing, and it is not
+                    // disabled while publishing because silencing the room you are speaking into
+                    // is exactly the case — monitoring on headphones, or two phones on one desk.
+                    Button {
+                        room.isPlaybackMuted.toggle()
+                    } label: {
+                        Label(
+                            room.isPlaybackMuted ? "Room silenced" : "Silence room",
+                            systemImage: room.isPlaybackMuted
+                                ? "speaker.slash.fill"
+                                : "speaker.wave.3"
+                        )
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(room.isPlaybackMuted ? .red : nil)
                     .controlCapsule()
 
                     Button {

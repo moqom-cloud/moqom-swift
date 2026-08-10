@@ -129,4 +129,19 @@ struct AudioGraphPurposeTests {
         graph.releaseMicrophone()
         graph.releaseMicrophone()
     }
+
+    /// The gain that exists because the system's does not reach zero while publishing.
+    @Test("the room can be silenced, and cannot be turned up past unity")
+    func theRoomCanBeSilenced() {
+        let graph = AudioGraph(configuration: .init(purpose: .broadcast))
+        #expect(graph.playbackVolume == 1, "a graph nobody has touched plays at the level it was sent at")
+
+        graph.playbackVolume = 0
+        #expect(graph.playbackVolume == 0, "silence is the whole point and 0.05 is not it")
+
+        graph.playbackVolume = 4
+        #expect(graph.playbackVolume == 1)
+        graph.playbackVolume = -1
+        #expect(graph.playbackVolume == 0)
+    }
 }

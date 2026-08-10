@@ -660,6 +660,7 @@ final class AppModel {
                             drawn.reshapes,
                             drawn.handbacks
                         )
+                        + String(format: " drains=%d/%d", drawn.drains, drawn.observations)
                         // And whether anything is presenting them. A rate of zero is a queue
                         // filling up behind a clock that never started, which every count above
                         // reports as a stream in perfect health.
@@ -848,6 +849,14 @@ final class AppModel {
                             // reach zero at all: a chat mode is a call as far as iOS is
                             // concerned, and a call's output stops short of silence.
                             + " mode=\(session.mode.rawValue.replacingOccurrences(of: "AVAudioSessionMode", with: ""))"
+                + " category=\(session.category.rawValue.replacingOccurrences(of: "AVAudioSessionCategory", with: ""))"
+                + String(format: " mix=%.2f", AudioGraph.shared.playbackVolume)
+                + String(
+                    format: " heard=%.1fdB room=%.1fdB sent=%.1fdB",
+                    AudioGraph.shared.meter.level,
+                    AudioGraph.shared.meter.noiseFloor,
+                    AudioGraph.shared.outputLevel
+                )
                             + " mic=\(AVAudioApplication.shared.recordPermission == .granted ? "granted" : "not granted")"
                             + (room.lastError.map { " error=\($0)" } ?? "")
                     )
@@ -1202,6 +1211,11 @@ final class AppModel {
             model.encodesEagerly = launch.eagerEncoding
             model.capturesPlainly = launch.plainCapture
             model.broadcastsToAnAudience = launch.mediaVolume
+            model.isPlaybackMuted = launch.silenceRoom
+            if let mix = launch.mix {
+                AudioGraph.shared.monitorOutput()
+                AudioGraph.shared.playbackVolume = mix
+            }
 
             // A figure given on the command line is a figure to be obeyed, so it turns the
             // adaptation off: the point of passing one is to see what that exact delay does.

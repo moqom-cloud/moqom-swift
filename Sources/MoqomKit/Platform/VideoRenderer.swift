@@ -552,7 +552,10 @@ import MoqomCore
             guard now - tracked >= .milliseconds(250) else { return }
             tracked = now
 
-            guard let rate = tracking.correction(depth: depth, wanted: wanted) else { return }
+            let moved = tracking.correction(depth: depth, wanted: wanted)
+            drawing.drains = tracking.drains
+            drawing.observations = tracking.observations
+            guard let rate = moved else { return }
             drawing.trim = tracking.standing * 1_000_000
             run(at: 1 + rate)
         }
@@ -728,6 +731,17 @@ import MoqomCore
             /// limit is the loop saying the thing it is being asked to track is not crystal
             /// drift at all.
             public var trim = 0.0
+
+            /// How many of the tracking loop's observations took its drain path, out of how many
+            /// it made.
+            ///
+            /// The drain leans on the error ten times harder than ordinary tracking and exists
+            /// for one case: a schedule holding more delay than was asked for. So a hold above
+            /// the request with this near zero is the drain being gated out, and a hold above the
+            /// request with this near one is the drain running and losing. See
+            /// ``ScheduleTracking/drains``.
+            public var drains = 0
+            public var observations = 0
 
             /// Times the even presentation grid was restarted.
             ///

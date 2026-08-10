@@ -135,6 +135,33 @@ struct ScheduleTrackingTests {
         #expect(abs(link.depth - link.wanted) < 0.005)
     }
 
+    /// The windup the guard above cannot see, because it only bites on errors big enough to
+    /// saturate the rate.
+    ///
+    /// Held a few milliseconds above the request and not allowed to move — which is the real
+    /// arrangement, since the ceiling correction tolerates a deadband and this loop is asked to
+    /// hold the ceiling exactly, leaving a band between them that nothing intends to close. On
+    /// two phones the history wound to 3374 and 4265 parts per million there and was still
+    /// climbing after four minutes.
+    @Test("a small error that never goes away is not learnt as a crystal")
+    func doesNotWindUpOnASmallStandingError() {
+        var tracking = ScheduleTracking()
+        let wanted = 0.020
+
+        for _ in 0 ..< 4000 {
+            _ = tracking.correction(depth: wanted + 0.006, wanted: wanted)
+        }
+
+        #expect(
+            tracking.standing <= ScheduleTracking.mostDriftWorthLearning,
+            "six milliseconds held for a thousand seconds is not two crystals disagreeing"
+        )
+        #expect(
+            tracking.standing < 0.0005,
+            "half a percent of rate is a picture running fast, not a correction"
+        )
+    }
+
     @Test("delay above what was asked for is drained in seconds, not minutes")
     func drainsAnExcessPromptly() {
         // The fault this answers, measured on a phone: a leg holding a hundred milliseconds more

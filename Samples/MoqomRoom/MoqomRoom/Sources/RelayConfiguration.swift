@@ -429,6 +429,22 @@ struct LaunchOptions {
     /// either of them from the volume buttons while the session is a call.
     var mediaVolume = false
 
+    /// Start with the room's playback at zero.
+    ///
+    /// See ``RoomModel/isPlaybackMuted``. A flag as well as a button because whether a speaker is
+    /// actually silent is not something a log can asserted from the value that was set — it has
+    /// to be heard. With cancellation off a phone's own microphone hears its own speaker, so a
+    /// scripted run can put a tone on one device, play it on the other, and read the second
+    /// device's input level with this on and off.
+    var silenceRoom = false
+
+    /// Start at an arbitrary playback gain, and watch what the mix sends.
+    ///
+    /// Silence on its own cannot be told from a meter that is broken, so the check needs a level
+    /// between the two: a half should read six decibels down from a whole, and a meter that does
+    /// that is a meter whose zero means something.
+    var mix: Float?
+
     /// Dial the relay unmarked, in the queue a background download would get.
     ///
     /// See ``NetworkQUICCarrier/serviceClass``. The A side of that measurement: the shipping
@@ -527,6 +543,8 @@ struct LaunchOptions {
             case "--eager-encoding": options.eagerEncoding = true
             case "--plain-capture": options.plainCapture = true
             case "--media-volume": options.mediaVolume = true
+            case "--silence-room": options.silenceRoom = true
+            case "--mix": options.mix = value.flatMap(Float.init)
             case "--best-effort": options.bestEffort = true
             case "--fps": options.frameRate = value.flatMap(Double.init)
             case "--kbps": options.kilobitsPerSecond = value.flatMap(Int.init)

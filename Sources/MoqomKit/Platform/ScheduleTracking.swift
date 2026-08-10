@@ -89,6 +89,33 @@ struct ScheduleTracking: Sendable, Equatable {
     /// working on something that resembles the drift.
     static let believeOfEachReading = 0.125
 
+    /// The most crystal disagreement the history is allowed to believe in.
+    ///
+    /// Two hundred parts per million: two oscillators at the hundred that
+    /// ``TrustedClock/maximumDrift`` takes as the datasheet worst case, pulling opposite ways.
+    /// That is a physical envelope rather than a tuning choice, and nothing outside it is the
+    /// quantity this term exists to hold.
+    ///
+    /// The clamp above it is not this one and does not do this job. That one stops the history
+    /// recording authority the loop could not apply, so it only bites on errors large enough to
+    /// saturate the rate. A small error that persists never saturates anything and accumulates
+    /// without limit — which is what two phones did, reaching 3374 and 4265 parts per million
+    /// and still climbing after four minutes, against a field whose own documentation says it
+    /// should settle within a few tens.
+    ///
+    /// Where the small error came from is worth keeping, because it is nobody's bug and it is
+    /// still a fault. The ceiling correction tolerates a deadband before it acts, so the hold's
+    /// resting place is the ceiling plus that deadband, while this loop is asked to hold the
+    /// ceiling exactly. Between the two sits a band a few milliseconds wide in which this loop
+    /// sees an error that no other mechanism intends to remove, and reads it as the crystals
+    /// disagreeing. Measured there: `ahead` at 24 and 28ms against a 20ms request, the drain path
+    /// declining to engage 93 percent of the time because an excess that small is not what it is
+    /// for, and the history quietly winding to half a percent of rate underneath both.
+    ///
+    /// Half a percent is not a correction, it is a picture running fast for the length of a call
+    /// and then overshooting when the error finally clears.
+    static let mostDriftWorthLearning = 2 * TrustedClock.maximumDrift
+
     /// A change smaller than this is not worth the timebase operation it would cost.
     ///
     /// Two parts per million. Coarser sounds harmless and is not: the whole quantity being
@@ -107,6 +134,16 @@ struct ScheduleTracking: Sendable, Equatable {
 
     /// The correction currently in force, so it is only reapplied when it has moved.
     private(set) var applied = 0.0
+
+    /// Observations that took the drain path rather than the tracking one, and observations in
+    /// total.
+    ///
+    /// Counted because the two paths differ by a factor of ten in gain, and which one is running
+    /// cannot be told from the rate afterwards. A schedule sitting above what it asked for while
+    /// this stays near zero means the drain is being gated out rather than being too weak, and
+    /// those want opposite fixes.
+    private(set) var drains = 0
+    private(set) var observations = 0
 
     /// The smoothed depth the loop is working from. See ``believeOfEachReading``.
     private var settled: Double?
@@ -134,6 +171,8 @@ struct ScheduleTracking: Sendable, Equatable {
         // that no longer has it, and the frames that should have filled it are shown late.
         let draining = error > Self.anExcessWorthDraining
             && depth - wanted > Self.anExcessWorthDraining
+        observations += 1
+        if draining { drains += 1 }
         let lean = draining ? Self.leanOnAnExcess : Self.leanOnTheError
         let most = draining ? Self.mostDrainWorthApplying : Self.mostTrimWorthApplying
 
@@ -150,7 +189,10 @@ struct ScheduleTracking: Sendable, Equatable {
         // standing correction for something that has already been drained away, and it would
         // then run fast for the rest of the call with nothing left to correct.
         if abs(proposed) < Self.mostTrimWorthApplying {
-            standing += Self.leanOnItsHistory * error
+            standing = min(
+                Self.mostDriftWorthLearning,
+                max(-Self.mostDriftWorthLearning, standing + Self.leanOnItsHistory * error)
+            )
         }
 
         let rate = min(most, max(-Self.mostTrimWorthApplying, proposed))
