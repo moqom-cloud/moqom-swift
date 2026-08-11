@@ -89,32 +89,37 @@ struct ScheduleTracking: Sendable, Equatable {
     /// working on something that resembles the drift.
     static let believeOfEachReading = 0.125
 
-    /// The most crystal disagreement the history is allowed to believe in.
+    /// The most standing correction the history may accumulate.
     ///
-    /// Two hundred parts per million: two oscillators at the hundred that
-    /// ``TrustedClock/maximumDrift`` takes as the datasheet worst case, pulling opposite ways.
-    /// That is a physical envelope rather than a tuning choice, and nothing outside it is the
-    /// quantity this term exists to hold.
+    /// The same figure the rate is clamped to, because they answer one question: there is no
+    /// point recording authority the loop is not permitted to use, and every part per million
+    /// recorded past that is time spent unwinding before the loop can respond to anything.
     ///
-    /// The clamp above it is not this one and does not do this job. That one stops the history
-    /// recording authority the loop could not apply, so it only bites on errors large enough to
-    /// saturate the rate. A small error that persists never saturates anything and accumulates
-    /// without limit — which is what two phones did, reaching 3374 and 4265 parts per million
-    /// and still climbing after four minutes, against a field whose own documentation says it
-    /// should settle within a few tens.
+    /// This was two hundred parts per million for a while, on the reasoning that two oscillators
+    /// at the hundred ``TrustedClock/maximumDrift`` calls a datasheet worst case is the physical
+    /// envelope, and nothing outside it can be crystal drift. The reasoning is sound and the
+    /// conclusion was wrong, because crystal drift is not the quantity here — see
+    /// ``mostTrimWorthApplying``, two constants up, which is set to two percent precisely because
+    /// what a viewer sees is a grid laid down at a slightly wrong interval walking against the
+    /// source at a percent or so. Bounding the term at two hundred sized it for the small
+    /// contributor and left it unable to cancel the large one.
     ///
-    /// Where the small error came from is worth keeping, because it is nobody's bug and it is
-    /// still a fault. The ceiling correction tolerates a deadband before it acts, so the hold's
-    /// resting place is the ceiling plus that deadband, while this loop is asked to hold the
-    /// ceiling exactly. Between the two sits a band a few milliseconds wide in which this loop
-    /// sees an error that no other mechanism intends to remove, and reads it as the crystals
-    /// disagreeing. Measured there: `ahead` at 24 and 28ms against a 20ms request, the drain path
-    /// declining to engage 93 percent of the time because an excess that small is not what it is
-    /// for, and the history quietly winding to half a percent of rate underneath both.
+    /// What that cost is worth writing down, because the loop looked innocent while paying it. On
+    /// a phone the term sat *exactly* on two hundred — saturated, contributing a fifth of a
+    /// millisecond a second against a mismatch needing ten to fifty times that — so the schedule
+    /// walked up regardless and the ceiling correction hauled it back in ten-millisecond steps
+    /// 1.4 times a second, five hundred times in six minutes, while the delay controller made one
+    /// decision. That sawtooth was read as instability in the delay controller three separate
+    /// times. Simulated across the range: at and below the old bound the loop cancels the
+    /// mismatch and the hold is flat to a tenth of a millisecond with no corrections at all;
+    /// above it, corrections appear and the hold spreads, reaching 20 to 29ms at one percent,
+    /// which is the shape both phones were showing.
     ///
-    /// Half a percent is not a correction, it is a picture running fast for the length of a call
-    /// and then overshooting when the error finally clears.
-    static let mostDriftWorthLearning = 2 * TrustedClock.maximumDrift
+    /// The reading that first prompted the bound — the term climbing past 3374 and 4265 parts per
+    /// million and still going after four minutes — was not runaway. It was the loop travelling
+    /// toward a real one-percent error at the only speed ``leanOnItsHistory`` allows, which takes
+    /// about ten minutes, and it was stopped a twentieth of the way there.
+    static let mostDriftWorthLearning = mostTrimWorthApplying
 
     /// A change smaller than this is not worth the timebase operation it would cost.
     ///

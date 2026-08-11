@@ -135,30 +135,49 @@ struct ScheduleTrackingTests {
         #expect(abs(link.depth - link.wanted) < 0.005)
     }
 
-    /// The windup the guard above cannot see, because it only bites on errors big enough to
-    /// saturate the rate.
+    /// The disagreement that actually shows up on a phone, which is not two crystals.
     ///
-    /// Held a few milliseconds above the request and not allowed to move — which is the real
-    /// arrangement, since the ceiling correction tolerates a deadband and this loop is asked to
-    /// hold the ceiling exactly, leaving a band between them that nothing intends to close. On
-    /// two phones the history wound to 3374 and 4265 parts per million there and was still
-    /// climbing after four minutes.
-    @Test("a small error that never goes away is not learnt as a crystal")
-    func doesNotWindUpOnASmallStandingError() {
+    /// A grid laid down at a slightly wrong interval walks against the source a hundred times
+    /// faster than the hardware does — see ``ScheduleTracking/mostTrimWorthApplying`` — and this
+    /// is the loop being asked to cancel one percent of it. It could not, for a while: the
+    /// history was bounded at two hundred parts per million on the reasoning that nothing larger
+    /// could be crystal drift, which was true and irrelevant, and left the term saturated at a
+    /// fiftieth of what it needed. What that looked like from outside was the ceiling correction
+    /// hauling the schedule back 1.4 times a second forever, and it was read as instability in
+    /// the delay controller three times before it was read here.
+    @Test("a grid that walks a percent against the source is cancelled")
+    func cancelsMoreThanCrystals() {
+        var link = Link(drift: 0.01, wanted: 0.020)
+        link.run(seconds: 20 * 60)
+
+        #expect(
+            abs(link.standing - 0.01) < 0.001,
+            "the loop settled somewhere other than the rate it was asked to match"
+        )
+        #expect(
+            abs(link.depth - link.wanted) < 0.002,
+            "a schedule this far from its request is one the ceiling correction has to hold down"
+        )
+    }
+
+    /// The other half of the bound: it may not record authority it cannot use.
+    ///
+    /// Held above the request and not allowed to move, which is a loop being asked for something
+    /// no rate correction can deliver. It has to stop somewhere, because every part per million
+    /// past what it may apply is time spent unwinding before it can answer anything real.
+    @Test("an error nothing can fix is not accumulated without limit")
+    func doesNotRecordAuthorityItCannotApply() {
         var tracking = ScheduleTracking()
         let wanted = 0.020
 
-        for _ in 0 ..< 4000 {
+        for _ in 0 ..< 40000 {
             _ = tracking.correction(depth: wanted + 0.006, wanted: wanted)
         }
 
+        #expect(tracking.standing <= ScheduleTracking.mostDriftWorthLearning)
         #expect(
-            tracking.standing <= ScheduleTracking.mostDriftWorthLearning,
-            "six milliseconds held for a thousand seconds is not two crystals disagreeing"
-        )
-        #expect(
-            tracking.standing < 0.0005,
-            "half a percent of rate is a picture running fast, not a correction"
+            tracking.standing <= ScheduleTracking.mostTrimWorthApplying,
+            "a history larger than the rate clamp is a record of authority the loop never had"
         )
     }
 
