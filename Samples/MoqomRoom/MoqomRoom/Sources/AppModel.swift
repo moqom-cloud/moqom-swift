@@ -660,7 +660,20 @@ final class AppModel {
                             drawn.reshapes,
                             drawn.handbacks
                         )
-                        + String(format: " drains=%d/%d", drawn.drains, drawn.observations)
+                        + String(
+                            format: " drains=%d refills=%d/%d",
+                            drawn.drains, drawn.refills, drawn.observations
+                        )
+                        + String(
+                            format: " gapped=%d crowded=%d stale=%d speed=%d/%.1f%%",
+                            drawn.gapped, drawn.crowded, drawn.stale, drawn.speedShifts,
+                            drawn.widestSpeed * 100
+                        )
+                        + String(
+                            format: " grid=%.3f source=%.3f ms phase=%.2f/%.2f ms",
+                            drawn.laid * 1000, drawn.arriving * 1000,
+                            drawn.phase * 1000, drawn.worstPhase * 1000
+                        )
                         // And whether anything is presenting them. A rate of zero is a queue
                         // filling up behind a clock that never started, which every count above
                         // reports as a stream in perfect health.

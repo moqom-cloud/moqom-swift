@@ -137,14 +137,10 @@ struct ScheduleTrackingTests {
 
     /// The disagreement that actually shows up on a phone, which is not two crystals.
     ///
-    /// A grid laid down at a slightly wrong interval walks against the source a hundred times
-    /// faster than the hardware does — see ``ScheduleTracking/mostTrimWorthApplying`` — and this
-    /// is the loop being asked to cancel one percent of it. It could not, for a while: the
-    /// history was bounded at two hundred parts per million on the reasoning that nothing larger
-    /// could be crystal drift, which was true and irrelevant, and left the term saturated at a
-    /// fiftieth of what it needed. What that looked like from outside was the ceiling correction
-    /// hauling the schedule back 1.4 times a second forever, and it was read as instability in
-    /// the delay controller three times before it was read here.
+    /// Bounded at two hundred parts per million the loop could not cancel it and the ceiling
+    /// correction hauled the schedule back about 1.4 times a second for the length of a call.
+    /// Bounded at two thousand — tried on the strength of a measurement that turned out to be
+    /// circular — the picture was visibly worse than either.
     @Test("a grid that walks a percent against the source is cancelled")
     func cancelsMoreThanCrystals() {
         var link = Link(drift: 0.01, wanted: 0.020)
@@ -158,6 +154,40 @@ struct ScheduleTrackingTests {
             abs(link.depth - link.wanted) < 0.002,
             "a schedule this far from its request is one the ceiling correction has to hold down"
         )
+    }
+
+    /// A queue about to run out, which used to be left to the re-anchor.
+    ///
+    /// At the tracking gain a thirty-seven millisecond shortfall commands 0.37 percent and needs
+    /// ten seconds, so the step always arrived first — and the step is the lurch. This is the
+    /// drain's authority pointed the other way.
+    @Test("a shortfall is recovered fast enough to matter")
+    func recoversAShortfallBeforeTheStepWould() {
+        var tracking = ScheduleTracking()
+        let wanted = 0.020
+
+        // Seventeen milliseconds past the newest frame: the queue is empty and frames are being
+        // shown late.
+        var rate = 0.0
+        for _ in 0 ..< 12 { rate = tracking.correction(depth: -0.017, wanted: wanted) ?? rate }
+
+        #expect(rate < -0.01, "a shortfall answered at \(rate) takes longer than the grace period")
+        #expect(rate >= -ScheduleTracking.mostDrainWorthApplying)
+        #expect(tracking.refills > 0)
+
+        // And it is not mistaken for evidence about the crystals, for the same reason a drain is
+        // not: it would otherwise run slow for the rest of the call with nothing left to recover.
+        #expect(tracking.standing == 0)
+    }
+
+    @Test("ordinary unevenness is not answered with the recovery gain")
+    func doesNotRefillOnJitter() {
+        var tracking = ScheduleTracking()
+
+        // Ten milliseconds short of a twenty millisecond request is inside the jitter the
+        // deadband exists for.
+        for _ in 0 ..< 12 { _ = tracking.correction(depth: 0.010, wanted: 0.020) }
+        #expect(tracking.refills == 0)
     }
 
     /// The other half of the bound: it may not record authority it cannot use.
@@ -198,11 +228,17 @@ struct ScheduleTrackingTests {
         #expect(link.depth - link.wanted < ScheduleTracking.anExcessWorthDraining + 0.005)
     }
 
-    @Test("a schedule short of its delay is filled with the old caution")
-    func fillsCautiously() {
-        // The asymmetry, which is the whole design: running fast moves towards the publisher's
-        // clock and can at worst empty the queue, while running slow adds the delay this exists
-        // to remove. Only the first gets the extra authority.
+    /// A schedule a hundred milliseconds short of its delay, which for a long time was filled with
+    /// the cautious gain.
+    ///
+    /// The reasoning was that running fast can at worst empty the queue, while running slow adds
+    /// the very delay the loop exists to remove — so only the drain got the authority. What that
+    /// left out is what emptying the queue costs: the re-anchor that answers it moves the timebase
+    /// under every queued frame, which is a lurch, and at the cautious gain a shortfall took ten
+    /// seconds to recover so the lurch always won. Measured on a seven-millisecond link, that was
+    /// a queue swinging seventy milliseconds and stepping twice a second.
+    @Test("a schedule short of its delay is filled fast enough to avoid the step")
+    func fillsBeforeTheStepWould() {
         var link = Link(drift: 0)
         link.depth = link.wanted - 0.1
 
@@ -212,8 +248,14 @@ struct ScheduleTrackingTests {
             slowest = min(slowest, link.applied)
         }
 
-        #expect(slowest >= -ScheduleTracking.mostTrimWorthApplying)
-        #expect(slowest < -0.001)
+        #expect(slowest >= -ScheduleTracking.mostDrainWorthApplying)
+        #expect(
+            slowest < -0.01,
+            "a shortfall answered at \(slowest) is one the re-anchor answers first"
+        )
+
+        // And it lands, rather than running slow past the point of having recovered.
+        #expect(abs(link.depth - link.wanted) < ScheduleTracking.anExcessWorthDraining)
     }
 
     @Test("a depth that drops in one step is not drained on a stale estimate")

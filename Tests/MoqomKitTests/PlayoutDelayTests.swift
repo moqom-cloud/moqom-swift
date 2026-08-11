@@ -323,4 +323,30 @@ struct PlayoutDelayTests {
         )
         #expect(fast < slow)
     }
+
+    /// One late frame, which is what a step used to cost a lurch for.
+    @Test("a momentary undershoot is left to the rate")
+    func ridesOutOneLateFrame() {
+        #expect(
+            !PlayoutDelay.needsAnchoring(depth: -0.023, allowance: 0.02, straying: 0.1),
+            "a frame arriving late is not a lost stream"
+        )
+    }
+
+    @Test("an undershoot the rate has not answered is stepped")
+    func stepsWhenTheRateHasHadItsChance() {
+        #expect(PlayoutDelay.needsAnchoring(depth: -0.023, allowance: 0.02, straying: 1.0))
+    }
+
+    /// Far enough out that waiting costs more than the step does.
+    @Test("a stall is stepped at once rather than ridden")
+    func doesNotRideOutAStall() {
+        #expect(PlayoutDelay.needsAnchoring(depth: -0.5, allowance: 0.02, straying: 0.01))
+    }
+
+    @Test("a schedule with frames in hand is left alone")
+    func leavesAHealthyScheduleAlone() {
+        #expect(!PlayoutDelay.needsAnchoring(depth: 0.018, allowance: 0.02, straying: nil))
+        #expect(!PlayoutDelay.needsAnchoring(depth: -0.01, allowance: 0.02, straying: nil))
+    }
 }

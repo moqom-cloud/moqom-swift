@@ -422,6 +422,7 @@ import MoqomCore
             // The next arrival follows a stream change rather than a pause, so the gap before it
             // means nothing and must not be read as one.
             arrived = nil
+            strayed = nil
             evidence.restart()
             catchUp = nil
 
@@ -532,10 +533,23 @@ import MoqomCore
         /// once per frame.
         private var tracked = ContinuousClock.now
 
+        /// When the schedule first ran past the frames it had, or `nil` while it has some.
+        private var strayed: ContinuousClock.Instant?
+
         /// Run the presentation clock at a rate, keeping the timeline continuous across it.
         private func run(at rate: Double) {
+            // A tenth of a percent, which is well under what an eye resolves in the motion of a
+            // talking head and well over the parts-per-million the drift correction deals in. What
+            // is being counted is the loop changing its mind, not the loop working.
+            if abs(rate - running) > 0.001 { drawing.speedShifts += 1 }
+            running = rate
+            drawing.widestSpeed = max(drawing.widestSpeed, abs(rate - 1))
+
             synchroniser.setRate(Float(rate), time: synchroniser.currentTime())
         }
+
+        /// The rate the presentation clock was last set to.
+        private var running = 1.0
 
         /// Hold the schedule level with the publisher's clock.
         ///
@@ -554,6 +568,7 @@ import MoqomCore
 
             let moved = tracking.correction(depth: depth, wanted: wanted)
             drawing.drains = tracking.drains
+            drawing.refills = tracking.refills
             drawing.observations = tracking.observations
             guard let rate = moved else { return }
             drawing.trim = tracking.standing * 1_000_000
@@ -741,6 +756,65 @@ import MoqomCore
             /// request with this near one is the drain running and losing. See
             /// ``ScheduleTracking/drains``.
             public var drains = 0
+
+            /// Observations that ran the same correction the other way, recovering a queue about
+            /// to run out. See ``ScheduleTracking/refills``.
+            public var refills = 0
+
+            /// Slots the grid left empty, and frames that arrived too close to the one before to
+            /// have a slot of their own.
+            ///
+            /// The pair describes the picture rather than the schedule, which every other figure
+            /// here describes instead. An empty slot holds the previous frame for two intervals
+            /// and the motion visibly stops; a crowded one means a frame was pushed later than it
+            /// was meant to be shown. A schedule can be perfectly level while both of these run,
+            /// and a viewer would call that jitter and be right.
+            public var gapped = 0
+            public var crowded = 0
+
+            /// Frames that arrived after one newer than themselves.
+            ///
+            /// Distinct from ``crowded`` in kind rather than degree: a crowded frame is half an
+            /// interval early and belongs where it is put, while one of these belongs at a moment
+            /// already gone. Shown anyway — the grid is kept monotonic, so it lands after the
+            /// newer frame — which puts older content on the screen after newer and takes the
+            /// motion backwards before it goes on. Nothing else here can see it.
+            public var stale = 0
+
+            /// The interval the grid is being laid at, and the interval the frames are actually
+            /// arriving at, both in seconds.
+            ///
+            /// The pair is the question the counters above raise and cannot answer. A grid laid a
+            /// little slower than the source runs out of slots, and the frames that find theirs
+            /// taken are pushed into the next one — which takes the slot after, and so on. Nothing
+            /// in the schedule reports that, because from the schedule's point of view every frame
+            /// was placed on the grid exactly as intended.
+            public var laid = 0.0
+            public var arriving = 0.0
+
+            /// How far frames are being shown from the moment their timestamp asks for, in
+            /// seconds: the middle of the recent window and its ninety-fifth.
+            ///
+            /// The figure that decides whether the grid is smoothing the stream or mangling it,
+            /// and the one thing the placement counters cannot say. Placing an arrival on an even
+            /// grid is only faithful while the arrival was nearly on it already — a frame moved
+            /// half an interval is shown at a moment the camera never saw, and a stream of them
+            /// moved by varying amounts is motion that stutters while every count reads clean.
+            /// Bounded by construction at half an interval, so what matters is where in that range
+            /// it sits: near zero is a grid locked to the stream, spread across it is not.
+            public var phase = 0.0
+            public var worstPhase = 0.0
+
+            /// How far the presentation speed has been moved, in parts per million, and how often
+            /// it has been moved by enough to matter.
+            ///
+            /// The loop's own documentation warns that a rate under constant adjustment is itself
+            /// a source of visible unevenness, and the recovery authority was recently widened to
+            /// five percent in both directions. This is what says whether that warning has come
+            /// true: a rate wandering percent-wide several times a second is motion that speeds up
+            /// and slows down, which looks like jitter and is not.
+            public var speedShifts = 0
+            public var widestSpeed = 0.0
             public var observations = 0
 
             /// Times the even presentation grid was restarted.
@@ -847,12 +921,33 @@ import MoqomCore
             // Two frames landing in one slot is jitter of half an interval, and the slot below is
             // already spent. Forward by one keeps the grid monotonic, which is the one property
             // the display layer cannot recover from losing.
-            if index <= Double(slot) { index = Double(slot) + 1 }
+            if index <= Double(slot) {
+                // Two cases that look identical here and are not remotely alike. A frame tied with
+                // the slot just used is jitter of half an interval, and moving it on by one is the
+                // smoothing this function exists for. A frame whose slot is *behind* that is a
+                // frame that arrived after one newer than itself, and moving it forward shows older
+                // content after newer — the motion goes back and then forward, which is visible,
+                // and which every counter here was blind to because the timestamps it hands out
+                // were made monotonic before anything could notice.
+                if index < Double(slot) {
+                    drawing.stale += 1
+                } else {
+                    drawing.crowded += 1
+                }
+                index = Double(slot) + 1
+            } else {
+                // Slots the grid leaves empty, which is the one thing here a person can actually
+                // see: the frame before it is held for two intervals and the motion stops for a
+                // sixtieth of a second. Counted rather than inferred, because every other figure
+                // in this class describes the schedule and none of them describes the picture.
+                drawing.gapped += Int(index) - Int(slot) - 1
+            }
 
             // Beyond this the source is not jittering, it has moved: a publisher that reconnected,
             // a stall long enough to break the run, a swapped source. Slewing toward that would
             // take minutes and show a lurch every frame of it.
             let error = offset - index * interval
+            record(phase: abs(error))
             guard abs(error) < 0.25 else {
                 grid = presentation
                 slot = 0
@@ -923,7 +1018,6 @@ import MoqomCore
         /// `nil` until there is enough history to be worth trusting.
         private func interval(after presentation: CMTime) -> Double? {
             defer { previousStamp = presentation }
-            if let latched { return latched }
             guard previousStamp.isValid else { return nil }
 
             let gap = (presentation - previousStamp).seconds
@@ -936,8 +1030,19 @@ import MoqomCore
                 }
             }
 
-            guard gaps.count >= 24 else { return nil }
+            // Kept measured past the latch purely so the two can be compared. The latched figure
+            // is deliberately not revised from this — see the note above on why a wandering median
+            // moves a frame a whole slot — but a grid and a source that disagree is the one thing
+            // the placement counters cannot distinguish from bad luck.
             let sorted = gaps.sorted()
+            if !sorted.isEmpty { drawing.arriving = sorted[sorted.count / 2] }
+
+            if let latched {
+                drawing.laid = latched
+                return latched
+            }
+
+            guard gaps.count >= 24 else { return nil }
             let median = sorted[sorted.count / 2]
 
             // Snapped to the rate the publisher is almost certainly running at, because a measured
@@ -1141,6 +1246,23 @@ import MoqomCore
             }
         }
 
+        /// Remember how far a frame was from the slot it was placed in.
+        private func record(phase seconds: Double) {
+            if phases.count < Self.gapWindow {
+                phases.append(seconds)
+            } else {
+                phases[phaseCursor] = seconds
+                phaseCursor = (phaseCursor + 1) % Self.gapWindow
+            }
+
+            let sorted = phases.sorted()
+            drawing.phase = sorted[sorted.count / 2]
+            drawing.worstPhase = sorted[min(sorted.count - 1, sorted.count * 95 / 100)]
+        }
+
+        private var phases: [Double] = []
+        private var phaseCursor = 0
+
         /// Move the grid, and with it every frame not yet due.
         private func shift(by seconds: Double, to depth: Duration) {
             guard let start = grid else { return }
@@ -1283,10 +1405,25 @@ import MoqomCore
             // left the adaptation with nothing to decide on.
             let allowance = max(interval ?? 0, 0.02)
 
+            // How long the schedule has been running past its frames, which is the difference
+            // between a late frame and a lost stream. Only the second is worth a step.
+            if depth < -allowance {
+                strayed = strayed ?? ContinuousClock.now
+            } else {
+                strayed = nil
+            }
+
             // Far enough out in either direction that the schedule has lost the stream rather
-            // than drifted within it, and a re-anchor is the only thing that recovers it.
-            if depth < -allowance || depth > seconds + 0.15 {
+            // than drifted within it, and a re-anchor is the only thing that recovers it. The
+            // undershoot side is a question about persistence rather than a threshold, because
+            // the rate can recover a momentary one and does it without a lurch.
+            if PlayoutDelay.needsAnchoring(
+                depth: depth,
+                allowance: allowance,
+                straying: strayed.map { (ContinuousClock.now - $0).asSeconds }
+            ) || depth > seconds + 0.15 {
                 anchorSchedule(to: newest, delay: delay)
+                strayed = nil
                 return
             }
 

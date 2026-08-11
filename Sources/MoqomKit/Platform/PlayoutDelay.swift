@@ -105,6 +105,42 @@ enum PlayoutDelay {
         return min(hold - ceiling, interval)
     }
 
+    /// How far a schedule may run past its frames and still be recovered by rate alone.
+    ///
+    /// Sixty milliseconds, which is what the clock can make up in a little over a second at the
+    /// five percent it is allowed. Past that the wait is longer than the interruption, and moving
+    /// the timebase — which is instant, and visible once — is the cheaper of the two.
+    static let mostAnUndershootWorthRiding = 0.060
+
+    /// How long the rate is given to answer before the timebase is moved instead.
+    ///
+    /// Three of the loop's four-a-second revisions, which is enough for it to have taken hold and
+    /// short enough that a schedule which has genuinely lost the stream is not left adrift while
+    /// something hopeless is attempted. A frame or two may be shown late inside this window; that
+    /// is the price, and it buys the absence of a lurch.
+    static let graceForTheRateToAnswer = 0.75
+
+    /// Whether a schedule that has run out of frames needs the timebase moved under it.
+    ///
+    /// The question used to be asked as a threshold — below it, step — and that made one late
+    /// frame cost a lurch. Measured on a link whose tail was seven milliseconds, the presentation
+    /// queue swung seventy and stepped about twice a second, all of it manufactured on the
+    /// receiving phone rather than arriving from the network.
+    ///
+    /// So it is asked as a question about persistence instead. A momentary undershoot is what the
+    /// rate is for, and it is only when the rate has been given its chance and the schedule is
+    /// still short that a step is the honest answer.
+    ///
+    /// - Parameters:
+    ///   - depth: Seconds of frames queued ahead of the playhead. Negative when it has run past
+    ///     them.
+    ///   - allowance: How far under it may sit before anyone is concerned at all.
+    ///   - straying: How long it has been under that, or `nil` if it is not.
+    static func needsAnchoring(depth: Double, allowance: Double, straying: Double?) -> Bool {
+        guard depth < -allowance, let straying else { return false }
+        return depth < -mostAnUndershootWorthRiding || straying > graceForTheRateToAnswer
+    }
+
     /// One move, or none.
     ///
     /// - Parameters:

@@ -64,13 +64,25 @@ struct ScheduleTracking: Sendable, Equatable {
     /// burst arrived long before that. The excess was not slowly corrected, it was permanent, and
     /// the leg sat at sixty-four milliseconds of hold against a fifty-millisecond ceiling.
     ///
-    /// Asymmetric, because the two directions do not carry the same risk. Running fast moves the
-    /// picture towards the publisher's clock, so it closes lip sync rather than opening it, and
-    /// the worst it can do is empty the queue — bounded, and answered by the schedule's own
-    /// re-anchor. Running slow adds delay, which is the thing being drained. So the authority
-    /// goes to the drain direction and the caution stays with the other.
+    /// Both directions, and for a while only the draining one. The reasoning for the asymmetry
+    /// was that running fast moves the picture towards the publisher's clock and the worst it can
+    /// do is empty the queue — bounded, and answered by the schedule's own re-anchor. Every step
+    /// of that is true and the last clause was the mistake, because a re-anchor is not a free
+    /// answer. It moves the timebase under every frame already queued, so what it costs is a
+    /// visible lurch, and leaving the only recovery from an empty queue in its hands meant an
+    /// exhausted schedule had no gentle way back.
     ///
-    /// Five percent of a talking head is not visible; ten seconds of avoidable delay is.
+    /// What that looked like on a phone is worth writing down, because every other figure said the
+    /// link was healthy. The tail was seven milliseconds and the presentation queue swung seventy,
+    /// lurching about twice a second: one frame arriving late crossed the re-anchor's threshold,
+    /// and the correction for one late frame was to move the whole timeline. The gentle answer was
+    /// unavailable at the tuning above — a shortfall of thirty-seven milliseconds commanded 0.37
+    /// percent, which needs ten seconds, so by the time the rate had done anything the step had
+    /// long since happened.
+    ///
+    /// So the authority is the same on both sides now, and only the *reason* for it differs: an
+    /// excess is delay nobody asked for, and a shortfall is frames shown late and a lurch coming.
+    /// Five percent of a talking head is not visible; either of those is.
     static let mostDrainWorthApplying = 0.05
     static let leanOnAnExcess = 1.0
 
@@ -95,30 +107,26 @@ struct ScheduleTracking: Sendable, Equatable {
     /// point recording authority the loop is not permitted to use, and every part per million
     /// recorded past that is time spent unwinding before the loop can respond to anything.
     ///
-    /// This was two hundred parts per million for a while, on the reasoning that two oscillators
-    /// at the hundred ``TrustedClock/maximumDrift`` calls a datasheet worst case is the physical
-    /// envelope, and nothing outside it can be crystal drift. The reasoning is sound and the
-    /// conclusion was wrong, because crystal drift is not the quantity here — see
-    /// ``mostTrimWorthApplying``, two constants up, which is set to two percent precisely because
-    /// what a viewer sees is a grid laid down at a slightly wrong interval walking against the
-    /// source at a percent or so. Bounding the term at two hundred sized it for the small
-    /// contributor and left it unable to cancel the large one.
+    /// The same figure the rate is clamped to, because they answer one question: there is no point
+    /// recording authority the loop is not permitted to use, and every part per million recorded
+    /// past that is time spent unwinding before the loop can respond to anything.
     ///
-    /// What that cost is worth writing down, because the loop looked innocent while paying it. On
-    /// a phone the term sat *exactly* on two hundred — saturated, contributing a fifth of a
-    /// millisecond a second against a mismatch needing ten to fifty times that — so the schedule
-    /// walked up regardless and the ceiling correction hauled it back in ten-millisecond steps
-    /// 1.4 times a second, five hundred times in six minutes, while the delay controller made one
-    /// decision. That sawtooth was read as instability in the delay controller three separate
-    /// times. Simulated across the range: at and below the old bound the loop cancels the
-    /// mismatch and the hold is flat to a tenth of a millisecond with no corrections at all;
-    /// above it, corrections appear and the hold spreads, reaching 20 to 29ms at one percent,
-    /// which is the shape both phones were showing.
+    /// It was two hundred parts per million for a while, on the reasoning that two oscillators at
+    /// the hundred ``TrustedClock/maximumDrift`` calls a datasheet worst case is the physical
+    /// envelope, and nothing outside it can be crystal drift. Sound about crystals, and it missed
+    /// that crystals are not the only contributor. Saturated at two hundred the term contributed a
+    /// fifth of a millisecond a second against a mismatch needing far more, so the schedule walked
+    /// up regardless and the ceiling correction hauled it back 1.4 times a second forever — a
+    /// sawtooth that was read as instability in the delay controller three separate times. Lifting
+    /// it here took about ten milliseconds off glass-to-glass on both phones.
     ///
-    /// The reading that first prompted the bound — the term climbing past 3374 and 4265 parts per
-    /// million and still going after four minutes — was not runaway. It was the loop travelling
-    /// toward a real one-percent error at the only speed ``leanOnItsHistory`` allows, which takes
-    /// about ten minutes, and it was stopped a twentieth of the way there.
+    /// Tightening it to two thousand was tried afterwards and made the picture visibly worse. The
+    /// case for it was a measurement of the latched grid interval against the median interval
+    /// frames arrive at — 16.654ms against 16.670ms, a tenth of a percent — which looked like
+    /// proof the term was eighteen times larger than anything real. It is not proof of that: the
+    /// latch is *derived* from that same median, so the two agreeing says only that the latch
+    /// works. Whatever the standing term is cancelling, it is not visible in that comparison, and
+    /// it is evidently worth cancelling.
     static let mostDriftWorthLearning = mostTrimWorthApplying
 
     /// A change smaller than this is not worth the timebase operation it would cost.
@@ -150,6 +158,15 @@ struct ScheduleTracking: Sendable, Equatable {
     private(set) var drains = 0
     private(set) var observations = 0
 
+    /// Observations that took the same path in the other direction: a queue short enough of its
+    /// request to be about to run out.
+    ///
+    /// Counted separately from the drains because they answer different questions about the same
+    /// number. A rate held below one is either recovering a shortfall or overshooting a drain, and
+    /// this is what tells the two apart — and against ``VideoRenderer``'s re-anchor count, it says
+    /// whether the gentle recovery is running often enough to be doing the work the step used to.
+    private(set) var refills = 0
+
     /// The smoothed depth the loop is working from. See ``believeOfEachReading``.
     private var settled: Double?
 
@@ -176,10 +193,21 @@ struct ScheduleTracking: Sendable, Equatable {
         // that no longer has it, and the frames that should have filled it are shown late.
         let draining = error > Self.anExcessWorthDraining
             && depth - wanted > Self.anExcessWorthDraining
+
+        // The same test with the sign turned round: a queue this far short of the request is one
+        // about to run out of frames, and the only alternative recovery is a re-anchor, which is
+        // the lurch. Both conditions for the same reason as above — the estimate lags a step
+        // change by about two seconds, and answering a shortfall that has already been filled
+        // would run the picture slow through a queue that is no longer short.
+        let refilling = error < -Self.anExcessWorthDraining
+            && depth - wanted < -Self.anExcessWorthDraining
+
         observations += 1
         if draining { drains += 1 }
-        let lean = draining ? Self.leanOnAnExcess : Self.leanOnTheError
+        if refilling { refills += 1 }
+        let lean = draining || refilling ? Self.leanOnAnExcess : Self.leanOnTheError
         let most = draining ? Self.mostDrainWorthApplying : Self.mostTrimWorthApplying
+        let least = refilling ? -Self.mostDrainWorthApplying : -Self.mostTrimWorthApplying
 
         let proposed = lean * error + standing
 
@@ -200,7 +228,7 @@ struct ScheduleTracking: Sendable, Equatable {
             )
         }
 
-        let rate = min(most, max(-Self.mostTrimWorthApplying, proposed))
+        let rate = min(most, max(least, proposed))
 
         guard abs(rate - applied) > Self.worthApplying else { return nil }
         applied = rate
