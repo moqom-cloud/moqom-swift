@@ -711,9 +711,9 @@ final class AppModel {
                             drawn.drains, drawn.refills, drawn.observations
                         )
                         + String(
-                            format: " gapped=%d crowded=%d stale=%d speed=%d/%.1f%%",
-                            drawn.gapped, drawn.crowded, drawn.stale, drawn.speedShifts,
-                            drawn.widestSpeed * 100
+                            format: " gapped=%d crowded=%d stale=%d repaid=%d speed=%d/%.1f%%",
+                            drawn.gapped, drawn.crowded, drawn.stale, drawn.reclaimedSlots,
+                            drawn.speedShifts, drawn.widestSpeed * 100
                         )
                         + String(
                             format: " grid=%.3f source=%.3f ms phase=%.2f/%.2f ms lead=%.2f/%.0f",

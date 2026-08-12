@@ -123,6 +123,19 @@ enum PlayoutDelay {
     /// a re-anchor snapped it back and it began again.
     static let mostOfAnIntervalWorthMoving = 0.5
 
+    /// The ceiling actually in force, given a floor that lip sync may have raised into it.
+    ///
+    /// A floor and a ceiling of the same value describe a delay with one legal setting, and every
+    /// decision in ``adjustment(headroom:delay:floor:ceiling:interval:mayGiveBack:mayTighten:display:)``
+    /// then reduces to holding still whatever the link is doing. The floor is the harder of the
+    /// two — below it the voice runs ahead of the mouth — so the ceiling is what gives.
+    ///
+    /// By a slot, which is the smallest move the grid can make and so the least that leaves a
+    /// controller able to make one.
+    static func ceiling(wanted: Double, floor: Double, interval: Double) -> Double {
+        max(wanted, floor + interval)
+    }
+
     static func ceilingCorrection(hold: Double, ceiling: Double, interval: Double) -> Double? {
         guard hold > ceiling + deadband else { return nil }
         return min(hold - ceiling, interval * mostOfAnIntervalWorthMoving)

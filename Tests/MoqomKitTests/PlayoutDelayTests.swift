@@ -280,6 +280,32 @@ struct PlayoutDelayTests {
         #expect(PlayoutDelay.margin(refresh: 1.0 / 30) == PlayoutDelay.margin)
     }
 
+    /// A ceiling nobody is pushing against is the ceiling that was asked for.
+    @Test("an untroubled ceiling is left where the application put it")
+    func ceilingUntouched() {
+        let ceiling = PlayoutDelay.ceiling(wanted: 0.020, floor: 0, interval: 1.0 / 60)
+        #expect(abs(ceiling - 0.020) < 1e-9)
+    }
+
+    /// The fault this exists for. Lip sync raises the floor while a call runs, and a floor that
+    /// reaches the ceiling used to be flattened onto it — leaving a delay with one legal value and
+    /// a controller with no move it was allowed to make.
+    @Test("a floor raised into the ceiling pushes it rather than flattening against it")
+    func ceilingGivesWayToTheFloor() {
+        let interval = 1.0 / 60
+        for floor in [0.020, 0.040, 0.120] {
+            let ceiling = PlayoutDelay.ceiling(wanted: 0.020, floor: floor, interval: interval)
+
+            // Room to move, and specifically room to make the smallest move there is.
+            #expect(ceiling >= floor + interval)
+
+            // And that room is real: a delay sitting on the floor has somewhere above it to go,
+            // which is the property the controller needs and the one that was missing.
+            #expect(PlayoutDelay.target(floor: floor, ceiling: ceiling) > floor - 1e-9)
+            #expect(ceiling > floor)
+        }
+    }
+
     /// A hold inside the ceiling is not something to correct, and the deadband is what stops the
     /// grid being nudged by the last digit of a median.
     @Test("a hold within the ceiling is left alone")

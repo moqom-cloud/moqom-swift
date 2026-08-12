@@ -42,6 +42,6 @@ public enum LipSync {
     ///     allowed to drift apart, which is the better failure.
     public static func floor(voice: Duration, bounds: (floor: Duration, ceiling: Duration)) -> Duration {
         let led = max(.zero, voice - pictureMayLead)
-        return min(max(bounds.floor, led), bounds.ceiling)
+        return max(bounds.floor, min(led, bounds.ceiling))
     }
 }

@@ -481,6 +481,20 @@ import MoqomCore
         private var slewed = 0.0
         private var slews = 0
 
+        /// Whole slots of delay the forcings have taken on and not yet handed back.
+        private var debt = 0
+
+        /// The most of it worth carrying, in slots.
+        ///
+        /// Four, which at sixty frames a second is a sixteenth of a second and more than a run of
+        /// bad luck produces. The cap is not about the delay — a debt this large has already been
+        /// paid, and refusing to record it does not give it back — but about the handing back. An
+        /// uncapped debt meeting a long gap after a stall would close the whole of it at once, and
+        /// a picture that jumps a quarter of a second forward to settle an old account is a worse
+        /// thing to watch than the account is to keep. Past this, the recovery belongs to a
+        /// re-anchor, which is the mechanism for a schedule that has lost its place.
+        private static let mostDebtWorthReclaiming = 4
+
         /// The last source timestamp, for measuring the interval to the next.
         private var previousStamp: CMTime = .invalid
 
@@ -773,6 +787,16 @@ import MoqomCore
             public var gapped = 0
             public var crowded = 0
 
+            /// Empty slots spent giving back delay a forcing had taken on, rather than left empty.
+            ///
+            /// The two counters above move in opposite directions and this is where they meet. A
+            /// crowded frame is held an interval longer than it asked for and the pointer keeps
+            /// that interval afterwards; a gap is an interval nothing was going to be shown in.
+            /// Closing one against the other costs no frame and no rate — the speeding up is
+            /// exactly the slowing down being undone — so this rising while ``gapped`` does not is
+            /// the schedule paying off its own delay out of time it had no use for.
+            public var reclaimedSlots = 0
+
             /// Frames that arrived after one newer than themselves.
             ///
             /// Distinct from ``crowded`` in kind rather than degree: a crowded frame is half an
@@ -929,6 +953,7 @@ import MoqomCore
             guard let start = grid else {
                 grid = presentation
                 slot = 0
+                debt = 0
                 return presentation
             }
 
@@ -982,12 +1007,44 @@ import MoqomCore
                     drawing.crowded += 1
                 }
                 index = Double(slot) + 1
+
+                // Recorded, because a forcing is a slot of delay taken on and not given back.
+                //
+                // It is a ratchet otherwise, and it was one. The pointer ends a forcing one slot
+                // beyond where the stream asked for, every later frame is forced for the same
+                // reason whatever the link then does, and each is placed one interval later than
+                // its own timestamp wanted — so a single half-interval of jitter, once, in the
+                // first second of a call, is sixteen and a half milliseconds held for the rest of
+                // it. Measured on three legs of four: ninety-nine percent of frames counted
+                // crowded and a lead pinned at zero, which is not ninety-nine percent of frames
+                // arriving badly. It is one, and then the consequence.
+                debt = min(debt + 1, Self.mostDebtWorthReclaiming)
             } else {
-                // Slots the grid leaves empty, which is the one thing here a person can actually
-                // see: the frame before it is held for two intervals and the motion stops for a
-                // sixtieth of a second. Counted rather than inferred, because every other figure
-                // in this class describes the schedule and none of them describes the picture.
-                drawing.gapped += Int(index) - Int(slot) - 1
+                // An empty slot, and the one place the delay a forcing took on can be handed back.
+                //
+                // The two are the same quantity with opposite signs. A forcing holds a frame an
+                // interval longer than its timestamp asked for; a gap is an interval in which no
+                // frame was going to be shown at all. Spend one against the other and the picture
+                // keeps the publisher's rate exactly — nothing is sped up on balance, because the
+                // slowing being undone is this function's own and not the source's.
+                //
+                // Which is what makes it safe against the rule above it: closing a gap that is
+                // there because a frame is genuinely missing would hide the loss by running the
+                // video fast. Closing one only as far as the debt allows cannot, because the debt
+                // is a count of intervals this already added.
+                //
+                // It is strictly the better moment for it, too. The alternative way to give a slot
+                // back is to decline a frame, which costs a frame and was measured doing far more
+                // harm than the delay it recovered. A gap costs nothing: the motion was going to
+                // stop for that interval regardless, and this fills it instead.
+                let empty = Int(index) - Int(slot) - 1
+                let reclaimed = min(debt, empty)
+                if reclaimed > 0 {
+                    index -= Double(reclaimed)
+                    debt -= reclaimed
+                    drawing.reclaimedSlots += reclaimed
+                }
+                drawing.gapped += empty - reclaimed
             }
 
             // Beyond this the source is not jittering, it has moved: a publisher that reconnected,
@@ -1002,6 +1059,7 @@ import MoqomCore
             guard abs(displaced) < 0.25 else {
                 grid = presentation
                 slot = 0
+                debt = 0
                 latched = nil
                 gaps = []
                 gapCursor = 0
@@ -1257,8 +1315,33 @@ import MoqomCore
             playoutHold = heldMedian()
 
             let depth = playoutDepth.asSeconds
-            let ceiling = bounds.ceiling.asSeconds
-            let floor = min(max(bounds.floor, playoutFloor).asSeconds, ceiling)
+            let floor = max(bounds.floor, playoutFloor).asSeconds
+
+            // The ceiling gives way to the floor rather than the floor being flattened onto it.
+            //
+            // Lip sync raises the floor while a call runs, and the floor it asks for is not a
+            // preference: below it the voice is ahead of the mouth. The ceiling is a preference —
+            // it is the latency this would rather not exceed. Clamping the floor down to meet it,
+            // which is what happened here and in ``LipSync/floor(voice:bounds:)``, does not
+            // enforce the ceiling; it leaves the two equal, and a controller whose floor and
+            // ceiling are the same number has no move it is allowed to make. Every path in
+            // ``PlayoutDelay`` then reduces to holding still, while the thing that wanted a change
+            // goes on wanting one.
+            //
+            // Seen twice, and only ever with the voice buffer grown: the audio target at seventy
+            // milliseconds against twenty in the runs either side of it, the floor pinned exactly
+            // on the ceiling, and a picture that a person watching called jittery while the
+            // schedule's own figures looked settled. Runs where the voice sat at twenty never
+            // reproduced it, which is why an A/B that did not grow the buffer cleared a change
+            // that was not at fault.
+            //
+            // A slot of room, because that is the smallest move the grid can make and therefore
+            // the least that makes the difference between a controller and a constant.
+            let ceiling = PlayoutDelay.ceiling(
+                wanted: bounds.ceiling.asSeconds,
+                floor: floor,
+                interval: interval
+            )
 
             // What a person waits is the hold, and the hold can sit well above the delay that was
             // asked for. The schedule is anchored on one frame's arrival, so whatever headroom
@@ -1951,6 +2034,7 @@ import MoqomCore
             // two seconds of measurement means two seconds of unsmoothed video to rebuild it.
             grid = nil
             slot = 0
+            debt = 0
             previousStamp = .invalid
         }
     }
