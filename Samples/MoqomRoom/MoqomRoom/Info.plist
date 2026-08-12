@@ -2,6 +2,14 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!-- Without this a variable-refresh phone runs this app's screen at 60Hz however fast the
+	     panel is, and sixty frames a second onto sixty refreshes a second has no slack in it:
+	     every frame has exactly one refresh it can be shown in, so any slop in when it is handed
+	     over puts two frames in one refresh and the display layer drops one. Measured at 60Hz,
+	     it dropped four to five percent of every frame it was given while the unscheduled
+	     preview beside it dropped none. At 120Hz each frame has two refreshes to land in. -->
+	<key>CADisableMinimumFrameDurationOnPhone</key>
+	<true/>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>

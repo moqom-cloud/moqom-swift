@@ -476,6 +476,7 @@ import MoqomCore
         private var latched: Double?
         private static let gapWindow = 120
 
+
         /// Slew applied since the interval was last corrected, and how many frames it took.
         private var slewed = 0.0
         private var slews = 0
@@ -805,6 +806,15 @@ import MoqomCore
             public var phase = 0.0
             public var worstPhase = 0.0
 
+            /// Slots between where a frame asked to go and the slot pointer, median and lowest.
+            ///
+            /// One is a grid keeping step with its stream. Below one is the pointer standing ahead
+            /// of the frames, which is both a frame shown late by that many intervals and a frame
+            /// that will be counted stale, so it is the quantity that says whether those are one
+            /// fault or two.
+            public var lead = 0.0
+            public var worstLead = 0.0
+
             /// How far the presentation speed has been moved, in parts per million, and how often
             /// it has been moved by enough to matter.
             ///
@@ -907,8 +917,9 @@ import MoqomCore
         /// which absorbs the difference between the publisher's crystal and this one without ever
         /// moving the picture enough to see.
         ///
-        /// - Returns: The time to present at, always later than the previous frame's.
-        private func regularise(_ presentation: CMTime, interval: Double) -> CMTime {
+        /// - Returns: The time to present at, always later than the previous frame's, or `nil` for
+        ///   a frame that belongs before one already shown and is therefore not shown at all.
+        private func regularise(_ presentation: CMTime, interval: Double) -> CMTime? {
             guard let start = grid else {
                 grid = presentation
                 slot = 0
@@ -916,7 +927,22 @@ import MoqomCore
             }
 
             let offset = (presentation - start).seconds
-            var index = (offset / interval).rounded()
+            let natural = (offset / interval).rounded()
+            var index = natural
+
+            // How far the slot pointer has run past where the frames actually are, in whole slots.
+            // One or more means the grid is waiting on frames that have not come; zero means this
+            // frame wants the slot just spent; negative means it wants one *behind* that and the
+            // pointer is ahead of the stream by that many slots.
+            //
+            // Nothing else reports this and two standing symptoms both fall out of it. Every
+            // forcing below sets the pointer one beyond itself whatever the frame asked for, so the
+            // gap a forcing opens is carried for the rest of the call, and a frame placed n slots
+            // past the one it asked for is shown n intervals late — which is held delay that never
+            // comes back. Measured: a fifth of frames arrive behind the spent slot, and the hold
+            // sits at twice the depth the schedule asked for. If the pointer is running ahead those
+            // are one fault and not two.
+            record(lead: natural - Double(slot))
 
             // Two frames landing in one slot is jitter of half an interval, and the slot below is
             // already spent. Forward by one keeps the grid monotonic, which is the one property
@@ -929,6 +955,21 @@ import MoqomCore
                 // content after newer — the motion goes back and then forward, which is visible,
                 // and which every counter here was blind to because the timestamps it hands out
                 // were made monotonic before anything could notice.
+                // Two cases that look identical here and are not remotely alike. A frame tied with
+                // the slot just used is jitter of half an interval, and moving it on by one is the
+                // smoothing this function exists for. A frame whose slot is *behind* that arrived
+                // after one newer than itself, and moving it forward shows older content after
+                // newer.
+                //
+                // Declining the second sort instead was tried, so that the pointer stands still
+                // and the stream catches up with it by a slot. It does cure the accumulation — the
+                // pointer never fell behind the stream again in either direction, where before it
+                // had been walking out to fourteen slots and snapping back. It also moved the
+                // phase onto a rounding boundary, and that is much worse: `natural` then alternates
+                // between the slot just spent and two slots on, which is a doubled frame followed
+                // by a skipped one, over and over. Measured, crowding went to 52% of frames,
+                // skipped slots to 46%, and the display layer's own drops from half a percent to
+                // ten. Twenty-nine frames were declined in the whole run to buy that.
                 if index < Double(slot) {
                     drawing.stale += 1
                 } else {
@@ -946,9 +987,13 @@ import MoqomCore
             // Beyond this the source is not jittering, it has moved: a publisher that reconnected,
             // a stall long enough to break the run, a swapped source. Slewing toward that would
             // take minutes and show a lurch every frame of it.
-            let error = offset - index * interval
-            record(phase: abs(error))
-            guard abs(error) < 0.25 else {
+            //
+            // Measured against the slot the frame was *placed* at, which during a run of forcings
+            // is how far the pointer has been pushed past the stream. That is the condition this
+            // needs to catch as well as a source that jumped: both leave the grid describing
+            // something the frames are no longer on, and both recover the same way.
+            let displaced = offset - index * interval
+            guard abs(displaced) < 0.25 else {
                 grid = presentation
                 slot = 0
                 latched = nil
@@ -961,6 +1006,30 @@ import MoqomCore
             }
 
             slot = Int64(index)
+
+            // Against the slot the frame *asked for*, never the one it may have just been moved
+            // to. This is a phase-locked loop and this term is its only reading of phase, so it
+            // has to be a property of the stream rather than of what this function did a few lines
+            // ago. Bounded by construction at half an interval, because the natural slot is the
+            // nearest one.
+            //
+            // Feeding it the forced slot instead is a loop that runs away, and it was running.
+            // During a run of forcings that figure is not a phase error at all, it is the whole
+            // accumulated displacement — measured, up to a hundred and sixty-seven milliseconds —
+            // which saturates the slew negative. With a quarter of frames on that path the average
+            // goes negative too, ``correctRate(after:)`` folds it into the latched interval and
+            // shortens it, a shorter interval pushes the grid's slots past the frames faster, more
+            // frames are forced, and each one shortens the interval again. Two phones sat in it
+            // for whole calls, laying a grid of 16.634ms against a source arriving every 16.670,
+            // which is the wrong direction from a loop whose entire job is to close that gap.
+            //
+            // What it cost is worth recording, because none of the counters this class publishes
+            // named it: the pointer walked up to fourteen slots past the stream, so a quarter of
+            // an hour into a call the typical frame was being shown ten slots — a sixth of a
+            // second — after the moment it was captured for, and then snapped back when the
+            // displacement finally tripped the regrid above. Build, snap, build again.
+            let error = offset - natural * interval
+            record(phase: abs(error))
 
             // Clamped well below one refresh, so correcting drift is never itself visible. Half a
             // millisecond per frame is thirty milliseconds a second of authority: far more than
@@ -985,16 +1054,75 @@ import MoqomCore
         ///
         /// The average slew over a long window *is* the frequency error, so adding it to the
         /// interval removes the drift and leaves the slew doing what it is for: jitter.
+        ///
+        /// Except that it is not, quite, and the part it misses is the one that shows. A slew is
+        /// driven by the phase error, and the phase error is the offset less the *nearest* whole
+        /// number of slots — so it can never exceed half a slot, whatever the frequency error
+        /// underneath it is doing. Let the grid run a fraction of a percent long and the offset
+        /// falls behind a slot at a time; each time it falls a whole one, the nearest slot changes
+        /// with it and the phase error drops back to nothing. The rounding hands the loop a
+        /// perfectly locked phase while the grid walks away from the stream underneath it.
+        ///
+        /// Which it did, in both directions, on the same pair of phones within a quarter of an
+        /// hour: sixty-six parts per million long on one run and a hundred and sixty short on the
+        /// next, with the placement faults following the sign — frames landing behind the slot
+        /// pointer when the grid ran long, empty slots when it ran short, and neither visible to
+        /// a loop reading a phase error that had been folded back to zero.
+        ///
+        /// So the arrival median is read as well, which is the same frequency error with nothing
+        /// rounded out of it — and the two are combined into the one figure the grid is actually
+        /// solving for rather than added as two independent corrections.
+        ///
+        /// That figure follows from what a stable pointer means. `natural` has to advance exactly
+        /// one slot per frame, or the grid walks away from the stream a slot at a time; it advances
+        /// by `(arriving - slew) / interval`; so the interval that holds it still is `arriving -
+        /// slew`, with the slew *subtracted* from the arrival rate. This had been adding it, and
+        /// two terms that pull against each other whenever there is anything to correct is an
+        /// oscillator — measured, the latched interval swung a thousand to two and a half thousand
+        /// parts per million either side of the source between consecutive readings.
+        ///
+        /// Tracking the target rather than dropping the slew, because the slew is load-bearing for
+        /// something else. Pinning the interval to the bare arrival rate does lock the grid — a
+        /// hundred and twenty parts per million against nine hundred, and not one stale frame in
+        /// four legs — but it also takes away the only place a persistent grid creep could be
+        /// absorbed, and the timebase trim inherits the whole of it. That was measured too: trim
+        /// ramping to fifteen hundred parts per million and being reset by a re-anchor, thirty to
+        /// sixty re-anchors a leg against seven, and a p95 out at two hundred milliseconds. The
+        /// interval has to keep that job, and this is the target that lets it keep it without
+        /// fighting the phase.
+        ///
+        /// A quarter of the distance at a time because the arrival figure is a median over a
+        /// rolling window and worth leaning on rather than trusting.
+        private static let believeOfEachArrivalMeasurement = 0.25
+
         private func correctRate(after slew: Double) {
             slewed += slew
             slews += 1
             guard slews >= 240, var interval = latched else { return }
 
+            // Ignored when it disagrees by more than the gap between adjacent frame rates worth
+            // latching, because at that size it is not a grid a shade off the stream, it is the
+            // wrong rate latched — and creeping a quarter at a time towards the wrong rate is a
+            // slower way to arrive somewhere this should not go at all.
+            // The bare arrival rate, with the slew left out of it. The slew belongs in the target
+            // on the arithmetic — a pointer holds still when the interval is `arriving - slew` —
+            // but it was measured in and it is worse in every column that matters: the grid came
+            // out further from the source than leaving it out entirely (sixteen hundred parts per
+            // million against a hundred and twenty), stale frames came back, and the re-anchors
+            // and the p95 came with them. It is an average of a quantity that saturates, over a
+            // window in which the thing it is correcting has already changed, and it carries more
+            // noise than the term it is refining.
+            let measured = drawing.arriving
+            let target = measured > 0 && abs(measured - interval) / interval < 0.02
+                ? measured
+                : interval
+
             // Bounded at a fifth of a percent, which is far more than two crystals disagree by
             // and far less than the distance between any two frame rates worth latching. A larger
             // correction would mean the interval is not slightly wrong, it is the wrong rate, and
             // the answer to that is to measure again rather than to creep towards it.
-            let correction = min(max(slewed / Double(slews), -interval / 500), interval / 500)
+            let wanted = (target - interval) * Self.believeOfEachArrivalMeasurement
+            let correction = min(max(wanted, -interval / 500), interval / 500)
             interval += correction
             latched = interval
             slewed = 0
@@ -1030,10 +1158,12 @@ import MoqomCore
                 }
             }
 
-            // Kept measured past the latch purely so the two can be compared. The latched figure
-            // is deliberately not revised from this — see the note above on why a wandering median
-            // moves a frame a whole slot — but a grid and a source that disagree is the one thing
-            // the placement counters cannot distinguish from bad luck.
+            // Kept measured past the latch, because the latched figure is corrected towards this
+            // by ``correctRate(after:)`` and nothing else in here can see a frequency error — the
+            // phase the slew reads has the whole slots rounded out of it. Slowly and by a fraction
+            // at a time rather than by assignment, which is what the note above rules out: a
+            // median that wanders half a percent as the window rolls would move a frame a whole
+            // slot if the grid followed it directly.
             let sorted = gaps.sorted()
             if !sorted.isEmpty { drawing.arriving = sorted[sorted.count / 2] }
 
@@ -1136,20 +1266,23 @@ import MoqomCore
             // ninety of a hundred and thirty-nine samples while every figure it published about
             // itself was inside its bounds.
             //
-            // Here rather than in ``maintainSchedule(delay:interval:)``, which was tried: a shift
-            // displaces every remembered slack sample, which is correct at this rate and empties
-            // the window at thirty times a second. Bounded to one frame per adjustment, so a large
-            // excess converges over a second or two rather than arriving as a jump.
-            if let hold = playoutHold,
-               let handBack = PlayoutDelay.ceilingCorrection(
-                   hold: hold,
-                   ceiling: ceiling,
-                   interval: interval
-               )
-            {
+            // Which is now ``ScheduleTracking``'s to close, and only its own, because two loops
+            // draining one buffer is one loop too many.
+            //
+            // This existed because the grid could not be driven — see ``shift(by:to:)`` for why
+            // every correction it made was undone — so the hold could sit at twice its ceiling
+            // with nothing able to reach it. Giving the shift the clock instead fixed that, and in
+            // fixing it made this the second controller pulling on a buffer the tracking loop was
+            // already regulating. Both drain, neither can see the other, and the buffer goes to
+            // nothing between them: measured with the grid locked to the source, the trim ramped
+            // to three thousand parts per million, the schedule starved, and the re-anchor that
+            // refilled it arrived thirty to sixty times a leg against seven, taking the p95 from
+            // seventy milliseconds to two hundred and fifty.
+            //
+            // So the excess is left to ``track(depth:wanted:)``, which is the loop that owns the
+            // depth, and which closes it at half a millisecond per frame without a step.
+            if let hold = playoutHold, hold > ceiling + PlayoutDelay.deadband {
                 drawing.handbacks += 1
-                shift(by: -handBack, to: playoutDepth)
-                return
             }
 
             // What to do is decided in ``PlayoutDelay``, which has no clock and no layer and can
@@ -1263,14 +1396,56 @@ import MoqomCore
         private var phases: [Double] = []
         private var phaseCursor = 0
 
+        /// Track where frames are asking to go relative to the slot pointer.
+        private func record(lead: Double) {
+            if leads.count < Self.gapWindow {
+                leads.append(lead)
+            } else {
+                leads[leadCursor] = lead
+                leadCursor = (leadCursor + 1) % Self.gapWindow
+            }
+
+            let sorted = leads.sorted()
+            drawing.lead = sorted[sorted.count / 2]
+            drawing.worstLead = sorted[0]
+        }
+
+        private var leads: [Double] = []
+        private var leadCursor = 0
+
         /// Move the grid, and with it every frame not yet due.
+        /// Moves the clock rather than the grid, which are not interchangeable however alike they
+        /// look from here.
+        ///
+        /// The grid's position is not this function's to set. It is owned by the slew, which holds
+        /// it against the arriving timestamps and nulls any phase error it finds — including one
+        /// this puts there. Move the grid by less than a slot and the slew reads the difference as
+        /// error and walks it back over the next thirty frames; move it by a whole slot and every
+        /// frame's index drops by one and cancels it outright. There is no third case: a grid move
+        /// is either undone or void, and the delay it was asked to carry comes back either way.
+        ///
+        /// Which is what six hundred hand-backs across two phones did. The correction fired twice a
+        /// second for the length of every call, the counter climbed exactly as designed, and the
+        /// hold it exists to bring to twenty milliseconds sat at thirty-nine for the duration. The
+        /// grid it moved was returned to where the slew wanted it, every time, before the next.
+        ///
+        /// The clock has no such owner. Nothing measures the timebase against the stream, so
+        /// advancing it by an amount shows every queued frame that much sooner and it stays shown
+        /// that much sooner. The sign is the one this reads oddly at: a schedule is delayed by
+        /// putting the clock *behind* it, so a shift later moves the clock earlier.
         private func shift(by seconds: Double, to depth: Duration) {
-            guard let start = grid else { return }
-            grid = start + CMTime(seconds: seconds, preferredTimescale: 90000)
+            guard grid != nil else { return }
+            synchroniser.setRate(
+                synchroniser.rate,
+                time: synchroniser.currentTime()
+                    - CMTime(seconds: seconds, preferredTimescale: 90000)
+            )
             playoutDepth = depth
 
-            // Every remembered arrival is re-read against the grid it would now be measured
-            // against, because moving the grid changes what all of them meant. Without this the
+            // Every remembered arrival is re-read against the clock it would now be measured
+            // against, because moving the clock changes what all of them meant — a headroom is a
+            // frame's time less the clock's, so a clock moved back by an amount is every headroom
+            // larger by it. Without this the
             // window holds ten seconds of headroom recorded before the last adjustment, each
             // adjustment is decided on evidence that predates the previous one, and the loop
             // tightens far past the point where the headroom was gone — measured, it walked a
@@ -1280,6 +1455,18 @@ import MoqomCore
             // that same amount.
             for index in slack.indices { slack[index] += seconds }
             playoutSlack = playoutSlack.map { $0 + seconds }
+
+            // And the holds, for the same reason and one more. The hold window is three hundred
+            // frames, so its median describes the middle of the last five seconds; the correction
+            // above runs four times a second. Left undisplaced, ten corrections land before the
+            // measurement that asks for them registers the first, and each of the ten reads the
+            // same stale excess and asks again — eighty milliseconds handed back to cure twenty.
+            //
+            // Which is what two of four legs did: a hold driven clean through its ceiling to zero,
+            // no buffer left to absorb anything, and a third of the frames then arriving behind
+            // the slot they were meant for. Displacing the window closes the loop on the same
+            // frame it acts, and the second correction sees the first.
+            for index in held.indices { held[index] += seconds }
         }
 
         /// Put the presented timeline where the arriving frames are.
@@ -1567,16 +1754,17 @@ import MoqomCore
             var drawn = sample
             var presentation = source
             var cadence: Double?
-            if
-                requestedDelay != nil,
-                source.isValid,
-                let interval = interval(after: source),
-                case let even = regularise(source, interval: interval),
-                let retimed = retime(drawn, to: even, duration: interval)
-            {
-                drawn = retimed
-                presentation = even
-                cadence = interval
+            if requestedDelay != nil, source.isValid, let interval = interval(after: source) {
+                // Declined rather than placed. Returning here rather than falling through to the
+                // enqueue below, which would hand the layer an unscheduled frame carrying its own
+                // source timestamp — behind the one already shown, which is the thing being
+                // avoided.
+                guard let even = regularise(source, interval: interval) else { return }
+                if let retimed = retime(drawn, to: even, duration: interval) {
+                    drawn = retimed
+                    presentation = even
+                    cadence = interval
+                }
             }
 
             renderer.enqueue(drawn)

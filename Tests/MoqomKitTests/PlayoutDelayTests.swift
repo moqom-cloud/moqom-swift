@@ -290,25 +290,62 @@ struct PlayoutDelayTests {
             == nil)
     }
 
-    /// An excess above the ceiling is handed back in full, because with lip sync holding the floor
-    /// at the ceiling this is the only thing left that can enforce it.
+    /// An excess above the ceiling is handed back, because with lip sync holding the floor at the
+    /// ceiling this is the only thing left that can enforce it.
+    ///
+    /// In full where the cap allows, and the cap is what decides here: ten milliseconds of excess
+    /// against a sixteen millisecond interval is more than half of one, so it arrives over two
+    /// passes a quarter of a second apart rather than one.
     @Test("an excess above the ceiling is handed back")
     func handsBackTheExcess() {
-        let correction = PlayoutDelay.ceilingCorrection(
-            hold: 0.030,
+        let interval = 1.0 / 60
+        let first = PlayoutDelay.ceilingCorrection(hold: 0.030, ceiling: 0.020, interval: interval)
+        #expect(first.map { abs($0 - interval / 2) < 1e-9 } == true)
+
+        // And the excess is gone within a second of passes rather than merely reduced, which is
+        // the property that matters: a cap that converges is a cap, and one that does not is the
+        // fault this replaced.
+        var hold = 0.080
+        var passes = 0
+        while let correction = PlayoutDelay.ceilingCorrection(
+            hold: hold,
             ceiling: 0.020,
-            interval: 1.0 / 60
-        )
-        #expect(correction.map { abs($0 - 0.010) < 1e-9 } == true)
+            interval: interval
+        ), passes < 100 {
+            hold -= correction
+            passes += 1
+        }
+        #expect(hold <= 0.020 + PlayoutDelay.deadband)
+        #expect(passes <= 8)
     }
 
     /// The cap survives, because a large excess arriving as one jump is a visible lurch whatever
-    /// the gain says.
+    /// the gain says. What changed is where it sits: short of a whole interval rather than at one.
     @Test("no single pass moves the picture more than a frame")
     func neverMoreThanAFrame() {
         let interval = 1.0 / 60
-        #expect(PlayoutDelay.ceilingCorrection(hold: 2.0, ceiling: 0.020, interval: interval)
-            == interval)
+        let capped = PlayoutDelay.ceilingCorrection(hold: 2.0, ceiling: 0.020, interval: interval)
+        #expect(capped.map { $0 < interval } == true)
+        #expect(capped.map { $0 > 0 } == true)
+    }
+
+    /// The reason for that, which is the whole of why this function was doing nothing for months.
+    ///
+    /// A move of one interval is the one move in the range that cancels: every frame's slot index
+    /// drops by exactly one, and grid plus index puts it back where it started. Anything short of
+    /// that arrives.
+    @Test("a correction never asks for the one move that cancels itself")
+    func neverAsksForACancellingMove() {
+        let interval = 1.0 / 60
+        for excess in stride(from: 0.007, through: 0.500, by: 0.003) {
+            let correction = PlayoutDelay.ceilingCorrection(
+                hold: 0.020 + excess,
+                ceiling: 0.020,
+                interval: interval
+            )
+            guard let correction else { continue }
+            #expect(correction < interval)
+        }
     }
 
     /// The point of the whole exercise: on a faster panel the delay settles lower, because the

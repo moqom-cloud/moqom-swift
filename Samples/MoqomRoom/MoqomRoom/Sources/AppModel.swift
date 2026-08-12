@@ -13,6 +13,8 @@ import Observation
 
 #if os(iOS)
     import AVFAudio
+    import QuartzCore
+    import UIKit
 #endif
 
 @MainActor
@@ -48,6 +50,11 @@ final class AppModel {
     var relay = RelayConfiguration.current()
 
     let launch = LaunchOptions.current()
+
+    #if os(iOS)
+        /// What the panel is refreshing at while the call runs. See ``PanelRate``.
+        let panelRate = PanelRate.shared
+    #endif
 
     /// A four digit code standing in for the relay's address and certificate hash.
     ///
@@ -87,6 +94,12 @@ final class AppModel {
         pairingCode = launch.pairingCode ?? ""
         username = defaults.string(forKey: "username") ?? ""
         roomName = defaults.string(forKey: "roomName") ?? "demo"
+
+        // From launch, because the first tile sizes its schedule against this and a link that has
+        // not ticked yet leaves it guessing from the screen's stated maximum.
+        #if os(iOS)
+            PanelRate.shared.start()
+        #endif
     }
 
     /// Everything the join screen asked for, kept for the next launch.
@@ -670,9 +683,10 @@ final class AppModel {
                             drawn.widestSpeed * 100
                         )
                         + String(
-                            format: " grid=%.3f source=%.3f ms phase=%.2f/%.2f ms",
+                            format: " grid=%.3f source=%.3f ms phase=%.2f/%.2f ms lead=%.2f/%.0f",
                             drawn.laid * 1000, drawn.arriving * 1000,
-                            drawn.phase * 1000, drawn.worstPhase * 1000
+                            drawn.phase * 1000, drawn.worstPhase * 1000,
+                            drawn.lead, drawn.worstLead
                         )
                         // And whether anything is presenting them. A rate of zero is a queue
                         // filling up behind a clock that never started, which every count above
@@ -932,9 +946,25 @@ final class AppModel {
                 // link stays clean is a thermal reading rather than a transport bug. Low
                 // power mode does the same thing for a different reason and is worth the two
                 // words it costs to rule out.
+                // The panel's own rate belongs beside them, and for the same reason. A schedule
+                // sized against a capability the panel is not currently honouring puts frames
+                // just past a refresh boundary, and the display layer drops what it cannot show
+                // in the period it has — which arrives looking like a network fault and is not.
+                var panel = ""
+                #if os(iOS)
+                    if let period = panelRate.period, period > 0 {
+                        panel = String(
+                            format: " panel=%.0fHz slowest=%.0fHz",
+                            1 / period,
+                            1 / (panelRate.longest ?? period)
+                        )
+                    }
+                #endif
+
                 Journal.shared.say(
                     "HOST thermal=\(Self.describe(ProcessInfo.processInfo.thermalState))"
                         + " lowpower=\(ProcessInfo.processInfo.isLowPowerModeEnabled)"
+                        + panel
                 )
 
                 // What the publisher did with the frames it captured, which is where an
@@ -1276,3 +1306,93 @@ final class AppModel {
 extension String {
     var trimmed: String { trimmingCharacters(in: .whitespacesAndNewlines) }
 }
+
+#if os(iOS)
+    /// Holds the panel at its fastest rate, and reports what that turned out to be.
+    ///
+    /// Two jobs, and the first one is not incidental — removing this to save a display link costs
+    /// about two percent of every frame received. Asking for the rate is what gets it: a phone
+    /// runs this app's screen at sixty however fast the panel is, unless something asks otherwise,
+    /// and sixty frames a second onto sixty refreshes a second has no slack anywhere in it. Every
+    /// frame has exactly one refresh it can be shown in, so any slop in when it is handed over
+    /// puts two frames in one refresh and the display layer drops one. Measured across four runs
+    /// a side: 3.9% of frames dropped at sixty against 2.2% at a hundred and twenty, every run
+    /// improved, and the slow climb in drops across a call — 1.7x from first half to second —
+    /// flattened to 1.1x. It costs latency, which is not yet paid for and wants its own look.
+    ///
+    /// The ``Info.plist`` key `CADisableMinimumFrameDurationOnPhone` is the other half and neither
+    /// works alone.
+    ///
+    /// Reporting it matters separately, because ``UIScreen/maximumFramesPerSecond`` is a
+    /// capability rather than a state: it reports 120 for the whole life of the process while the
+    /// screen may be running at any rate the system likes. Anything sizing a schedule against the
+    /// capability holds margin for a boundary that is not the one its frame will be shown at, and
+    /// it is wrong in the expensive direction. A display link is the only honest source, being
+    /// driven by the same clock the panel is.
+    @MainActor
+    final class PanelRate {
+        /// One per app, because it is a property of the screen rather than of any view, and every
+        /// tile sizing its schedule against it wants the same answer.
+        static let shared = PanelRate()
+
+        private var link: CADisplayLink?
+        private var periods: [Double] = []
+        private var cursor = 0
+
+        /// A second at 120Hz, long enough to see a settled rate and short enough to follow a
+        /// change in one.
+        private static let window = 120
+
+        /// The period the panel is currently running at, in seconds, and the longest seen.
+        ///
+        /// Both, because a rate that changes is the thing worth catching and a median alone hides
+        /// it. Reading 8.3 and 8.3 is a panel pinned at its maximum; 8.3 and 16.7 is one that has
+        /// been dropping to half of it.
+        private(set) var period: Double?
+        private(set) var longest: Double?
+
+        func start() {
+            guard link == nil else { return }
+            let link = CADisplayLink(target: self, selector: #selector(tick))
+
+            // The line that does the work. Asked for explicitly because a link that does not ask
+            // is given sixty whatever the panel can do — and it would then report sixty as though
+            // that were the panel's answer, which is how this was missed the first time round.
+            let hertz = Float(UIScreen.main.maximumFramesPerSecond)
+            if hertz > 0 {
+                link.preferredFrameRateRange = CAFrameRateRange(
+                    minimum: min(60, hertz),
+                    maximum: hertz,
+                    preferred: hertz
+                )
+            }
+
+            link.add(to: .main, forMode: .common)
+            self.link = link
+        }
+
+        func stop() {
+            link?.invalidate()
+            link = nil
+        }
+
+        @objc private func tick(_ link: CADisplayLink) {
+            // The interval this callback is *for*, rather than the one that has just elapsed,
+            // because the second is a reading of how late this callback ran and the first is the
+            // panel's period, which is the question.
+            let elapsed = link.targetTimestamp - link.timestamp
+            guard elapsed > 0 else { return }
+
+            if periods.count < Self.window {
+                periods.append(elapsed)
+            } else {
+                periods[cursor] = elapsed
+                cursor = (cursor + 1) % Self.window
+            }
+
+            let sorted = periods.sorted()
+            period = sorted[sorted.count / 2]
+            longest = sorted[sorted.count - 1]
+        }
+    }
+#endif

@@ -217,13 +217,19 @@ final class VideoTile {
         renderer.playoutBounds = await room.playoutBounds
         renderer.playoutTolerance = await room.playoutTolerance
 
-        // The panel, because the schedule holds margin for a refresh boundary and the default is
-        // the slowest one worth assuming. Both phones this is measured on run at a hundred and
-        // twenty hertz, so they were each holding about six milliseconds against a wait they do
-        // not have. The view is where this is known: the renderer has a layer, not a screen.
+        // The panel, because the schedule holds margin for a refresh boundary. The view is where
+        // this is known: the renderer has a layer, not a screen.
+        //
+        // Measured rather than asked for, which is the whole point. ``maximumFramesPerSecond`` is
+        // a capability and reports 120 on both phones here for the life of the process, while a
+        // display link on the same screen reports 60 for the whole of a call — the app never opted
+        // into high refresh, so it does not get it. Believing the capability credits the margin
+        // down to its 12ms floor when the panel wants the full 18ms, and six milliseconds short of
+        // a refresh boundary is not a latency saving, it is the display layer dropping what it
+        // cannot show in the period it has. That is the fault ``PlayoutDelay/margin`` was written
+        // for, and it came back the moment the figure feeding it stopped being true.
         #if os(iOS)
-            let hertz = UIScreen.main.maximumFramesPerSecond
-            if hertz > 0 { renderer.displayRefresh = 1 / Double(hertz) }
+            renderer.displayRefresh = Self.panelPeriod()
         #endif
 
         if let codec = await room.codec(of: identity) {
@@ -338,10 +344,32 @@ final class VideoTile {
                     // delay driven up by jitter are the same number on screen and want
                     // opposite responses.
                     room.playoutFloorInForce = floor
+
+                    // Re-read for the same reason the floor is: a variable-refresh panel changes
+                    // rate during a call, and the margin the schedule holds has to follow it. The
+                    // first reading is taken before the link has ticked at all.
+                    #if os(iOS)
+                        renderer.displayRefresh = Self.panelPeriod()
+                    #endif
                 }
             }
         }
     }
+
+    #if os(iOS)
+        /// How long the panel is currently taking between refreshes, in seconds.
+        ///
+        /// The measurement where there is one, and the screen's stated maximum only until the
+        /// display link has ticked. The fallback is deliberately the optimistic figure rather than
+        /// a safe one: it is in force for a fraction of a second at the start of a call, and
+        /// pinning it low would charge every call latency for a boundary most panels do not have.
+        @MainActor
+        static func panelPeriod() -> Double {
+            if let measured = PanelRate.shared.period, measured > 0 { return measured }
+            let hertz = UIScreen.main.maximumFramesPerSecond
+            return hertz > 0 ? 1 / Double(hertz) : 1.0 / 60
+        }
+    #endif
 
     func detach() {
         pump?.cancel()

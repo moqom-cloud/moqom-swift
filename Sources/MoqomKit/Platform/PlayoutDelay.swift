@@ -100,9 +100,32 @@ enum PlayoutDelay {
     ///
     /// - Returns: The seconds to move the grid down by, or `nil` when the hold is within the
     ///   ceiling and there is nothing to hand back.
+    /// The most of one that is worth asking for at a time.
+    ///
+    /// Half, and the half matters more than the bound. Moving the grid by `s` moves the frames on
+    /// it by `s`, but only because their slots are unchanged — a frame's slot is the nearest one,
+    /// so the move only fails to arrive for a frame whose rounding was already close enough to a
+    /// boundary that `s` carries it over. At exactly one interval that stops being an exception
+    /// and becomes the rule: *every* frame crosses, every slot index drops by one, and the grid
+    /// and the index cancel to leave each frame exactly where it was.
+    ///
+    /// A whole interval is therefore the one move in the range that does nothing, and it was the
+    /// move this asked for on every call. The excess it corrects ran to twenty-six milliseconds
+    /// against a sixteen millisecond interval, so the cap bound every time. Two phones showed what
+    /// that looks like: the correction firing on every opportunity it got, twice a second for a
+    /// whole call, while the hold it exists to reduce sat at twice its ceiling and never moved —
+    /// and, when it was switched off entirely, a hold that did not change by a millisecond.
+    ///
+    /// What the cancelled move leaves behind is worse than nothing. The index that dropped by one
+    /// is measured against a pointer that did not, so each call pushes the pointer another slot
+    /// past the stream, and the frames it then finds behind that pointer are shown late by however
+    /// many slots have accumulated — measured, up to fourteen of them, a sixth of a second, before
+    /// a re-anchor snapped it back and it began again.
+    static let mostOfAnIntervalWorthMoving = 0.5
+
     static func ceilingCorrection(hold: Double, ceiling: Double, interval: Double) -> Double? {
         guard hold > ceiling + deadband else { return nil }
-        return min(hold - ceiling, interval)
+        return min(hold - ceiling, interval * mostOfAnIntervalWorthMoving)
     }
 
     /// How far a schedule may run past its frames and still be recovered by rate alone.
