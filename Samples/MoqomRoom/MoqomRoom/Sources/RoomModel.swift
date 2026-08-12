@@ -1185,10 +1185,21 @@ final class RoomModel {
     /// far side off. The floor is deliberate on Apple's part and there is no way to ask for the
     /// one without the other, so this is the trade stated plainly rather than worked around.
     ///
-    /// Off by default because the default room is interactive, and there the loop this gives up
-    /// cancelling is real: a device on its loudspeaker with the microphone open in the same room
-    /// will howl.
-    var broadcastsToAnAudience = false {
+    /// On by default, because what this application is for is broadcasting, and the case the
+    /// default is chosen against is the case that cannot be worked around. A host who cannot make
+    /// the far side inaudible has no recourse at all — the in-call floor is Apple's and there is
+    /// no API that lifts it — whereas a room that howls has several, starting with headphones and
+    /// ending with ``capturesEverythingItHears``.
+    ///
+    /// Two costs come with it and neither is hypothetical. The echo canceller goes, so a device
+    /// on its loudspeaker with the microphone open in the same room will howl; that is the same
+    /// switch, not a second one. And the media path runs a looser buffer than the call path, worth
+    /// about seven and a half milliseconds mouth-to-ear — measured, output latency 9.0ms to 15.5ms
+    /// and input 1.0ms to 2.0ms across two phones and two runs each way.
+    ///
+    /// Turned off for an interactive room, where the loop is real and the seven milliseconds are
+    /// better spent than the volume floor is.
+    var broadcastsToAnAudience = true {
         didSet { applyAudioPurpose() }
     }
 

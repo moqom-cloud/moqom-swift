@@ -557,6 +557,39 @@ final class AppModel {
         }
     }
 
+    /// What is left in the battery, and whether it is being filled while we watch.
+    ///
+    /// Here because the thermal state is four buckets and a slow one: a phone doing half again
+    /// the work of another reports `nominal` alongside it for the first quarter of an hour, so a
+    /// comparison between two settings either runs long enough to bake both or says nothing.
+    /// Charge falls continuously and in minutes, which makes it the measurement a power question
+    /// actually wants, with the thermal state as the thing it eventually causes.
+    ///
+    /// The plug state is reported with it because it decides whether any of it means anything.
+    /// A phone on a cable is being warmed by the charger and its level is pinned, so a soak run
+    /// against one measures the charger — and over a local network tunnel, which is how these are
+    /// driven, there is nothing else that would say so.
+    private static func charge() -> String {
+        #if os(iOS)
+            UIDevice.current.isBatteryMonitoringEnabled = true
+            let level = UIDevice.current.batteryLevel
+            let state = switch UIDevice.current.batteryState {
+            case .charging: "charging"
+            case .full: "full"
+            case .unplugged: "unplugged"
+            default: "unknown"
+            }
+
+            // Negative is what this reports when monitoring has only just been switched on, and
+            // it is worth saying so rather than printing it: a run whose first samples read -100%
+            // has a battery column that cannot be differenced.
+            guard level >= 0 else { return " charge=pending power=\(state)" }
+            return String(format: " charge=%.0f%% power=%@", level * 100, state)
+        #else
+            return ""
+        #endif
+    }
+
     private func report(on room: RoomModel) {
         reporter?.cancel()
         reporter = Task { [weak room] in
@@ -964,7 +997,7 @@ final class AppModel {
                 Journal.shared.say(
                     "HOST thermal=\(Self.describe(ProcessInfo.processInfo.thermalState))"
                         + " lowpower=\(ProcessInfo.processInfo.isLowPowerModeEnabled)"
-                        + panel
+                        + panel + Self.charge()
                 )
 
                 // What the publisher did with the frames it captured, which is where an
@@ -1253,7 +1286,11 @@ final class AppModel {
             model.flatLayers = launch.flatLayers
             model.encodesEagerly = launch.eagerEncoding
             model.capturesPlainly = launch.plainCapture
-            model.broadcastsToAnAudience = launch.mediaVolume
+            // Left alone when neither flag was given, so the model's own default decides rather
+            // than the absence of a command line quietly meaning "call volume".
+            if let mediaVolume = launch.mediaVolume {
+                model.broadcastsToAnAudience = mediaVolume
+            }
             model.isPlaybackMuted = launch.silenceRoom
             if let mix = launch.mix {
                 AudioGraph.shared.monitorOutput()

@@ -424,10 +424,12 @@ struct LaunchOptions {
 
     /// Publish on the media volume rather than the in-call one.
     ///
-    /// See ``RoomModel/broadcastsToAnAudience``. Here as a flag because it is the setting a
-    /// scripted run wants: two phones on one desk, both publishing, and no way to silence
-    /// either of them from the volume buttons while the session is a call.
-    var mediaVolume = false
+    /// See ``RoomModel/broadcastsToAnAudience``, which is on by default and is what `nil` here
+    /// means. Both directions are flags rather than one, because with the default flipped a
+    /// scripted run needs to be able to ask for either: `--media-volume` to state the default
+    /// rather than inherit it, and `--call-volume` to get the echo canceller back for a run with
+    /// two phones on one desk, both publishing, in a room that would otherwise howl.
+    var mediaVolume: Bool?
 
     /// Start with the room's playback at zero.
     ///
@@ -543,6 +545,7 @@ struct LaunchOptions {
             case "--eager-encoding": options.eagerEncoding = true
             case "--plain-capture": options.plainCapture = true
             case "--media-volume": options.mediaVolume = true
+            case "--call-volume": options.mediaVolume = false
             case "--silence-room": options.silenceRoom = true
             case "--mix": options.mix = value.flatMap(Float.init)
             case "--best-effort": options.bestEffort = true
