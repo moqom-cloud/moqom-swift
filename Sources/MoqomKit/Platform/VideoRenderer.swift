@@ -834,17 +834,23 @@ import MoqomCore
             /// frame rate, and the smoothing it provides is not being had.
             public var regrids = 0
 
-            /// Times the grid was moved down to bring the hold back under the ceiling.
+            /// Frames found holding above the ceiling, which nothing here now acts on directly.
+            ///
+            /// It used to be the count of corrections made, and the correction is gone — see
+            /// ``shift(by:to:)`` for why it could never work and the note beside its removal for
+            /// why, once it could, it was one draining loop too many. What is left is the
+            /// observation without the action: how often the hold is over its ceiling while
+            /// ``ScheduleTracking`` is the only thing closing it.
+            ///
+            /// Which is the more useful of the two anyway. A count of corrections says how busy
+            /// this was; a count of excesses says whether the loop that owns the depth is keeping
+            /// its promise, and a number that does not fall over a call says it is not.
             ///
             /// Counted apart from ``regrids``, which it shared until the conflation hid a fault
             /// for the length of an investigation: four hundred of these beside two decisions by
             /// the delay controller reads as a grid restarting for no reason, and was in fact the
-            /// ceiling being enforced twice a second. Different events, different causes, and
-            /// only one of them is about the source's timeline.
-            ///
-            /// Occasional is the design — the hold drifts above the ceiling and is walked back.
-            /// About one a second is this correcting faster than it can measure, and the hold
-            /// underneath it is a sawtooth rather than a setting.
+            /// ceiling being missed twice a second. Different events, different causes, and only
+            /// one of them is about the source's timeline.
             public var handbacks = 0
 
             /// Times the publisher changed the shape of the picture.
