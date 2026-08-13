@@ -646,13 +646,6 @@ final class CadenceMeter: @unchecked Sendable {
     private var stallPeriods: [Double] = []
     private var previousStall: ContinuousClock.Instant?
 
-    /// Whether a normal interval has been seen, so the picture is actually running.
-    ///
-    /// The gap before that is waiting for a stream — subscribe, the first keyframe, a
-    /// drain that just started — not a freeze of one. Counting it is how a remote tile
-    /// lighting up reads as a stall on a call nobody watching would say froze.
-    private var flowing = false
-
     /// A gap this long is a visible stall rather than jitter.
     ///
     /// At 30fps a frame is due every 33ms, and the display can absorb a few missed ones
@@ -669,7 +662,6 @@ final class CadenceMeter: @unchecked Sendable {
     func restart() {
         lock.withLock {
             previous = nil
-            flowing = false
         }
     }
 
@@ -687,11 +679,7 @@ final class CadenceMeter: @unchecked Sendable {
                 (instant - previous).components.attoseconds
             ) / 1e15 + Double((instant - previous).components.seconds) * 1000
 
-            // A freeze is the picture stopping, which can only happen once it has started.
-            if milliseconds < Self.freezeThreshold {
-                flowing = true
-            }
-            if milliseconds >= Self.freezeThreshold, flowing {
+            if milliseconds >= Self.freezeThreshold {
                 freezes += 1
                 frozen += milliseconds
                 if keyFrame { freezesOnKeyFrame += 1 }

@@ -321,12 +321,14 @@ final class VideoTile {
             if let stamp {
                 meter.record(capturedAt: frame.frame.timestamp, receivedAt: stamp())
             }
-            cadence.record(keyFrame: frame.frame.isKeyFrame)
             timeline.record(stamp: frame.frame.timestamp.nanoseconds)
             drawn += 1
 
+            var shown = false
             await MainActor.run {
+                let before = renderer.drawing.enqueued
                 try? renderer.enqueue(frame)
+                shown = renderer.drawing.enqueued > before
 
                 // The publisher changed the shape of the picture. Read after enqueueing,
                 // because the format description this reports is built from the keyframe
@@ -348,6 +350,13 @@ final class VideoTile {
                 room.tileSize = renderer.drawnSize
                 room.tileCount = VideoTile.live
                 if drawn % 30 == 0 { room.timing = renderer.timing }
+            }
+
+            // After a frame has been handed to the layer, not when an object arrived.
+            // Subscribe, the first keyframe, a drain that just started — those waits have
+            // no picture yet, and counting them as freezes is how connecting read as a stall.
+            if shown {
+                cadence.record(keyFrame: frame.frame.isKeyFrame)
             }
 
             // Off the drain. This used to `await` the display pipeline's performance metrics
