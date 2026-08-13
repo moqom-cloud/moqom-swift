@@ -247,6 +247,39 @@ struct ScheduleTracking: Sendable, Equatable {
         return standing
     }
 
+    /// How much of the standing correction survives the schedule running out of frames.
+    ///
+    /// Half, which is chosen for how it behaves when it is wrong rather than for being the right
+    /// step. Too large a cut is re-learnt in seconds by the loop that measured it in the first
+    /// place; too small a one leaves the ratchet in place, only slower.
+    static let keptAfterOutrunning = 0.5
+
+    /// The picture ran out of stream, which is evidence about the rate and the only evidence of
+    /// its kind the loop ever gets.
+    ///
+    /// The history in ``standing`` can otherwise only climb. A queue deeper than the request is
+    /// an error the loop is left to integrate for as long as it lasts, while a queue running dry
+    /// is cut short within a frame or two by a re-anchor that puts the depth back above the
+    /// request — so positive error accumulates over seconds and negative error is never
+    /// available long enough to unwind it. Nothing in the arithmetic is asymmetric; the exposure
+    /// is, and the effect is the same.
+    ///
+    /// Left alone it ends where it was measured ending, on two phones at a hundred and twenty
+    /// seconds: a standing correction climbing steadily past twenty-eight hundred parts per
+    /// million with no sign of settling, the picture therefore permanently three tenths of a
+    /// percent fast, three milliseconds of queue drained every second, and a re-anchor arriving
+    /// every couple of seconds to refill what the rate had just emptied — sixty-four of them in
+    /// two minutes against seven. Each one is a visible lurch, and because the climb takes a
+    /// minute to amount to anything, the call begins clean and gets worse, which is exactly how
+    /// it was reported.
+    ///
+    /// Only a correction that was running fast is cut. Starving while already running slow says
+    /// the frames were not there to be shown, and the rate did not do it.
+    mutating func outran() {
+        guard standing > 0 else { return }
+        standing *= Self.keptAfterOutrunning
+    }
+
     /// Forget everything, for a stream that is no longer the same stream.
     ///
     /// Unlike a re-anchor, which keeps it. A restart may bring a different publisher, and a

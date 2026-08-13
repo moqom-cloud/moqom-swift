@@ -1693,11 +1693,18 @@ import MoqomCore
             // than drifted within it, and a re-anchor is the only thing that recovers it. The
             // undershoot side is a question about persistence rather than a threshold, because
             // the rate can recover a momentary one and does it without a lurch.
-            if PlayoutDelay.needsAnchoring(
+            let outran = PlayoutDelay.needsAnchoring(
                 depth: depth,
                 allowance: allowance,
                 straying: strayed.map { (ContinuousClock.now - $0).asSeconds }
-            ) || depth > seconds + 0.15 {
+            )
+            if outran || depth > seconds + 0.15 {
+                // Which side it failed on is the one thing worth telling the rate loop, because
+                // the two say opposite things about it. Overshooting is a queue that grew, and
+                // the rate is what will drain it. Running out is the rate having already drained
+                // more than there was, and carrying that correction across unchanged is how a
+                // loop arranges its own next re-anchor.
+                if outran { tracking.outran() }
                 anchorSchedule(to: newest, delay: delay)
                 strayed = nil
                 return

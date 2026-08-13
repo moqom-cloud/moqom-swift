@@ -9,6 +9,63 @@ import Testing
 /// call and four hundred milliseconds of simulated time here.
 @Suite("Schedule tracking")
 struct ScheduleTrackingTests {
+    /// Running out of frames says the picture was too fast, and that is the whole of the claim.
+    @Test("outrunning the stream cuts a correction that was running fast")
+    func outranCutsAFastCorrection() {
+        var tracking = ScheduleTracking()
+        for _ in 0 ..< 200 { _ = tracking.correction(depth: 0.030, wanted: 0.020) }
+
+        let was = tracking.standing
+        #expect(was > 0)
+        tracking.outran()
+        #expect(tracking.standing < was)
+
+        // And it is resumed at the reduced figure rather than the one that emptied the queue.
+        #expect(tracking.resuming() == tracking.standing)
+    }
+
+    /// A queue that ran dry while the picture was already slow ran dry for some other reason, and
+    /// slowing further is not the answer to it.
+    @Test("outrunning leaves a correction that was running slow alone")
+    func outranSparesASlowCorrection() {
+        var tracking = ScheduleTracking()
+        for _ in 0 ..< 200 { _ = tracking.correction(depth: 0.010, wanted: 0.020) }
+
+        let was = tracking.standing
+        #expect(was < 0)
+        tracking.outran()
+        #expect(tracking.standing == was)
+    }
+
+    /// The fault this exists for, in the shape it actually had.
+    ///
+    /// A queue above its request is an error the loop integrates for as long as it lasts; a queue
+    /// below it is cut short within a frame or two by the re-anchor, which puts the depth back
+    /// above the request. So the loop is exposed to one sign far longer than the other, and the
+    /// history climbs whatever the link is really doing.
+    @Test("the history does not ratchet when only one sign of error is ever visible")
+    func theHistoryDoesNotRatchet() {
+        var ratcheting = ScheduleTracking()
+        var corrected = ScheduleTracking()
+
+        // Two minutes of it, at the quarter-second the loop actually runs at, with the schedule
+        // held ten milliseconds above its request and starved once every couple of seconds —
+        // which is the cadence the phones re-anchored at.
+        for observation in 1 ... 480 {
+            _ = ratcheting.correction(depth: 0.047, wanted: 0.037)
+            _ = corrected.correction(depth: 0.047, wanted: 0.037)
+            if observation % 8 == 0 { corrected.outran() }
+        }
+
+        // Measured on two phones before the cut: a standing correction past twenty-eight hundred
+        // parts per million and still climbing, which is a picture running three tenths of a
+        // percent fast for the rest of the call.
+        #expect(ratcheting.standing > 0.0028)
+
+        // After it, something that stays inside what two crystals could plausibly be apart by.
+        #expect(corrected.standing < 0.0002)
+    }
+
     /// A viewer's schedule against a publisher whose clock runs at a different rate.
     ///
     /// The only physics involved: the depth between the newest frame and the playhead grows at
