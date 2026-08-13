@@ -290,7 +290,7 @@
                     // So that a size or format this cannot handle says so, rather than
                     // presenting as a scene that never drew.
                     logger: MoqomLogger(
-                        sink: SystemLogSink(subsystem: "cloud.moqom.sample", privacy: .hashed),
+                        sink: Journal.diagnostics,
                         minimum: .warning
                     )
                 )

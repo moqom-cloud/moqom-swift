@@ -412,4 +412,34 @@ struct PlayoutDelayTests {
         #expect(!PlayoutDelay.needsAnchoring(depth: 0.018, allowance: 0.02, straying: nil))
         #expect(!PlayoutDelay.needsAnchoring(depth: -0.01, allowance: 0.02, straying: nil))
     }
+
+    /// The overlay that read several hundred milliseconds late was this case: a stall, then
+    /// the pictures for the time that passed, offered to a grid whose next slot was already
+    /// gone. Showing them is the hitch; skipping them is not.
+    @Test("a stall's backlog is too late to show")
+    func aStallsBacklogIsTooLate() {
+        let interval = 1.0 / 60
+        let delay = 0.020
+        let playhead = 1.0
+        #expect(PlayoutDelay.tooLateToShow(
+            source: playhead - delay - 0.813,
+            playhead: playhead,
+            delay: delay,
+            interval: interval
+        ))
+    }
+
+    /// One frame behind the hold is why the buffer exists, and showing it is not a hitch.
+    @Test("a frame the buffer is meant to absorb is shown")
+    func aBufferedFrameIsShown() {
+        let interval = 1.0 / 60
+        let delay = 0.038
+        let playhead = 1.0
+        #expect(!PlayoutDelay.tooLateToShow(
+            source: playhead - delay - interval,
+            playhead: playhead,
+            delay: delay,
+            interval: interval
+        ))
+    }
 }

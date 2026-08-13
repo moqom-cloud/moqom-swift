@@ -1052,7 +1052,7 @@ final class RoomModel {
         connection = Task { [weak self, session] in
             for await state in session.states {
                 guard self != nil else { return }
-                print("SESSION \(state.description)")
+                Journal.shared.say("SESSION \(state.description)")
             }
         }
     }
@@ -1488,7 +1488,7 @@ final class RoomModel {
                     position: cameraPosition,
                     oversampling: capturesPlainly ? .off : .automatic,
                     logger: MoqomLogger(
-                        sink: SystemLogSink(subsystem: "cloud.moqom.sample", privacy: .hashed),
+                        sink: Journal.diagnostics,
                         minimum: .debug
                     )
                 )

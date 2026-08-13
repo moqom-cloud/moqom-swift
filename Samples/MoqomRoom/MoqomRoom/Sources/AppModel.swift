@@ -327,9 +327,9 @@ final class AppModel {
 
     /// Join on the settings a script supplied, if it supplied any.
     ///
-    /// Prints rather than only logging, so `devicectl process launch --console` makes the
-    /// outcome legible from the Mac. Whether a phone can reach a relay at all is the first
-    /// question of a two-device run and the console is where it gets answered.
+    /// Whether a phone can reach a relay at all is the first question of a two-device run.
+    /// The journal is where it gets answered — stdout only in Debug, because a live console
+    /// pipe over Wi-Fi is traffic on the radio the call is using.
     func joinOnLaunch() async {
         // Filled in whether or not this launch joins by itself, because the name and the room
         // are half of what a token is minted against. A launch that supplies a token and no
@@ -394,7 +394,7 @@ final class AppModel {
                     + " \(live.size.width)x\(live.size.height)@\(Int(live.frameRate))"
                     + " \(live.bitrate / 1000)kbps layers=\(live.temporalLayers)"
                     + " codec=hevc source=\(room.videoInput.rawValue)"
-                    + " fps=\(Int(launch.frameRate ?? 30))"
+                    + " fps=\(Int(launch.frameRate ?? 60))"
                     + " playout=\(launch.playoutMilliseconds.map { "\($0)ms fixed" } ?? "adaptive")"
                     + " layers=\(launch.flatLayers ? "flat" : "temporal")"
                     + " encode=\(launch.eagerEncoding ? "eager" : "efficient")"
@@ -489,7 +489,13 @@ final class AppModel {
         default: room.videoInput = .camera
         }
 
-        let fps = launch.frameRate ?? 30
+        // Sixty, which is what every measurement of this application has been taken at and what
+        // the capture, encode and presentation paths are tuned around. Thirty was the default for
+        // as long as the frame rate was only ever set from the command line, and the effect of
+        // leaving it there was that the app a person opens by hand behaved unlike the one being
+        // measured — the same build, half the frames, and no indication which one you were
+        // looking at.
+        let fps = launch.frameRate ?? 60
 
         // Bitrate with the frame rate, not fixed. Twice the frames at the same budget is half
         // the bits each, and a sixty frame run that looks worse than a thirty frame one has
@@ -672,13 +678,14 @@ final class AppModel {
                 Journal.shared.say(
                     String(
                         format: "DRAW shown=%d late=%d undescribed=%d failures=%d"
-                            + " backwards=%d reanchors=%d regrids=%d delivered=%.1f%%"
+                            + " backwards=%d skippedLate=%d reanchors=%d regrids=%d delivered=%.1f%%"
                             + " buffer=%.0fms",
                         drawn.enqueued,
                         drawn.skippedNotReady,
                         drawn.skippedUndescribed,
                         drawn.failures,
                         drawn.outOfOrder,
+                        drawn.skippedLate,
                         drawn.reanchors,
                         drawn.regrids,
                         drawn.delivered * 100,
@@ -1265,7 +1272,7 @@ final class AppModel {
                 // demo's log is the one most likely to end up in a screenshot.
                 logger: MoqomLogger(
                     sink: BroadcastLogSink(sinks: [
-                        SystemLogSink(subsystem: "cloud.moqom.sample", privacy: .hashed),
+                        Journal.diagnostics,
                         // And into the file this app keeps, so a session driven by hand can
                         // be read afterwards. Warnings only: the unified log can afford
                         // every subscribe and every object, and a file on a phone cannot.

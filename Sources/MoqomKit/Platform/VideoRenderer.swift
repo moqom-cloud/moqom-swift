@@ -734,6 +734,12 @@ import MoqomCore
             /// Normal at the very start of a subscription and a bug if it continues.
             public var skippedUndescribed = 0
 
+            /// Frames not shown because their moment had already passed.
+            ///
+            /// Distinct from ``skippedNotReady``: the decoder was willing, the timestamps were
+            /// not. After a stall these are the backlog, and showing them is the hitch.
+            public var skippedLate = 0
+
             /// Times the display layer failed and was rebuilt.
             public var failures = 0
 
@@ -919,7 +925,7 @@ import MoqomCore
 
             /// The share of frames that reached the display layer.
             public var delivered: Double {
-                let total = enqueued + skippedNotReady + skippedUndescribed
+                let total = enqueued + skippedNotReady + skippedUndescribed + skippedLate
                 return total > 0 ? Double(enqueued) / Double(total) : 0
             }
         }
@@ -1850,7 +1856,29 @@ import MoqomCore
             var drawn = sample
             var presentation = source
             var cadence: Double?
-            if requestedDelay != nil, source.isValid, let interval = interval(after: source) {
+            if let delay = requestedDelay, source.isValid, let interval = interval(after: source) {
+                // Before the grid, because the grid's next slot is still the one after the last
+                // shown frame, and after a stall that slot is in the past. Regularising first
+                // would spend it, and then skipping would leave the pointer one step further
+                // into a hole.
+                if synchroniser.rate != 0 {
+                    let playhead = synchroniser.currentTime()
+                    let held = Double(delay.components.seconds)
+                        + Double(delay.components.attoseconds) / 1e18
+                    if playhead.isValid, PlayoutDelay.tooLateToShow(
+                        source: source.seconds,
+                        playhead: playhead.seconds,
+                        delay: held,
+                        interval: interval
+                    ) {
+                        drawing.skippedLate += 1
+                        grid = nil
+                        slot = 0
+                        debt = 0
+                        return
+                    }
+                }
+
                 // Declined rather than placed. Returning here rather than falling through to the
                 // enqueue below, which would hand the layer an unscheduled frame carrying its own
                 // source timestamp — behind the one already shown, which is the thing being
