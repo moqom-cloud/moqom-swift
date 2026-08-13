@@ -315,6 +315,7 @@ final class VideoTile {
         reportingTo room: RoomModel
     ) async {
         var drawn = 0
+        cadence.restart()
         for await frame in frames {
             if Task.isCancelled { return }
             if let stamp {

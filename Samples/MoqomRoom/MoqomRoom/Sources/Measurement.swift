@@ -646,6 +646,13 @@ final class CadenceMeter: @unchecked Sendable {
     private var stallPeriods: [Double] = []
     private var previousStall: ContinuousClock.Instant?
 
+    /// Whether a normal interval has been seen, so the picture is actually running.
+    ///
+    /// The gap before that is waiting for a stream — subscribe, the first keyframe, a
+    /// drain that just started — not a freeze of one. Counting it is how a remote tile
+    /// lighting up reads as a stall on a call nobody watching would say froze.
+    private var flowing = false
+
     /// A gap this long is a visible stall rather than jitter.
     ///
     /// At 30fps a frame is due every 33ms, and the display can absorb a few missed ones
@@ -653,6 +660,18 @@ final class CadenceMeter: @unchecked Sendable {
     /// held, so that is where a late frame stops being jitter and starts being a freeze —
     /// the same threshold WebRTC's freeze counters use, for the same reason.
     private static let freezeThreshold = 150.0
+
+    /// Forget the last arrival, because the next one is a different stream.
+    ///
+    /// A subscription that just became ready, or a drain that just started, is separated
+    /// from whatever was recorded before by waiting, not by a freeze. Comparing across that
+    /// boundary is how connecting reads as a stall.
+    func restart() {
+        lock.withLock {
+            previous = nil
+            flowing = false
+        }
+    }
 
     /// - Parameter keyFrame: Whether the frame that ended this gap was a keyframe. Only used to
     ///   attribute stalls; pass `false` where it is not known and the attribution reads zero.
@@ -668,7 +687,11 @@ final class CadenceMeter: @unchecked Sendable {
                 (instant - previous).components.attoseconds
             ) / 1e15 + Double((instant - previous).components.seconds) * 1000
 
-            if milliseconds >= Self.freezeThreshold {
+            // A freeze is the picture stopping, which can only happen once it has started.
+            if milliseconds < Self.freezeThreshold {
+                flowing = true
+            }
+            if milliseconds >= Self.freezeThreshold, flowing {
                 freezes += 1
                 frozen += milliseconds
                 if keyFrame { freezesOnKeyFrame += 1 }
