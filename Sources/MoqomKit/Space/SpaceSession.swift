@@ -12,23 +12,19 @@
 // before the first bubble appears. Instead the rule is entirely local and
 // arrives at the same answer everywhere:
 //
-// - A device that hears nothing on the space track for ``Configuration/quiet``
+// - A device that hears nothing on any peer's space track for ``Configuration/quiet``
 //   claims it, by publishing a snapshot at an epoch above the highest it has
-//   seen.
+//   seen, on its own participant namespace.
 // - A device that sees a higher epoch than its own stops publishing.
 // - Two devices that claim the same epoch — the case that a quiet interval and
 //   two phones makes likely rather than rare — are separated by their
 //   identities, and the one that loses stands down.
 //
-// That last rule is why the tie-break is by name and not by "who claimed
-// first": both claimants believe they were first, and the only fact they agree
-// on is who they are.
-//
-// The relay makes this work in a way worth knowing about. Several sessions may
-// announce the room's namespace at once and the newest announcement is the one
-// subscribers are routed to, so a handover does not need the outgoing authority
-// to cooperate — or to still exist. Subscribers pinned to the old publisher
-// find out when its track ends, which is what ``watch()`` re-subscribes on.
+// The space lives under the participant, not the room. The room namespace is
+// the control log, and a guest is not allowed to announce it; putting the
+// field there made both phones simulate a game whose ticks never left the
+// device. Each authority publishes `.space` beside its video, and everyone
+// else subscribes to it the same way they subscribe to a camera.
 //
 // # Why the simulation is a protocol and not a closure
 //
@@ -109,10 +105,13 @@ public actor SpaceSession {
 
         /// Silence on the space track before this device claims it.
         ///
-        /// Long enough that a stalled uplink does not cause a takeover, short
-        /// enough that a host who quit does not leave the game frozen. The
-        /// epoch fence makes a wrong guess recoverable rather than fatal, which
-        /// is what allows it to be this short.
+        /// Longer than one snapshot interval, because a joiner who arrives in
+        /// the middle of a group cannot decode until the next snapshot, and
+        /// treating that as an abandoned space is how two phones end up
+        /// simulating two different games. Four seconds matches the handover
+        /// the rest of this file talks about: a host in a tunnel is replaced
+        /// without looking like a glitch, and a host who quit does not leave
+        /// the field frozen.
         public var quiet: Duration
 
         /// How old an intent may be and still be acted on.
@@ -134,7 +133,7 @@ public actor SpaceSession {
         public init(
             tickRate: Double = 20,
             groupLength: Int = 40,
-            quiet: Duration = .milliseconds(1500),
+            quiet: Duration = .seconds(4),
             intentLifetime: Duration = .seconds(2),
             mayLead: Bool = true
         ) {
@@ -154,13 +153,13 @@ public actor SpaceSession {
 
     /// What a space tells the application about.
     public enum Event: Sendable {
-        /// The state moved, with what moved it.
+        /// The state moved, with what moved it, at the instant the simulation
+        /// produced it.
         ///
-        /// Both, because a renderer wants the delta — spawn a node, remove a
-        /// node, set thirty transforms — and anything joining the stream late
-        /// wants the state. Computing either from the other at the call site is
-        /// work this already did.
-        case changed(SpaceSnapshot, SpaceDelta)
+        /// The timestamp is the one on the tick, not the one on the packet: a
+        /// renderer that samples against a shared clock can draw the same pose
+        /// as every other participant rather than the pose as of arrival.
+        case changed(SpaceSnapshot, SpaceDelta, at: Timecode)
 
         /// This device started or stopped simulating.
         case roleChanged(Role)
@@ -173,10 +172,15 @@ public actor SpaceSession {
     public nonisolated let tenant: TenantID
     public nonisolated let room: RoomID
 
-    /// The track the space is replicated on.
+    /// The track this device publishes when it is simulating.
+    ///
+    /// Under this participant's own namespace, not the room's. The room
+    /// namespace is the control log, and the relay will not let a guest
+    /// announce it — which is what made two phones simulate two games: both
+    /// thought they had published, and neither's ticks left the device.
     public nonisolated let track: FullTrackName
 
-    /// The room's namespace, which the authority announces.
+    /// The room's prefix, for finding everyone else on stage.
     private nonisolated let roomNamespace: TrackNamespace
 
     private let connection: any TransportSession
@@ -197,14 +201,11 @@ public actor SpaceSession {
     private var encoder = SpaceEncoder()
     private var decoder = SpaceDecoder()
 
-    private var watcher: Task<Void, Never>?
-    private var subscription: (any SubscriptionHandle)?
     private var ticker: Task<Void, Never>?
     private var claimer: Task<Void, Never>?
     private var roster: Task<Void, Never>?
 
     private var writer: (any TrackWriter)?
-    private var announcement: (any AnnouncementHandle)?
     private var group: UInt64 = 0
     private var object: UInt64 = 0
     private var ticksThisGroup = 0
@@ -213,7 +214,8 @@ public actor SpaceSession {
     private var pending: [(SpaceIntent, ParticipantIdentity)] = []
     private var applied: [ParticipantIdentity: UInt64] = [:]
     private var intents: [ParticipantIdentity: Task<Void, Never>] = [:]
-    private var peers: Set<ParticipantIdentity> = []
+    private var spaces: [ParticipantIdentity: Task<Void, Never>] = [:]
+    private var rostered: [ParticipantIdentity: ParticipantSlot] = [:]
 
     /// This device's own outgoing intents.
     private var outgoing: (any TrackWriter)?
@@ -239,8 +241,11 @@ public actor SpaceSession {
     ) throws(MoqomError) {
         do {
             roomNamespace = try MoqomNamespaces.room(tenant: tenant, room: room)
+            let ownNamespace = try MoqomNamespaces.participant(
+                tenant: tenant, room: room, identity: identity
+            )
             track = try FullTrackName(
-                namespace: roomNamespace,
+                namespace: ownNamespace,
                 name: TrackName(SpaceUpdate.trackName)
             )
         } catch {
@@ -270,7 +275,7 @@ public actor SpaceSession {
     public func start() async {
         guard !isRunning else { return }
         isRunning = true
-        watch()
+        watchRoster()
 
         // The intent track is opened now rather than on the first tap, and the
         // reason is a race that only shows up on the tap that matters most. An
@@ -279,6 +284,10 @@ public actor SpaceSession {
         // breath as its first intent has sent it before anybody was listening.
         // Announcing early costs one idle track and makes the first thing a
         // player does as reliable as the second.
+        //
+        // The same announcement is what makes this device's space track
+        // reachable: it lives under the participant namespace, which a guest
+        // is allowed to publish, rather than under the room, which is not.
         //
         // Refused for a viewer with no publish rights, which is not an error
         // worth reporting: `act` retries, and by then the answer will be the
@@ -294,10 +303,11 @@ public actor SpaceSession {
         claimer?.cancel()
         claimer = nil
         await follow()
-        watcher?.cancel()
-        watcher = nil
-        await subscription?.cancel()
-        subscription = nil
+        roster?.cancel()
+        roster = nil
+        for task in spaces.values { task.cancel() }
+        spaces.removeAll()
+        rostered.removeAll()
         await outgoing?.finish()
         outgoing = nil
         await ownAnnouncement?.withdraw()
@@ -307,68 +317,26 @@ public actor SpaceSession {
 
     // MARK: - Watching
 
-    /// Subscribe, read until the track ends, and subscribe again.
+    /// Follow every other participant's space track, and their intents once
+    /// this device is the one that can act on them.
     ///
-    /// The loop is the point. A space track ends when its publisher does, which
-    /// on a handover is the normal course of events rather than a failure —
-    /// and the next subscription is what routes this device to whoever took
-    /// over.
-    private func watch() {
-        watcher?.cancel()
-        watcher = Task { [weak self] in
-            while let self, await self.isRunning, !Task.isCancelled {
-                guard await self.readThrough() else {
-                    // Nothing to subscribe to yet, which is the ordinary state
-                    // of a space nobody has started. Retried rather than
-                    // treated as an error, and slowly, because the claim timer
-                    // is what resolves it.
-                    try? await Task.sleep(for: .milliseconds(400))
-                    continue
-                }
+    /// One prefix watch, not two. The relay refuses overlapping
+    /// `SUBSCRIBE_NAMESPACE` on a session, and the intents already needed this
+    /// roster — folding the space into it is what lets a follower find the
+    /// authority without announcing a namespace it is not allowed to.
+    private func watchRoster() {
+        roster?.cancel()
+        roster = Task { [weak self] in
+            guard let self else { return }
+            let prefix = self.roomNamespace
+            guard let stream = try? await self.connection.announcements(matching: prefix) else {
+                return
+            }
+            for await event in stream {
+                if Task.isCancelled { return }
+                await self.applyAnnouncement(event, under: prefix)
             }
         }
-    }
-
-    /// One subscription, from start to end.
-    ///
-    /// - Returns: Whether it was established. `false` asks the caller to wait
-    ///   before trying again.
-    private func readThrough() async -> Bool {
-        let handle: any SubscriptionHandle
-        do {
-            handle = try await connection.subscribe(
-                SubscribeRequest(
-                    track: track,
-                    priority: SpaceUpdate.priority,
-                    // The current group rather than the next, because a group
-                    // opens with a snapshot and the next one is up to two
-                    // seconds away. This is the difference between a joiner
-                    // seeing the space immediately and seeing it eventually.
-                    start: .latestGroup
-                )
-            )
-        } catch {
-            return false
-        }
-
-        adopt(handle)
-        for await object in handle.objects {
-            receive(object)
-        }
-        await handle.cancel()
-        forget(handle)
-        return true
-    }
-
-    private func adopt(_ handle: any SubscriptionHandle) {
-        subscription = handle
-        // The interning table belongs to the subscription, not to the space: a
-        // new one starts with a snapshot that renumbers everything.
-        decoder.reset()
-    }
-
-    private func forget(_ handle: any SubscriptionHandle) {
-        if subscription === handle { subscription = nil }
     }
 
     /// Internal rather than private so a test can hand this an update from a
@@ -376,21 +344,28 @@ public actor SpaceSession {
     /// publishing, above all, which needs two relays and a partition to stage
     /// honestly and one line to state directly.
     func receive(_ object: TrackObject) {
+        ingest(object, decoder: &decoder)
+    }
+
+    private func markHeard() {
+        lastHeard = .nanoseconds(DispatchTime.now().uptimeNanoseconds)
+    }
+
+    private func ingest(_ object: TrackObject, decoder: inout SpaceDecoder) {
+        markHeard()
         let update: SpaceUpdate
         do {
             update = try decoder.decode(object.payload)
         } catch {
-            // A delta naming a handle no snapshot introduced, most likely, which
-            // means this subscription missed the start of a group. The next
-            // group opens with a snapshot and repairs it.
             logger.warning(.control, "space update rejected", [
                 LogField("reason", .text("\(error)")),
             ])
             return
         }
+        apply(update)
+    }
 
-        lastHeard = .nanoseconds(DispatchTime.now().uptimeNanoseconds)
-
+    private func apply(_ update: SpaceUpdate) {
         guard shouldApply(update) else { return }
         tick = update.tick
 
@@ -407,7 +382,7 @@ public actor SpaceSession {
         if state.authority != wasAuthority {
             eventContinuation.yield(.authorityChanged(state.authority))
         }
-        eventContinuation.yield(.changed(state, delta))
+        eventContinuation.yield(.changed(state, delta, at: update.at))
     }
 
     /// Whether an arriving update is news, and whether this device should stand
@@ -474,16 +449,11 @@ public actor SpaceSession {
     public func lead() async throws(MoqomError) {
         guard role == .following else { return }
 
-        let announced = try await connection.announce(roomNamespace)
-        let opened: any TrackWriter
-        do {
-            opened = try await connection.publish(track, priority: SpaceUpdate.priority)
-        } catch {
-            await announced.withdraw()
-            throw error
-        }
+        // The participant namespace is already announced — `intentWriter` did
+        // that at start, and a broadcast usually did it too. Publishing the
+        // space as another track under it is what a guest is allowed to do.
+        let opened = try await connection.publish(track, priority: SpaceUpdate.priority)
 
-        announcement = announced
         writer = opened
         role = .leading
         tick = tick.succeeding
@@ -506,13 +476,8 @@ public actor SpaceSession {
         // world rather than an empty group.
         try await writeSnapshot(at: now)
 
-        listenForIntents()
+        for slot in rostered.values { listenForIntents(of: slot) }
         startTicking()
-
-        // Re-subscribed so that this device is routed to its own announcement,
-        // which is what makes reading its own writes back — and therefore
-        // noticing a successor — possible at all.
-        watch()
     }
 
     /// Stop simulating, without deciding who should instead.
@@ -524,8 +489,6 @@ public actor SpaceSession {
         pending.removeAll()
         await writer?.finish()
         writer = nil
-        await announcement?.withdraw()
-        announcement = nil
         guard role == .leading else { return }
         role = .following
         eventContinuation.yield(.roleChanged(.following))
@@ -582,7 +545,7 @@ public actor SpaceSession {
         }
 
         if !delta.isEmpty {
-            eventContinuation.yield(.changed(state, delta))
+            eventContinuation.yield(.changed(state, delta, at: now))
         }
     }
 
@@ -730,37 +693,22 @@ public actor SpaceSession {
         return writer
     }
 
-    /// Follow every participant's intent track, for as long as this device is
-    /// the one that can act on them.
-    private func listenForIntents() {
-        roster?.cancel()
-        roster = Task { [weak self] in
-            guard let self else { return }
-            let prefix = self.roomNamespace
-            guard let stream = try? await self.connection.announcements(matching: prefix) else {
-                return
-            }
-            for await event in stream {
-                if Task.isCancelled { return }
-                await self.applyAnnouncement(event, under: prefix)
-            }
-        }
-    }
-
     private func applyAnnouncement(_ event: AnnouncementEvent, under prefix: TrackNamespace) {
         guard let slot = ParticipantSlot(announced: event.namespace, under: prefix) else { return }
         guard slot.identity != identity else { return }
         switch event {
         case .announced:
-            guard peers.insert(slot.identity).inserted else { return }
-            listen(to: slot)
+            guard rostered.updateValue(slot, forKey: slot.identity) == nil else { return }
+            listenToSpace(of: slot)
+            listenForIntents(of: slot)
         case .withdrawn:
-            peers.remove(slot.identity)
+            rostered.removeValue(forKey: slot.identity)
             intents.removeValue(forKey: slot.identity)?.cancel()
+            spaces.removeValue(forKey: slot.identity)?.cancel()
         }
     }
 
-    private func listen(to slot: ParticipantSlot) {
+    private func listenForIntents(of slot: ParticipantSlot) {
         guard role == .leading, intents[slot.identity] == nil else { return }
         let who = slot.identity
         intents[who] = Task { [weak self] in
@@ -780,17 +728,6 @@ public actor SpaceSession {
                         SubscribeRequest(
                             track: name,
                             priority: SpaceIntent.priority,
-                            // The current group rather than the next, because
-                            // an intent is one group and a subscription that
-                            // began a millisecond after it was written would
-                            // otherwise miss it entirely — which on a fresh
-                            // authority is everybody's first tap.
-                            //
-                            // What that risks is replaying something old to a
-                            // late-arriving authority, and two things bound it:
-                            // a sender's sequence never goes backwards, and
-                            // `isFresh` refuses anything that has clearly been
-                            // sitting there.
                             start: .latestGroup
                         )
                     )
@@ -804,6 +741,60 @@ public actor SpaceSession {
                 await subscription.cancel()
             }
         }
+    }
+
+    /// Read one peer's space track for as long as they are on stage.
+    ///
+    /// Each peer is a separate intern table, so the decoder lives in this task
+    /// rather than on the session. Mixing them would make a snapshot from one
+    /// authority rename the other authority's bubbles.
+    private func listenToSpace(of slot: ParticipantSlot) {
+        guard spaces[slot.identity] == nil else { return }
+        let who = slot.identity
+        spaces[who] = Task { [weak self] in
+            guard let self else { return }
+            let name: FullTrackName
+            do {
+                name = try FullTrackName(
+                    namespace: slot.namespace,
+                    name: TrackName(SpaceUpdate.trackName)
+                )
+            } catch {
+                return
+            }
+            var decoder = SpaceDecoder()
+            while !Task.isCancelled {
+                decoder.reset()
+                guard
+                    let subscription = try? await self.connection.subscribe(
+                        SubscribeRequest(
+                            track: name,
+                            priority: SpaceUpdate.priority,
+                            start: .latestGroup
+                        )
+                    )
+                else {
+                    try? await Task.sleep(for: .milliseconds(400))
+                    continue
+                }
+                for await object in subscription.objects {
+                    await self.markHeard()
+                    do {
+                        let update = try decoder.decode(object.payload)
+                        await self.apply(update)
+                    } catch {
+                        await self.rejected(error)
+                    }
+                }
+                await subscription.cancel()
+            }
+        }
+    }
+
+    private func rejected(_ error: any Error) {
+        logger.warning(.control, "space update rejected", [
+            LogField("reason", .text("\(error)")),
+        ])
     }
 
     private func receive(_ object: TrackObject, from who: ParticipantIdentity) async {

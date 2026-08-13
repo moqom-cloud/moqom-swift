@@ -77,6 +77,53 @@ struct SpaceGeometryTests {
     }
 }
 
+@Suite("Sampling a space on a shared clock")
+struct SpaceTimelineTests {
+    private func tick(_ nanoseconds: Int64) -> Timecode {
+        Timecode(nanoseconds: nanoseconds, uncertainty: .milliseconds(1), trust: .synchronised)
+    }
+
+    @Test("The end of a span is 1, and past it is extrapolation")
+    func samplesAlongTheSpan() {
+        let start = tick(1_000_000_000)
+        let end = tick(1_050_000_000)
+
+        #expect(abs((SpaceTimeline.progress(from: start, to: end, at: start) ?? -1)) < 1e-5)
+        #expect(abs((SpaceTimeline.progress(from: start, to: end, at: end) ?? -1) - 1) < 1e-5)
+
+        let halfway = tick(1_025_000_000)
+        #expect(abs((SpaceTimeline.progress(from: start, to: end, at: halfway) ?? -1) - 0.5) < 1e-5)
+
+        let late = tick(1_075_000_000)
+        #expect(abs((SpaceTimeline.progress(from: start, to: end, at: late) ?? -1) - 1.5) < 1e-5)
+    }
+
+    @Test("A dropped stream does not coast forever")
+    func coastingIsCapped() {
+        let start = tick(1_000_000_000)
+        let end = tick(1_050_000_000)
+        let far = tick(2_000_000_000)
+
+        let amount = SpaceTimeline.progress(
+            from: start,
+            to: end,
+            at: far,
+            coasting: .milliseconds(250)
+        )
+        // 50ms span, 250ms past the end: (50+250)/50 = 6.
+        #expect(abs((amount ?? -1) - 6) < 1e-5)
+    }
+
+    @Test("Fallback clocks are not placed against each other")
+    func fallbackIsIncomparable() {
+        let start = Timecode(
+            nanoseconds: 1_000_000_000, uncertainty: .milliseconds(1), trust: .fallback
+        )
+        let end = tick(1_050_000_000)
+        #expect(SpaceTimeline.progress(from: start, to: end, at: end) == nil)
+    }
+}
+
 @Suite("Placing a shared space in a room")
 struct SpaceAnchorTests {
     @Test("A placement round-trips")

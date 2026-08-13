@@ -237,6 +237,29 @@ struct SpaceSessionTests {
         #expect(await session.state.entities["ball"] != nil)
         #expect(await session.authority == grace)
     }
+
+    @Test("undecodable objects still count as the space being live")
+    func noiseDoesNotLookLikeSilence() async throws {
+        // A joiner who arrives mid-group gets deltas it cannot decode until the
+        // next snapshot. Those are not silence: treating them as such is how a
+        // second phone claims a game that is already running.
+        let relay = LoopbackRelay()
+        let session = try await space(
+            ada, on: relay, simulation: Sandbox(), quiet: .milliseconds(80)
+        )
+        await session.start()
+
+        let garbage = TrackObject(
+            group: 1, object: 0, payload: Data([0x00, 0xFF, 0x00]), isKeyFrame: false
+        )
+        for _ in 0 ..< 8 {
+            await session.receive(garbage)
+            try? await Task.sleep(for: .milliseconds(30))
+        }
+
+        #expect(await session.role == .following)
+        await session.stop()
+    }
 }
 
 @Suite("A space intent on the wire")

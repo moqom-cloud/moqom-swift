@@ -1641,9 +1641,11 @@ final class RoomModel {
 
             let configuration = SpaceSession.Configuration()
             field.cadence = 1 / configuration.tickRate
-            scene.show(field)
-
             let stamp = trustedStamp
+            field.clock = { stamp?() ?? .fallback() }
+            scene.show(field)
+            field.startPresenting(in: scene.view)
+
             do {
                 let joined = try await room.joinSpace(
                     BubbleField(),
@@ -1688,8 +1690,8 @@ final class RoomModel {
                 for await event in space.events {
                     guard let self else { return }
                     switch event {
-                    case let .changed(state, delta):
-                        field.apply(state, delta)
+                    case let .changed(state, delta, at: when):
+                        field.apply(state, delta, at: when)
                         standings = BubbleField.standings(in: state).map {
                             Score(who: $0.who, score: $0.score)
                         }

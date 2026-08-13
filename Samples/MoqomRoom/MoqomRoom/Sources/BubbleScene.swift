@@ -7,6 +7,10 @@
 // and a slow one for the remote, and only the second would ever be tested on
 // the phone doing the demo.
 //
+// Poses are sampled against the same clock the ticks were stamped on, so a
+// follower is not a round-trip behind the authority. Without that, two phones
+// looking at the same field would not look like they were.
+//
 // # Where the shared space lands
 //
 // The bubbles arrive in space coordinates: an invented room with its floor at
@@ -30,6 +34,7 @@
 // field the other player can see.
 
 #if canImport(ARKit) && !targetEnvironment(simulator)
+    import Combine
     import Foundation
     import MoqomCore
     import MoqomKit
@@ -78,20 +83,33 @@
         /// for — and if it is not tapped, it leaves without a pop.
         private var leaving: Set<SpaceEntityID> = []
 
-        /// How long an update is expected to be the newest one, which is how
-        /// long a node is given to travel to where it now is.
-        ///
-        /// Interpolation rather than teleportation, and not cosmetic: the
-        /// authority ticks at twenty a second into a view drawing at sixty, so
-        /// without this every bubble moves in three-frame steps — which on a
-        /// broadcast of that view is indistinguishable from a stuttering
-        /// encoder, and would send anyone debugging it to the wrong place.
+        /// How long an update is expected to be the newest one, used only when
+        /// the clocks cannot be compared. With a shared clock the display loop
+        /// samples ``SpaceTimeline`` instead, so both phones draw the same
+        /// instant rather than the follower sitting a round-trip behind.
         var cadence: TimeInterval = 1.0 / 20
+
+        /// The clock the ticks were stamped on. Same closure the space uses.
+        var clock: @Sendable () -> Timecode = { .fallback() }
+
+        private var motions: [SpaceEntityID: Motion] = [:]
+        private var presenting: (any Cancellable)?
 
         init() {}
 
+        /// Drive poses from the shared clock, once the field is in a scene.
+        func startPresenting(in view: ARView) {
+            presenting = view.scene.subscribe(to: SceneEvents.Update.self) { [weak self] _ in
+                MainActor.assumeIsolated { self?.present() }
+            }
+        }
+
+        func stopPresenting() {
+            presenting = nil
+        }
+
         /// Take the state as it now is, and what just changed about it.
-        func apply(_ state: SpaceSnapshot, _ delta: SpaceDelta) {
+        func apply(_ state: SpaceSnapshot, _ delta: SpaceDelta, at time: Timecode) {
             // Before the removals, because an update that both flags a bubble
             // as leaving and drops it is one the renderer must not treat as a
             // pop — and a slow link is exactly where two ticks arrive as one.
@@ -99,7 +117,7 @@
                 leaving.insert(id)
             }
             for entity in delta.spawned where entity.kind == BubbleField.kind {
-                add(entity)
+                add(entity, at: time)
             }
             for id in delta.removed {
                 remove(id)
@@ -107,33 +125,31 @@
                 guessed.removeValue(forKey: id)
             }
             for (id, pose) in delta.moved {
-                guard let node = nodes[id] else { continue }
-                node.move(
-                    to: transform(for: pose),
-                    relativeTo: root,
-                    duration: cadence,
-                    timingFunction: .linear
-                )
+                motions[id]?.push(pose, at: time)
             }
 
-            reconcile(with: state)
+            reconcile(with: state, at: time)
         }
 
         /// Draw a state nothing has been drawn from yet.
         ///
         /// The joining case, and the case after a handover. A delta cannot
         /// express it — there is nothing to be a delta from.
-        func reset(to state: SpaceSnapshot) {
+        func reset(to state: SpaceSnapshot, at time: Timecode? = nil) {
+            let stamped = time ?? clock()
             for node in nodes.values { node.removeFromParent() }
             nodes.removeAll()
+            motions.removeAll()
             guessed.removeAll()
             leaving.removeAll()
-            for entity in BubbleField.bubbles(in: state) { add(entity) }
+            for entity in BubbleField.bubbles(in: state) { add(entity, at: stamped) }
         }
 
         func clear() {
+            stopPresenting()
             for node in nodes.values { node.removeFromParent() }
             nodes.removeAll()
+            motions.removeAll()
             guessed.removeAll()
             leaving.removeAll()
         }
@@ -165,7 +181,7 @@
 
         // MARK: - Nodes
 
-        private func add(_ entity: SpaceEntity) {
+        private func add(_ entity: SpaceEntity, at time: Timecode) {
             if entity.facts[BubbleField.leaving] != nil { leaving.insert(entity.id) }
             guard nodes[entity.id] == nil else { return }
             let hue: Double = if case let .decimal(value) = entity.facts["hue"] { value } else { 0.5 }
@@ -191,9 +207,11 @@
             node.generateCollisionShapes(recursive: false)
             root.addChild(node)
             nodes[entity.id] = node
+            motions[entity.id] = Motion(pose: entity.pose, at: time)
         }
 
         private func remove(_ id: SpaceEntityID) {
+            motions.removeValue(forKey: id)
             guard let node = nodes.removeValue(forKey: id) else { return }
             if leaving.remove(id) != nil {
                 // It got away. Nothing to celebrate and nothing to draw: by the
@@ -250,6 +268,7 @@
 
         /// Take a bubble away now and remember that nobody agreed yet.
         private func burst(_ id: SpaceEntityID) {
+            motions.removeValue(forKey: id)
             guard let node = nodes.removeValue(forKey: id) else { return }
             guessed[id] = ContinuousClock.now
             vanish(node)
@@ -260,19 +279,28 @@
         /// Also the repair for a missed spawn: a bubble in the state with no
         /// node is one whose delta went astray, and the next snapshot is what
         /// makes it appear rather than it being lost for the bubble's lifetime.
-        private func reconcile(with state: SpaceSnapshot) {
+        private func reconcile(with state: SpaceSnapshot, at time: Timecode) {
             let now = ContinuousClock.now
             for entity in BubbleField.bubbles(in: state) {
                 if let guessedAt = guessed[entity.id] {
                     guard now - guessedAt > Self.grace else { continue }
                     guessed.removeValue(forKey: entity.id)
                 }
-                add(entity)
+                add(entity, at: time)
             }
 
             // And the reverse: a node for something the state no longer has.
             for id in nodes.keys where state.entities[id] == nil {
                 remove(id)
+            }
+        }
+
+        /// Put every bubble where the shared clock says it is, this frame.
+        private func present() {
+            let now = clock()
+            for (id, node) in nodes {
+                guard let motion = motions[id] else { continue }
+                node.transform = transform(for: motion.pose(at: now, cadence: cadence))
             }
         }
 
@@ -288,6 +316,41 @@
                 ),
                 translation: SIMD3(placed.position.x, placed.position.y, placed.position.z)
             )
+        }
+
+        /// The last two poses a bubble was given, and when.
+        ///
+        /// Two, because one pose is a point and two are a path. The display
+        /// loop samples the path against the shared clock so a follower is not
+        /// a round-trip behind the authority.
+        private struct Motion {
+            var previous: (pose: SpacePose, at: Timecode)?
+            var current: (pose: SpacePose, at: Timecode)
+            var arrived = ContinuousClock.now
+
+            init(pose: SpacePose, at: Timecode) {
+                current = (pose, at)
+            }
+
+            mutating func push(_ pose: SpacePose, at: Timecode) {
+                previous = current
+                current = (pose, at)
+                arrived = .now
+            }
+
+            func pose(at now: Timecode, cadence: TimeInterval) -> SpacePose {
+                let startPose = previous?.pose ?? current.pose
+                let startAt = previous?.at ?? current.at
+                if let amount = SpaceTimeline.progress(from: startAt, to: current.at, at: now) {
+                    return .interpolated(from: startPose, to: current.pose, amount: amount)
+                }
+                // Fallback clocks cannot be placed against each other. Travel
+                // toward the last pose over one cadence from arrival, then hold.
+                let elapsed = Double((ContinuousClock.now - arrived).wholeNanoseconds)
+                    / 1_000_000_000
+                let amount = Float(min(1, max(0, elapsed / max(cadence, 0.001))))
+                return .interpolated(from: startPose, to: current.pose, amount: amount)
+            }
         }
     }
 #endif

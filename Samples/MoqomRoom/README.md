@@ -499,7 +499,7 @@ arrives. The scoreboard says which you are, and the two are meant to be
 indistinguishable to play. Nobody chooses this: `SpaceSession` claims an unheard
 space after a quiet interval, stands down when it sees a higher epoch, and
 settles a two-way tie by name. A host that walks into a tunnel is replaced
-inside two seconds, and the bubbles that were up stay up, because the successor
+inside a few seconds, and the bubbles that were up stay up, because the successor
 continues from the last state it received rather than starting a new world.
 
 **What a tap does.** A viewer cannot write to the space — one writer is what

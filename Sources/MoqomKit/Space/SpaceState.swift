@@ -33,8 +33,12 @@
 //
 // ``SpaceTick`` is the fence. Every tick carries an epoch that increments on
 // handover, and a client ignores anything from an epoch below the highest it has
-// seen. The stale authority's writes are then inert rather than corrupting, and
-// it discovers it has been replaced the moment it reads its own track back.
+// seen. The stale authority's writes are then inert rather than corrupting.
+// Noticing the replacement is a separate problem: a real relay pins each
+// subscription to the publisher it first found, so an incumbent that never
+// subscribes again will simulate forever beside a successor nobody told it
+// about. ``SpaceSession`` resubscribes while it is leading, which is what
+// makes the fence observable rather than merely correct.
 
 import Foundation
 import MoqomCore
@@ -456,6 +460,40 @@ public extension SpaceUpdate {
     /// is a broken one, and a call where the audio breaks up is unusable. When
     /// the link cannot carry everything, this is what should suffer.
     static let priority: UInt8 = 24
+}
+
+/// Where a renderer samples a space that ticks slower than the display.
+///
+/// The simulation publishes twenty times a second. A view drawing at sixty
+/// that showed only those instants would step, and a follower that waited for
+/// the packet before moving would sit a round-trip behind the authority — two
+/// phones, two different games to look at. Sampling both against the same
+/// clock, and extrapolating a little when the next tick has not arrived, is
+/// what makes them draw the same pose.
+public enum SpaceTimeline {
+    /// How far between two ticks `now` sits: 0 at `start`, 1 at `end`.
+    ///
+    /// Unclamped above 1, because that is extrapolation — the thing a renderer
+    /// wants when the next state has not arrived yet and the alternative is
+    /// freezing. Capped at `coasting` past `end` so a dropped stream does not
+    /// fling entities into the distance.
+    ///
+    /// `nil` when the clocks cannot be compared. A fallback timecode is one
+    /// machine's opinion of itself, and sampling it against another would
+    /// place bubbles where nobody put them.
+    public static func progress(
+        from start: Timecode,
+        to end: Timecode,
+        at now: Timecode,
+        coasting: Duration = .milliseconds(250)
+    ) -> Float? {
+        guard now.isTrusted, start.isTrusted, end.isTrusted else { return nil }
+        let span = end.nanoseconds - start.nanoseconds
+        guard span > 0 else { return 1 }
+        let cap = end.nanoseconds &+ coasting.wholeNanoseconds
+        let sampled = min(max(now.nanoseconds, start.nanoseconds), cap)
+        return Float(Double(sampled - start.nanoseconds) / Double(span))
+    }
 }
 
 // Deliberately no `encoded()` here, though every other track type in this SDK
