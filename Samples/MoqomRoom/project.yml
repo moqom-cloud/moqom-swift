@@ -41,6 +41,10 @@ targets:
   MoqomRoom:
     type: application
     platform: iOS
+    scheme:
+      testTargets:
+        - MoqomRoomTests
+        - MoqomRoomUITests
     sources:
       - path: MoqomRoom/Sources
     dependencies:
@@ -166,6 +170,23 @@ targets:
         # As with the UI test bundle: one identifier per bundle, and the
         # extension's must be prefixed by the app's or it will not embed.
         PRODUCT_BUNDLE_IDENTIFIER: $(MOQOM_BUNDLE_PREFIX).room.widgets
+
+  # The cadence meter's stall rules: connecting must not count as a freeze, and
+  # a freeze after the picture has been moving must. MoqomKit never sees this
+  # type — it lives in the sample — so the kit suite cannot cover it.
+  MoqomRoomTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: MoqomRoomTests
+    dependencies:
+      - target: MoqomRoom
+    settings:
+      base:
+        SWIFT_VERSION: "6.0"
+        TEST_TARGET_NAME: MoqomRoom
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: $(MOQOM_BUNDLE_PREFIX).room.tests
 
   # The only place the SwiftUI layer is executed. MoqomKit's 103 tests drive
   # RoomSession directly and never render, so the @Observable bridge and the

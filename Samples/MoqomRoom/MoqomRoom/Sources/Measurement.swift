@@ -654,6 +654,27 @@ final class CadenceMeter: @unchecked Sendable {
     /// the same threshold WebRTC's freeze counters use, for the same reason.
     private static let freezeThreshold = 150.0
 
+    /// Tighter than this is a clump, not a frame interval.
+    ///
+    /// A drain that just became ready often hands the layer a burst a millisecond apart,
+    /// then waits. Treating the burst as "the picture is moving" would arm the freeze
+    /// counter, and the wait that follows would be the stall connecting still recorded.
+    private static let clump = 5.0
+
+    /// How long after the first picture is shown a long gap is still the stream starting.
+    ///
+    /// Subscribe, the first keyframe, the layer filling, the tile being laid out — those
+    /// waits either have no picture yet or a picture that has not started moving. A freeze
+    /// is a session total, so counting one of them puts "1 stall" on the overlay for the
+    /// rest of the call.
+    private static let settle = Duration.seconds(1)
+
+    /// When the first frame of this drain was recorded. Cleared by ``restart()``.
+    private var pictured: ContinuousClock.Instant?
+
+    /// Whether two frames have arrived at a plausible interval, so the picture is moving.
+    private var flowing = false
+
     /// Forget the last arrival, because the next one is a different stream.
     ///
     /// A subscription that just became ready, or a drain that just started, is separated
@@ -662,6 +683,8 @@ final class CadenceMeter: @unchecked Sendable {
     func restart() {
         lock.withLock {
             previous = nil
+            pictured = nil
+            flowing = false
         }
     }
 
@@ -671,6 +694,7 @@ final class CadenceMeter: @unchecked Sendable {
         lock.withLock {
             frames += 1
             if first == nil { first = instant }
+            if pictured == nil { pictured = instant }
             last = instant
             defer { previous = instant }
 
@@ -679,16 +703,27 @@ final class CadenceMeter: @unchecked Sendable {
                 (instant - previous).components.attoseconds
             ) / 1e15 + Double((instant - previous).components.seconds) * 1000
 
+            if milliseconds >= Self.clump, milliseconds < Self.freezeThreshold {
+                flowing = true
+            }
+
             if milliseconds >= Self.freezeThreshold {
-                freezes += 1
-                frozen += milliseconds
-                if keyFrame { freezesOnKeyFrame += 1 }
-                if let previousStall {
-                    let apart = Double((instant - previousStall).components.seconds)
-                        + Double((instant - previousStall).components.attoseconds) / 1e18
-                    stallPeriods.append(apart)
+                let settled = pictured.map { instant - $0 >= Self.settle } ?? false
+                if flowing, settled {
+                    freezes += 1
+                    frozen += milliseconds
+                    if keyFrame { freezesOnKeyFrame += 1 }
+                    if let previousStall {
+                        let apart = Double((instant - previousStall).components.seconds)
+                            + Double((instant - previousStall).components.attoseconds) / 1e18
+                        stallPeriods.append(apart)
+                    }
+                    previousStall = instant
+                } else {
+                    // Starting up, not stalling. Leave it out of the window too, or `max`
+                    // is the connect wait for the next fifteen seconds of PLAY lines.
+                    return
                 }
-                previousStall = instant
             }
 
             if gaps.count < Self.window {

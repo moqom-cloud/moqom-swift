@@ -355,6 +355,10 @@ final class VideoTile {
             // After a frame has been handed to the layer, not when an object arrived.
             // Subscribe, the first keyframe, a drain that just started — those waits have
             // no picture yet, and counting them as freezes is how connecting read as a stall.
+            // The meter itself also refuses a freeze until a second after the first
+            // picture is shown: that first frame is not enough, because the next one is
+            // often a long gap later while the tile and the decoder settle, and that one
+            // gap became the stall that sat on the overlay for the rest of the call.
             if shown {
                 cadence.record(keyFrame: frame.frame.isKeyFrame)
             }
