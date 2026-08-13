@@ -139,31 +139,56 @@ final class VideoTile {
     /// A different path from the remote one and deliberately so: nothing is
     /// encoded, relayed, or decoded, so the preview keeps working when the
     /// publication does not.
+    ///
+    /// The same loop as ``attach(to:in:)``, and for the same reason. Stop ends the
+    /// publication, which ends the tap this is reading; a pump that drained once then
+    /// returned left `pump` set and ``attachPreview(in:)`` refusing to start again.
+    /// Go live after that published a new camera — viewers saw it — while this tile
+    /// still held the last frame of the previous one.
     func attachPreview(in room: RoomModel) {
         guard pump == nil else { return }
         pump = Task { [weak self] in
-            var tap: MediaTap<VideoFrame>?
-            while tap == nil, !Task.isCancelled {
-                tap = await room.localPreview()
-                if tap == nil { try? await Task.sleep(for: .milliseconds(100)) }
+            while !Task.isCancelled {
+                guard let self else { return }
+                await self.followPreview(in: room)
+                if !Task.isCancelled { try? await Task.sleep(for: .milliseconds(100)) }
             }
-            guard let tap, let self else {
-                // Cancelled while waiting, so nobody will ever read this one.
-                tap?.stop()
-                return
-            }
-            preview = tap
-            var drawn = 0
-            for await frame in tap.elements {
-                renderer.enqueue(frame)
+        }
+    }
 
-                // The control for the received tile's own figure. This layer is on the same
-                // screen, in the same app, fed by the same camera — and nothing schedules it:
-                // frames go in as they are captured. So a drop count here is the panel's, and
-                // a drop count only on the other layer is ours.
-                drawn += 1
-                if drawn % 30 == 0, let presentation = await renderer.presentation() {
-                    room.previewPresentation = presentation
+    /// Take one broadcast's capture and draw it until that broadcast ends.
+    private func followPreview(in room: RoomModel) async {
+        var tap: MediaTap<VideoFrame>?
+        while tap == nil, !Task.isCancelled {
+            tap = await room.localPreview()
+            if tap == nil { try? await Task.sleep(for: .milliseconds(100)) }
+        }
+        guard let tap else { return }
+        preview?.stop()
+        preview = tap
+        defer {
+            tap.stop()
+            preview = nil
+        }
+        var drawn = 0
+        for await frame in tap.elements {
+            renderer.enqueue(frame)
+
+            // The control for the received tile's own figure. This layer is on the same
+            // screen, in the same app, fed by the same camera — and nothing schedules it:
+            // frames go in as they are captured. So a drop count here is the panel's, and
+            // a drop count only on the other layer is ours.
+            drawn += 1
+            if drawn % 30 == 0 {
+                // Off the pump. `loadVideoPerformanceMetrics` was awaited here and took
+                // about two hundred milliseconds, twice a second — which is forty percent
+                // of the call spent not reading the next frame, and is exactly the stall
+                // overlay: `every 0.5s`, `frozen=39%`, a median gap of half a frame as
+                // the ones that piled up during the wait then arrived in a clump.
+                Task { @MainActor in
+                    if let presentation = await renderer.presentation() {
+                        room.previewPresentation = presentation
+                    }
                 }
             }
         }
@@ -324,10 +349,17 @@ final class VideoTile {
                 if drawn % 30 == 0 { room.timing = renderer.timing }
             }
 
-            // Twice a second rather than per frame: this crosses into the display pipeline and
-            // asking it sixty times a second to describe sixty frames is its own overhead.
-            if drawn % 30 == 0, let presentation = await renderer.presentation() {
-                await MainActor.run { room.presentation = presentation }
+            // Off the drain. This used to `await` the display pipeline's performance metrics
+            // on the same loop that pulls the next frame. The call ran twice a second and
+            // took about two hundred milliseconds, which is forty percent of the wall clock
+            // spent not reading — measured as `PLAY ... p50=8.8 p95=41 max=260 freezes=135
+            // frozen=39% every=0.5s` while capture beside it was sixty frames, no freezes.
+            if drawn % 30 == 0 {
+                Task { @MainActor in
+                    if let presentation = await renderer.presentation() {
+                        room.presentation = presentation
+                    }
+                }
             }
 
             // Lip sync, re-read at the same interval because the voice's buffer resizes itself

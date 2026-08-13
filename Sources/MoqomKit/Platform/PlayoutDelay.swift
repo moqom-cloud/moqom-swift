@@ -177,29 +177,6 @@ enum PlayoutDelay {
         return depth < -mostAnUndershootWorthRiding || straying > graceForTheRateToAnswer
     }
 
-    /// Whether a frame's capture time is too far behind the playhead to be worth putting on
-    /// the screen.
-    ///
-    /// After a stall the next arrivals are the pictures for time that has already passed. The
-    /// grid's slot pointer does not advance while nothing arrives, so placing them on the next
-    /// slot puts timestamps that are already in the past onto the display layer. The layer then
-    /// either drops them or shows them immediately as a clump — which is the hitch a person
-    /// watching called choppiness, on a readout that said several hundred milliseconds late.
-    ///
-    /// Two intervals past the hold, which is more than ordinary jitter the buffer is there to
-    /// absorb and less than a freeze. A frame that missed by one is shown; a frame that missed
-    /// by a stall is skipped, the grid forgotten, and the next on-time frame starts a new one
-    /// at the live edge rather than playing the backlog.
-    static func tooLateToShow(
-        source: Double,
-        playhead: Double,
-        delay: Double,
-        interval: Double
-    ) -> Bool {
-        guard interval > 0 else { return false }
-        return source < playhead - delay - 2 * interval
-    }
-
     /// One move, or none.
     ///
     /// - Parameters:

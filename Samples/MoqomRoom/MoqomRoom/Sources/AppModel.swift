@@ -678,14 +678,13 @@ final class AppModel {
                 Journal.shared.say(
                     String(
                         format: "DRAW shown=%d late=%d undescribed=%d failures=%d"
-                            + " backwards=%d skippedLate=%d reanchors=%d regrids=%d delivered=%.1f%%"
+                            + " backwards=%d reanchors=%d regrids=%d delivered=%.1f%%"
                             + " buffer=%.0fms",
                         drawn.enqueued,
                         drawn.skippedNotReady,
                         drawn.skippedUndescribed,
                         drawn.failures,
                         drawn.outOfOrder,
-                        drawn.skippedLate,
                         drawn.reanchors,
                         drawn.regrids,
                         drawn.delivered * 100,
