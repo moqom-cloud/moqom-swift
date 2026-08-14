@@ -431,7 +431,25 @@ import MoqomCore
             // learnt — and a correction carried onto a clock it was not measured against is
             // worse than none.
             tracking.forget()
-            playoutDepth = playoutBounds.map { min(max($0.floor, playoutFloor), $0.ceiling) }
+            // The display's target, not the application's floor. Starting at zero — which is
+            // what `bounds.floor` is, on purpose, so the floor is not the answer — spent the
+            // first two seconds missing deadlines, leapt to the ceiling, and left the hold
+            // sitting on the extra the leap was anchored with. The target is what the loop
+            // would settle on once it had evidence; beginning there skips the evidence it
+            // would have drawn from a depth nobody would choose.
+            playoutDepth = playoutBounds.map { bounds in
+                let floor = max(bounds.floor, playoutFloor).asSeconds
+                let display = PlayoutDelay.margin(refresh: displayRefresh)
+                let ceiling = PlayoutDelay.ceiling(
+                    asked: bounds.ceiling.asSeconds,
+                    floor: floor,
+                    interval: displayRefresh,
+                    display: display
+                )
+                return .seconds(
+                    PlayoutDelay.target(floor: floor, ceiling: ceiling, display: display)
+                )
+            }
                 ?? playoutDelay
                 ?? .zero
 
@@ -1337,10 +1355,12 @@ import MoqomCore
             //
             // A slot of room, because that is the smallest move the grid can make and therefore
             // the least that makes the difference between a controller and a constant.
+            let display = PlayoutDelay.margin(refresh: displayRefresh)
             let ceiling = PlayoutDelay.ceiling(
-                wanted: bounds.ceiling.asSeconds,
+                asked: bounds.ceiling.asSeconds,
                 floor: floor,
-                interval: interval
+                interval: interval,
+                display: display
             )
 
             // What a person waits is the hold, and the hold can sit well above the delay that was
@@ -1386,7 +1406,7 @@ import MoqomCore
                 mayGiveBack: catchUp == nil
                     && ContinuousClock.now - reclaimed > .milliseconds(1500),
                 mayTighten: ContinuousClock.now - tightened > .milliseconds(250),
-                display: PlayoutDelay.margin(refresh: displayRefresh)
+                display: display
             )
 
             switch move {

@@ -238,10 +238,6 @@ final class VideoTile {
         // in twenty held for two and a half frame times. The delay is the app's choice
         // because it is a latency the user pays; the room model carries it so a benchmark
         // can set it to zero and see both halves of the trade.
-        renderer.playoutDelay = await room.playoutDelay
-        renderer.playoutBounds = await room.playoutBounds
-        renderer.playoutTolerance = await room.playoutTolerance
-
         // The panel, because the schedule holds margin for a refresh boundary. The view is where
         // this is known: the renderer has a layer, not a screen.
         //
@@ -253,9 +249,17 @@ final class VideoTile {
         // a refresh boundary is not a latency saving, it is the display layer dropping what it
         // cannot show in the period it has. That is the fault ``PlayoutDelay/margin`` was written
         // for, and it came back the moment the figure feeding it stopped being true.
+        //
+        // Set before the bounds, because assigning the bounds restarts the schedule and the
+        // restart sizes the delay against this. A restart that still had the sixty-hertz default
+        // would hold eighteen milliseconds on a panel that can do twelve.
         #if os(iOS)
             renderer.displayRefresh = Self.panelPeriod()
         #endif
+
+        renderer.playoutDelay = await room.playoutDelay
+        renderer.playoutBounds = await room.playoutBounds
+        renderer.playoutTolerance = await room.playoutTolerance
 
         if let codec = await room.codec(of: identity) {
             renderer.setCodec(codec)

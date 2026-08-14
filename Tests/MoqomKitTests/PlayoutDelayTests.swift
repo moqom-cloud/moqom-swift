@@ -306,6 +306,30 @@ struct PlayoutDelayTests {
         }
     }
 
+    /// Twenty milliseconds was the application's ceiling and eight of them were jitter the hold
+    /// then doubled. The live ceiling is what the panel still needs after enqueue.
+    @Test("the live ceiling is the display's margin, not the application's twenty")
+    func liveCeilingFollowsThePanel() {
+        let sixty = PlayoutDelay.ceiling(
+            asked: 0.020, floor: 0, interval: 1.0 / 60, display: 0.018
+        )
+        #expect(abs(sixty - 0.018) < 1e-9)
+
+        let fast = PlayoutDelay.ceiling(
+            asked: 0.020, floor: 0, interval: 1.0 / 120, display: 0.012
+        )
+        #expect(abs(fast - 0.012) < 1e-9)
+    }
+
+    @Test("lip sync still pushes a ceiling that has been capped at the display")
+    func liveCeilingGivesWayToTheFloor() {
+        let interval = 1.0 / 60
+        let ceiling = PlayoutDelay.ceiling(
+            asked: 0.020, floor: 0.020, interval: interval, display: 0.012
+        )
+        #expect(ceiling >= 0.020 + interval - 1e-9)
+    }
+
     /// A hold inside the ceiling is not something to correct, and the deadband is what stops the
     /// grid being nudged by the last digit of a median.
     @Test("a hold within the ceiling is left alone")

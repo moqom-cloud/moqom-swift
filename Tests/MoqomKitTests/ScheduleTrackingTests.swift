@@ -268,6 +268,20 @@ struct ScheduleTrackingTests {
         )
     }
 
+    /// The overshoot that sat on the glass: eighteen milliseconds extra against a twenty
+    /// millisecond request. At a twenty millisecond gate that is jitter, drained at two
+    /// milliseconds a second, and still there when the next burst arrives. Twelve milliseconds
+    /// lets it through.
+    @Test("a standing overshoot smaller than a thirty-fps frame is still drained")
+    func drainsTheOvershootThatLookedLikeJitter() {
+        var link = Link(drift: 0, wanted: 0.020)
+        link.depth = 0.038
+
+        link.run(seconds: 4)
+
+        #expect(link.depth - link.wanted < ScheduleTracking.anExcessWorthDraining)
+    }
+
     @Test("delay above what was asked for is drained in seconds, not minutes")
     func drainsAnExcessPromptly() {
         // The fault this answers, measured on a phone: a leg holding a hundred milliseconds more

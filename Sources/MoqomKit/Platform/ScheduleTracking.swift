@@ -88,10 +88,20 @@ struct ScheduleTracking: Sendable, Equatable {
 
     /// How much more than was asked for counts as an excess rather than jitter.
     ///
-    /// A frame's worth at thirty a second. Below this the reading is the ordinary unevenness of
-    /// live arrivals, and answering it with the authority above is how a loop ends up wobbling
-    /// the picture's speed in time with the network.
-    static let anExcessWorthDraining = 0.02
+    /// Twelve milliseconds, which is the display's own least margin — one refresh of a
+    /// hundred-and-twenty hertz panel, plus a little for decode. Below this the reading is
+    /// the ordinary unevenness of live arrivals, and answering it with the drain's authority
+    /// is how a loop ends up wobbling the picture's speed in time with the network.
+    ///
+    /// It was twenty, a frame at thirty a second, and that is the whole of the standing
+    /// overshoot. The delay this loop is asked to hold is itself twenty milliseconds, so a
+    /// deadband the size of the budget treats every overshoot short of doubling as jitter.
+    /// Measured, the hold sat at thirty-eight to fifty against a twenty millisecond request:
+    /// eighteen milliseconds of extra wait, one millisecond under the gate, drained at the
+    /// tracking gain of a tenth — two milliseconds a second — and refilled by the next burst
+    /// long before then. Glass-to-glass followed the wait. Twelve lets that eighteen through
+    /// and still ignores a ten millisecond wobble, which is the jitter test.
+    static let anExcessWorthDraining = 0.012
 
     /// How much of a new depth reading to believe, against the running estimate.
     ///

@@ -136,6 +136,22 @@ enum PlayoutDelay {
         max(wanted, floor + interval)
     }
 
+    /// The most delay worth holding: what the display needs, unless the application asked for
+    /// even less, unless lip sync has raised the floor past either.
+    ///
+    /// The application's ceiling used to be the answer rather than a bound — twenty milliseconds
+    /// sitting on twenty, eight of them jitter budget that the hold then doubled. Capping at the
+    /// panel's margin leaves only what a frame still needs after enqueue: a decode and one
+    /// refresh. Lip sync can still push past that; the display cannot be starved to buy a number.
+    static func ceiling(
+        asked: Double,
+        floor: Double,
+        interval: Double,
+        display: Double
+    ) -> Double {
+        ceiling(wanted: min(asked, display), floor: floor, interval: interval)
+    }
+
     static func ceilingCorrection(hold: Double, ceiling: Double, interval: Double) -> Double? {
         guard hold > ceiling + deadband else { return nil }
         return min(hold - ceiling, interval * mostOfAnIntervalWorthMoving)

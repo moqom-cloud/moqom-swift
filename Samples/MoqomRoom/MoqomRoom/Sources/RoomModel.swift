@@ -219,9 +219,11 @@ final class RoomModel {
     /// twenty-five is this ceiling and the rest was the network. The hold is the honest measure of
     /// what changed here, and it is measured directly.
     ///
-    /// Left standing: the hold still overshoots to nearly four times this, 76 to 78ms, and
-    /// ``VideoRenderer``'s correction for it fires about nine hundred times in twenty minutes.
-    /// Lowering the ceiling did not touch that, and it is the next thing wrong in this area.
+    /// Twenty is the application's outer cap. The live ceiling is the panel's own margin —
+    /// eighteen milliseconds on sixty hertz, twelve on a hundred and twenty — because eight
+    /// milliseconds of jitter budget on top of that was delay the hold then doubled, and it
+    /// did not save frames. Lip sync can still push past it; starving the display to buy a
+    /// number cannot.
     ///
     /// What it costs is still the frames out in the tail, which arrive too late to be shown on
     /// time whatever this says — the choice is between showing them late and not showing them, not
