@@ -25,13 +25,24 @@
 /// The depth a playout queue should hold, and why.
 struct QueueDepth: Sendable {
     /// The smallest depth worth holding, whatever the measurements say.
-    static let leastWorthHolding = Duration.milliseconds(40)
+    ///
+    /// One packet. Forty was two, and those extra twenty sat in front of the
+    /// speaker on every clean call, which is what pulled the picture up once
+    /// the voice queue then grew. Twenty is the jitter buffer's own floor —
+    /// shallower and it cannot reorder — so this is the same number, not a
+    /// tighter one.
+    static let leastWorthHolding = Duration.milliseconds(20)
 
     /// The largest. Past this a call is better served by admitting the link cannot carry it.
     static let mostWorthHolding = Duration.milliseconds(400)
 
     /// What the link's jitter asks for, as the jitter buffer measured it.
-    private(set) var aim = Duration.milliseconds(60)
+    ///
+    /// Starts on the floor rather than on sixty. Sixty was a guess at a talking
+    /// head on a bad radio, and it became the answer: a clean link never
+    /// measured enough jitter to justify it and never had a reason to come
+    /// down. The measurement can still raise it.
+    private(set) var aim = Duration.milliseconds(20)
 
     mutating func aim(at delay: Duration) {
         aim = max(Self.leastWorthHolding, min(delay, Self.mostWorthHolding))

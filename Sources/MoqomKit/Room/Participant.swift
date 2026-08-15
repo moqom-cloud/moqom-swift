@@ -57,6 +57,18 @@ public struct ParticipantSlot: Hashable, Sendable {
         self.identity = identity
         self.isBackstage = isBackstage
     }
+
+    /// A slot announced as a personal channel, `(tenant, "u", user, device)`.
+    public init?(personal namespace: TrackNamespace) {
+        let fields = namespace.fields
+        guard fields.count == 4, fields[1] == "u" else { return nil }
+        guard let username = try? Username(fields[2]), let device = try? DeviceID(fields[3]) else {
+            return nil
+        }
+        self.namespace = namespace
+        self.identity = ParticipantIdentity(username: username, device: device)
+        self.isBackstage = false
+    }
 }
 
 /// Why a participant's media is not arriving.
@@ -175,6 +187,14 @@ public struct Participant: Hashable, Sendable, Identifiable {
     /// What they are actually publishing, and at what qualities.
     public var ladders: [MediaKind.RawValue: LayerLadder]
 
+    /// The language they last published on their catalog, as a BCP 47 tag.
+    ///
+    /// `nil` until a catalog arrives, and again if a later catalog omits it.
+    /// Taken from what they said, not from the token they joined with, so it
+    /// can change mid-call when the phone's locale does or when the app
+    /// overrides it.
+    public var locale: String?
+
     public var id: ParticipantIdentity { slot.identity }
 
     /// The user, which is a string and stays one.
@@ -193,7 +213,8 @@ public struct Participant: Hashable, Sendable, Identifiable {
         presence: Presence = .connected,
         mute: MuteState = MuteState(),
         isSpotlighted: Bool = false,
-        ladders: [MediaKind.RawValue: LayerLadder] = [:]
+        ladders: [MediaKind.RawValue: LayerLadder] = [:],
+        locale: String? = nil
     ) {
         self.slot = slot
         self.grants = grants
@@ -201,6 +222,7 @@ public struct Participant: Hashable, Sendable, Identifiable {
         self.mute = mute
         self.isSpotlighted = isSpotlighted
         self.ladders = ladders
+        self.locale = locale
     }
 }
 

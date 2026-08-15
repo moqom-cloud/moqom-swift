@@ -23,6 +23,14 @@ public actor RoomSession {
     public nonisolated let tenant: TenantID
     public nonisolated let room: RoomID
 
+    /// The personal channel this session is watching, when it is one.
+    ///
+    /// Set for ``MoqomSession/goLive()`` and ``MoqomSession/watch(_:)``.
+    /// Publishing then uses the caller's own `(tenant, "u", …)` slot rather
+    /// than a room participant slot, and the roster is built from that
+    /// prefix plus any catalog references the host publishes.
+    public nonisolated let channel: Username?
+
     /// The prefix every participant announces under.
     public nonisolated let namespace: TrackNamespace
 
@@ -76,6 +84,15 @@ public actor RoomSession {
     /// their own microphone has not changed and must not be quietly discarded.
     private var ownMute: MediaKind = []
 
+    /// The language this device is publishing, as a BCP 47 tag.
+    ///
+    /// Source of truth for the same reason ``ownMute`` is: the roster entry is
+    /// this device's own announcement arriving back, and a locale set before
+    /// that lands — or changed while the catalog is down — must not be
+    /// discarded. Starts as the phone's current locale; ``setLocale(_:)``
+    /// replaces it, including mid-broadcast.
+    private var ownLocale: String? = SpokenLocale.current()
+
     /// What this device's own hardware has stopped producing, unasked.
     ///
     /// Kept beside ``ownMute`` and never merged into it. They are published in
@@ -114,6 +131,10 @@ public actor RoomSession {
     private var receivers: [ParticipantIdentity: AudioReceiver] = [:]
     private var estimator = BandwidthEstimator()
     private var rosterTask: Task<Void, Never>?
+    private var prefixTasks: [Task<Void, Never>] = []
+    private var followed: Set<TrackNamespace> = []
+    private var ownReferences: [TrackNamespace] = []
+    private var ownInvitations: [StageInvitationRecord] = []
 
     private var speakers = ActiveSpeakers()
     private var gallery = Gallery()
@@ -169,11 +190,13 @@ public actor RoomSession {
         identity: ParticipantIdentity,
         connection: any TransportSession,
         logger: MoqomLogger = .silent,
-        seatPolicy: SeatPolicy = .default
+        seatPolicy: SeatPolicy = .default,
+        channel: Username? = nil
     ) {
         self.seatPolicy = seatPolicy
         self.tenant = tenant
         self.room = room
+        self.channel = channel
         self.namespace = namespace
         self.identity = identity
         self.connection = connection
@@ -389,18 +412,31 @@ public actor RoomSession {
     func begin() async {
         watchControl()
         watchPolicy()
-        guard rosterTask == nil else { return }
-        let stream: AsyncStream<AnnouncementEvent>
-        do {
-            stream = try await connection.announcements(matching: namespace)
-        } catch {
-            return
+        guard prefixTasks.isEmpty else { return }
+        watchPrefix(namespace)
+        if let channel, let personal = try? MoqomNamespaces.personalPrefix(
+            tenant: tenant, username: channel
+        ) {
+            watchPrefix(personal)
         }
-        rosterTask = Task { [weak self] in
+    }
+
+    /// Watch announcements under `prefix` and fold them into the roster.
+    private func watchPrefix(_ prefix: TrackNamespace) {
+        let task = Task { [weak self] in
+            guard let self else { return }
+            let stream: AsyncStream<AnnouncementEvent>
+            do {
+                stream = try await self.connection.announcements(matching: prefix)
+            } catch {
+                return
+            }
             for await event in stream {
-                await self?.applyAnnouncement(event)
+                await self.applyAnnouncement(event, under: prefix)
             }
         }
+        prefixTasks.append(task)
+        if rosterTask == nil { rosterTask = task }
     }
 
     /// Move the room onto a new transport session after a reconnect.
@@ -442,6 +478,9 @@ public actor RoomSession {
         }
         rosterTask?.cancel()
         rosterTask = nil
+        for task in prefixTasks { task.cancel() }
+        prefixTasks.removeAll()
+        followed.removeAll()
         speechTask?.cancel()
         speechTask = nil
 
@@ -777,6 +816,8 @@ public actor RoomSession {
 
         rosterTask?.cancel()
         rosterTask = nil
+        for task in prefixTasks { task.cancel() }
+        prefixTasks.removeAll()
         speechTask?.cancel()
         speechTask = nil
         controlTask?.cancel()
@@ -845,6 +886,26 @@ public actor RoomSession {
 
     // MARK: - Publishing
 
+    /// The namespace this device publishes under.
+    ///
+    /// A personal channel uses the caller's own `(tenant, "u", …)` slot, even
+    /// when the session is watching someone else — that is how a guest uploads
+    /// once and the host's catalog points at them. A room uses the participant
+    /// slot under the room prefix, or backstage when they have not gone live.
+    private func slotNamespace(backstage: Bool) throws(NameError) -> TrackNamespace {
+        if backstage {
+            return try MoqomNamespaces.backstageParticipant(
+                tenant: tenant, room: room, identity: identity
+            )
+        }
+        if channel != nil {
+            return try MoqomNamespaces.personal(tenant: tenant, identity: identity)
+        }
+        return try MoqomNamespaces.participant(
+            tenant: tenant, room: room, identity: identity
+        )
+    }
+
     /// Go live.
     ///
     /// Called by the participant, never by the SDK in response to a scope
@@ -860,13 +921,7 @@ public actor RoomSession {
 
         let publishNamespace: TrackNamespace
         do {
-            publishNamespace = backstage
-                ? try MoqomNamespaces.backstageParticipant(
-                    tenant: tenant, room: room, identity: identity
-                )
-                : try MoqomNamespaces.participant(
-                    tenant: tenant, room: room, identity: identity
-                )
+            publishNamespace = try slotNamespace(backstage: backstage)
         } catch {
             throw MoqomError.invalidName(error)
         }
@@ -1004,7 +1059,10 @@ public actor RoomSession {
             audio: audio?.configuration,
             keyID: encryption?.sender.key.keyID,
             muted: ownMute,
-            interrupted: ownInterruption
+            interrupted: ownInterruption,
+            locale: ownLocale,
+            references: ownReferences,
+            invitations: ownInvitations.filter(\.isOpen)
         )
         _ = try? await publisher.publish(catalog)
         return configurations.count >= ladder.rungs.count
@@ -1111,13 +1169,7 @@ public actor RoomSession {
         let publishNamespace: TrackNamespace
         let name: FullTrackName
         do {
-            publishNamespace = backstage
-                ? try MoqomNamespaces.backstageParticipant(
-                    tenant: tenant, room: room, identity: identity
-                )
-                : try MoqomNamespaces.participant(
-                    tenant: tenant, room: room, identity: identity
-                )
+            publishNamespace = try slotNamespace(backstage: backstage)
             name = try FullTrackName(namespace: publishNamespace, name: TrackName("audio"))
         } catch {
             throw MoqomError.invalidName(error)
@@ -1428,10 +1480,175 @@ public actor RoomSession {
         eventContinuation.yield(.muteChanged(target, participant.mute))
     }
 
+    // MARK: - Stage handshake
+
+    /// Invite someone onto this channel.
+    ///
+    /// Lands on the catalog, not the control log. The invitee must be watching
+    /// this catalog to see it. Accepting grants publish rights and starts
+    /// nothing — they still have to go live.
+    @discardableResult
+    public func invite(
+        _ username: Username,
+        offered: PublishScope = .camera,
+        expiresAfter: Duration = .seconds(30)
+    ) async throws(MoqomError) -> StageInvitationRecord {
+        let subject = ParticipantIdentity(
+            username: username,
+            device: identity.device
+        )
+        let record = StageInvitationRecord(
+            direction: .invitation,
+            subject: subject,
+            issuedBy: identity,
+            offered: offered,
+            expiresAt: Date().addingTimeInterval(Double(expiresAfter.components.seconds))
+        )
+        ownInvitations.removeAll { $0.subject.username == username && $0.isOpen }
+        ownInvitations.append(record)
+        try await publishStageCatalog()
+        if let prefix = try? MoqomNamespaces.personalPrefix(tenant: tenant, username: username) {
+            watchPrefix(prefix)
+        }
+        adoptInvitations(ownInvitations, from: identity)
+        logger.info(.room, "invited", [LogField("username", .text(username.value))])
+        return record
+    }
+
+    /// Ask to come up on the channel this session is watching.
+    ///
+    /// Written on *this* device's catalog, so the host sees it only after they
+    /// follow this namespace — which they do the moment they invite, and which
+    /// a two-way watch does from the start.
+    @discardableResult
+    public func requestStage(
+        offered: PublishScope = .camera,
+        expiresAfter: Duration = .seconds(30)
+    ) async throws(MoqomError) -> StageInvitationRecord {
+        let record = StageInvitationRecord(
+            direction: .request,
+            subject: identity,
+            issuedBy: identity,
+            offered: offered,
+            expiresAt: Date().addingTimeInterval(Double(expiresAfter.components.seconds))
+        )
+        ownInvitations.removeAll { $0.direction == .request && $0.isOpen }
+        ownInvitations.append(record)
+        try await publishStageCatalog()
+        adoptInvitations(ownInvitations, from: identity)
+        return record
+    }
+
+    /// Accept a pending invitation. Does not start a camera.
+    public func accept(_ id: UUID) async throws(MoqomError) {
+        try await resolve(id, to: .accepted)
+    }
+
+    public func decline(_ id: UUID) async throws(MoqomError) {
+        try await resolve(id, to: .declined)
+    }
+
+    public func cancel(_ id: UUID) async throws(MoqomError) {
+        try await resolve(id, to: .cancelled)
+    }
+
+    private func resolve(_ id: UUID, to outcome: StageOutcome) async throws(MoqomError) {
+        if let index = ownInvitations.firstIndex(where: { $0.id == id && $0.isOpen }) {
+            ownInvitations[index].outcome = outcome
+        }
+        if let index = state.stage.pending.firstIndex(where: { $0.id == id }) {
+            var invitation = state.stage.pending[index]
+            switch outcome {
+            case .accepted: invitation.accept()
+            case .declined: invitation.decline()
+            case .cancelled: invitation.cancel()
+            case .timedOut, .pending: break
+            }
+            state.stage.pending[index] = invitation
+            eventContinuation.yield(.stageChanged(state.stage))
+        }
+        try await publishStageCatalog()
+    }
+
+    /// If we invited this person, their going live is the accept.
+    private func linkIfInvited(_ who: ParticipantIdentity) async {
+        guard let index = ownInvitations.firstIndex(where: {
+            $0.subject.username == who.username && $0.isOpen
+        }) else { return }
+        ownInvitations[index].outcome = .accepted
+        await link(who)
+    }
+
+    /// Point this catalog at `who`'s personal channel so viewers follow them.
+    private func link(_ who: ParticipantIdentity) async {
+        guard let namespace = try? MoqomNamespaces.personal(tenant: tenant, identity: who) else {
+            return
+        }
+        guard !ownReferences.contains(namespace) else { return }
+        ownReferences.append(namespace)
+        await follow(namespace, hop: 0)
+        _ = await refreshCatalog()
+    }
+
+    /// Publish a catalog so invitations exist even before anyone is on camera.
+    private func publishStageCatalog() async throws(MoqomError) {
+        if catalogPublisher != nil {
+            _ = await refreshCatalog()
+            return
+        }
+        let publishNamespace: TrackNamespace
+        do {
+            publishNamespace = try slotNamespace(backstage: false)
+        } catch {
+            throw MoqomError.invalidName(error)
+        }
+        _ = try? await connection.announce(publishNamespace)
+        try await publishCatalog(under: publishNamespace)
+        _ = await refreshCatalog()
+    }
+
     // MARK: - Muting yourself
 
     /// What this device has muted on itself.
     public var selfMuted: MediaKind { ownMute }
+
+    /// The language this device is publishing, as a BCP 47 tag.
+    public var locale: String? { ownLocale }
+
+    /// Tell the room which language this device is speaking.
+    ///
+    /// ```swift
+    /// await room.setLocale(SpokenLocale.current())   // follow the phone
+    /// await room.setLocale("es-MX")                  // override
+    /// await room.setLocale(nil)                      // stop claiming one
+    /// ```
+    ///
+    /// The phone's own locale is the default, taken at join. Call this when
+    /// that changes — `NSLocale.currentLocaleDidChangeNotification` — or when
+    /// the application has an override of its own. Either may happen in the
+    /// middle of a broadcast; the catalog is republished and everyone already
+    /// subscribed reads the new tag, including the relay.
+    ///
+    /// `raw` is normalised to BCP 47 (`en_US` becomes `en-US`). A string that
+    /// is not a language tag is ignored rather than published, so a typo in an
+    /// override cannot take the catalog down.
+    public func setLocale(_ raw: String?) async {
+        let next = SpokenLocale.normalize(raw)
+        guard ownLocale != next else { return }
+        ownLocale = next
+
+        if var participant = state.roster[identity] {
+            participant.locale = next
+            state.roster[identity] = participant
+        }
+
+        _ = await refreshCatalog()
+
+        logger.info(.media, "locale changed", [
+            LogField("locale", .text(next ?? "")),
+        ])
+        eventContinuation.yield(.localeChanged(identity, next))
+    }
 
     /// Stop sending your own microphone or camera.
     ///
@@ -2389,8 +2606,14 @@ public actor RoomSession {
     /// is there and is acted on at once; a withdrawal is only proof their
     /// session ended, which is a different and much weaker claim, so it starts
     /// a clock instead. See ``SeatPolicy``.
-    private func applyAnnouncement(_ event: AnnouncementEvent) async {
-        guard let slot = ParticipantSlot(announced: event.namespace, under: namespace) else {
+    private func applyAnnouncement(
+        _ event: AnnouncementEvent,
+        under prefix: TrackNamespace? = nil
+    ) async {
+        let prefix = prefix ?? namespace
+        let slot = ParticipantSlot(announced: event.namespace, under: prefix)
+            ?? ParticipantSlot(personal: event.namespace)
+        guard let slot else {
             // A namespace this client does not model. The relay is entitled to
             // announce those and it is not an error to ignore them.
             return
@@ -2411,7 +2634,9 @@ public actor RoomSession {
     /// Somebody who was never here before.
     private func admit(_ slot: ParticipantSlot) async {
         let before = Set(state.roster.participants.map(\.id))
-        state.roster.apply(.announced(slot.namespace), under: namespace)
+        if state.roster[slot.identity] == nil {
+            state.roster.insert(Participant(slot: slot))
+        }
         let after = Set(state.roster.participants.map(\.id))
 
         for joined in after.subtracting(before) {
@@ -2421,8 +2646,13 @@ public actor RoomSession {
                 // empty mute. Restating what the user already chose keeps a
                 // mute set before the roster caught up — or before a
                 // reconnect — from appearing to have been undone.
-                if joined == identity, participant.mute.selfMuted != ownMute {
-                    participant.mute.selfMuted = ownMute
+                if joined == identity {
+                    if participant.mute.selfMuted != ownMute {
+                        participant.mute.selfMuted = ownMute
+                    }
+                    if participant.locale != ownLocale {
+                        participant.locale = ownLocale
+                    }
                     state.roster[joined] = participant
                 }
 
@@ -2469,6 +2699,7 @@ public actor RoomSession {
                 // Cheap enough to do unconditionally — a few hundred bytes against a joining
                 // participant's first video keyframe.
                 if joined != identity { restateCatalog() }
+                await linkIfInvited(slot.identity)
             }
         }
         if before != after { await refreshGallery() }
@@ -2747,9 +2978,76 @@ public actor RoomSession {
         // muting themselves would be acted on one catalog late.
         adoptSelfMute(catalog.muted, of: who)
         adoptInterruption(catalog.interrupted, of: who)
+        adoptLocale(catalog.locale, of: who)
 
         await followAudio(of: who, in: catalog)
+        await followReferences(in: catalog, hop: 0)
+        adoptInvitations(catalog.invitations, from: who)
         eventContinuation.yield(.catalogChanged(who, catalog))
+    }
+
+    /// Subscribe to every namespace this catalog points at, once, with a hop
+    /// limit so A→B→C→A cannot chase its own tail on the client.
+    ///
+    /// Relay-side loop detection on the mesh is a separate problem; this is
+    /// what stops one device from opening the same subscription forever.
+    private func followReferences(in catalog: Catalog, hop: Int) async {
+        guard hop < 3 else { return }
+        for namespace in catalog.references {
+            await follow(namespace, hop: hop + 1)
+        }
+    }
+
+    private func follow(_ namespace: TrackNamespace, hop: Int) async {
+        guard !followed.contains(namespace) else { return }
+        followed.insert(namespace)
+        if let slot = ParticipantSlot(personal: namespace)
+            ?? ParticipantSlot(announced: namespace, under: self.namespace)
+        {
+            if state.roster[slot.identity] == nil {
+                await admit(slot)
+            }
+        }
+        if namespace.fields.count >= 3, namespace.fields[1] == "u",
+           let username = try? Username(namespace.fields[2]),
+           let prefix = try? MoqomNamespaces.personalPrefix(tenant: tenant, username: username)
+        {
+            watchPrefix(prefix)
+        }
+        // A catalog we already admitted will be pulled by watchCatalog; if the
+        // slot was new, admit did that. If we already knew them, pull again
+        // so a newly referenced publisher is not waiting on a restatement.
+        if let slot = ParticipantSlot(personal: namespace),
+           let participant = state.roster[slot.identity]
+        {
+            watchCatalog(of: participant)
+        }
+        _ = hop
+    }
+
+    /// Take pending invitations off a catalog this session is reading.
+    private func adoptInvitations(_ records: [StageInvitationRecord], from who: ParticipantIdentity) {
+        let open = records.filter(\.isOpen)
+        guard !open.isEmpty || !state.stage.pending.isEmpty else { return }
+        // Host-authored invitations replace the pending set for that host.
+        // Requests from a guest land as themselves.
+        let others = state.stage.pending.filter { $0.issuedBy != who }
+        var next = others
+        for record in open {
+            next.append(
+                StageInvitation(
+                    id: record.id,
+                    direction: record.direction,
+                    subject: record.subject,
+                    issuedBy: record.issuedBy,
+                    offered: record.offered,
+                    issuedAt: .zero,
+                    expiresAfter: .seconds(max(1, record.expiresAt.timeIntervalSinceNow))
+                )
+            )
+        }
+        state.stage.pending = next
+        eventContinuation.yield(.stageChanged(state.stage))
     }
 
     /// Take what a participant says their own hardware has stopped giving them.
@@ -2781,6 +3079,20 @@ public actor RoomSession {
         participant.mute.selfMuted = muted
         state.roster[who] = participant
         eventContinuation.yield(.muteChanged(who, participant.mute))
+    }
+
+    /// Take a participant's language from the catalog they published.
+    ///
+    /// Trusted on the same terms as their mute: it is theirs to state, and a
+    /// lie about it slanders nobody but themselves. Normalised again here so a
+    /// modified client that put something that is not a language tag on the
+    /// wire does not land it on the roster.
+    private func adoptLocale(_ locale: String?, of who: ParticipantIdentity) {
+        let next = SpokenLocale.normalize(locale)
+        guard var participant = state.roster[who], participant.locale != next else { return }
+        participant.locale = next
+        state.roster[who] = participant
+        eventContinuation.yield(.localeChanged(who, next))
     }
 
     // MARK: - Audio

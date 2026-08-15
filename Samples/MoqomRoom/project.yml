@@ -75,16 +75,6 @@ targets:
         # the app would otherwise be terminated on the first capture attempt.
         NSCameraUsageDescription: Publish your camera to the room.
         NSMicrophoneUsageDescription: Publish your microphone to the room.
-        # A relay on a desk is on a private address, and iOS blackholes traffic to
-        # those until this string exists to be shown in a prompt. Without it the
-        # connection does not fail: it hangs, which reads as a relay that is down.
-        NSLocalNetworkUsageDescription: >-
-          Connect to a relay running on your own network, for development.
-        # Browsing is gated separately from connecting, and only for types listed
-        # here — an unlisted type returns no results at all rather than an error,
-        # so a pairing code would simply never be found.
-        NSBonjourServices:
-          - _moqom-relay._udp
         # The token service, and nothing else on the internet.
         #
         # Its certificate is one this deployment issued itself, and App Transport
@@ -113,6 +103,10 @@ targets:
         # suggests: without it the system refuses to start the window, and the
         # refusal arrives as a delegate error rather than as a build failure.
         # It is the same key that keeps room audio running when backgrounded.
+        # The other half of asking the panel for 120Hz. ``PanelRate`` sets a
+        # display link's preferred range to the screen's maximum, and without
+        # this key iOS still clamps the app to 60. Neither works alone.
+        CADisableMinimumFrameDurationOnPhone: true
         UIBackgroundModes:
           - audio
         # Lets the app start a Live Activity at all.

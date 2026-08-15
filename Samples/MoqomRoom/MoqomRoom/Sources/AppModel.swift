@@ -56,19 +56,12 @@ final class AppModel {
         let panelRate = PanelRate.shared
     #endif
 
-    /// A four digit code standing in for the relay's address and certificate hash.
+    /// The shared call on the GCP relay.
     ///
-    /// Resolved over Bonjour at join, then discarded in favour of what it resolved to, so the
-    /// settings below always show what is actually being dialled. A code that stayed as the
-    /// configuration would leave the interface unable to say where the media went.
+    /// Two phones that type the same code join the same room there and go live. It is
+    /// not a lookup: nothing is browsed on the LAN. Kept after join so the next tap
+    /// is the same call, not a drop back onto whatever room name was left in the field.
     var pairingCode: String
-
-    /// Why the last pairing attempt found nothing, if it found nothing.
-    ///
-    /// Kept beside the field rather than raised as a failure screen. Nothing has been dialled
-    /// yet, the settings typed by hand are still there to fall back on, and "no relay is
-    /// advertising 4242" is a different sentence from "the relay refused".
-    private(set) var pairingProblem: String?
 
     /// Publish one pinned rung on a disciplined clock, and measure what arrives.
     ///
@@ -91,9 +84,12 @@ final class AppModel {
     init(defaults: UserDefaults = .standard) {
         Journal.shared.begin()
         measure = true
-        pairingCode = launch.pairingCode ?? ""
+        pairingCode = launch.pairingCode ?? defaults.string(forKey: "pairingCode") ?? ""
         username = defaults.string(forKey: "username") ?? ""
         roomName = defaults.string(forKey: "roomName") ?? "demo"
+        if !RelayConfiguration.relayHostOverridden {
+            relay.useDevelopmentEndpoint()
+        }
 
         // From launch, because the first tile sizes its schedule against this and a link that has
         // not ticked yet leaves it guessing from the screen's stated maximum.
@@ -106,6 +102,7 @@ final class AppModel {
     private func remember(to defaults: UserDefaults = .standard) {
         defaults.set(username, forKey: "username")
         defaults.set(roomName, forKey: "roomName")
+        defaults.set(pairingCode, forKey: "pairingCode")
         relay.save(to: defaults)
     }
 
@@ -305,8 +302,8 @@ final class AppModel {
                 )
             } ?? relay.tokenService
         )
-        // A pairing code left in the field would resolve on the next Join and
-        // throw all of this away for whatever is on the local network.
+        // A pairing code left in the field would be the room on the next Join
+        // and throw away the room this invitation named.
         pairingCode = ""
 
         if let credential = invitation.credential {
@@ -322,7 +319,40 @@ final class AppModel {
     var credential: Credential? { relay.credential }
 
     var credentialComplaint: String? {
-        credential?.complaint(joining: roomName.trimmed, as: username.trimmed)
+        credential?.complaint(joining: destinationRoomName(pairing: pairing), as: username.trimmed)
+    }
+
+    /// Where Join puts this device, given the fields as they stand.
+    ///
+    /// Pairing is the shared call on the GCP relay. `@ada` is a watch. A `--room`
+    /// from a script still wins, because benches share a code as the room and a
+    /// room name to stay off this path. Empty everything is a solo channel.
+    private enum Destination {
+        case channel
+        case watch(String)
+        case room(String)
+    }
+
+    private var pairing: String? {
+        let code = pairingCode.trimmed
+        return code.isEmpty ? nil : code
+    }
+
+    private func destination(pairing: String?) -> Destination {
+        let room = roomName.trimmed
+        if room.hasPrefix("@") { return .watch(String(room.dropFirst())) }
+        if let launched = launch.room?.trimmed, !launched.isEmpty { return .room(launched) }
+        if let pairing { return .room(pairing) }
+        if !room.isEmpty { return .room(room) }
+        return .channel
+    }
+
+    private func destinationRoomName(pairing: String?) -> String {
+        switch destination(pairing: pairing) {
+        case .channel: return ""
+        case let .watch(name): return "@\(name)"
+        case let .room(name): return name
+        }
     }
 
     /// Join on the settings a script supplied, if it supplied any.
@@ -344,13 +374,17 @@ final class AppModel {
         joinedOnLaunch = true
 
         if username.isEmpty { username = "device" }
-        Journal.shared.say("JOINING relay=\(relay.summary) room=\(roomName) as=\(username)")
+        Journal.shared.say(
+            "JOINING relay=\(relay.summary) room=\(destinationRoomName(pairing: pairing)) as=\(username)"
+        )
 
         await join()
 
         switch phase {
         case let .inRoom(room):
-            Journal.shared.say("JOINED relay=\(relay.summary) room=\(roomName)")
+            Journal.shared.say(
+                "JOINED relay=\(relay.summary) room=\(destinationRoomName(pairing: pairing))"
+            )
             guard launch.goesLive else { return }
 
             // Before the broadcast, because going live now brings a voice with it. Named
@@ -483,10 +517,15 @@ final class AppModel {
             Journal.shared.say("CLOCK unavailable — latency across devices will be meaningless")
         }
 
-        switch launch.video {
-        case "pattern": room.videoInput = .pattern
-        case "scene", "ar": room.videoInput = .scene
-        default: room.videoInput = .camera
+        // Only when asked. Absent `--video` the room keeps its own default — the AR
+        // field on a phone — so a hand launch and a scripted one without the flag
+        // are the same call.
+        if let video = launch.video {
+            switch video {
+            case "pattern": room.videoInput = .pattern
+            case "scene", "ar": room.videoInput = .scene
+            default: room.videoInput = .camera
+            }
         }
 
         // Sixty, which is what every measurement of this application has been taken at and what
@@ -1128,10 +1167,10 @@ final class AppModel {
 
     /// Why the last attempt to fetch a token failed, if it failed.
     ///
-    /// Beside the join screen rather than on the failure screen, like
-    /// ``pairingProblem``: nothing has been dialled, the pasted token is still
-    /// there to fall back on, and "the token service refused this name" is a
-    /// different sentence from "the relay is unreachable".
+    /// Beside the join screen rather than on the failure screen: nothing has
+    /// been dialled, the pasted token is still there to fall back on, and "the
+    /// token service refused this name" is a different sentence from "the relay
+    /// is unreachable".
     private(set) var tokenProblem: String?
 
     /// Which tenant to dial as: whichever one the token in hand was minted for.
@@ -1163,7 +1202,7 @@ final class AppModel {
     private func fetchATokenIfNeeded() async -> Bool {
         tokenProblem = nil
 
-        let room = roomName.trimmed
+        let room = destinationRoomName(pairing: pairing)
         let name = username.trimmed
         guard let service = relay.tokenService, service.isUsable else {
             // No service configured, which is a legitimate setup: a relay on a desk
@@ -1215,28 +1254,12 @@ final class AppModel {
     func join() async {
         guard canJoin else { return }
         phase = .connecting
-        pairingProblem = nil
 
-        // Before the transport is built, since what it resolves to decides both where to dial
-        // and which certificate to pin. A code that resolves to nothing falls back to the
-        // address in the fields when there is one, and stops when there is not — because the
-        // fallback in that case is the loopback, which joins, looks like a room, and measures
-        // nothing. The stopping case is the one worth refusing; refusing both taught a phone
-        // with a relay already configured to sit there failing over a stale code.
-        if !pairingCode.trimmed.isEmpty {
-            let code = pairingCode.trimmed
-            if let paired = await RelayPairing.find(code: pairingCode) {
-                relay = paired
-                pairingCode = ""
-            } else if relay.host != nil {
-                pairingProblem =
-                    "Nothing is advertising \(code) — using \(relay.summary) instead."
-                pairingCode = ""
-            } else {
-                pairingProblem = "Nothing is advertising \(code) on this network."
-                phase = .joining
-                return
-            }
+        // The code is the room, not a lookup. The relay is always the compiled-in
+        // GCP endpoint unless a script passed `--relay-host`.
+        let sharedCode = pairing
+        if !RelayConfiguration.relayHostOverridden || relay.host == nil {
+            relay.useDevelopmentEndpoint()
         }
 
         // Before anything is dialled, because this is the credential the dialling
@@ -1281,11 +1304,20 @@ final class AppModel {
                 )
             )
             try await session.connect(to: relay.endpoint)
-            let room = try await session.join(room: RoomID(roomName))
+            let room: RoomSession
+            switch destination(pairing: sharedCode) {
+            case .channel:
+                room = try await session.goLive()
+            case let .watch(name):
+                room = try await session.watch(try Username(name))
+            case let .room(name):
+                room = try await session.join(room: RoomID(name))
+            }
             let model = RoomModel(
                 session: session,
                 room: room,
                 identity: identity,
+                locale: launch.locale,
                 statisticsInterval: launch.statisticsMilliseconds
                     .map { .milliseconds($0) } ?? .milliseconds(250)
             )
@@ -1318,6 +1350,14 @@ final class AppModel {
             }
             if measure { await prepareMeasurement(in: model) }
             phase = .inRoom(model)
+
+            // Same pairing code is a call: both phones publish as soon as they meet.
+            // Scripted joins still decide this themselves — a silent bench that
+            // shares a code to find the relay must not get a camera forced on.
+            if sharedCode != nil, !launch.autojoin {
+                await model.startBroadcast()
+                await model.startAudio()
+            }
         } catch let error as MoqomError {
             phase = .failed(error)
         } catch let error as NameError {

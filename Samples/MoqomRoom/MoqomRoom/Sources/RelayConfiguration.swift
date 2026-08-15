@@ -164,6 +164,21 @@ struct RelayConfiguration {
         tokenService: JoinService.development
     )
 
+    /// Whether a script named the relay, rather than leaving the compiled-in GCP one.
+    static var relayHostOverridden: Bool {
+        ProcessInfo.processInfo.arguments.contains("--relay-host")
+    }
+
+    /// Point at the compiled-in GCP relay without dropping the token or join service.
+    ///
+    /// Pairing used to overwrite the host from Bonjour. A leftover LAN address in
+    /// defaults would then keep sending phones at a Mac that is no longer there.
+    mutating func useDevelopmentEndpoint() {
+        host = Self.development.host
+        port = Self.development.port
+        certificateHashes = Self.development.certificateHashes
+    }
+
     /// Read from launch arguments first, then the defaults database, then ``development``.
     ///
     /// Arguments win so that a scripted run can override whatever was last set by hand in
@@ -363,10 +378,9 @@ struct LaunchOptions {
     /// default suits the loopback, where nothing checks.
     var tenant = "demo"
 
-    /// A pairing code to resolve instead of being told the relay's address and hash.
+    /// The shared call, the same field a person types on the join screen.
     ///
-    /// Here as well as in the interface so that a scripted run exercises the same lookup a
-    /// person does, rather than the two paths drifting until only the scripted one works.
+    /// It names the room on the GCP relay. It does not find a relay.
     var pairingCode: String?
 
     /// Join without waiting to be asked, and go live once in.
@@ -488,7 +502,15 @@ struct LaunchOptions {
     /// desk publishing microphones is a feedback loop, and what it measures is the room.
     var audio: String?
 
-    /// What to publish as video: `camera` or `pattern`. The camera by default.
+    /// Language tag to publish instead of the phone's current locale.
+    ///
+    /// The phone is the default, and it can change while the call is up. This
+    /// is the override that does not: a scripted run that needs both ends to
+    /// agree on a language, or to disagree on purpose, passes `--locale`.
+    var locale: String?
+
+    /// What to publish as video: `camera`, `pattern`, or `scene`. Absent, the room
+    /// keeps its own default — the AR field on a phone.
     ///
     /// The pattern is the bisect. Everything from the encoder onwards treats the two identically,
     /// so a pattern that arrives when a camera does not says the fault is in front of the
@@ -557,6 +579,7 @@ struct LaunchOptions {
             case "--floor-ms": options.playoutFloorMilliseconds = value.flatMap(Int.init)
             case "--audio": options.audio = value ?? "tone"
             case "--video": options.video = value ?? "camera"
+            case "--locale": options.locale = value
             case "--bubbles": options.bubbles = true
             case "--pop-every": options.popEverySeconds = value.flatMap(Double.init)
             case "--reshape-every": options.reshapeEverySeconds = value.flatMap(Double.init)

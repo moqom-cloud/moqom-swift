@@ -84,6 +84,20 @@ struct RoomScreen: View {
                     .padding(.horizontal)
             }
 
+            ForEach(room.invitationsForMe) { invitation in
+                HStack {
+                    Text("\(invitation.issuedBy.username.value) invited you up")
+                    Spacer()
+                    Button("Accept") {
+                        Task { await room.acceptInvitation(invitation.id) }
+                    }
+                    Button("Decline", role: .destructive) {
+                        Task { await room.declineInvitation(invitation.id) }
+                    }
+                }
+                .padding(.horizontal)
+            }
+
             if room.participants.isEmpty {
                 ContentUnavailableView(
                     "Nobody on stage",
@@ -692,6 +706,15 @@ struct BroadcastControls: View {
                     // The launched path is deliberately not routed through here. A
                     // benchmark that publishes a voice nobody asked for is measuring a
                     // different link; see ``AppModel``, where absent `--audio` is silence.
+                    TextField("Invite", text: $room.inviteName)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(maxWidth: 120)
+                    Button("Invite") {
+                        Task { await room.inviteGuest() }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(room.inviteName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
                     Button {
                         Task {
                             if room.isBroadcasting {

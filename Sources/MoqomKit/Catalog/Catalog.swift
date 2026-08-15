@@ -188,6 +188,37 @@ public struct Catalog: Hashable, Sendable, Codable {
     /// own camera, and that is a fact rather than an inference.
     public let interrupted: MediaKind
 
+    /// The language this publisher is speaking, as a BCP 47 tag.
+    ///
+    /// On the catalog for the same reason ``muted`` is: this is the one
+    /// document a participant authors about themselves, everyone already
+    /// subscribes to it, and a late joiner reads the current value without
+    /// asking. It is also the document a relay is allowed to read — catalogs
+    /// are never encrypted — so the control plane learns the same tag the
+    /// other clients do, without a second channel.
+    ///
+    /// Optional, and absent from catalogs published before this field existed.
+    /// Those are not malformed; they are a publisher who has not said.
+    public let locale: String?
+
+    /// Other publishers this catalog's audience should also receive.
+    ///
+    /// Each entry is a full participant namespace. The publisher uploads once,
+    /// under their own name; anyone watching this catalog follows the
+    /// reference. That is how two lives share an audience without a second
+    /// uplink, and how a guest appears on a personal channel that has no
+    /// room roster.
+    ///
+    /// Absent from catalogs published before this field existed.
+    public let references: [TrackNamespace]
+
+    /// Stage handshakes this publisher has in flight.
+    ///
+    /// On the catalog rather than the room control log because a handshake has
+    /// a deadline and must not be replayed from a snapshot. A late joiner
+    /// reads whatever is still pending.
+    public let invitations: [StageInvitationRecord]
+
     public static let currentVersion = 1
 
     public init(
@@ -195,12 +226,18 @@ public struct Catalog: Hashable, Sendable, Codable {
         keyID: UInt64? = nil,
         muted: MediaKind = [],
         interrupted: MediaKind = [],
+        locale: String? = nil,
+        references: [TrackNamespace] = [],
+        invitations: [StageInvitationRecord] = [],
         tracks: [CatalogTrack]
     ) {
         self.version = version
         self.keyID = keyID
         self.muted = muted
         self.interrupted = interrupted
+        self.locale = locale
+        self.references = references
+        self.invitations = invitations
         self.tracks = tracks
     }
 
@@ -209,9 +246,10 @@ public struct Catalog: Hashable, Sendable, Codable {
     // who has muted nothing, and refusing to decode it would take the whole
     // participant off the stage over a missing key. The same now goes for
     // `interrupted`, which an older publisher never sends and whose absence
-    // means a camera nobody has taken away.
+    // means a camera nobody has taken away, and for `locale`, which an older
+    // publisher never sends and whose absence means they have not said.
     private enum CodingKeys: String, CodingKey {
-        case version, keyID, muted, interrupted, tracks
+        case version, keyID, muted, interrupted, locale, references, invitations, tracks
     }
 
     public init(from decoder: any Decoder) throws {
@@ -220,7 +258,24 @@ public struct Catalog: Hashable, Sendable, Codable {
         keyID = try container.decodeIfPresent(UInt64.self, forKey: .keyID)
         muted = try container.decodeIfPresent(MediaKind.self, forKey: .muted) ?? []
         interrupted = try container.decodeIfPresent(MediaKind.self, forKey: .interrupted) ?? []
+        locale = try container.decodeIfPresent(String.self, forKey: .locale)
+        references = try container.decodeIfPresent([TrackNamespace].self, forKey: .references) ?? []
+        invitations = try container.decodeIfPresent(
+            [StageInvitationRecord].self, forKey: .invitations
+        ) ?? []
         tracks = try container.decode([CatalogTrack].self, forKey: .tracks)
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(version, forKey: .version)
+        try container.encodeIfPresent(keyID, forKey: .keyID)
+        try container.encode(muted, forKey: .muted)
+        try container.encode(interrupted, forKey: .interrupted)
+        try container.encodeIfPresent(locale, forKey: .locale)
+        if !references.isEmpty { try container.encode(references, forKey: .references) }
+        if !invitations.isEmpty { try container.encode(invitations, forKey: .invitations) }
+        try container.encode(tracks, forKey: .tracks)
     }
 
     /// The video rungs, cheapest first.

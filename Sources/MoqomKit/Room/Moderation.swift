@@ -86,7 +86,7 @@ public enum ModerationAction: Hashable, Sendable {
 }
 
 /// Which way a stage change was initiated.
-public enum StageDirection: String, Hashable, Sendable {
+public enum StageDirection: String, Hashable, Sendable, Codable {
     /// The viewer asked to come up.
     case request
 
@@ -95,7 +95,7 @@ public enum StageDirection: String, Hashable, Sendable {
 }
 
 /// How a pending stage change resolved.
-public enum StageOutcome: String, Hashable, Sendable {
+public enum StageOutcome: String, Hashable, Sendable, Codable {
     case pending
     case accepted
     case declined
@@ -175,6 +175,56 @@ public struct StageInvitation: Hashable, Sendable, Identifiable {
         outcome = .timedOut
         return true
     }
+}
+
+/// A stage handshake as it travels on a catalog.
+///
+/// Invitations are not on the room control log: that log is snapshotted and
+/// replayed, and replaying a handshake to someone who has been offline for
+/// thirty seconds is the failure ``StageInvitation`` exists to prevent. The
+/// catalog is the current document a publisher authors about themselves, so a
+/// late joiner reads whatever is still pending and nothing that has already
+/// expired.
+public struct StageInvitationRecord: Hashable, Sendable, Codable, Identifiable {
+    public var id: UUID
+    public var direction: StageDirection
+    public var subject: ParticipantIdentity
+    public var issuedBy: ParticipantIdentity
+    public var offered: PublishScope
+    public var expiresAt: Date
+    public var outcome: StageOutcome
+
+    public init(
+        id: UUID = UUID(),
+        direction: StageDirection,
+        subject: ParticipantIdentity,
+        issuedBy: ParticipantIdentity,
+        offered: PublishScope,
+        expiresAt: Date,
+        outcome: StageOutcome = .pending
+    ) {
+        self.id = id
+        self.direction = direction
+        self.subject = subject
+        self.issuedBy = issuedBy
+        self.offered = offered
+        self.expiresAt = expiresAt
+        self.outcome = outcome
+    }
+
+    public init(_ invitation: StageInvitation, expiresAt: Date) {
+        self.init(
+            id: invitation.id,
+            direction: invitation.direction,
+            subject: invitation.subject,
+            issuedBy: invitation.issuedBy,
+            offered: invitation.offered,
+            expiresAt: expiresAt,
+            outcome: invitation.outcome
+        )
+    }
+
+    public var isOpen: Bool { outcome == .pending && expiresAt > Date() }
 }
 
 /// The stage, its queue, and its cap.

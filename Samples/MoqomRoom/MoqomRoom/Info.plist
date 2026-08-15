@@ -2,6 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>CADisableMinimumFrameDurationOnPhone</key>
+	<true/>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
@@ -44,14 +46,8 @@
 			</dict>
 		</dict>
 	</dict>
-	<key>NSBonjourServices</key>
-	<array>
-		<string>_moqom-relay._udp</string>
-	</array>
 	<key>NSCameraUsageDescription</key>
 	<string>Publish your camera to the room.</string>
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>Connect to a relay running on your own network, for development.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Publish your microphone to the room.</string>
 	<key>NSSupportsLiveActivities</key>

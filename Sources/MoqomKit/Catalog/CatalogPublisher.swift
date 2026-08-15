@@ -168,7 +168,10 @@ public extension Catalog {
         audio: AudioPublicationConfiguration? = nil,
         keyID: UInt64? = nil,
         muted: MediaKind = [],
-        interrupted: MediaKind = []
+        interrupted: MediaKind = [],
+        locale: String? = nil,
+        references: [TrackNamespace] = [],
+        invitations: [StageInvitationRecord] = []
     ) -> Catalog {
         // The live ladder when there is one, because a publication's geometry can
         // move after it starts: the rungs keep their names and their short sides,
@@ -204,7 +207,15 @@ public extension Catalog {
             )
         }
 
-        return Catalog(keyID: keyID, muted: muted, interrupted: interrupted, tracks: tracks)
+        return Catalog(
+            keyID: keyID,
+            muted: muted,
+            interrupted: interrupted,
+            locale: locale,
+            references: references,
+            invitations: invitations,
+            tracks: tracks
+        )
     }
 }
 

@@ -14,6 +14,13 @@ struct QueueDepthTests {
         }
     }
 
+    @Test("a clean call starts on one packet, not on a guess")
+    func startsOnTheFloor() {
+        let depth = QueueDepth()
+        #expect(depth.target == QueueDepth.leastWorthHolding)
+        #expect(QueueDepth.leastWorthHolding == .milliseconds(20))
+    }
+
     @Test("an even feed asks for nothing beyond the link")
     func anEvenFeedCostsNothing() {
         var depth = QueueDepth()

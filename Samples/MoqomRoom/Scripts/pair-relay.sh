@@ -1,11 +1,8 @@
 #!/bin/sh
 # Advertise a running development relay under a four digit code.
 #
-# What the phones actually need is an address and the SHA-256 of the certificate the relay
-# signed for itself, and typing 44 characters of base64 into two phones is how a test run ends
-# up debugging a typo. So the Mac publishes both over Bonjour and the phone looks them up by a
-# code short enough to type: the pin is still the exact certificate, and only the typing got
-# shorter.
+# The sample app no longer browses for this. It dials the compiled-in GCP relay.
+# Kept for a desk relay that a script points at with `--relay-host`.
 #
 # Runs alongside the relay rather than inside it. Nothing here needs the relay's cooperation —
 # the certificate is a file on disk and the hash is a digest of it — and keeping it out means a

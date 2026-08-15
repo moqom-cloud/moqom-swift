@@ -93,10 +93,8 @@ if [ -n "${MOQOM_MINT:-}" ]; then
     VIEWER_TOKEN="$(MOQOM_TENANT=$TENANT "$JOIN" viewer "$ROOM")"
 fi
 
-# Where the relay is. Bonjour discovery by default, which only works for the relay on this Mac —
-# a pairing code is a local-network mechanism and there is nothing to discover across the
-# internet. With MOQOM_RELAY_HOST set, as relay-on-gcp.sh writes it, the phones are told the
-# address and the certificate to expect instead.
+# Where the relay is. The app already dials the compiled-in GCP endpoint. A host
+# here overrides that; a pairing code is the room, not a lookup.
 FPS="${MOQOM_FPS:-30}"
 if [ -n "${MOQOM_RELAY_HOST:-}" ]; then
     WHERE="--relay-host $MOQOM_RELAY_HOST --relay-port ${MOQOM_RELAY_PORT:-4443}"
@@ -105,8 +103,8 @@ if [ -n "${MOQOM_RELAY_HOST:-}" ]; then
     fi
     echo "relay: $MOQOM_RELAY_HOST:${MOQOM_RELAY_PORT:-4443}"
 else
-    WHERE="--pairing-code $CODE"
-    echo "relay: whatever answers to pairing code $CODE on this network"
+    WHERE=""
+    echo "relay: compiled-in GCP default"
 fi
 WHERE="$WHERE --fps $FPS${MOQOM_FLAT_LAYERS:+ --flat-layers}"
 WHERE="$WHERE${MOQOM_EAGER:+ --eager-encoding}"

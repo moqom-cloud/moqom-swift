@@ -137,7 +137,19 @@ public enum MoqomNamespaces {
         tenant: TenantID,
         identity: ParticipantIdentity
     ) throws(NameError) -> TrackNamespace {
-        try TrackNamespace([tenant.value, "u", identity.username.value, identity.device.value])
+        try personalPrefix(tenant: tenant, username: identity.username)
+            .appending(identity.device.value)
+    }
+
+    /// The prefix a viewer subscribes to in order to receive every device
+    /// that user is live on.
+    ///
+    /// `(tenant, "u", username)`
+    public static func personalPrefix(
+        tenant: TenantID,
+        username: Username
+    ) throws(NameError) -> TrackNamespace {
+        try TrackNamespace([tenant.value, "u", username.value])
     }
 
     /// The prefix a viewer subscribes to in order to receive every participant
@@ -203,10 +215,23 @@ public enum MoqomNamespaces {
         announcedAt namespace: TrackNamespace,
         under prefix: TrackNamespace
     ) -> ParticipantIdentity? {
-        guard let tail = namespace.suffix(after: prefix), tail.count == 2 else { return nil }
-        guard let username = try? Username(tail[0]), let device = try? DeviceID(tail[1]) else {
-            return nil
+        guard let tail = namespace.suffix(after: prefix) else { return nil }
+        if tail.count == 2,
+           let username = try? Username(tail[0]),
+           let device = try? DeviceID(tail[1])
+        {
+            return ParticipantIdentity(username: username, device: device)
         }
-        return ParticipantIdentity(username: username, device: device)
+        // A personal channel is announced under `(tenant, "u", username)`, so
+        // the suffix is only the device. The username is already in the prefix.
+        if tail.count == 1,
+           prefix.fields.count >= 3,
+           prefix.fields[1] == "u",
+           let username = try? Username(prefix.fields[2]),
+           let device = try? DeviceID(tail[0])
+        {
+            return ParticipantIdentity(username: username, device: device)
+        }
+        return nil
     }
 }

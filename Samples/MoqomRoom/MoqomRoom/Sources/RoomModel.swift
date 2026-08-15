@@ -24,6 +24,7 @@ final class RoomModel {
     private(set) var participants: [Participant] = []
     private(set) var watchdogs: [Watchdog] = []
     private(set) var stage = StageState()
+    var inviteName = ""
     private(set) var lifecycle: RoomLifecycle = .live
     private(set) var isBroadcasting = false
     private(set) var isPublishingAudio = false
@@ -106,11 +107,14 @@ final class RoomModel {
     /// swapping the ``FrameSource`` the publication is bound to, which is a stop
     /// and a restart; switching between the two *cameras* is the thing that does
     /// not need one, and that is ``flipCamera()``.
-    /// The camera on a device that has one, and the pattern where there is none. Defaulting
-    /// to the pattern everywhere meant a phone that showed a moving gradient until somebody
-    /// found the picker, which reads as a broken camera rather than as a deliberate default.
+    /// The shared AR field on a phone that can run one, the camera where it cannot, and the
+    /// pattern in a simulator. Defaulting to the camera meant every hand-driven call started
+    /// as a talking-head tile until somebody found the picker and then the bubbles button —
+    /// two extra taps for the mode this app is actually demonstrating.
     #if targetEnvironment(simulator)
         var videoInput: VideoInput = .pattern
+    #elseif canImport(ARKit)
+        var videoInput: VideoInput = ARSceneSource.isSupported ? .scene : .camera
     #else
         var videoInput: VideoInput = .camera
     #endif
@@ -957,16 +961,34 @@ final class RoomModel {
     private var players: [ParticipantIdentity: AudioPlayer] = [:]
     private var playback: [ParticipantIdentity: Task<Void, Never>] = [:]
 
+    /// Language tag to publish instead of the phone's, when a run asked for one.
+    ///
+    /// `nil` means follow the phone, including when the phone changes mid-call.
+    /// Setting this, or clearing it, republishes the catalog.
+    var localeOverride: String? {
+        didSet {
+            guard localeOverride != oldValue else { return }
+            Task { await applyLocale() }
+        }
+    }
+
+    /// What this device is currently publishing as its locale.
+    private(set) var publishedLocale: String?
+
+    private var localeObserver: NSObjectProtocol?
+
     init(
         session: MoqomSession,
         room: RoomSession,
         identity: ParticipantIdentity,
+        locale: String? = nil,
         statisticsInterval: Duration = .milliseconds(250)
     ) {
         self.session = session
         self.room = room
         self.identity = identity
         self.statisticsInterval = statisticsInterval
+        self.localeOverride = locale
         layout.bind(to: room)
 
         // The layout decides what this device publishes, not just what it subscribes to.
@@ -985,6 +1007,34 @@ final class RoomModel {
             }
         #endif
         start()
+        watchPhoneLocale()
+        Task { await applyLocale() }
+    }
+
+    /// Publish the override if there is one, otherwise the phone's current locale.
+    ///
+    /// Safe to call again: ``RoomSession/setLocale(_:)`` no-ops when the tag
+    /// has not changed, so a notification that restates the same language costs
+    /// a comparison and nothing on the wire.
+    func applyLocale() async {
+        let tag = localeOverride.flatMap(SpokenLocale.normalize) ?? SpokenLocale.current()
+        await room.setLocale(tag)
+        publishedLocale = await room.locale
+        Journal.shared.say("LOCALE own=\(publishedLocale ?? "none")")
+    }
+
+    /// Follow the phone unless a launch override is holding the tag still.
+    private func watchPhoneLocale() {
+        localeObserver = NotificationCenter.default.addObserver(
+            forName: NSLocale.currentLocaleDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.localeOverride == nil else { return }
+                await self.applyLocale()
+            }
+        }
     }
 
     var roomName: String { room.room.value }
@@ -1070,6 +1120,9 @@ final class RoomModel {
         case .catalogChanged(let who, let catalog):
             catalogs[who] = catalog
             if catalog.audioTrack != nil { await startPlayback(for: who) }
+        case .localeChanged(let who, let locale):
+            Journal.shared.say("LOCALE \(who.username.value)=\(locale ?? "none")")
+            await refresh()
         case .galleryChanged(let updated):
             // Carries speaking state as well as occupancy, so this one event
             // drives both the rings and the layout — and because a tile holds its
@@ -1446,15 +1499,54 @@ final class RoomModel {
         await broadcast?.tapFrames(policy: TapPolicy(cadence: .everyFrame, depth: 2))
     }
 
+    // MARK: - Stage
+
+    var invitationsForMe: [StageInvitation] {
+        stage.pending.filter {
+            $0.outcome == .pending && $0.subject.username == identity.username
+        }
+    }
+
+    func inviteGuest() async {
+        let name = inviteName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, let username = try? Username(name) else { return }
+        do {
+            _ = try await room.invite(username)
+            Journal.shared.say("INVITE \(name)")
+        } catch {
+            lastError = error as? MoqomError ?? .invalidState(
+                expected: "invite",
+                actual: String(describing: error)
+            )
+        }
+    }
+
+    func acceptInvitation(_ id: UUID) async {
+        do {
+            try await room.accept(id)
+            Journal.shared.say("ACCEPT \(id)")
+        } catch {
+            lastError = error as? MoqomError
+        }
+    }
+
+    func declineInvitation(_ id: UUID) async {
+        do {
+            try await room.decline(id)
+            Journal.shared.say("DECLINE \(id)")
+        } catch {
+            lastError = error as? MoqomError
+        }
+    }
+
     // MARK: - Broadcasting
 
     func startBroadcast() async {
         guard !isBroadcasting else { return }
 
-        // A rendered pattern by default rather than a camera or a scene, so the
-        // sample runs in a simulator with nothing attached — and unlike an
-        // empty relay, it produces pixels that actually encode. `SceneCapture`
-        // is the third option a real build reaches for.
+        // The source is ``videoInput``: the AR field on a phone, the pattern in
+        // a simulator. `SceneCapture` is not a third option somebody has to
+        // find; it is the default broadcast.
         // One rung, decided here. A measured run brings its own — the point of a benchmark is
         // that both ends agree on a figure that does not move — and any other run publishes
         // what the layout on screen is going to draw. See ``rungForLayout``.
@@ -1605,6 +1697,12 @@ final class RoomModel {
             #if os(iOS)
                 await startLiveActivity()
             #endif
+            // The field is why the scene exists. Going live on it and leaving the bubbles
+            // behind a second button meant the default broadcast was an empty orb until
+            // somebody found that control — the same two-tap tax the input default used to
+            // charge. A camera or a pattern still waits for the button: those views have
+            // nowhere to put the entities.
+            if videoInput == .scene { await startSharing() }
             await refresh()
         } catch {
             // Written here as well as shown, because the alert is only seen by whoever is
@@ -2131,6 +2229,10 @@ final class RoomModel {
         sampler = nil
         connection?.cancel()
         connection = nil
+        if let localeObserver {
+            NotificationCenter.default.removeObserver(localeObserver)
+            self.localeObserver = nil
+        }
         #if os(iOS)
             pictureInPicture?.stop()
             endLiveActivity()

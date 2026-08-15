@@ -182,6 +182,54 @@ public actor MoqomSession {
         return session
     }
 
+    /// Go live on this device's own channel, without a room.
+    ///
+    /// The channel is the username. Viewers call ``watch(_:)`` with that name.
+    /// Guests arrive by invitation: they still upload under their own name,
+    /// and this catalog points at them.
+    public func goLive(seatPolicy: SeatPolicy = .default) async throws(MoqomError) -> RoomSession {
+        try await openChannel(identity.username, seatPolicy: seatPolicy)
+    }
+
+    /// Watch someone else's personal channel.
+    public func watch(
+        _ username: Username,
+        seatPolicy: SeatPolicy = .default
+    ) async throws(MoqomError) -> RoomSession {
+        try await openChannel(username, seatPolicy: seatPolicy)
+    }
+
+    private func openChannel(
+        _ username: Username,
+        seatPolicy: SeatPolicy
+    ) async throws(MoqomError) -> RoomSession {
+        let room = RoomID(username.value)
+        if let existing = rooms[room] { return existing }
+        guard let connection else {
+            throw MoqomError.invalidState(expected: "connected", actual: machine.state.description)
+        }
+        let namespace: TrackNamespace
+        do {
+            namespace = try MoqomNamespaces.personalPrefix(tenant: tenant, username: username)
+        } catch {
+            throw MoqomError.invalidName(error)
+        }
+        let session = RoomSession(
+            tenant: tenant,
+            room: room,
+            namespace: namespace,
+            identity: identity,
+            connection: connection,
+            logger: logger,
+            seatPolicy: seatPolicy,
+            channel: username
+        )
+        rooms[room] = session
+        await session.begin()
+        logger.info(.room, "channel", [LogField("username", .text(username.value))])
+        return session
+    }
+
     public func leave(room: RoomID) async {
         guard let session = rooms.removeValue(forKey: room) else { return }
         await session.end()

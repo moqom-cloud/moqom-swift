@@ -50,28 +50,25 @@ struct JoinScreen: View {
             }
 
             Section {
-                TextField("Room", text: $model.roomName)
+                TextField("Pairing code", text: $model.pairingCode)
+                    #if os(iOS)
+                        .keyboardType(.numberPad)
+                    #endif
+
+                TextField("Room or @username", text: $model.roomName)
             } header: {
-                Text("Room")
+                Text("Call")
             } footer: {
-                // Worth saying out loud in a sample: the same username on a
-                // phone and an iPad is two participants, not a conflict to
-                // resolve. Nothing here deduplicates by username.
-                Text("Joining from a second device adds a second tile.")
+                Text(
+                    "Share the pairing code. Both phones join that call and go live. "
+                        + "@ada watches ada. A room name is used only when the code is empty."
+                )
             }
 
             // Where the media actually goes. Left blank the sample runs on the in-process
             // loopback, which is the right default and measures nothing: two phones only
             // become a broadcast when both are pointed at the same relay.
             Section {
-                // First, because it is the only field anyone should have to touch. The three
-                // below are what it resolves to, left visible so the interface can still say
-                // where the media is going.
-                TextField("Pairing code", text: $model.pairingCode)
-                    #if os(iOS)
-                        .keyboardType(.numberPad)
-                    #endif
-
                 TextField("Relay host", text: $model.relayHost)
                     #if os(iOS)
                         .textInputAutocapitalization(.never)
@@ -99,17 +96,10 @@ struct JoinScreen: View {
                 // desk signs its own certificate, so there is nothing for the platform to
                 // check and the connection is refused before any media moves — which on
                 // screen is indistinguishable from the relay being down.
-                VStack(alignment: .leading, spacing: 4) {
-                    if let problem = model.pairingProblem {
-                        Text(problem).foregroundStyle(.orange)
-                    }
-                    Text(
-                        "A pairing code finds a relay advertising itself on this network and "
-                            + "fills in the rest, including the hash of the certificate it "
-                            + "signed for itself. Without one, type the address by hand; "
-                            + "blank runs on the loopback, with nothing on the network."
-                    )
-                }
+                Text(
+                    "The GCP relay this build is compiled against. A pairing code is "
+                        + "the call on that relay, not a lookup on this network."
+                )
             }
 
             // Before the token, because it is what produces one. A phone with a

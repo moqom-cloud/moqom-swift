@@ -193,6 +193,13 @@ public enum RoomEvent: Sendable {
     case presenceChanged(ParticipantIdentity, Presence)
     case muteChanged(ParticipantIdentity, MuteState)
 
+    /// A participant published a new language tag, or cleared the one they had.
+    ///
+    /// The catalog is the source; this is the roster-shaped form of the same
+    /// fact, so an interface that already walks mute and presence changes does
+    /// not have to parse the document to draw a badge.
+    case localeChanged(ParticipantIdentity, String?)
+
     /// A moderator's mute reached this device and closed its hardware, or
     /// stopped doing so.
     ///

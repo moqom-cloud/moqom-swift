@@ -36,12 +36,11 @@ per-viewer mute is an unsubscribe that never reaches the relay, and moderation
 is refused when the grants do not allow it.
 
 **Input → Video** chooses among three sources, and all three are wired in
-`RoomModel.startBroadcast()`. The test pattern needs no hardware and is what a
-simulator falls back to. **Camera** is a real `CameraSource`. **AR scene** is
-`SceneCapture` behind a RealityKit view — the camera feed with an orb floating
-half a metre in front of it — and is the input worth compressing if you want to
-know what the codec does with synthetic geometry over hand-held video, since the
-orb's hard edge is the first thing to smear when the bitrate is not there.
+`RoomModel.startBroadcast()`. On a phone the default is the **AR scene** with
+the shared bubble field already joined — Go live is the game. The test pattern
+needs no hardware and is what a simulator falls back to. **Camera** is a real
+`CameraSource`. The scene is `SceneCapture` behind a RealityKit view: the camera
+feed with the field in front of it.
 
 The AR source carries two constraints the other two do not, both in
 `ARSceneSource.swift`. RealityKit only draws what is in a window, so the scene
@@ -252,8 +251,7 @@ frame back.
 | `PictureInPicture.swift` | Handing SwiftUI's `UIView` to the SDK as the source |
 | `RoomModel.swift` | `startLiveActivity` — one call, and the card tracks the room |
 | `MoqomRoomWidgets/` | The Lock Screen card and Dynamic Island, out of process |
-| `RelayConfiguration.swift` | Choosing between the loopback and a relay without a code change |
-| `RelayPairing.swift` | Why a four digit code is a lookup and never a trust decision |
+| `RelayConfiguration.swift` | The compiled-in GCP relay, and when a script overrides it |
 | `Measurement.swift` | Stamping frames on a clock both devices share, and what that costs |
 
 ## Measuring echo cancellation on a device
@@ -306,44 +304,12 @@ Then heat, since this runs alongside hardware video encode.
 
 ## Measuring latency between two devices
 
-The app runs on an in-process loopback by default, which is the right default and
-measures nothing about a network: a loopback hands frames between two objects, so
-latency, jitter, loss and congestion response are all absent. Two phones pointed
-at the same relay is the only arrangement where the numbers mean anything.
+The app dials the compiled-in GCP relay. Two phones that type the same pairing
+code join the same room there and go live. The code is the call, not a lookup:
+nothing is browsed on the LAN.
 
-**The relay.** Start `moqom-relay` on the Mac with a certificate that persists
-across restarts, because the phones pin it and a relay that regenerates one on
-every launch invalidates the pin:
-
-```sh
-MOQOM_RELAY_ADDR=0.0.0.0:4443 \
-MOQOM_RELAY_CERT=/tmp/relay-tls/cert.pem \
-MOQOM_RELAY_KEY=/tmp/relay-tls/key.pem \
-    ./target/release/moqom-relay
-```
-
-Bind `0.0.0.0` rather than `[::]`, or phones dialling an IPv4 address are not
-answered and the failure looks like a relay that is down.
-
-**Pairing.** The phones need the relay's address and the SHA-256 of that
-certificate. Rather than typing 44 characters of base64 into each one, advertise
-both over Bonjour and look them up by a short code:
-
-```sh
-Scripts/pair-relay.sh 4242
-```
-
-The code is a lookup and not a credential — the phone still pins the exact
-certificate the advertisement named. That is only safe because it assumes a
-trusted LAN, where anyone able to forge the advertisement could equally well be
-the relay, which is why it lives in this sample and not in MoqomKit.
-
-**On each phone.** Enter the code as the **Pairing code**, turn on **Measure this
-run**, and Join — the host, port and hash fill themselves in, so the interface
-still shows where the media is going. Allow local network access when asked;
-until that prompt is answered iOS blackholes the traffic and the connection hangs
-rather than failing. Use a different username on each phone and the same room on
-both.
+**On each phone.** Enter a username and the same **Pairing code**, then Join.
+A room name or `@username` is used only when the code is empty.
 
 **Read.** Measured runs publish one pinned 720p HEVC rung from the camera instead
 of a ladder, because a viewer free to move between three rungs makes any figure
@@ -380,10 +346,8 @@ MOQOM_SECONDS=90 Scripts/bench-two-phones.sh
 ```
 
 Both are idempotent, and the second prints the same block the readout shows,
-per phone, at the end of the run. Leave the **Pairing code** field empty when
-connecting by hand: it is a Bonjour lookup for a relay on the LAN, and with
-nothing advertising the code the connection fails before the host and hash
-below it are ever tried.
+per phone, at the end of the run. The app itself already points at that relay;
+`--relay-host` is only needed when a script wants a different one.
 
 ### The credential
 
@@ -422,10 +386,9 @@ the relay it was minted for.
 deploy/tools/join.sh ada demo      # in the moqom repository; prints a token
 ```
 
-Filed per host, so pairing with a relay on the desk does not throw away the one
-for Los Angeles, and so a credential is never offered to a relay it does not
-belong to — a relay with keys refuses a token it cannot verify outright, rather
-than falling back to admitting the session anonymously.
+Filed per host, so a credential is never offered to a relay it does not belong
+to — a relay with keys refuses a token it cannot verify outright, rather than
+falling back to admitting the session anonymously.
 
 The screen reads the token's claims back to you: who it names, which room, and
 when it expires. Nothing checks the signature and nothing could — the phone

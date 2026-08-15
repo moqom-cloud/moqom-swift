@@ -120,6 +120,26 @@ struct CatalogDocumentTests {
         #expect(catalog.audioTrack?.sampleRate == 48000)
         #expect(catalog.keyID == 3)
     }
+
+    @Test("a locale round-trips, and an older catalog without one is not malformed")
+    func localeIsOptional() throws {
+        let spoken = Catalog(locale: "en-US", tracks: [])
+        #expect(try Catalog.decode(spoken.encoded()).locale == "en-US")
+
+        let older = try Catalog.decode(Data(#"{"tracks":[],"version":1}"#.utf8))
+        #expect(older.locale == nil)
+        #expect(older.muted == [])
+        #expect(older.interrupted == [])
+    }
+
+    @Test("a description of a broadcast carries the locale it was given")
+    func describingCarriesLocale() {
+        let catalog = Catalog.describing(
+            BroadcastConfiguration(ladder: LayerLadder(rungs: [])),
+            locale: "es-MX"
+        )
+        #expect(catalog.locale == "es-MX")
+    }
 }
 
 @Suite("Catalog reader")
