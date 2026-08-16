@@ -432,6 +432,46 @@ final class RoomModel {
     /// How many bubbles are up.
     private(set) var bubblesUp = 0
 
+    /// The round being played, or the one whose result is still standing.
+    private(set) var round: BubbleField.Round?
+
+    /// The clock the space is stamped on, which is the one the deadline is on.
+    private var spaceNow: Timecode { trustedStamp?() ?? .fallback() }
+
+    /// How long is left, in seconds, or nil between rounds.
+    ///
+    /// Read against the deadline rather than counted down locally, because the
+    /// deadline is a fact in the shared state: a timer of our own would drift
+    /// away from the other phone's and the two would stop agreeing about who
+    /// ran out of time first.
+    var secondsLeftInRound: Int? {
+        guard let round else { return nil }
+        let left = round.ends &- spaceNow.nanoseconds
+        guard left > 0 else { return nil }
+        return Int((left + 999_999_999) / 1_000_000_000)
+    }
+
+    /// Seconds until the next round, while the last one's result is up.
+    var secondsUntilNextRound: Int? {
+        guard let round else { return nil }
+        let now = spaceNow.nanoseconds
+        guard now >= round.ends else { return nil }
+        return Int((max(0, round.opens &- now) + 999_999_999) / 1_000_000_000)
+    }
+
+    /// Who won the round that has just finished, if anybody did.
+    ///
+    /// Nil while a round is running, and nil for a draw — including the draw
+    /// where nobody scored at all, which is the ordinary result of a round
+    /// nobody was in the room for.
+    var winner: Score? {
+        guard secondsUntilNextRound != nil, let best = standings.first, best.score > 0 else {
+            return nil
+        }
+        guard standings.count == 1 || standings[1].score < best.score else { return nil }
+        return best
+    }
+
     struct Score: Identifiable, Hashable {
         var id: String { who }
         let who: String
@@ -1710,12 +1750,12 @@ final class RoomModel {
             #if os(iOS)
                 await startLiveActivity()
             #endif
-            // The field is why the scene exists. Going live on it and leaving the bubbles
-            // behind a second button meant the default broadcast was an empty orb until
-            // somebody found that control — the same two-tap tax the input default used to
-            // charge. A camera or a pattern still waits for the button: those views have
-            // nowhere to put the entities.
-            if videoInput == .scene { await startSharing() }
+            // Going live is joining the game. It used to be the scene's privilege, because
+            // the field lived inside the AR view and a camera tile had nowhere to put the
+            // entities. The field is drawn on an overlay above the whole room now, so any
+            // source can host it — and the pairing flow, which goes live for both phones
+            // the moment they meet, therefore starts the game for both of them.
+            if canShare { await startSharing() }
             await refresh()
         } catch {
             // Written here as well as shown, because the alert is only seen by whoever is
@@ -1772,6 +1812,7 @@ final class RoomModel {
                 )
                 space = joined
                 isSharing = true
+                round = BubbleField.round(in: await joined.state)
                 field.reset(to: await joined.state)
                 follow(joined, with: field)
                 presentBubbles()
@@ -1792,6 +1833,7 @@ final class RoomModel {
         isRunningTheField = false
         standings = []
         bubblesUp = 0
+        round = nil
         await room.leaveSpace()
         #if canImport(ARKit) && !targetEnvironment(simulator)
             bubbleField = nil
@@ -1836,6 +1878,7 @@ final class RoomModel {
                             Score(who: $0.who, score: $0.score)
                         }
                         bubblesUp = BubbleField.bubbles(in: state).count
+                        round = BubbleField.round(in: state)
                     case let .roleChanged(role):
                         isRunningTheField = role == .leading
                         Journal.shared.say("SPACE role=\(role)")

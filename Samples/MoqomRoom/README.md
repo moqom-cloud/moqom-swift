@@ -36,11 +36,15 @@ per-viewer mute is an unsubscribe that never reaches the relay, and moderation
 is refused when the grants do not allow it.
 
 **Input → Video** chooses among three sources, and all three are wired in
-`RoomModel.startBroadcast()`. On a phone the default is the **AR scene** with
-the shared bubble field already joined — Go live is the game. The test pattern
-needs no hardware and is what a simulator falls back to. **Camera** is a real
-`CameraSource`. The scene is `SceneCapture` behind a RealityKit view: the camera
-feed with the field in front of it.
+`RoomModel.startBroadcast()`. On a phone the default is the **AR scene**. The
+test pattern needs no hardware and is what a simulator falls back to. **Camera**
+is a real `CameraSource`. The scene is `SceneCapture` behind a RealityKit view:
+the camera feed with the field in front of it.
+
+Whichever is chosen, going live joins the bubble field — Go live is the game.
+That used to be the scene's privilege, because the field lived inside the AR
+view and a camera tile had nowhere to put the entities. It is drawn on an
+overlay above the whole room now, so any source can host it.
 
 The AR source carries two constraints the other two do not, both in
 `ARSceneSource.swift`. RealityKit only draws what is in a window, so the scene
@@ -443,9 +447,9 @@ was smooth because somebody's frames were thrown away.
 
 ## The shared bubble field
 
-Two phones in AR mode can share one world. Bubbles rise in front of both, and a
-tap on either pops it on both. It is a small game and a real test of the SDK's
-shared-space path: everything about it travels the same relay as the video.
+Two phones share one world. Bubbles rise in front of both, and a tap on either
+pops it on both. It is a small game and a real test of the SDK's shared-space
+path: everything about it travels the same relay as the video.
 
 Nothing pops on its own. A bubble that reaches the top of the field accelerates
 away and is dropped once it is well out of shot, so every pop in the game is one
@@ -453,9 +457,26 @@ somebody caused and a score is the whole story of the round. The field only
 counts the reachable ones against its capacity, so the ones on their way out do
 not leave the playable part empty behind them.
 
-**Turn it on.** Set the video source to **AR scene**, go live, and press
-**Bubbles**. A scoreboard appears at the top with everybody's count. There is no
-setup handshake to wait for — a device that finds the space unclaimed claims it.
+**Turn it on.** Nothing to turn on: pairing is the game. Two phones that enter
+the same code go live together and join the field together, side by side, with
+a scoreboard above them. There is no setup handshake to wait for either — a
+device that finds the space unclaimed claims it. **Bubbles** is still there to
+leave and rejoin with.
+
+**Rounds.** Ninety seconds, then the field closes, the last bubbles are taken
+down unpopped, and the result stands for eight seconds before the next round
+starts and the scores clear. The clock is a deadline in the shared state rather
+than a timer on each phone, so both run out of time at the same instant and a
+device that joins halfway through joins the round in progress.
+
+**Nothing sends a position.** A bubble's path is a function of its name — a
+hashed course, a closed-form climb — so both devices work out where it is
+instead of one telling the other twenty times a second. A tick carries a spawn,
+a pop, a score, or nothing at all. That started as a bandwidth argument and
+became a correctness one: motion that arrives at the tick rate is only as smooth
+as the network was, and on a phone that redraws when it feels like it, the whole
+field appeared to jump once a second. A path nobody has to receive cannot
+stutter.
 
 **Who simulates.** One participant runs the field and the rest render what
 arrives. The scoreboard says which you are, and the two are meant to be

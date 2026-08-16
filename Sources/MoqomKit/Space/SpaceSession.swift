@@ -528,7 +528,16 @@ public actor SpaceSession {
         state = next
 
         do {
-            if ticksThisGroup >= configuration.groupLength {
+            // Counted in ticks rather than in published objects, which is what
+            // ``Configuration/groupLength`` says and what a joiner is relying
+            // on. Counting objects made the recovery interval a function of how
+            // busy the simulation happened to be: a space whose state only
+            // changes when something happens — which is the point of putting
+            // derivable motion in the clients rather than on the wire — reached
+            // forty published deltas in a minute rather than in two seconds,
+            // and a phone joining it waited that long to see anything at all.
+            ticksThisGroup += 1
+            if ticksThisGroup > configuration.groupLength {
                 try await writeSnapshot(at: now)
             } else if !delta.isEmpty {
                 tick = tick.next
@@ -536,7 +545,6 @@ public actor SpaceSession {
                     SpaceUpdate(tick: tick, at: now, body: .delta(delta)),
                     on: writer
                 )
-                ticksThisGroup += 1
             }
         } catch {
             logger.warning(.control, "space tick not published", [

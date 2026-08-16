@@ -667,7 +667,65 @@ struct Scoreboard: View {
     let room: RoomModel
 
     var body: some View {
-        HStack(spacing: 12) {
+        // The timeline decides when to look, not what the answer is: both the
+        // deadline and the scores are facts in the shared state, so this ticks
+        // a display rather than running a clock of its own. Two phones counting
+        // their own way down would eventually disagree about who was still in
+        // time, and the whole point of the round is that they do not.
+        TimelineView(.periodic(from: .now, by: 1)) { _ in
+            // Two rows rather than one. Six things in a row ran out of width and
+            // SwiftUI spent it on the ones that could truncate, which were the
+            // clock and the bubble count — so the one number a player is
+            // actually watching was showing as an ellipsis.
+            VStack(spacing: 5) {
+                round
+                standings
+            }
+            // The scoreboard gets the width it asks for. Truncating it is never
+            // the right answer: every item in it is a short number whose whole
+            // purpose is to be read at a glance.
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
+        }
+    }
+
+    /// The clock while a round runs, and the result while the next one waits.
+    ///
+    /// Bigger than everything else here, because it is the only part of the
+    /// scoreboard that changes what a player does.
+    @ViewBuilder private var round: some View {
+        if let next = room.secondsUntilNextRound {
+            HStack(spacing: 6) {
+                if let winner = room.winner {
+                    Text("\(winner.who) wins")
+                        .foregroundStyle(.purple)
+                } else {
+                    Text(room.standings.isEmpty ? "Nobody scored" : "Draw")
+                }
+                Text("again in \(next)")
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+            .font(.callout.weight(.semibold))
+            .capsuled()
+        } else if let left = room.secondsLeftInRound {
+            HStack(spacing: 5) {
+                Image(systemName: "timer")
+                    .font(.footnote)
+                Text(String(format: "%d:%02d", left / 60, left % 60))
+                    .monospacedDigit()
+            }
+            .font(.callout.weight(.semibold))
+            // The last ten seconds are the ones worth hurrying for, and a
+            // countdown that looks the same throughout does not say so.
+            .foregroundStyle(left <= 10 ? AnyShapeStyle(.orange) : AnyShapeStyle(.primary))
+            .capsuled()
+        }
+    }
+
+    /// Who is winning, how many bubbles are up, and which end this device is.
+    private var standings: some View {
+        HStack(spacing: 10) {
             ForEach(room.standings) { standing in
                 HStack(spacing: 4) {
                     Text(standing.who)
@@ -684,20 +742,34 @@ struct Scoreboard: View {
                     .foregroundStyle(.secondary)
             }
 
-            Divider().frame(height: 12)
+            // An explicit rule rather than a `Divider`, which is flexible along
+            // the stack's axis and will take width from the numbers beside it.
+            Rectangle()
+                .fill(.quaternary)
+                .frame(width: 1, height: 11)
 
             Label("\(room.bubblesUp)", systemImage: "circle.hexagongrid")
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
 
-            Image(systemName: room.isRunningTheField ? "cpu.fill" : "antenna.radiowaves.left.and.right")
-                .font(.caption2)
-                .foregroundStyle(room.isRunningTheField ? .purple : .secondary)
-                .help(room.isRunningTheField ? "This device is running the field" : "Following")
+            Image(
+                systemName: room.isRunningTheField
+                    ? "cpu.fill" : "antenna.radiowaves.left.and.right"
+            )
+            .font(.caption2)
+            .foregroundStyle(room.isRunningTheField ? .purple : .secondary)
+            .help(room.isRunningTheField ? "This device is running the field" : "Following")
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 7)
-        .background(.regularMaterial, in: Capsule())
+        .capsuled()
+    }
+}
+
+private extension View {
+    /// The scoreboard's chrome: a little material pill.
+    func capsuled() -> some View {
+        padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(.regularMaterial, in: Capsule())
     }
 }
 

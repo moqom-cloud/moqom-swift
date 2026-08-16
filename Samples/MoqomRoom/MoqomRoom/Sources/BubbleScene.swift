@@ -304,7 +304,11 @@
         private func add(_ entity: SpaceEntity, at time: Timecode) {
             if entity.facts[BubbleField.leaving] != nil { leaving.insert(entity.id) }
             guard nodes[entity.id] == nil else { return }
-            let hue: Double = if case let .decimal(value) = entity.facts["hue"] { value } else { 0.5 }
+            let hue: Double = if case let .decimal(value) = entity.facts[BubbleField.hue] {
+                value
+            } else {
+                0.5
+            }
             let node = ModelEntity(
                 mesh: .generateSphere(radius: BubbleField.Field.radius),
                 materials: [
@@ -323,7 +327,15 @@
             // The identifier travels on the entity so that a hit test answers
             // in the space's own terms rather than in RealityKit's.
             node.name = entity.id.rawValue
-            node.transform = transform(for: entity.pose)
+            // Where it is now rather than where it was released, which are the
+            // same thing for a bubble this device watched appear and are not
+            // for one that was already up when we joined.
+            let age = BubbleField.age(of: entity, at: time)
+            var placed = entity.pose
+            placed.position = BubbleField.position(
+                spawnedAt: entity.pose.position, as: entity.id, after: age
+            )
+            node.transform = transform(for: placed)
             // Input only — no physics. A slightly fat sphere so a finger that
             // lands on the highlight still counts; the drawn mesh stays the
             // true radius.
@@ -337,33 +349,31 @@
             nodes[entity.id] = node
             appearing[entity.id] = .now
             node.components.set(OpacityComponent(opacity: 0))
-            climb(node, from: entity.pose, id: entity.id)
+            climb(node, entity, from: age)
         }
 
-        /// Send a bubble to the top under its own power, swaying as it goes.
+        /// Send a bubble on its way, swaying as it climbs.
         ///
-        /// The path is the same integration the authority uses — rise plus the
-        /// sine/cosine drift — baked into a RealityKit animation so the view
-        /// keeps drawing frames. A straight `move` was smooth and lifeless.
-        private func climb(_ node: ModelEntity, from pose: SpacePose, id: SpaceEntityID) {
-            let course = course(for: id)
-            let distance = max(0, BubbleField.Field.departure - pose.position.y)
-            let duration = TimeInterval(distance / course.speed)
-            guard duration > 0.05 else { return }
+        /// The path is ``BubbleField/position(spawnedAt:as:after:)`` — the same
+        /// one the authority uses to decide when this bubble is out of reach —
+        /// sampled into a RealityKit animation. An animation rather than a
+        /// transform written every frame because that is what gets the view
+        /// redrawing; writing transforms from a display link does not.
+        private func climb(_ node: ModelEntity, _ entity: SpaceEntity, from age: Float) {
+            let spawn = entity.pose.position
+            let remaining = BubbleField.lifetime(spawnedAt: spawn, as: entity.id) - age
+            guard remaining > 0.05 else { return }
 
-            let interval: Float = 1.0 / 30.0
-            let steps = max(2, Int(ceil(duration / TimeInterval(interval))))
-            var pose = pose
-            var phase = course.phase
+            let interval: Float = 1.0 / 30
+            let steps = max(2, Int(ceil(remaining / interval)))
             var frames: [Transform] = []
             frames.reserveCapacity(steps + 1)
             for step in 0 ... steps {
+                var pose = entity.pose
+                pose.position = BubbleField.position(
+                    spawnedAt: spawn, as: entity.id, after: age + Float(step) * interval
+                )
                 frames.append(transform(for: pose))
-                guard step < steps else { break }
-                pose.position.y += course.speed * interval
-                pose.position.x += sin(phase * 1.7) * course.sway * interval
-                pose.position.z += cos(phase * 1.1) * course.sway * interval
-                phase += interval
             }
 
             let animation = SampledAnimation(
@@ -375,19 +385,6 @@
             )
             guard let resource = try? AnimationResource.generate(with: animation) else { return }
             node.playAnimation(resource)
-        }
-
-        /// The same course on every phone, from the name.
-        private func course(for id: SpaceEntityID) -> (speed: Float, sway: Float, phase: Float) {
-            let sum = id.rawValue.unicodeScalars.reduce(UInt64(0)) { $0 &* 131 + UInt64($1.value) }
-            let a = Float(sum % 1000) / 1000
-            let b = Float((sum / 1000) % 1000) / 1000
-            let c = Float((sum / 1_000_000) % 1000) / 1000
-            return (
-                speed: BubbleField.Rules.default.rise * (0.75 + 0.5 * a),
-                sway: 0.4 + 0.8 * b,
-                phase: c * 6.28
-            )
         }
 
         private func remove(_ id: SpaceEntityID) {
