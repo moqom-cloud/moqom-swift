@@ -83,7 +83,10 @@ struct SceneEffectsMenu: View {
         Menu {
             Picker("Effect", selection: $effects.active) {
                 ForEach(SceneEffect.allCases) { effect in
-                    Label(effect.label, systemImage: effect.symbol).tag(effect)
+                    Label(effect.label, systemImage: effect.symbol)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                        .tag(effect)
                 }
             }
             .pickerStyle(.inline)

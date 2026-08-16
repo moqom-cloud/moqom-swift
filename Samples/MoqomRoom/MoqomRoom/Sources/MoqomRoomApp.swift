@@ -65,9 +65,6 @@ struct JoinScreen: View {
                 )
             }
 
-            // Where the media actually goes. Left blank the sample runs on the in-process
-            // loopback, which is the right default and measures nothing: two phones only
-            // become a broadcast when both are pointed at the same relay.
             Section {
                 TextField("Relay host", text: $model.relayHost)
                     #if os(iOS)
@@ -201,14 +198,11 @@ struct JoinScreen: View {
                 }
                 .disabled(!model.canJoin)
             } footer: {
-                // Which relay this build talks to, because "loopback" and "a relay on the
-                // desk" produce very different numbers and look identical on screen.
                 Text(
                     "Relay: \(model.relay.summary)."
                         + (model.measure
-                            ? " Publishes one 720p HEVC rung from the camera on an "
-                                + "NTP-disciplined clock, and reports what the far side's "
-                                + "frames cost to arrive."
+                            ? " Stamps both phones on a shared clock and reports how long "
+                                + "the far side's frames take to arrive."
                             : "")
                 )
             }

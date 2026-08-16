@@ -532,8 +532,9 @@
         self.field = field
         orb?.removeFromParent()
         orb = nil
-        if !view.scene.anchors.contains(where: { $0 === field.root }) {
-            view.scene.addAnchor(field.root)
+        field.lockToCamera()
+        if !view.scene.anchors.contains(where: { $0 === field.cameraAnchor }) {
+            view.scene.addAnchor(field.cameraAnchor)
         }
         installTapHandling()
     }
@@ -541,9 +542,31 @@
     @MainActor
     func hideField() {
         field?.clear()
-        field.map { view.scene.removeAnchor($0.root) }
+        field?.lockToWorld()
         field = nil
         buildScene()
+    }
+
+    /// Take the field out of this view without destroying it, so it can live on an overlay.
+    ///
+    /// Does not put the placeholder orb back. That orb is what a scene publishes
+    /// when nobody is playing; with the field on the overlay the camera should
+    /// just be a face.
+    @MainActor
+    func detachField() {
+        field?.lockToWorld()
+        field = nil
+        clearPlaceholder()
+    }
+
+    /// Remove the bouncing orb, leaving the camera feed alone.
+    @MainActor
+    func clearPlaceholder() {
+        orb?.removeFromParent()
+        orb = nil
+        if field == nil {
+            view.scene.anchors.removeAll()
+        }
     }
 
     @MainActor
@@ -573,7 +596,8 @@
             // The field survives a rebuild: it is the room's state, not the
             // scene's, and dropping it here would empty a space that is still
             // being played in on the other phone.
-            view.scene.addAnchor(field.root)
+            field.lockToCamera()
+            view.scene.addAnchor(field.cameraAnchor)
             let light = DirectionalLight()
             light.light.intensity = 2600
             light.look(at: [0, 0, -0.5], from: [0.4, 0.6, 0], relativeTo: field.root)

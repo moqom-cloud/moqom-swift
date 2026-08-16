@@ -546,6 +546,13 @@ import MoqomCore
         private var arrived: ContinuousClock.Instant?
         private var evidence = ArrivalEvidence()
 
+        /// Waiting for a keyframe after dropping a late backlog.
+        ///
+        /// Delta frames cannot be shown once their neighbours have been skipped:
+        /// they reference pictures the decoder no longer has. The next keyframe
+        /// is independently decodable and is what snaps the picture back.
+        private var skipUntilKey = false
+
         /// When the delay was last tightened, so tightening happens gradually.
         private var tightened = ContinuousClock.now
 
@@ -752,6 +759,10 @@ import MoqomCore
             /// Normal at the very start of a subscription and a bug if it continues.
             public var skippedUndescribed = 0
 
+            /// Frames dropped because they had already missed the playhead by enough
+            /// that showing them would be a catch-up stutter rather than a picture.
+            public var skippedLate = 0
+
             /// Times the display layer failed and was rebuilt.
             public var failures = 0
 
@@ -937,7 +948,7 @@ import MoqomCore
 
             /// The share of frames that reached the display layer.
             public var delivered: Double {
-                let total = enqueued + skippedNotReady + skippedUndescribed
+                let total = enqueued + skippedNotReady + skippedUndescribed + skippedLate
                 return total > 0 ? Double(enqueued) / Double(total) : 0
             }
         }
@@ -1864,6 +1875,30 @@ import MoqomCore
                 flush()
             }
 
+            // A burst of frames that have already missed the playhead is the
+            // choppy catch-up a person describes as late video. Playing them
+            // all, in order, on the main thread also hitchs the AR scene that
+            // shares it. Drop the backlog, skip until a keyframe, and start
+            // the schedule again from there.
+            if requestedDelay != nil, anchor != nil, source.isValid {
+                let playhead = synchroniser.currentTime()
+                if playhead.isValid {
+                    let lateBy = (playhead - source).seconds
+                    let interval = interval(after: source) ?? (1.0 / 30)
+                    let hopeless = lateBy > max(interval * 3, 0.08)
+                    if skipUntilKey || hopeless {
+                        if !frame.isKeyFrame {
+                            if !skipUntilKey { dropLateBacklog() }
+                            skipUntilKey = true
+                            drawing.skippedLate += 1
+                            return
+                        }
+                        dropLateBacklog()
+                        skipUntilKey = false
+                    }
+                }
+            }
+
             // Regridded only when something is scheduling presentation. With no schedule the
             // frames are shown on arrival whatever their timestamps say, and rewriting a timestamp
             // nothing reads would cost a copy per frame to no effect.
@@ -2063,6 +2098,22 @@ import MoqomCore
             slot = 0
             debt = 0
             previousStamp = .invalid
+            skipUntilKey = false
+        }
+
+        /// Throw away frames that have already missed, without blanking the last picture.
+        ///
+        /// The displayed image stays so a late burst is a still for a moment
+        /// rather than a black tile, then the next keyframe starts a new
+        /// schedule from now.
+        private func dropLateBacklog() {
+            layer.sampleBufferRenderer.flush(removingDisplayedImage: false, completionHandler: nil)
+            anchor = nil
+            newest = .invalid
+            newestSource = .invalid
+            grid = nil
+            slot = 0
+            debt = 0
         }
     }
 

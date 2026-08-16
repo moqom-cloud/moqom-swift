@@ -84,20 +84,6 @@ struct RoomScreen: View {
                     .padding(.horizontal)
             }
 
-            ForEach(room.invitationsForMe) { invitation in
-                HStack {
-                    Text("\(invitation.issuedBy.username.value) invited you up")
-                    Spacer()
-                    Button("Accept") {
-                        Task { await room.acceptInvitation(invitation.id) }
-                    }
-                    Button("Decline", role: .destructive) {
-                        Task { await room.declineInvitation(invitation.id) }
-                    }
-                }
-                .padding(.horizontal)
-            }
-
             if room.participants.isEmpty {
                 ContentUnavailableView(
                     "Nobody on stage",
@@ -168,11 +154,21 @@ struct RoomScreen: View {
                 }
             }
         }
-        .frame(maxHeight: .infinity)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .overlay {
+            #if canImport(ARKit) && !targetEnvironment(simulator)
+                if room.isSharing, room.bubblesFillScreen, let field = room.bubbleField {
+                    BubbleOverlayView(field: field)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .ignoresSafeArea(edges: .top)
+                }
+            #endif
+        }
         .overlay(alignment: .top) {
             if room.isSharing {
                 Scoreboard(room: room)
                     .padding(.top, 6)
+                    .allowsHitTesting(false)
             }
         }
         // On the video area rather than on the screen, because the system
@@ -188,7 +184,7 @@ struct RoomScreen: View {
                 Menu("Room", systemImage: "ellipsis.circle") {
                     Picker("Layout", selection: $room.mode) {
                         ForEach(RoomModel.Mode.allCases) { mode in
-                            Text(mode.rawValue).tag(mode)
+                            Text(mode.rawValue).fillsMenuRow().tag(mode)
                         }
                     }
 
@@ -197,7 +193,7 @@ struct RoomScreen: View {
                     // not sixteen streams of anything larger.
                     Picker("Tiles", selection: $room.boxes) {
                         ForEach([4, 9, 16], id: \.self) { count in
-                            Text("\(count)").tag(count)
+                            Text("\(count)").fillsMenuRow().tag(count)
                         }
                     }
 
@@ -211,13 +207,13 @@ struct RoomScreen: View {
                     // same face captured here and returned by the relay, at the same size.
                     Picker("Stage", selection: $room.screen) {
                         ForEach(RoomModel.Screen.allCases) { choice in
-                            Text(choice.rawValue).tag(choice)
+                            Text(choice.rawValue).fillsMenuRow().tag(choice)
                         }
                     }
 
                     Picker("Grid", selection: $room.arrangement) {
                         ForEach(RoomModel.Arrangement.allCases) { choice in
-                            Text(choice.rawValue).tag(choice)
+                            Text(choice.rawValue).fillsMenuRow().tag(choice)
                         }
                     }
 
@@ -226,13 +222,22 @@ struct RoomScreen: View {
                     // than a flip each viewer performs — which is what makes it a decision
                     // at all instead of a per-client preference nobody agrees on.
                     Toggle("Mirror my video", isOn: $room.publishesMirrored)
+                        .fillsMenuRow()
+
+                    if room.isSharing {
+                        Toggle("Bubbles fill screen", isOn: $room.bubblesFillScreen)
+                            .fillsMenuRow()
+                            .onChange(of: room.bubblesFillScreen) {
+                                room.presentBubbles()
+                            }
+                    }
 
                     // Who stays on screen once the app is not. A rule rather
                     // than a list, so it keeps following the room as people
                     // join, leave and take the stage.
                     Picker("In small window", selection: $room.cast) {
                         ForEach(CastChoice.allCases) { choice in
-                            Text(choice.rawValue).tag(choice)
+                            Text(choice.rawValue).fillsMenuRow().tag(choice)
                         }
                     }
 
@@ -243,20 +248,32 @@ struct RoomScreen: View {
                     // is anything to clear, and disabling it on what this launch knows about
                     // would grey out exactly the case somebody is reaching for.
                     #if os(iOS)
-                        Button("End Lock Screen card", systemImage: "rectangle.badge.xmark") {
+                        Button {
                             Task { await room.clearBroadcastCard() }
+                        } label: {
+                            Label("End Lock Screen card", systemImage: "rectangle.badge.xmark")
+                                .fillsMenuRow()
                         }
                     #endif
 
-                    Button("Record session", systemImage: "record.circle") {
+                    Button {
                         Task { await room.attachRecorder() }
+                    } label: {
+                        Label("Record session", systemImage: "record.circle")
+                            .fillsMenuRow()
                     }
-                    Button("Lock stage", systemImage: "lock") {
+                    Button {
                         Task { await room.moderate(.lockStage(true)) }
+                    } label: {
+                        Label("Lock stage", systemImage: "lock")
+                            .fillsMenuRow()
                     }
                     Divider()
-                    Button("Leave", systemImage: "rectangle.portrait.and.arrow.right", role: .destructive) {
+                    Button(role: .destructive) {
                         Task { await onLeave() }
+                    } label: {
+                        Label("Leave", systemImage: "rectangle.portrait.and.arrow.right")
+                            .fillsMenuRow()
                     }
                 }
             }
@@ -625,6 +642,16 @@ private extension View {
     func controlCapsule(iconOnly: Bool = true) -> some View {
         modifier(ControlCapsule(iconOnly: iconOnly))
     }
+
+    /// The whole menu row, not just the symbol.
+    ///
+    /// `Button("Title", systemImage:)` and a bare `Label` inside a `Menu` only
+    /// accept taps on the icon. Stretching the label and making the full frame
+    /// the hit target is what makes the text and the padding work as well.
+    func fillsMenuRow() -> some View {
+        frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+    }
 }
 
 /// Who is winning, how much is in the air, and which phone is doing the work.
@@ -683,6 +710,16 @@ struct BroadcastControls: View {
         )
     }
 
+    private var fillScreen: Binding<Bool> {
+        Binding(
+            get: { room.bubblesFillScreen },
+            set: { fill in
+                room.bubblesFillScreen = fill
+                room.presentBubbles()
+            }
+        )
+    }
+
     var body: some View {
         VStack(spacing: 8) {
             // Scrolled sideways rather than squeezed, and this is not only about the buttons.
@@ -706,15 +743,6 @@ struct BroadcastControls: View {
                     // The launched path is deliberately not routed through here. A
                     // benchmark that publishes a voice nobody asked for is measuring a
                     // different link; see ``AppModel``, where absent `--audio` is silence.
-                    TextField("Invite", text: $room.inviteName)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(maxWidth: 120)
-                    Button("Invite") {
-                        Task { await room.inviteGuest() }
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(room.inviteName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-
                     Button {
                         Task {
                             if room.isBroadcasting {
@@ -872,24 +900,32 @@ struct BroadcastControls: View {
                     // it cannot be joined would be a control that does nothing on
                     // every other source.
                     if room.canShare || room.isSharing {
-                        Button {
-                            Task {
-                                if room.isSharing {
-                                    await room.stopSharing()
-                                } else {
-                                    await room.startSharing()
+                        if room.isSharing {
+                            Menu {
+                                Toggle("Fill screen", isOn: fillScreen)
+                                    .fillsMenuRow()
+                                Button(role: .destructive) {
+                                    Task { await room.stopSharing() }
+                                } label: {
+                                    Label("Leave bubbles", systemImage: "circle.slash")
+                                        .fillsMenuRow()
                                 }
+                            } label: {
+                                Label("Bubbles", systemImage: "circle.hexagongrid.fill")
                             }
-                        } label: {
-                            Label(
-                                room.isSharing ? "Leave bubbles" : "Bubbles",
-                                systemImage: room.isSharing
-                                    ? "circle.slash" : "circle.hexagongrid.fill"
-                            )
+                            .menuStyle(.button)
+                            .buttonStyle(.bordered)
+                            .tint(.purple)
+                            .controlCapsule()
+                        } else {
+                            Button {
+                                Task { await room.startSharing() }
+                            } label: {
+                                Label("Bubbles", systemImage: "circle.hexagongrid.fill")
+                            }
+                            .buttonStyle(.bordered)
+                            .controlCapsule()
                         }
-                        .buttonStyle(.bordered)
-                        .tint(room.isSharing ? .purple : nil)
-                        .controlCapsule()
                     }
 
                     // Fixed while publishing. Swapping the source under a live
@@ -904,13 +940,13 @@ struct BroadcastControls: View {
                         // will not move.
                         Picker("Audio", selection: $room.audioInput) {
                             ForEach(RoomModel.AudioInput.allCases) { input in
-                                Text(input.rawValue).tag(input)
+                                Text(input.rawValue).fillsMenuRow().tag(input)
                             }
                         }
 
                         Picker("Video", selection: $room.videoInput) {
                             ForEach(room.videoInputs) { input in
-                                Text(input.rawValue).tag(input)
+                                Text(input.rawValue).fillsMenuRow().tag(input)
                             }
                         }
                         .disabled(room.isBroadcasting)
@@ -920,6 +956,7 @@ struct BroadcastControls: View {
                         // difference the canceller is worth, which is the only
                         // honest way to know it is doing anything.
                         Toggle("Bypass voice processing", isOn: $room.isBypassingVoiceProcessing)
+                            .fillsMenuRow()
                             .disabled(!room.isPublishingAudio || room.audioInput != .microphone)
                     } label: {
                         Label("Input", systemImage: "slider.horizontal.3")
@@ -936,13 +973,13 @@ struct BroadcastControls: View {
                     Menu {
                         Picker("Stage", selection: $room.screen) {
                             ForEach(RoomModel.Screen.allCases) { choice in
-                                Text(choice.rawValue).tag(choice)
+                                Text(choice.rawValue).fillsMenuRow().tag(choice)
                             }
                         }
 
                         Picker("Grid", selection: $room.arrangement) {
                             ForEach(RoomModel.Arrangement.allCases) { choice in
-                                Text(choice.rawValue).tag(choice)
+                                Text(choice.rawValue).fillsMenuRow().tag(choice)
                             }
                         }
 
@@ -953,12 +990,18 @@ struct BroadcastControls: View {
                         // freeze, no gap. Anything else is the seam showing.
                         Picker("My video shape", selection: shape) {
                             ForEach(RoomModel.Shape.allCases) { choice in
-                                Text(choice.rawValue).tag(choice)
+                                Text(choice.rawValue).fillsMenuRow().tag(choice)
                             }
                         }
                         .disabled(room.videoInput == .scene)
 
                         Toggle("Mirror my video", isOn: $room.publishesMirrored)
+                            .fillsMenuRow()
+
+                        if room.isSharing {
+                            Toggle("Bubbles fill screen", isOn: fillScreen)
+                                .fillsMenuRow()
+                        }
                     } label: {
                         Label("Layout", systemImage: "rectangle.3.group")
                     }

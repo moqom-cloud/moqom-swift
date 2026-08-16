@@ -402,12 +402,22 @@ final class RoomModel {
         /// window, so the source cannot produce a single frame until something puts its view
         /// on screen. See ``ARSceneView``.
         private(set) var arScene: ARSceneSource?
+
+        /// The field drawn over the room, when ``bubblesFillScreen`` is on.
+        private(set) var bubbleField: BubbleScene?
     #endif
 
     // MARK: - The shared space
 
     /// Whether this device has joined the room's bubble field.
     private(set) var isSharing = false
+
+    /// Draw the field over the room instead of inside the self tile.
+    ///
+    /// The default, because a tile is a talking-head box and the game wants the
+    /// phone. Off puts the entities back in the AR scene, which is also what
+    /// gets encoded, so the other person sees them in the picture.
+    var bubblesFillScreen = true
 
     /// Whether this device is the one simulating it.
     ///
@@ -433,12 +443,11 @@ final class RoomModel {
 
     /// Whether the shared space can be joined at all right now.
     ///
-    /// It needs somewhere to draw, and the AR scene is that: the bubbles are
-    /// RealityKit entities in the session's own view. Offering it beside a test
-    /// pattern would be a switch that turns nothing on.
+    /// The overlay can host the field on its own, so a camera broadcast can
+    /// still play. The simulator has neither an AR view nor that overlay.
     var canShare: Bool {
         #if canImport(ARKit) && !targetEnvironment(simulator)
-            return arScene != nil
+            return true
         #else
             return false
         #endif
@@ -1615,6 +1624,10 @@ final class RoomModel {
 
                     let scene = ARSceneSource(format: format)
                     try scene.start()
+                    // The orb is a stand-in for a still scene. Bubble mode draws
+                    // the field on the overlay, so the published picture should
+                    // be the face, not that placeholder bouncing in the middle.
+                    if bubblesFillScreen { scene.clearPlaceholder() }
                     arScene = scene
                     source = scene
 
@@ -1731,7 +1744,9 @@ final class RoomModel {
     /// the two happened; nothing here chooses it.
     func startSharing() async {
         #if canImport(ARKit) && !targetEnvironment(simulator)
-            guard !isSharing, let scene = arScene else { return }
+            guard !isSharing else { return }
+            if arScene == nil { bubblesFillScreen = true }
+            if bubblesFillScreen { arScene?.clearPlaceholder() }
 
             let field = BubbleScene()
             field.onPop = { [weak self] id in
@@ -1743,8 +1758,7 @@ final class RoomModel {
             field.cadence = 1 / configuration.tickRate
             let stamp = trustedStamp
             field.clock = { stamp?() ?? .fallback() }
-            scene.show(field)
-            field.startPresenting(in: scene.view)
+            bubbleField = field
 
             do {
                 let joined = try await room.joinSpace(
@@ -1760,10 +1774,12 @@ final class RoomModel {
                 isSharing = true
                 field.reset(to: await joined.state)
                 follow(joined, with: field)
+                presentBubbles()
                 Journal.shared.say("SPACE joined room=\(room.room.value)")
             } catch {
                 lastError = error as? MoqomError
-                scene.hideField()
+                bubbleField = nil
+                arScene?.hideField()
             }
         #endif
     }
@@ -1778,7 +1794,31 @@ final class RoomModel {
         bubblesUp = 0
         await room.leaveSpace()
         #if canImport(ARKit) && !targetEnvironment(simulator)
+            bubbleField = nil
             arScene?.hideField()
+        #endif
+    }
+
+    /// Put the field in the overlay or back in the self tile.
+    func presentBubbles() {
+        #if canImport(ARKit) && !targetEnvironment(simulator)
+            guard let field = bubbleField else { return }
+            field.placement = bubblesFillScreen
+                ? BubbleScene.screenPlacement
+                : BubbleScene.tilePlacement
+            if bubblesFillScreen {
+                // World space, not the face-tracking camera. A camera anchor
+                // added to the overlay still bound itself to the AR session
+                // and drew inside the self tile.
+                field.lockToWorld()
+                arScene?.detachField()
+            } else if let scene = arScene {
+                scene.show(field)
+                field.startPresenting(in: scene.view.scene)
+            } else {
+                bubblesFillScreen = true
+                arScene?.clearPlaceholder()
+            }
         #endif
     }
 

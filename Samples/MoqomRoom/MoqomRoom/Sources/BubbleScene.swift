@@ -1,15 +1,12 @@
 // Drawing somebody else's simulation, and turning a finger into an intent.
 //
-// This is the whole of the client half of the shared space: a node per bubble,
-// moved when an update says so, removed when one says that. It runs identically
-// whether this device is the authority or not, which is the property worth
-// protecting — a renderer that knew would grow a fast path for the local player
-// and a slow one for the remote, and only the second would ever be tested on
-// the phone doing the demo.
-//
-// Poses are sampled against the same clock the ticks were stamped on, so a
-// follower is not a round-trip behind the authority. Without that, two phones
-// looking at the same field would not look like they were.
+// The wire is the scorekeeper, not the animator. A spawn is a bubble that
+// appears and starts climbing. A pop is a bubble that bursts. Pose ticks in
+// between used to be written onto the nodes, and on a phone that only
+// redraws when SwiftUI refreshes that looked like the whole field jumping
+// once a second. The climb is a RealityKit move from where the bubble was
+// first seen to the top of the field, linear, and it is not touched again
+// until someone pops it.
 //
 // # Where the shared space lands
 //
@@ -34,7 +31,6 @@
 // field the other player can see.
 
 #if canImport(ARKit) && !targetEnvironment(simulator)
-    import Combine
     import Foundation
     import MoqomCore
     import MoqomKit
@@ -56,18 +52,60 @@
         /// it: half a metre out, dropped below the eye line so bubbles rise
         /// through the shot rather than starting in the middle of somebody's
         /// face.
-        static let placement = SpaceAnchor(
+        static let tilePlacement = SpaceAnchor(
             origin: SpaceVector(x: 0, y: -0.30, z: -0.55),
             rotation: .identity,
             scale: 0.5
         )
 
+        /// Framed for the overlay camera: floor at the bottom of the view,
+        /// ceiling at the top. The previous origin sat the floor near the
+        /// middle of the phone, which is what "they stop too high" was.
+        static let screenPlacement = SpaceAnchor(
+            origin: SpaceVector(x: 0, y: -0.70, z: 0),
+            rotation: .identity,
+            scale: 1.0
+        )
+
+        /// The virtual camera the overlay uses, so taps can be projected
+        /// without asking RealityKit for a hit test it will not give us.
+        enum OverlayCamera {
+            static let distance: Float = 1.35
+            static let fieldOfView: Float = 50
+        }
+
+        var placement = tilePlacement
+
         /// How long a guessed pop has to be confirmed before it is taken back.
         private static let grace = Duration.seconds(1)
 
-        /// The anchor everything hangs from. Added to the scene by
-        /// ``ARSceneSource``, which owns the view.
-        let root = AnchorEntity(.camera)
+        /// The bubbles themselves. A plain entity so the overlay can parent it
+        /// in world space. ``AnchorEntity/camera`` follows the face-tracking
+        /// camera, and adding that to a RealityView still bound it to the AR
+        /// session — which drew the field inside the self tile and clipped it
+        /// to that rounded rect.
+        let root = Entity()
+
+        /// Used only when the field lives in the AR tile.
+        let cameraAnchor = AnchorEntity(.camera)
+
+        /// Hang the field off the face-tracking camera.
+        func lockToCamera() {
+            if root.parent !== cameraAnchor {
+                root.removeFromParent()
+                cameraAnchor.addChild(root)
+            }
+        }
+
+        /// Hang the field in world space, for the full-screen overlay.
+        func lockToWorld() {
+            root.removeFromParent()
+            cameraAnchor.removeFromParent()
+            // Hierarchical: a collision on any bubble is then a tap target,
+            // including ones that spawned before we started setting the
+            // component on each node.
+            root.components.set(InputTargetComponent())
+        }
 
         /// What this device wants the space to do. Set by the model.
         var onPop: (@MainActor (SpaceEntityID) -> Void)?
@@ -76,6 +114,9 @@
 
         /// Bubbles removed on this device before anybody agreed.
         private var guessed: [SpaceEntityID: ContinuousClock.Instant] = [:]
+
+        /// Two gestures fire for one finger. The second must not take a neighbour.
+        private var lastPopAt: ContinuousClock.Instant?
 
         /// Bubbles the field has said are climbing away.
         ///
@@ -92,20 +133,57 @@
         /// The clock the ticks were stamped on. Same closure the space uses.
         var clock: @Sendable () -> Timecode = { .fallback() }
 
-        private var motions: [SpaceEntityID: Motion] = [:]
-        private var presenting: (any Cancellable)?
+        private var appearing: [SpaceEntityID: ContinuousClock.Instant] = [:]
+        private var pulse: FramePulse?
+        private var link: CADisplayLink?
+
+        /// How long a new bubble takes to arrive, in seconds.
+        private static let fadeIn: Double = 0.32
 
         init() {}
 
-        /// Drive poses from the shared clock, once the field is in a scene.
-        func startPresenting(in view: ARView) {
-            presenting = view.scene.subscribe(to: SceneEvents.Update.self) { [weak self] _ in
-                MainActor.assumeIsolated { self?.present() }
+        /// Drive poses from the panel, not from RealityKit's scene tick.
+        ///
+        /// The overlay used to subscribe to `SceneEvents.Update`. That fires
+        /// when RealityView decides to draw, and SwiftUI re-subscribes it
+        /// every time the room model publishes — scores, cadence, statistics
+        /// four times a second. The bubbles then jumped to each new tick
+        /// instead of interpolating between them. A display link is the same
+        /// clock the glass is on, and it does not care what SwiftUI is doing.
+        func startPresenting(in _: Scene? = nil) {
+            guard link == nil else { return }
+            let pulse = FramePulse(scene: self)
+            let link = CADisplayLink(target: pulse, selector: #selector(FramePulse.fire))
+            let hertz = Float(UIScreen.main.maximumFramesPerSecond)
+            if hertz > 0 {
+                link.preferredFrameRateRange = CAFrameRateRange(
+                    minimum: min(60, hertz),
+                    maximum: hertz,
+                    preferred: hertz
+                )
             }
+            link.add(to: .main, forMode: .common)
+            self.pulse = pulse
+            self.link = link
         }
 
         func stopPresenting() {
-            presenting = nil
+            link?.invalidate()
+            link = nil
+            pulse = nil
+        }
+
+        /// The display link's target. `CADisplayLink` retains it, so this
+        /// must not retain the scene. `@unchecked Sendable` because the
+        /// callback is scheduled on the main run loop, which is the scene's
+        /// actor — the compiler cannot see that.
+        private final class FramePulse: NSObject, @unchecked Sendable {
+            weak var scene: BubbleScene?
+            init(scene: BubbleScene) { self.scene = scene }
+            @objc func fire(_ link: CADisplayLink) {
+                let scene = scene
+                MainActor.assumeIsolated { scene?.present() }
+            }
         }
 
         /// Take the state as it now is, and what just changed about it.
@@ -124,9 +202,8 @@
                 leaving.remove(id)
                 guessed.removeValue(forKey: id)
             }
-            for (id, pose) in delta.moved {
-                motions[id]?.push(pose, at: time)
-            }
+            // Pose ticks are ignored. Applying them is what made the field
+            // hitch: each arrival snapped every bubble to a new height.
 
             reconcile(with: state, at: time)
         }
@@ -139,7 +216,7 @@
             let stamped = time ?? clock()
             for node in nodes.values { node.removeFromParent() }
             nodes.removeAll()
-            motions.removeAll()
+            appearing.removeAll()
             guessed.removeAll()
             leaving.removeAll()
             for entity in BubbleField.bubbles(in: state) { add(entity, at: stamped) }
@@ -149,7 +226,7 @@
             stopPresenting()
             for node in nodes.values { node.removeFromParent() }
             nodes.removeAll()
-            motions.removeAll()
+            appearing.removeAll()
             guessed.removeAll()
             leaving.removeAll()
         }
@@ -161,18 +238,61 @@
         @discardableResult
         func pop(at point: CGPoint, in view: ARView) -> Bool {
             guard let hit = view.entity(at: point) else { return false }
+            return pop(hitting: hit)
+        }
 
+        /// A tap in the overlay, projected through the same camera that drew it.
+        ///
+        /// RealityView's `SpatialTapGesture.targetedToAnyEntity()` does not see
+        /// these spheres — that path wants an `InputTargetComponent` and still
+        /// misses more often than it hits. The AR view used `entity(at:)`, which
+        /// this view does not have. Projecting the nodes we already have is the
+        /// same test a finger is making.
+        @discardableResult
+        func pop(at point: CGPoint, in size: CGSize) -> Bool {
+            let depthToPlane = OverlayCamera.distance
+            let halfHeight = tan(OverlayCamera.fieldOfView * .pi / 360)
+            let aspect = Float(size.width / max(size.height, 1))
+            let halfWidth = halfHeight * aspect
+            let finger = max(44 as CGFloat, 1)
+
+            var best: (SpaceEntityID, CGFloat)?
+            for (id, node) in nodes {
+                let world = node.position(relativeTo: nil)
+                let depth = depthToPlane - world.z
+                guard depth > 0.05 else { continue }
+                let screen = CGPoint(
+                    x: CGFloat(world.x / (depth * halfWidth) * 0.5 + 0.5) * size.width,
+                    y: CGFloat(-world.y / (depth * halfHeight) * 0.5 + 0.5) * size.height
+                )
+                let radius = CGFloat(
+                    BubbleField.Field.radius * placement.scale / depth
+                        * Float(size.height) / (2 * halfHeight)
+                )
+                let dx = point.x - screen.x
+                let dy = point.y - screen.y
+                let distance = (dx * dx + dy * dy).squareRoot()
+                guard distance <= max(radius * 1.8, finger) else { continue }
+                if best == nil || distance < best!.1 {
+                    best = (id, distance)
+                }
+            }
+            guard let id = best?.0 else { return false }
+            return commitPop(id)
+        }
+
+        /// Whatever bubble owns this entity, popped.
+        @discardableResult
+        func pop(hitting entity: Entity) -> Bool {
             // Up through the hierarchy, because a hit reports the entity that
             // owns the collision shape and a model with children reports the
             // child. One bubble is one entity today; walking anyway costs a
             // pointer chase and survives the day it is not.
-            var candidate: Entity? = hit
+            var candidate: Entity? = entity
             while let current = candidate {
                 let id = SpaceEntityID(current.name)
                 if nodes[id] != nil {
-                    burst(id)
-                    onPop?(id)
-                    return true
+                    return commitPop(id)
                 }
                 candidate = current.parent
             }
@@ -204,14 +324,74 @@
             // in the space's own terms rather than in RealityKit's.
             node.name = entity.id.rawValue
             node.transform = transform(for: entity.pose)
-            node.generateCollisionShapes(recursive: false)
+            // Input only — no physics. A slightly fat sphere so a finger that
+            // lands on the highlight still counts; the drawn mesh stays the
+            // true radius.
+            var collision = CollisionComponent(
+                shapes: [.generateSphere(radius: BubbleField.Field.radius * 1.8)]
+            )
+            collision.filter = CollisionFilter(group: [], mask: [])
+            node.components.set(collision)
+            node.components.set(InputTargetComponent())
             root.addChild(node)
             nodes[entity.id] = node
-            motions[entity.id] = Motion(pose: entity.pose, at: time)
+            appearing[entity.id] = .now
+            node.components.set(OpacityComponent(opacity: 0))
+            climb(node, from: entity.pose, id: entity.id)
+        }
+
+        /// Send a bubble to the top under its own power, swaying as it goes.
+        ///
+        /// The path is the same integration the authority uses — rise plus the
+        /// sine/cosine drift — baked into a RealityKit animation so the view
+        /// keeps drawing frames. A straight `move` was smooth and lifeless.
+        private func climb(_ node: ModelEntity, from pose: SpacePose, id: SpaceEntityID) {
+            let course = course(for: id)
+            let distance = max(0, BubbleField.Field.departure - pose.position.y)
+            let duration = TimeInterval(distance / course.speed)
+            guard duration > 0.05 else { return }
+
+            let interval: Float = 1.0 / 30.0
+            let steps = max(2, Int(ceil(duration / TimeInterval(interval))))
+            var pose = pose
+            var phase = course.phase
+            var frames: [Transform] = []
+            frames.reserveCapacity(steps + 1)
+            for step in 0 ... steps {
+                frames.append(transform(for: pose))
+                guard step < steps else { break }
+                pose.position.y += course.speed * interval
+                pose.position.x += sin(phase * 1.7) * course.sway * interval
+                pose.position.z += cos(phase * 1.1) * course.sway * interval
+                phase += interval
+            }
+
+            let animation = SampledAnimation(
+                frames: frames,
+                name: "climb",
+                tweenMode: .linear,
+                frameInterval: interval,
+                bindTarget: .transform
+            )
+            guard let resource = try? AnimationResource.generate(with: animation) else { return }
+            node.playAnimation(resource)
+        }
+
+        /// The same course on every phone, from the name.
+        private func course(for id: SpaceEntityID) -> (speed: Float, sway: Float, phase: Float) {
+            let sum = id.rawValue.unicodeScalars.reduce(UInt64(0)) { $0 &* 131 + UInt64($1.value) }
+            let a = Float(sum % 1000) / 1000
+            let b = Float((sum / 1000) % 1000) / 1000
+            let c = Float((sum / 1_000_000) % 1000) / 1000
+            return (
+                speed: BubbleField.Rules.default.rise * (0.75 + 0.5 * a),
+                sway: 0.4 + 0.8 * b,
+                phase: c * 6.28
+            )
         }
 
         private func remove(_ id: SpaceEntityID) {
-            motions.removeValue(forKey: id)
+            appearing.removeValue(forKey: id)
             guard let node = nodes.removeValue(forKey: id) else { return }
             if leaving.remove(id) != nil {
                 // It got away. Nothing to celebrate and nothing to draw: by the
@@ -239,9 +419,19 @@
         /// three times the size reads as a bigger bubble arriving rather than
         /// as the one that was there coming apart.
         private func vanish(_ node: ModelEntity) {
+            // The climb is an animation. `node.transform` is still the spawn
+            // pose, so a pop that used it burst on the floor. Bake where it
+            // actually is, then swell from there.
+            let parent = node.parent
+            node.transform = Transform(
+                scale: node.scale(relativeTo: parent),
+                rotation: node.orientation(relativeTo: parent),
+                translation: node.position(relativeTo: parent)
+            )
+            node.stopAllAnimations()
             var swollen = node.transform
             swollen.scale *= 3.2
-            node.move(to: swollen, relativeTo: node.parent, duration: 0.18)
+            node.move(to: swollen, relativeTo: parent, duration: 0.18)
             thin(node)
             Task { @MainActor in
                 try? await Task.sleep(for: .milliseconds(190))
@@ -266,9 +456,19 @@
             node.model = model
         }
 
+        /// One finger, one bubble — even when both tap gestures fire.
+        private func commitPop(_ id: SpaceEntityID) -> Bool {
+            let now = ContinuousClock.now
+            if let last = lastPopAt, now - last < .milliseconds(80) { return false }
+            lastPopAt = now
+            burst(id)
+            onPop?(id)
+            return true
+        }
+
         /// Take a bubble away now and remember that nobody agreed yet.
         private func burst(_ id: SpaceEntityID) {
-            motions.removeValue(forKey: id)
+            appearing.removeValue(forKey: id)
             guard let node = nodes.removeValue(forKey: id) else { return }
             guessed[id] = ContinuousClock.now
             vanish(node)
@@ -295,17 +495,21 @@
             }
         }
 
-        /// Put every bubble where the shared clock says it is, this frame.
+        /// Fade new bubbles in. Positions are left to the climb animation.
         private func present() {
-            let now = clock()
             for (id, node) in nodes {
-                guard let motion = motions[id] else { continue }
-                node.transform = transform(for: motion.pose(at: now, cadence: cadence))
+                guard let born = appearing[id] else { continue }
+                let elapsed = Double((ContinuousClock.now - born).wholeNanoseconds)
+                    / 1_000_000_000
+                let fade = Float(min(1, elapsed / Self.fadeIn))
+                let eased = 1 - (1 - fade) * (1 - fade)
+                node.components.set(OpacityComponent(opacity: eased))
+                if fade >= 1 { appearing.removeValue(forKey: id) }
             }
         }
 
         private func transform(for pose: SpacePose) -> Transform {
-            let placed = Self.placement.world(from: pose)
+            let placed = placement.world(from: pose)
             return Transform(
                 scale: SIMD3(repeating: placed.scale),
                 rotation: simd_quatf(
@@ -318,39 +522,5 @@
             )
         }
 
-        /// The last two poses a bubble was given, and when.
-        ///
-        /// Two, because one pose is a point and two are a path. The display
-        /// loop samples the path against the shared clock so a follower is not
-        /// a round-trip behind the authority.
-        private struct Motion {
-            var previous: (pose: SpacePose, at: Timecode)?
-            var current: (pose: SpacePose, at: Timecode)
-            var arrived = ContinuousClock.now
-
-            init(pose: SpacePose, at: Timecode) {
-                current = (pose, at)
-            }
-
-            mutating func push(_ pose: SpacePose, at: Timecode) {
-                previous = current
-                current = (pose, at)
-                arrived = .now
-            }
-
-            func pose(at now: Timecode, cadence: TimeInterval) -> SpacePose {
-                let startPose = previous?.pose ?? current.pose
-                let startAt = previous?.at ?? current.at
-                if let amount = SpaceTimeline.progress(from: startAt, to: current.at, at: now) {
-                    return .interpolated(from: startPose, to: current.pose, amount: amount)
-                }
-                // Fallback clocks cannot be placed against each other. Travel
-                // toward the last pose over one cadence from arrival, then hold.
-                let elapsed = Double((ContinuousClock.now - arrived).wholeNanoseconds)
-                    / 1_000_000_000
-                let amount = Float(min(1, max(0, elapsed / max(cadence, 0.001))))
-                return .interpolated(from: startPose, to: current.pose, amount: amount)
-            }
-        }
     }
 #endif
