@@ -97,7 +97,11 @@ struct RoomScreen: View {
                 SelfView(room: room, height: nil)
                     .padding(.horizontal, 8)
             } else {
-                switch room.screen {
+                // The field is a game two people play together. A full-screen
+                // self view with the other face in a corner is the wrong
+                // picture for that; both tiles stay the same size for as long
+                // as the bubbles are up, and the stage picker is left alone.
+                switch room.isSharing ? .sideBySide : room.screen {
                 case .others:
                     gallery
                         .padding(.horizontal, 8)
