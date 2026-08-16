@@ -124,14 +124,10 @@
         /// for — and if it is not tapped, it leaves without a pop.
         private var leaving: Set<SpaceEntityID> = []
 
-        /// How long an update is expected to be the newest one, used only when
-        /// the clocks cannot be compared. With a shared clock the display loop
-        /// samples ``SpaceTimeline`` instead, so both phones draw the same
-        /// instant rather than the follower sitting a round-trip behind.
-        var cadence: TimeInterval = 1.0 / 20
-
-        /// The clock the ticks were stamped on. Same closure the space uses.
-        var clock: @Sendable () -> Timecode = { .fallback() }
+        // No tick rate and no clock of its own. Both were here to interpolate
+        // poses off the wire, and there are none: a bubble's path is derived,
+        // and the only instant this renderer needs is the one stamped on the
+        // update that told it the bubble exists.
 
         private var appearing: [SpaceEntityID: ContinuousClock.Instant] = [:]
         private var pulse: FramePulse?
@@ -208,18 +204,27 @@
             reconcile(with: state, at: time)
         }
 
-        /// Draw a state nothing has been drawn from yet.
+        /// Forget every bubble, because the world is about to be restated.
         ///
-        /// The joining case, and the case after a handover. A delta cannot
-        /// express it — there is nothing to be a delta from.
-        func reset(to state: SpaceSnapshot, at time: Timecode? = nil) {
-            let stamped = time ?? clock()
+        /// The joining case, and the case after a handover. Nothing is drawn
+        /// here, and that is the point. This used to take the new state and draw
+        /// it, which meant guessing every bubble's age from *this* device's wall
+        /// clock — and then throwing away the right answer, because the update
+        /// that follows a moment later carries the authority's own timestamp but
+        /// ``add(_:at:)`` leaves an existing node alone. The guess won every
+        /// time. On the phone whose clock ran ahead, every bubble that was up at
+        /// that moment was computed as older than it was, placed above the top
+        /// of the field, and never seen again.
+        ///
+        /// So the restatement is left to ``reconcile(with:at:)``, which runs on
+        /// the next update and has the only clock a bubble's age may be measured
+        /// against: the one the simulation stamped it with.
+        func forget() {
             for node in nodes.values { node.removeFromParent() }
             nodes.removeAll()
             appearing.removeAll()
             guessed.removeAll()
             leaving.removeAll()
-            for entity in BubbleField.bubbles(in: state) { add(entity, at: stamped) }
         }
 
         func clear() {
@@ -330,7 +335,24 @@
             // Where it is now rather than where it was released, which are the
             // same thing for a bubble this device watched appear and are not
             // for one that was already up when we joined.
-            let age = BubbleField.age(of: entity, at: time)
+            //
+            // `time` is the timestamp on the tick, which is the authority's —
+            // the same clock that stamped `born` — so this is exact for any
+            // bubble simulated by whoever is simulating now, however far the two
+            // devices' wall clocks are apart. It is not exact across a handover:
+            // the outgoing authority stamped `born`, the incoming one stamps the
+            // ticks, and a bubble that outlives the changeover is aged against a
+            // clock that did not release it.
+            //
+            // Hence the ceiling. Too low is a bubble drawn lower than it should
+            // be, which climbs out of the error within a second. Too high is a
+            // bubble outside the shot, and that one never recovers, because
+            // nothing revisits a node that already exists. The asymmetry is the
+            // whole reason this clamps rather than trusting the arithmetic.
+            let age = min(
+                BubbleField.age(of: entity, at: time),
+                BubbleField.climbTime(spawnedAt: entity.pose.position, as: entity.id)
+            )
             var placed = entity.pose
             placed.position = BubbleField.position(
                 spawnedAt: entity.pose.position, as: entity.id, after: age

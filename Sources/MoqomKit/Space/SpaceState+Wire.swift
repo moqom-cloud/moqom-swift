@@ -73,6 +73,7 @@ private enum DeltaTag {
     static let claimed: UInt32 = 5
     static let facts: UInt32 = 6
     static let entityFacts: UInt32 = 7
+    static let forgotten: UInt32 = 8
 }
 
 private enum SnapshotTag {
@@ -445,6 +446,12 @@ public struct SpaceEncoder: Sendable {
         }
 
         writer.facts(DeltaTag.facts, delta.facts)
+
+        // Keys rather than a key and an empty value, because "no longer present"
+        // is not one of the four things a ``SpaceValue`` can be.
+        for key in delta.forgotten.sorted() {
+            writer.string(DeltaTag.forgotten, key)
+        }
 
         for (id, facts) in try delta.entityFacts
             .map({ (handle: try resolve($0.key), facts: $0.value) })
@@ -830,6 +837,8 @@ public struct SpaceDecoder: Sendable {
             case DeltaTag.facts:
                 let fact = try reader.fact()
                 delta.facts[fact.key] = fact.value
+            case DeltaTag.forgotten:
+                delta.forgotten.append(try reader.string())
             case DeltaTag.entityFacts:
                 let entry = try decodeEntityFacts(try reader.bytes())
                 delta.entityFacts[entry.id] = entry.facts

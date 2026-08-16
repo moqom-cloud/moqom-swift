@@ -172,7 +172,12 @@ struct RoomScreen: View {
             if room.isSharing {
                 Scoreboard(room: room)
                     .padding(.top, 6)
-                    .allowsHitTesting(false)
+                    // Untouchable while a round is running, so that a tap aimed
+                    // at a bubble behind it is not swallowed by a score. The one
+                    // thing here that wants a finger is Rematch, and by the time
+                    // that appears the field is empty and there is nothing
+                    // behind the scoreboard to miss.
+                    .allowsHitTesting(room.roundIsOver)
             }
         }
         // On the video area rather than on the screen, because the system
@@ -686,27 +691,40 @@ struct Scoreboard: View {
             // purpose is to be read at a glance.
             .lineLimit(1)
             .fixedSize(horizontal: true, vertical: false)
+            .animation(.spring(duration: 0.25), value: room.roundIsOver)
         }
     }
 
-    /// The clock while a round runs, and the result while the next one waits.
+    /// The clock while a round runs, and the result and the way back in when it
+    /// has finished.
     ///
-    /// Bigger than everything else here, because it is the only part of the
-    /// scoreboard that changes what a player does.
+    /// Bigger than the rest of the scoreboard, because it is the only part that
+    /// changes what a player does.
     @ViewBuilder private var round: some View {
-        if let next = room.secondsUntilNextRound {
-            HStack(spacing: 6) {
+        if room.roundIsOver {
+            HStack(spacing: 8) {
                 if let winner = room.winner {
                     Text("\(winner.who) wins")
                         .foregroundStyle(.purple)
                 } else {
-                    Text(room.standings.isEmpty ? "Nobody scored" : "Draw")
+                    Text(room.standings.isEmpty ? "No score" : "Draw")
                 }
-                Text("again in \(next)")
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
+
+                Button {
+                    Task { await room.rematch() }
+                } label: {
+                    Text("Rematch")
+                        .font(.caption.weight(.semibold))
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.purple)
+                .controlSize(.small)
+                // Either phone may ask, and the first to ask starts it. Worth
+                // saying, because a button in one player's scoreboard looks
+                // like it only speaks for that player.
+                .accessibilityHint("Starts another round on both phones")
             }
-            .font(.callout.weight(.semibold))
+            .font(.subheadline.weight(.semibold))
             .capsuled()
         } else if let left = room.secondsLeftInRound {
             HStack(spacing: 5) {
@@ -736,7 +754,11 @@ struct Scoreboard: View {
                 }
             }
 
-            if room.standings.isEmpty {
+            // Only while there is something to tap. The pill above already says
+            // how a round with no score ended, and telling somebody to tap an
+            // empty field underneath it would be instructions for a game that
+            // is not running.
+            if room.standings.isEmpty, !room.roundIsOver {
                 Text("Tap the bubbles")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -772,6 +794,7 @@ private extension View {
             .background(.regularMaterial, in: Capsule())
     }
 }
+
 
 struct BroadcastControls: View {
     @Bindable var room: RoomModel

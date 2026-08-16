@@ -433,7 +433,45 @@ final class RoomModel {
     private(set) var bubblesUp = 0
 
     /// The round being played, or the one whose result is still standing.
-    private(set) var round: BubbleField.Round?
+    private(set) var round: BubbleField.Round? {
+        didSet {
+            guard round != oldValue else { return }
+            watchTheClock()
+        }
+    }
+
+    /// Whether the field has closed and is waiting to be asked for another.
+    private(set) var roundIsOver = false
+
+    private var whistle: Task<Void, Never>?
+
+    /// Wait for the deadline, so that the round ending is a change views see.
+    ///
+    /// A round ends because time passed, and nothing publishes that: the last
+    /// tick before the whistle looks like every other tick, and once the field
+    /// has emptied there are no ticks at all. Deriving it in the view instead
+    /// would mean the view had to keep asking — and a view that only re-reads
+    /// the clock when some *other* piece of state happens to change would put
+    /// the result on screen late, or in an empty round, never.
+    private func watchTheClock() {
+        whistle?.cancel()
+        whistle = nil
+        guard let round else {
+            roundIsOver = false
+            return
+        }
+        let left = round.ends &- spaceNow.nanoseconds
+        guard left > 0 else {
+            roundIsOver = true
+            return
+        }
+        roundIsOver = false
+        whistle = Task { [weak self] in
+            try? await Task.sleep(for: .nanoseconds(left))
+            guard !Task.isCancelled else { return }
+            self?.roundIsOver = true
+        }
+    }
 
     /// The clock the space is stamped on, which is the one the deadline is on.
     private var spaceNow: Timecode { trustedStamp?() ?? .fallback() }
@@ -451,23 +489,13 @@ final class RoomModel {
         return Int((left + 999_999_999) / 1_000_000_000)
     }
 
-    /// Seconds until the next round, while the last one's result is up.
-    var secondsUntilNextRound: Int? {
-        guard let round else { return nil }
-        let now = spaceNow.nanoseconds
-        guard now >= round.ends else { return nil }
-        return Int((max(0, round.opens &- now) + 999_999_999) / 1_000_000_000)
-    }
-
     /// Who won the round that has just finished, if anybody did.
     ///
     /// Nil while a round is running, and nil for a draw — including the draw
     /// where nobody scored at all, which is the ordinary result of a round
     /// nobody was in the room for.
     var winner: Score? {
-        guard secondsUntilNextRound != nil, let best = standings.first, best.score > 0 else {
-            return nil
-        }
+        guard roundIsOver, let best = standings.first, best.score > 0 else { return nil }
         guard standings.count == 1 || standings[1].score < best.score else { return nil }
         return best
     }
@@ -1795,9 +1823,7 @@ final class RoomModel {
             }
 
             let configuration = SpaceSession.Configuration()
-            field.cadence = 1 / configuration.tickRate
             let stamp = trustedStamp
-            field.clock = { stamp?() ?? .fallback() }
             bubbleField = field
 
             do {
@@ -1813,7 +1839,7 @@ final class RoomModel {
                 space = joined
                 isSharing = true
                 round = BubbleField.round(in: await joined.state)
-                field.reset(to: await joined.state)
+                field.forget()
                 follow(joined, with: field)
                 presentBubbles()
                 Journal.shared.say("SPACE joined room=\(room.room.value)")
@@ -1884,11 +1910,12 @@ final class RoomModel {
                         Journal.shared.say("SPACE role=\(role)")
                     case let .authorityChanged(who):
                         // The world is about to be restated by somebody else,
-                        // and the entity names they use are their own. Starting
-                        // from their snapshot rather than folding it into what
-                        // the last authority left is what keeps two bubbles
-                        // from sharing a node.
-                        field.reset(to: await space.state)
+                        // and the entity names they use are their own. Dropping
+                        // what the last authority left, rather than folding the
+                        // new world into it, is what keeps two bubbles from
+                        // sharing a node. The redraw is left to the update that
+                        // follows this one — see ``BubbleScene/forget()``.
+                        field.forget()
                         Journal.shared.say(
                             "SPACE authority=\(who?.username.value ?? "nobody")"
                         )
@@ -1902,6 +1929,16 @@ final class RoomModel {
             await space?.act(verb: BubbleField.pop, subject: id)
         }
     #endif
+
+    /// Ask for another round.
+    ///
+    /// An intent like a pop, and for the same reason: a follower cannot write to
+    /// the space, so this asks whoever is simulating and arrives back as the
+    /// clock restarting on both phones. Which means either player can call it,
+    /// and neither has to be the one running the field.
+    func rematch() async {
+        await space?.act(verb: BubbleField.rematch)
+    }
 
     /// Pop something, anything, as though a finger had landed on it.
     ///

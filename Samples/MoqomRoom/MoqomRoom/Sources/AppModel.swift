@@ -1099,8 +1099,21 @@ final class AppModel {
                         let scores = room.standings
                             .map { "\($0.who)=\($0.score)" }
                             .joined(separator: " ")
+                        // The round as well as the field. An empty field means
+                        // two completely different things depending on whether
+                        // a round is running, and a log that could not tell
+                        // them apart is a log that cannot answer the only
+                        // question worth asking about a field with nothing in
+                        // it.
+                        let round = room.round.map {
+                            " round=\($0.number)"
+                                + (room.roundIsOver
+                                    ? " over"
+                                    : " left=\(room.secondsLeftInRound ?? 0)s")
+                        } ?? " round=none"
                         Journal.shared.say(
                             "SPACE role=\(room.isRunningTheField ? "authority" : "follower")"
+                                + round
                                 + " bubbles=\(room.bubblesUp)"
                                 + (scores.isEmpty ? "" : " · \(scores)")
                         )

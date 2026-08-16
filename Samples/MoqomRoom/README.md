@@ -463,11 +463,22 @@ a scoreboard above them. There is no setup handshake to wait for either — a
 device that finds the space unclaimed claims it. **Bubbles** is still there to
 leave and rejoin with.
 
-**Rounds.** Ninety seconds, then the field closes, the last bubbles are taken
-down unpopped, and the result stands for eight seconds before the next round
-starts and the scores clear. The clock is a deadline in the shared state rather
-than a timer on each phone, so both run out of time at the same instant and a
-device that joins halfway through joins the round in progress.
+**Rounds.** Ninety seconds, then the field closes and the last bubbles are taken
+down unpopped. The clock in the scoreboard becomes the result and a **Rematch**
+button, which clears the scores and starts the next round on both phones — the
+scoreboard is untouchable while a round is running, so that a tap meant for a
+bubble is never swallowed by a score, and accepts one only once the field is
+empty and there is nothing behind it to miss. The clock is a
+deadline in the shared state rather than a timer on each handset, so both run out
+of time at the same instant and a device that joins halfway through joins the
+round in progress.
+
+Rematch is a `SpaceIntent` like a pop, which is what makes it work from either
+end: a follower cannot write to the space, so it asks whoever is simulating and
+the answer arrives as the clock restarting on both. Whoever taps first starts the
+round, and a second request finds one already running and is ignored — so two
+people reaching for the button at once cannot wipe a score somebody has just
+earned.
 
 **Nothing sends a position.** A bubble's path is a function of its name — a
 hashed course, a closed-form climb — so both devices work out where it is

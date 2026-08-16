@@ -259,6 +259,15 @@ public struct SpaceDelta: Hashable, Sendable, Codable {
     /// Space-wide application state, as new values.
     public var facts: [String: SpaceValue]
 
+    /// Space-wide facts that no longer exist.
+    ///
+    /// A new value cannot say "gone", and without this a fact could be set but
+    /// never unset — a simulation that cleared one had to wait for the next
+    /// snapshot for anybody else to find out. Which read, in the sample this
+    /// exists for, as last round's scores staying on screen for two seconds
+    /// after the rematch that cleared them.
+    public var forgotten: [String]
+
     /// Per-entity application state, as new values.
     public var entityFacts: [SpaceEntityID: [String: SpaceValue]]
 
@@ -268,6 +277,7 @@ public struct SpaceDelta: Hashable, Sendable, Codable {
         removed: [SpaceEntityID] = [],
         claimed: [SpaceEntityID: ParticipantIdentity?] = [:],
         facts: [String: SpaceValue] = [:],
+        forgotten: [String] = [],
         entityFacts: [SpaceEntityID: [String: SpaceValue]] = [:]
     ) {
         self.moved = moved
@@ -275,6 +285,7 @@ public struct SpaceDelta: Hashable, Sendable, Codable {
         self.removed = removed
         self.claimed = claimed
         self.facts = facts
+        self.forgotten = forgotten
         self.entityFacts = entityFacts
     }
 
@@ -284,7 +295,8 @@ public struct SpaceDelta: Hashable, Sendable, Codable {
     /// empty object sixty times a second.
     public var isEmpty: Bool {
         moved.isEmpty && spawned.isEmpty && removed.isEmpty
-            && claimed.isEmpty && facts.isEmpty && entityFacts.isEmpty
+            && claimed.isEmpty && facts.isEmpty && forgotten.isEmpty
+            && entityFacts.isEmpty
     }
 }
 
@@ -328,10 +340,17 @@ public struct SpaceSnapshot: Hashable, Sendable, Codable {
             entities[id]?.owner = owner
         }
         for (id, facts) in delta.entityFacts {
-            for (key, value) in facts { entities[id]?.facts[key] = value }
+            // Replaced, not merged. ``delta(to:)`` sends an entity's whole bag
+            // precisely because a dropped key cannot be sent as a new value;
+            // folding it in key by key undid that, and a fact the authority had
+            // cleared stayed set on everybody watching.
+            entities[id]?.facts = facts
         }
         for (key, value) in delta.facts {
             facts[key] = value
+        }
+        for key in delta.forgotten {
+            facts.removeValue(forKey: key)
         }
         for id in delta.removed {
             entities.removeValue(forKey: id)
@@ -364,6 +383,9 @@ public struct SpaceSnapshot: Hashable, Sendable, Codable {
         }
         for (key, value) in next.facts where facts[key] != value {
             delta.facts[key] = value
+        }
+        for key in facts.keys where next.facts[key] == nil {
+            delta.forgotten.append(key)
         }
         return delta
     }

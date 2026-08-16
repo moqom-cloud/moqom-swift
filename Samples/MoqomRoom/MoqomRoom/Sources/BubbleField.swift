@@ -122,14 +122,18 @@ final class BubbleField: SpaceSimulation, @unchecked Sendable {
         static let `default` = Rules()
     }
 
-    /// How long a round lasts, and how long its result stands.
+    /// How long a round lasts.
     ///
     /// A field that never ends is a demo rather than a game: nothing is won, so
     /// there is no reason to hurry, and hurrying is the whole of it. Ninety
     /// seconds is long enough for a lead to change hands and short enough that
     /// losing costs nothing to sit through.
+    ///
+    /// Nothing starts the next one but somebody asking. A clock that restarted
+    /// by itself would begin a round while both players were still reading the
+    /// last one's score, and the first few seconds of a round nobody is looking
+    /// at are the ones that decide it.
     static let roundLength = Duration.seconds(90)
-    static let interlude = Duration.seconds(8)
 
     private let rules: Rules
     private var sinceSpawn = Duration.zero
@@ -166,10 +170,9 @@ final class BubbleField: SpaceSimulation, @unchecked Sendable {
         let seconds = Float(elapsed.wholeNanoseconds) / 1_000_000_000
         guard seconds > 0, seconds < 1 else { return }
 
-        var round = Self.round(in: state) ?? begin(1, in: &state, at: now)
-        if now.nanoseconds >= round.opens {
-            round = begin(round.number + 1, in: &state, at: now)
-        }
+        // The first round starts because somebody went live. Every round after
+        // it starts because somebody asked — see ``rematch``.
+        let round = Self.round(in: state) ?? begin(1, in: &state, at: now)
         let playing = now.nanoseconds < round.ends
 
         // Nothing below integrates a position or writes one. Where a bubble is
@@ -230,8 +233,9 @@ final class BubbleField: SpaceSimulation, @unchecked Sendable {
     /// Start a round, and clear the last one's scores.
     ///
     /// The scores go here rather than at the final whistle so that the result
-    /// stays on screen for the whole interlude. Clearing them when the round
-    /// ended would show the winner for exactly one frame.
+    /// stays on screen for as long as it takes somebody to call for a rematch.
+    /// Clearing them when the round ended would show the winner for exactly one
+    /// frame.
     @discardableResult
     private func begin(_ number: Int, in state: inout SpaceSnapshot, at now: Timecode) -> Round {
         for key in state.facts.keys where key.hasPrefix(Self.scorePrefix) {
@@ -251,9 +255,20 @@ final class BubbleField: SpaceSimulation, @unchecked Sendable {
         _ intent: SpaceIntent,
         from who: ParticipantIdentity,
         to state: inout SpaceSnapshot,
-        at _: Timecode
+        at now: Timecode
     ) {
         switch intent.verb {
+        case Self.rematch:
+            // Either player may call for one, and whoever asks first is the one
+            // who starts it. A second request — the other phone tapping a
+            // moment later, or the same phone tapped twice — finds a round
+            // already running and does nothing, rather than restarting the
+            // round that has just begun and wiping a score somebody earned.
+            guard
+                let round = Self.round(in: state),
+                now.nanoseconds >= round.ends
+            else { return }
+            begin(round.number + 1, in: &state, at: now)
         case Self.pop:
             guard
                 let subject = intent.subject,
@@ -311,8 +326,9 @@ extension BubbleField {
     /// What a bubble is called on the wire.
     static let kind = "bubble"
 
-    /// The one verb this game understands.
+    /// The two verbs this game understands.
     static let pop = "pop"
+    static let rematch = "rematch"
 
     /// Set on a bubble that is climbing out of reach.
     ///
@@ -366,9 +382,6 @@ extension BubbleField {
 
         /// When the field closes, in nanoseconds on the shared clock.
         var ends: Int64
-
-        /// When the next one starts.
-        var opens: Int64 { ends &+ BubbleField.interlude.wholeNanoseconds }
     }
 
     static func round(in state: SpaceSnapshot) -> Round? {
@@ -465,14 +478,24 @@ extension BubbleField {
         return seconds.isFinite && seconds > 0 ? seconds : 0
     }
 
+    /// How long a bubble takes to reach the ceiling.
+    ///
+    /// The oldest a bubble may be *drawn* as being, whatever the clocks say.
+    /// See ``BubbleScene`` for why that matters: an age guessed too high puts a
+    /// bubble above the shot, and a node placed out of shot stays there for the
+    /// rest of its life, because nothing redraws one that already exists. Too
+    /// low is a bubble that appears lower than it should and climbs out of it.
+    static func climbTime(spawnedAt spawn: SpaceVector, as id: SpaceEntityID) -> Float {
+        max(0, (Field.ceiling - spawn.y) / course(for: id).speed)
+    }
+
     /// How long a bubble lasts, from release to out of shot.
     static func lifetime(spawnedAt spawn: SpaceVector, as id: SpaceEntityID) -> Float {
         let course = course(for: id)
-        let toCeiling = max(0, (Field.ceiling - spawn.y) / course.speed)
         let over = Field.departure - Field.ceiling
         let flight = Rules.default.flight
         let escape = (-course.speed + (course.speed * course.speed + 2 * flight * over).squareRoot())
             / flight
-        return toCeiling + escape
+        return climbTime(spawnedAt: spawn, as: id) + escape
     }
 }

@@ -233,6 +233,46 @@ struct SpaceReplicationTests {
         #expect(state == once)
     }
 
+    @Test("A fact the authority cleared is cleared everywhere")
+    func factsCanBeForgotten() {
+        // The case a new value cannot express, and the reason `forgotten`
+        // exists: a simulation that clears a score — the bubble field does it
+        // on every rematch — had no way to say so, and every follower kept
+        // showing the last round's numbers until the next full snapshot.
+        let before = SpaceSnapshot(facts: [
+            "score/ada": .number(7),
+            "round": .number(1),
+        ])
+        let after = SpaceSnapshot(facts: ["round": .number(2)])
+
+        let delta = before.delta(to: after)
+        #expect(delta.forgotten == ["score/ada"])
+
+        var replica = before
+        replica.apply(delta)
+        #expect(replica == after)
+    }
+
+    @Test("An entity fact the authority cleared is cleared everywhere")
+    func entityFactsAreReplacedNotMerged() {
+        // ``SpaceSnapshot/delta(to:)`` sends an entity's whole bag rather than
+        // the keys that changed, precisely so that a dropped one is expressible.
+        // Folding it in key by key threw that away.
+        let before = SpaceSnapshot(entities: [
+            "b-1": SpaceEntity(id: "b-1", kind: "bubble", facts: [
+                "hue": .decimal(0.5),
+                "leaving": .flag(true),
+            ]),
+        ])
+        let after = SpaceSnapshot(entities: [
+            "b-1": SpaceEntity(id: "b-1", kind: "bubble", facts: ["hue": .decimal(0.5)]),
+        ])
+
+        var replica = before
+        replica.apply(before.delta(to: after))
+        #expect(replica == after)
+    }
+
     @Test("A thing can be spawned and moved in the same tick")
     func spawnsLandBeforeMoves() {
         var state = SpaceSnapshot()
@@ -414,6 +454,7 @@ struct SpaceWireTests {
                 removed: ["old"],
                 claimed: ["ball": identity("ada")],
                 facts: ["score": .decimal(1.5)],
+                forgotten: ["phase"],
                 entityFacts: ["cup": ["full": .flag(true)]]
             ))
         )
