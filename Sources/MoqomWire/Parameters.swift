@@ -262,4 +262,47 @@ public enum SetupOption {
     public static let implementation: UInt64 = 0x07
     /// Unacknowledged `REQUEST_UPDATE`s allowed per stream. Default 0.
     public static let maximumRequestUpdates: UInt64 = 0x08
+
+    /// A proof that the sender holds the key its token was issued to.
+    ///
+    /// Not a draft assignment. The private-use number is the one the relay's
+    /// registry picks, and the three properties it was chosen for are asserted
+    /// at compile time on that side: odd, so it carries bytes rather than a
+    /// varint; not a value the greasing sequence produces, since a peer is
+    /// entitled to discard those; and above every assignment the draft has made,
+    /// so a future one cannot land on it silently.
+    ///
+    /// Carried at SETUP rather than per-request, which reads as a departure from
+    /// RFC 9449 and is not. HTTP is stateless so every request needs its own
+    /// evidence; a MOQT session establishes who the peer is once and checks
+    /// every later announce against *that*, so a per-request proof would be
+    /// proving possession to a relay that had stopped asking, at the price of a
+    /// Secure Enclave signature per subscribe.
+    public static let authorizationProof: UInt64 = 0x4D51
+}
+
+/// Request parameter type codes, per draft-19's own registry for them.
+///
+/// A separate registry from ``SetupOption`` that happens to agree on the
+/// authorization token, and the point of naming it twice rather than reusing
+/// the setup constant is that nothing guarantees they keep agreeing. A future
+/// draft could move one and not the other, and a shared constant would make
+/// that a silent misparse instead of one edit in one place.
+public enum RequestParameter {
+    /// An authorization token, as a byte string. May repeat.
+    ///
+    /// Valid on any request and on `REQUEST_UPDATE`, which is what makes a
+    /// credential renewable without reconnecting: an update overwrites the
+    /// parameter on a request that is already established, so a session can
+    /// present a fresh token without disturbing anything it is doing.
+    public static let authorizationToken: UInt64 = 0x03
+
+    /// A proof that the sender holds the key the accompanying token names.
+    ///
+    /// The same private-use number as ``SetupOption/authorizationProof``,
+    /// spelled again here for the reason the type note gives. It travels with a
+    /// renewal because a proof commits to one token by hash: without it, a
+    /// session could present a proven credential at SETUP and then quietly trade
+    /// it for an unproven one.
+    public static let authorizationProof: UInt64 = 0x4D51
 }

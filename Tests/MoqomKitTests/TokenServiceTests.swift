@@ -21,6 +21,10 @@ import Testing
 // eight different-looking causes.
 @Suite("The token service", .serialized)
 struct TokenServiceTests {
+    /// The key a token would be bound to. Held once per test rather than
+    /// generated per call, because a device has one and the request carries it.
+    private let key = DeviceKey.ephemeral()
+
     private func service(_ answers: Stub.Answer) -> (TokenService, URLSession) {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [Stub.self]
@@ -44,7 +48,7 @@ struct TokenServiceTests {
         """))
 
         let issued = try await service.token(
-            username: "ada", room: "handsync", device: "thumb", session: session
+            username: "ada", room: "handsync", device: key, session: session
         )
 
         #expect(issued.token == Data("header.payload.signature".utf8))
@@ -66,7 +70,7 @@ struct TokenServiceTests {
         """))
 
         let issued = try await service.token(
-            username: "u", room: "r", device: "thumb", session: session
+            username: "u", room: "r", device: key, session: session
         )
         #expect(issued.expiresAt.timeIntervalSince1970 == 1_785_953_700)
     }
@@ -74,7 +78,7 @@ struct TokenServiceTests {
     @Test("what the device asks for is what it sends")
     func requestBody() async throws {
         let (service, session) = self.service(.ok(#"{"token":"a.b.c","room":"r","username":"u"}"#))
-        _ = try await service.token(username: "Ada", room: "handsync", device: "thumb", session: session)
+        _ = try await service.token(username: "Ada", room: "handsync", device: key, session: session)
 
         let sent = try #require(Stub.received)
         #expect(sent.httpMethod == "POST")
@@ -85,11 +89,24 @@ struct TokenServiceTests {
         #expect(sent.value(forHTTPHeaderField: "Authorization") == "Bearer device-secret")
 
         let body = try #require(Stub.body)
-        let decoded = try #require(try JSONSerialization.jsonObject(with: body) as? [String: String])
-        #expect(decoded["username"] == "Ada")
-        #expect(decoded["room"] == "handsync")
-        #expect(decoded["device"] == "thumb")
-        #expect(decoded["tenant"] == "demo")
+        let decoded = try #require(try JSONSerialization.jsonObject(with: body) as? [String: Any])
+        #expect(decoded["username"] as? String == "Ada")
+        #expect(decoded["room"] as? String == "handsync")
+        #expect(decoded["tenant"] as? String == "demo")
+
+        // The key, not just its name. The control plane derives `cnf.jkt` from
+        // what is sent here, so a request that carried only the thumbprint would
+        // get a token bound to a claim rather than to a key — and this assertion
+        // is the one that notices if that regresses.
+        let sentKey = try #require(decoded["key"] as? [String: String])
+        #expect(sentKey["kty"] == "EC")
+        #expect(sentKey["crv"] == "P-256")
+        #expect(sentKey["x"] == key.x)
+        #expect(sentKey["y"] == key.y)
+
+        // Truncated the way a namespace field is, since that is what the device
+        // announces under and what the endpoint checks the key against.
+        #expect(decoded["device"] as? String == String(key.thumbprint.prefix(16)))
     }
 
     @Test("a refusal keeps the reason, because somebody has to read it")
@@ -97,11 +114,11 @@ struct TokenServiceTests {
         let (service, session) = self.service(.status(403, "account join-backend cannot mint publish rights it does not hold"))
 
         await #expect(throws: TokenServiceError.self) {
-            try await service.token(username: "ada", room: "r", device: "thumb", session: session)
+            try await service.token(username: "ada", room: "r", device: key, session: session)
         }
 
         do {
-            _ = try await service.token(username: "ada", room: "r", device: "thumb", session: session)
+            _ = try await service.token(username: "ada", room: "r", device: key, session: session)
         } catch let error as TokenServiceError {
             guard case let .refused(status, reason) = error else {
                 Issue.record("a 403 became \(error)")
@@ -130,7 +147,7 @@ struct TokenServiceTests {
         let (service, session) = self.service(.failure)
 
         do {
-            _ = try await service.token(username: "ada", room: "r", device: "thumb", session: session)
+            _ = try await service.token(username: "ada", room: "r", device: key, session: session)
             Issue.record("a dead service produced a token")
         } catch let error as TokenServiceError {
             guard case .unreachable = error else {
@@ -151,7 +168,7 @@ struct TokenServiceTests {
         let (service, session) = self.service(.ok(#"{"expiresAt":"2026-08-05T18:15:00Z"}"#))
 
         do {
-            _ = try await service.token(username: "ada", room: "r", device: "thumb", session: session)
+            _ = try await service.token(username: "ada", room: "r", device: key, session: session)
             Issue.record("a response with no token produced one")
         } catch let error as TokenServiceError {
             guard case .malformed = error else {

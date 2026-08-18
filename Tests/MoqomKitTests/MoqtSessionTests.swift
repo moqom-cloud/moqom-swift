@@ -330,6 +330,112 @@ struct MoqtSessionTests {
         try await stream.write(writer.bytes)
     }
 
+    /// A relay closes a session when the token that admitted it runs out, so on
+    /// a call longer than a token's lifetime the credential has to be replaced
+    /// without reconnecting. Draft-19 carries that as a `REQUEST_UPDATE` with an
+    /// authorization token parameter, on a request stream the session already
+    /// holds — there is no session-level message for a credential.
+    @Test("a renewed credential goes out on a live request stream")
+    func renewedCredential() async throws {
+        let (clientCarrier, serverCarrier) = MemoryCarrier.pair()
+        let heard = Tokens()
+        let relay = tokenRecordingRelay(on: serverCarrier, into: heard)
+        defer { relay.cancel() }
+
+        let client = try await MoqtSession.connect(
+            over: clientCarrier,
+            credentials: credentials("alice")
+        )
+
+        // A watch, because that is the stream every participant has: it is how
+        // anybody learns who else is in the room, whether or not they publish.
+        _ = try await client.announcements(
+            matching: MoqomNamespaces.room(tenant: "acme", room: "room-42")
+        )
+        try await client.renewCredential(Data("the-fresh-one".utf8))
+
+        try #require(await heard.first(within: .seconds(2)) == Data("the-fresh-one".utf8))
+        await client.close(code: 0, reason: "done")
+    }
+
+    /// The failure worth having an error for rather than a silent no-op: renewal
+    /// needs somewhere to write, and a session that is announcing nothing and
+    /// watching nothing has nowhere. Reporting it is what lets a caller notice
+    /// before the relay closes them for a credential they thought they replaced.
+    @Test("renewing with no request stream open says so")
+    func renewalWithNowhereToGo() async throws {
+        let (clientCarrier, serverCarrier) = MemoryCarrier.pair()
+        let relay = tokenRecordingRelay(on: serverCarrier, into: Tokens())
+        defer { relay.cancel() }
+
+        let client = try await MoqtSession.connect(
+            over: clientCarrier,
+            credentials: credentials("alice")
+        )
+
+        await #expect(throws: MoqomError.self) {
+            try await client.renewCredential(Data("nowhere-to-put-this".utf8))
+        }
+        await client.close(code: 0, reason: "done")
+    }
+
+    /// Somewhere for a relay stand-in to put what it heard, since the assertion
+    /// happens on one task and the reading on another.
+    private actor Tokens {
+        private var seen: [Data] = []
+
+        func record(_ token: Data) { seen.append(token) }
+
+        /// The first token heard, waited for rather than polled once: the write
+        /// and the read are different tasks and there is no ordering between
+        /// them.
+        func first(within limit: Duration) async -> Data? {
+            let deadline = ContinuousClock.now.advanced(by: limit)
+            while ContinuousClock.now < deadline {
+                if let first = seen.first { return first }
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            return seen.first
+        }
+    }
+
+    /// A relay that completes SETUP and notes the authorization token on every
+    /// `REQUEST_UPDATE` it is sent.
+    ///
+    /// Hand-rolled rather than a second `MoqtSession` for the reason
+    /// ``refusingRelay`` is: a session has no credentials to renew and nothing
+    /// to check one against, so it would neither read the parameter nor care.
+    private func tokenRecordingRelay(
+        on carrier: MemoryCarrier,
+        into heard: Tokens
+    ) -> Task<Void, Never> {
+        Task {
+            for await stream in carrier.incomingBidirectionalStreams {
+                Task {
+                    var framer = StreamFramer()
+                    while let chunk = try? await stream.read() {
+                        framer.append(chunk)
+                        while let frame = try? framer.next() {
+                            switch frame.type {
+                            case .setup:
+                                try? await Self.write(Setup(), to: stream)
+                            case .requestUpdate:
+                                var body = WireReader(frame.body)
+                                guard let update = try? RequestUpdate.read(from: &body),
+                                      let token = update.parameters
+                                      .bytes(RequestParameter.authorizationToken)
+                                else { break }
+                                await heard.record(token)
+                            default:
+                                break
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     @Test("subscribing to a track nobody publishes is refused")
     func unknownTrack() async throws {
         let (_, subscriber) = try await connectedPair()

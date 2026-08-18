@@ -32,6 +32,27 @@ public protocol QUICCarrier: Sendable {
     /// refused datagrams.
     var maximumDatagramSize: Int { get }
 
+    /// base64url SHA-256 of the peer's leaf certificate, or `nil` where there is
+    /// no certificate to hash.
+    ///
+    /// Exposed for one caller: a proof of possession is bound to the relay it was
+    /// made for, so that a compromised relay in a fleet cannot take the perfectly
+    /// good credentials every session hands it and present them to its
+    /// neighbours. Requiring proofs without this would have moved the confused
+    /// deputy rather than removed it.
+    ///
+    /// base64url rather than the standard base64 that ``RelayTrust`` pins with,
+    /// because this one goes into a JWS claim and that is the encoding a JWS
+    /// uses. The digest is over the same bytes — the whole DER leaf — so the two
+    /// spellings describe the same certificate.
+    ///
+    /// `nil` for a carrier with no TLS underneath it, which is the in-memory one.
+    /// The distinction from "TLS, but the certificate could not be read" is left
+    /// to the caller and it matters: the first is a test harness and the second
+    /// is a client that will be refused by any relay that knows its own
+    /// certificate.
+    var peerCertificateDigest: String? { get }
+
     func openBidirectionalStream() async throws(MoqomError) -> any QUICStream
     func openUnidirectionalStream() async throws(MoqomError) -> any QUICSendStream
 

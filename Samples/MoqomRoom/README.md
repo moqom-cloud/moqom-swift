@@ -393,20 +393,51 @@ fallback when there is no service configured. It is kept in the Keychain against
 the relay it was minted for.
 
 ```sh
-deploy/tools/join.sh ada demo      # in the moqom repository; prints a token
+deploy/tools/join.sh ada demo cn-I_WNMClehiVp5   # in the moqom repository
 ```
+
+The third argument is this phone's key, which the join screen prints under the
+username. A token is minted against it and, on a relay that requires proof, is
+usable from nowhere else — so it has to be the thumbprint of the phone that will
+paste the token in, not of the Mac minting it or of the other phone.
 
 Filed per host, so a credential is never offered to a relay it does not belong
 to — a relay with keys refuses a token it cannot verify outright, rather than
 falling back to admitting the session anonymously.
 
-The screen reads the token's claims back to you: who it names, which room, and
-when it expires. Nothing checks the signature and nothing could — the phone
-holds no key — so this is display only. It is there because the control plane
-caps a token at fifteen minutes, and a saved credential that has gone stale is
-otherwise indistinguishable on screen from a good one. It will also say when
-the token names a different room or person than the fields above it, which is
-the mismatch that costs the most time to find by any other means.
+The screen reads the token's claims back to you: who it names, which room, when
+it expires, and which key it was bound to. Nothing checks the signature and
+nothing could — the phone holds no verification key — so that much is display
+only. The binding is not: the phone knows its own thumbprint, so a token minted
+for another device is caught here rather than at the relay. The rest is there
+because the control plane caps a token at fifteen minutes, and a saved credential
+that has gone stale is otherwise indistinguishable on screen from a good one. It
+will also say when the token names a different room or person than the fields
+above it, which is the mismatch that costs the most time to find by any other
+means.
+
+### The key under your name
+
+The join screen prints a short string beneath the username, and says whether it
+came from the Secure Enclave or from the Keychain. That is the RFC 7638
+thumbprint of a P-256 key this installation generated the first time it ran, and
+it is the device's identity in three places at once: the last field of every
+namespace it publishes under, the `cnf.jkt` of every token it is issued, and the
+key it signs with to prove a token is its own.
+
+Which of the two it says matters. In the Secure Enclave the private key cannot
+leave the phone at all, so a token bound to it is worthless to anyone who copies
+it. In the Keychain — a simulator, or hardware without an enclave — the key is
+software, which is a real key with a weaker story about extraction, and it says
+so rather than looking identical. If it can produce neither, it says that too,
+and the phone falls back to bearer tokens against a relay that permits them.
+
+That cap now bounds the call and not merely the joining of it, because the relay
+closes a session whose credential has lapsed. With a service configured the phone
+fetches the next token a couple of minutes ahead of that and hands it over on the
+connection it already has, so a broadcast runs for as long as it runs. A pasted
+token cannot replace itself, so a session on one ends when it expires — which is
+worth knowing before starting a long run with one.
 
 ### Scanning a way in
 
@@ -419,7 +450,10 @@ deploy/tools/invite.sh ada demo    # prints the code, and opens it as a PNG
 
 That carries what a device cannot be told by hand — the relay's address, the
 hash of the certificate to pin, the token service beside it and the credential
-to spend there — as a `moqom://join?...` link. Point the Camera app at it and
+to spend there — as a `moqom://join?...` link. It carries no token, which is the
+point of it: whichever phone scans the code spends the credential and is issued a
+token bound to that phone's own key. A link with a token in it could only be for
+one phone, and would have to know which before anybody had scanned anything. Point the Camera app at it and
 MOQOM opens with a **Scanned link** section at the top of the join screen,
 naming the address first and what it enrols the device for second.
 
@@ -469,7 +503,7 @@ a scoreboard above them. There is no setup handshake to wait for either — a
 device that finds the space unclaimed claims it. **Bubbles** is still there to
 leave and rejoin with.
 
-**Rounds.** Ninety seconds, then the field closes and the last bubbles are taken
+**Rounds.** Thirty seconds, then the field closes and the last bubbles are taken
 down unpopped. The clock in the scoreboard becomes the result and a **Rematch**
 button, which clears the scores and starts the next round on both phones — the
 scoreboard is untouchable while a round is running, so that a tap meant for a

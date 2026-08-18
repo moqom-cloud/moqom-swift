@@ -319,7 +319,11 @@ final class AppModel {
     var credential: Credential? { relay.credential }
 
     var credentialComplaint: String? {
-        credential?.complaint(joining: destinationRoomName(pairing: pairing), as: username.trimmed)
+        credential?.complaint(
+            joining: destinationRoomName(pairing: pairing),
+            as: username.trimmed,
+            on: deviceName
+        )
     }
 
     /// Where Join puts this device, given the fields as they stand.
@@ -361,6 +365,12 @@ final class AppModel {
     /// The journal is where it gets answered — stdout only in Debug, because a live console
     /// pipe over Wi-Fi is traffic on the radio the call is using.
     func joinOnLaunch() async {
+        // First, because everything below depends on it: the device this phone
+        // announces under, the key a token is bound to, and the key a proof is
+        // signed with are all this one key, and a join that ran before it
+        // existed would announce under a name the credential does not carry.
+        prepareDeviceKey()
+
         // Filled in whether or not this launch joins by itself, because the name and the room
         // are half of what a token is minted against. A launch that supplies a token and no
         // autojoin used to leave the fields at their defaults, so the person tapping Join
@@ -1168,15 +1178,47 @@ final class AppModel {
 
     /// The key this device's tokens are bound to, by the `cnf` claim.
     ///
-    /// A constant, and it should not be: a real client generates a key in the
-    /// Secure Enclave at install and derives this from it, which is what makes a
-    /// device ban a ban on one phone rather than on every copy of the sample. It
-    /// stays a constant because it is a constant in three places — here, in
-    /// `moqom-mint`'s default, and in the relay's own fixtures — and a token whose
-    /// thumbprint disagrees with the device its holder announces under is a
-    /// session the relay is right to refuse. Changing it means changing all three
-    /// together, which is a different piece of work from this one.
-    static let deviceThumbprint = "sample-device-key"
+    /// Generated in the Secure Enclave the first time the app runs and kept in
+    /// the Keychain after that, which is what makes a device ban a ban on one
+    /// phone rather than on every copy of the sample. This used to be the string
+    /// `sample-device-key`, repeated here, in `moqom-mint`'s default and in the
+    /// relay's fixtures — three copies of a name no key answered for, so `cnf`
+    /// was a label and a copied token worked from anywhere.
+    ///
+    /// `nil` only where the Keychain refuses, which on a device means something
+    /// is wrong with the install. The app carries on unproven rather than
+    /// refusing to start: a relay that does not require proofs still admits it,
+    /// and a sample that will not launch is worse than one that says why it is
+    /// weaker than it should be. ``deviceProblem`` is that saying.
+    private(set) var deviceKey: DeviceKey?
+
+    /// Why there is no device key, if there is none.
+    private(set) var deviceProblem: String?
+
+    /// What this device is called on the wire: the thumbprint, truncated.
+    ///
+    /// Falls back to a name that cannot be mistaken for a real one. A relay
+    /// requiring proofs refuses it, which is the correct outcome and a legible
+    /// one — the alternative, reusing the old constant, produces a device that
+    /// looks ordinary and is not.
+    var deviceName: String {
+        deviceKey.map { DeviceID.field(of: $0.thumbprint) } ?? "unkeyed-device"
+    }
+
+    /// Install or recover the device key. Called once, at startup.
+    func prepareDeviceKey() {
+        guard deviceKey == nil else { return }
+        do {
+            let key = try DeviceKey.installed()
+            deviceKey = key
+            Journal.shared.say(
+                "DEVICE key in the \(key.storage), thumbprint \(key.thumbprint)"
+            )
+        } catch {
+            deviceProblem = String(describing: error)
+            Journal.shared.say("DEVICE no key: \(deviceProblem ?? "")")
+        }
+    }
 
     /// Why the last attempt to fetch a token failed, if it failed.
     ///
@@ -1222,19 +1264,28 @@ final class AppModel {
             // asks for nothing, and a pasted token still works. Said out loud only
             // when the token in hand will not do, because that combination is the
             // one that produces a puzzling session rather than a working one.
-            if relay.host != nil, relay.needsAToken(joining: room, as: name) {
+            if relay.host != nil, relay.needsAToken(joining: room, as: name, on: deviceName) {
                 Journal.shared.say("TOKEN stale and no service configured")
             }
             return true
         }
-        guard relay.needsAToken(joining: room, as: name) else { return true }
+        guard relay.needsAToken(joining: room, as: name, on: deviceName) else { return true }
+
+        guard let deviceKey else {
+            // Asking without a key would mint a token bound to nothing this
+            // device can sign for, which a relay requiring proofs refuses. The
+            // reason is worth carrying rather than discovering at the relay.
+            tokenProblem = "This device has no key, so no token can be bound to it."
+            Journal.shared.say("TOKEN not asked for: no device key")
+            return false
+        }
 
         Journal.shared.say("TOKEN asking \(service.host):\(service.port) for \(name) in \(room)")
         do {
             let issued = try await service.client().token(
                 username: name,
                 room: room,
-                device: Self.deviceThumbprint
+                device: deviceKey
             )
             relay.token = issued.token
             // What the service actually minted, which can differ from what was
@@ -1276,9 +1327,7 @@ final class AppModel {
         }
 
         // Before anything is dialled, because this is the credential the dialling
-        // presents. A token lasts fifteen minutes and is checked once, at the
-        // start of the session, so the only moment worth having a fresh one is
-        // this one.
+        // presents.
         if !(await fetchATokenIfNeeded()) { return }
 
         remember()
@@ -1286,10 +1335,28 @@ final class AppModel {
         do {
             let identity = try ParticipantIdentity(
                 username: Username(username.trimmed),
-                // A real client derives this from the Secure Enclave key the
-                // token's `cnf` claim is bound to, at install.
-                device: DeviceID(thumbprint: Self.deviceThumbprint)
+                // The same thumbprint the token's `cnf` claim is bound to, so
+                // the device announcing and the device named by the credential
+                // are one device — which a relay checks and is right to.
+                device: DeviceID(deviceName)
             )
+            // The relay closes a session when the credential that admitted it runs
+            // out, and a token is good for fifteen minutes, so a call any longer
+            // than that needs the next one fetched while it runs. Only possible
+            // where there is a service to ask: a token pasted in by
+            // `deploy/tools/join.sh` cannot replace itself, and a session on one
+            // ends when it expires, which is the honest behaviour rather than a
+            // limitation of the sample.
+            var renew: (@Sendable () async throws -> IssuedToken)?
+            if let mint = relay.tokenService.flatMap({ $0.isUsable ? $0.client() : nil }),
+               let key = deviceKey {
+                let asking = username.trimmed
+                let joining = destinationRoomName(pairing: sharedCode)
+                renew = {
+                    try await mint.token(username: asking, room: joining, device: key)
+                }
+            }
+
             let session = MoqomSession(
                 transport: relay.transport(bestEffort: launch.bestEffort),
                 credentials: DeviceCredentials(
@@ -1299,7 +1366,15 @@ final class AppModel {
                     // in. Empty against a relay that verifies means a session that
                     // connects and may publish nothing.
                     token: relay.token,
-                    proofSigner: { challenge in challenge }
+                    deviceKey: deviceKey,
+                    // Read out of the token, which the SDK would rather a caller
+                    // did not do — it prefers the expiry the minting service
+                    // stated, precisely so nobody has to decode a credential to
+                    // find out. This screen already decodes it to display the
+                    // claims, so the parsing exists either way; an app with a
+                    // server of its own should pass what that server said.
+                    expiresAt: renew == nil ? nil : Credential(relay.token)?.expires,
+                    renew: renew
                 ),
                 tenant: TenantID(tenant),
                 // The sample opts in, because the sample is what an integrator

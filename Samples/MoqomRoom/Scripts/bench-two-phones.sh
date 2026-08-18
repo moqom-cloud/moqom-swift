@@ -26,7 +26,7 @@ This script takes no arguments; everything is an environment variable.
 
   MOQOM_ROOM=name        room to join (default: bench)
   MOQOM_SECONDS=20       stop after this long, and print each log's last report
-  MOQOM_FPS=60           capture and publish rate (default: 30)
+  MOQOM_FPS=30           capture and publish rate (default: 60)
   MOQOM_KBPS=2000        publish bitrate
   MOQOM_AUDIO=mic        publish audio: mic, or tone for a synthetic source
   MOQOM_VIDEO=camera     publish video: camera, pattern, or scene for the AR orb
@@ -40,7 +40,7 @@ This script takes no arguments; everything is an environment variable.
   MOQOM_TENANT=moqom     which tenant, and it must be the token's
 
 For example:
-  MOQOM_ROOM=turn3 MOQOM_SECONDS=20 MOQOM_FPS=60 MOQOM_AUDIO=mic ./Scripts/bench-two-phones.sh
+  MOQOM_ROOM=turn3 MOQOM_SECONDS=20 MOQOM_AUDIO=mic ./Scripts/bench-two-phones.sh
 USAGE
     exit 2
 fi
@@ -79,6 +79,14 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 # Minted here rather than checked in, because they expire in fifteen minutes.
 # The relay against a laptop has no keys and needs none of this, which is why
 # this is off unless asked for.
+#
+# A pasted token now bounds the run and not just the joining of it: a relay with
+# keys closes a session whose credential has lapsed, and a token handed in this
+# way cannot replace itself. That collides with the advice at the bottom of this
+# file to give a run fifteen minutes or more — so for the long runs, enrol the
+# phones with the join service instead (MOQOM_JOIN_* on the Join screen, or a
+# scanned link) and they fetch and renew their own credentials for as long as the
+# run lasts.
 TENANT="${MOQOM_TENANT:-moqom}"
 PUBLISHER_TOKEN="${MOQOM_PUBLISHER_TOKEN:-}"
 VIEWER_TOKEN="${MOQOM_VIEWER_TOKEN:-}"
@@ -88,14 +96,30 @@ if [ -n "${MOQOM_MINT:-}" ]; then
         echo "MOQOM_MINT is set but $JOIN is not there — set MOQOM_JOIN to it" >&2
         exit 2
     fi
+    # Each phone's own thumbprint, which its join screen prints beneath the
+    # username. There is no default and there cannot be one: a token is bound to
+    # a key in that phone's Secure Enclave, and one minted against any other
+    # thumbprint is refused by a relay requiring proof of possession. Read them
+    # off the two screens once; they do not change.
+    if [ -z "${MOQOM_PUBLISHER_DEVICE:-}" ] || [ -z "${MOQOM_VIEWER_DEVICE:-}" ]; then
+        echo "MOQOM_MINT needs MOQOM_PUBLISHER_DEVICE and MOQOM_VIEWER_DEVICE:" >&2
+        echo "  the thumbprint each phone's join screen prints under its username" >&2
+        echo "  (or leave MOQOM_MINT unset and enrol both with the join service)" >&2
+        exit 2
+    fi
     echo "minting a token for each phone"
-    PUBLISHER_TOKEN="$(MOQOM_TENANT=$TENANT "$JOIN" publisher "$ROOM")"
-    VIEWER_TOKEN="$(MOQOM_TENANT=$TENANT "$JOIN" viewer "$ROOM")"
+    PUBLISHER_TOKEN="$(MOQOM_TENANT=$TENANT "$JOIN" publisher "$ROOM" "$MOQOM_PUBLISHER_DEVICE")"
+    VIEWER_TOKEN="$(MOQOM_TENANT=$TENANT "$JOIN" viewer "$ROOM" "$MOQOM_VIEWER_DEVICE")"
 fi
+
+# Sixty, which is what this application is tuned around and what a hand launch
+# now uses too. Thirty was the default here for as long as the two disagreed, and
+# the effect was that the build being measured behaved unlike the build somebody
+# opened — the same binary, half the frames, and nothing on screen saying which.
+FPS="${MOQOM_FPS:-60}"
 
 # Where the relay is. The app already dials the compiled-in GCP endpoint. A host
 # here overrides that; a pairing code is the room, not a lookup.
-FPS="${MOQOM_FPS:-30}"
 if [ -n "${MOQOM_RELAY_HOST:-}" ]; then
     WHERE="--relay-host $MOQOM_RELAY_HOST --relay-port ${MOQOM_RELAY_PORT:-4443}"
     if [ -n "${MOQOM_RELAY_CERT_HASH:-}" ]; then

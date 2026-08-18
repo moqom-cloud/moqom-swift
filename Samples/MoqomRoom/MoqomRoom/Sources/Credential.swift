@@ -24,6 +24,14 @@ struct Credential {
     var room: String
     var expires: Date
 
+    /// The device key this token is bound to, from `cnf.jkt`, untruncated.
+    ///
+    /// Read for the same reason the room is: a token bound to a key this phone
+    /// does not hold is refused by a relay requiring proof of possession, and the
+    /// symptom without this is a Join that fails with the reason sealed inside
+    /// the credential. Empty for a token minted before binding meant anything.
+    var device: String
+
     /// Read the claims out of a JWT without checking the signature. See the file comment.
     init?(_ token: Data) {
         let parts = token.split(separator: UInt8(ascii: "."))
@@ -33,10 +41,12 @@ struct Credential {
         // room lives under `moqt` with the rest of what a relay enforces.
         struct Claims: Decodable {
             struct Scope: Decodable { var room: String? }
+            struct Confirmation: Decodable { var jkt: String? }
             var sub: String?
             var aud: String?
             var exp: Double?
             var moqt: Scope?
+            var cnf: Confirmation?
         }
 
         guard
@@ -47,6 +57,7 @@ struct Credential {
         subject = claims.sub ?? ""
         tenant = claims.aud ?? ""
         room = claims.moqt?.room ?? ""
+        device = claims.cnf?.jkt ?? ""
         self.expires = Date(timeIntervalSince1970: expires)
     }
 
@@ -74,13 +85,20 @@ struct Credential {
     /// The failure it names cost an evening: a token minted for one room, a room field saying
     /// another, and a relay that refuses the pair — which on the phone is a Join that fails
     /// and a Go live that does nothing, with the reason sitting unread in the token itself.
-    func complaint(joining room: String, as username: String) -> String? {
+    func complaint(joining room: String, as username: String, on device: String = "") -> String? {
         if hasExpired { return "This token expired \(expires.formatted(.relative(presentation: .numeric)))." }
         if !self.room.isEmpty, self.room != room {
             return "This token is for room \(self.room), not \(room)."
         }
         if !subject.isEmpty, subject != username {
             return "This token names \(subject), not \(username)."
+        }
+        // Last, because it is the newest way to be wrong and the least likely:
+        // a token minted for another phone, or minted by hand with whatever
+        // `-device` defaulted to. A relay requiring proof of possession refuses
+        // it, and this is the only place the two values are visible together.
+        if !self.device.isEmpty, !device.isEmpty, !self.device.hasPrefix(device) {
+            return "This token is bound to another device's key (\(self.device.prefix(16)))."
         }
         return nil
     }

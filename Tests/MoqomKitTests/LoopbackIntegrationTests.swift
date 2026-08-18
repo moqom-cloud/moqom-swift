@@ -43,7 +43,7 @@ func credentials(_ name: String, device: String = "iphone-0001") -> DeviceCreden
     DeviceCredentials(
         identity: identity(name, device: device),
         token: Data("token-\(name)".utf8),
-        proofSigner: { challenge in challenge }
+        deviceKey: nil
     )
 }
 

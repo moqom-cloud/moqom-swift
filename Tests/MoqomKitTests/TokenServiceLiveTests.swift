@@ -76,7 +76,7 @@ struct TokenServiceLiveTests {
         )
 
         let issued = try await service.token(
-            username: "ada", room: "handsync", device: "sample-device-key"
+            username: "ada", room: "handsync", device: DeviceKey.ephemeral()
         )
 
         #expect(!issued.token.isEmpty)
@@ -108,7 +108,7 @@ struct TokenServiceLiveTests {
 
         do {
             _ = try await service.token(
-                username: "ada", room: "handsync", device: "sample-device-key"
+                username: "ada", room: "handsync", device: DeviceKey.ephemeral()
             )
             Issue.record("the client trusted a certificate it was not pinned to")
         } catch let error as TokenServiceError {

@@ -112,14 +112,16 @@ public struct TokenService: Sendable, Hashable {
 
     /// Ask for a token for this name, in this room, on this device.
     ///
-    /// - Parameter device: A thumbprint of a key this device holds, which the
-    ///   token is bound to by its `cnf` claim. Recorded rather than proven today;
-    ///   what it buys already is that a stolen token names a device, so it can be
-    ///   banned without banning the person.
+    /// - Parameter device: The key this token is to be bound to. The public half
+    ///   is sent and the control plane derives `cnf.jkt` from it rather than
+    ///   accepting a thumbprint, because a thumbprint from a client is a claim
+    ///   about which key it holds and the relay will later demand a signature
+    ///   from whatever the claim names. Sending the key is what makes those two
+    ///   the same key by construction rather than by agreement.
     public func token(
         username: String,
         room: String,
-        device: String,
+        device: DeviceKey,
         session: URLSession? = nil
     ) async throws -> IssuedToken {
         var components = URLComponents()
@@ -137,7 +139,17 @@ public struct TokenService: Sendable, Hashable {
             "tenant": tenant,
             "username": username,
             "room": room,
-            "device": device,
+            // Both, and they have to agree. The thumbprint is the truncated form
+            // this device announces under, which the endpoint checks against
+            // what the key actually hashes to — so a client whose namespace and
+            // whose key disagree is told here rather than at a relay.
+            "device": DeviceID.field(of: device.thumbprint),
+            "key": [
+                "kty": "EC",
+                "crv": "P-256",
+                "x": device.x,
+                "y": device.y,
+            ],
         ])
         // Short, because this sits in front of a connection somebody is waiting
         // for. A token service that hangs for the platform's default of sixty

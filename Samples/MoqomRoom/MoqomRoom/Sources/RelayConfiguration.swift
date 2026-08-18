@@ -305,10 +305,10 @@ struct RelayConfiguration {
     /// the connection succeeds, the session is admitted as nobody, and the phone
     /// shows a room it cannot publish into. A minute covers the walk from here to
     /// a relay on the other side of the country.
-    func needsAToken(joining room: String, as username: String) -> Bool {
+    func needsAToken(joining room: String, as username: String, on device: String = "") -> Bool {
         guard let held = credential else { return true }
         if held.expires.timeIntervalSinceNow < 60 { return true }
-        return held.complaint(joining: room, as: username) != nil
+        return held.complaint(joining: room, as: username, on: device) != nil
     }
 
     /// What the token says about itself, or nothing when there is no token to ask.

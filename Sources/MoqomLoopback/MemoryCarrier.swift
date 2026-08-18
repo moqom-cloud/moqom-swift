@@ -144,6 +144,14 @@ public final class MemoryCarrier: QUICCarrier {
     public let alpn: String
     public let maximumDatagramSize: Int
 
+    /// What a proof of possession made over this connection is bound to.
+    ///
+    /// Settable rather than always `nil`, because "there is no certificate" and
+    /// "there is one, and here is its digest" are different code paths in the
+    /// session above and both deserve a test. There is no TLS here, so this is a
+    /// stand-in for one and nothing verifies it.
+    public let peerCertificateDigest: String?
+
     private let incomingBidirectional: AsyncStream<any QUICStream>
     private let incomingUnidirectional: AsyncStream<any QUICReceiveStream>
     private let incomingDatagrams: AsyncStream<Data>
@@ -169,9 +177,13 @@ public final class MemoryCarrier: QUICCarrier {
     ///
     /// - Parameter alpn: reported by both ends, since a handshake that had
     ///   really happened would have agreed on one.
+    /// - Parameter certificate: stood in for the relay's, on both ends. `nil`
+    ///   means a carrier with nothing underneath it to identify, which is what
+    ///   an in-memory pair honestly is and what most tests want.
     public static func pair(
         alpn: String = "moqt-19",
-        maximumDatagramSize: Int = 1200
+        maximumDatagramSize: Int = 1200,
+        certificate: String? = nil
     ) -> (client: MemoryCarrier, server: MemoryCarrier) {
         let (clientBidi, clientBidiIn) = AsyncStream.makeStream(
             of: (any QUICStream).self,
@@ -209,6 +221,7 @@ public final class MemoryCarrier: QUICCarrier {
         let client = MemoryCarrier(
             alpn: alpn,
             maximumDatagramSize: maximumDatagramSize,
+            certificate: certificate,
             incomingBidirectional: clientBidi,
             incomingUnidirectional: clientUni,
             incomingDatagrams: clientDatagrams,
@@ -222,6 +235,7 @@ public final class MemoryCarrier: QUICCarrier {
         let server = MemoryCarrier(
             alpn: alpn,
             maximumDatagramSize: maximumDatagramSize,
+            certificate: certificate,
             incomingBidirectional: serverBidi,
             incomingUnidirectional: serverUni,
             incomingDatagrams: serverDatagrams,
@@ -238,6 +252,7 @@ public final class MemoryCarrier: QUICCarrier {
     private init(
         alpn: String,
         maximumDatagramSize: Int,
+        certificate: String?,
         incomingBidirectional: AsyncStream<any QUICStream>,
         incomingUnidirectional: AsyncStream<any QUICReceiveStream>,
         incomingDatagrams: AsyncStream<Data>,
@@ -250,6 +265,7 @@ public final class MemoryCarrier: QUICCarrier {
     ) {
         self.alpn = alpn
         self.maximumDatagramSize = maximumDatagramSize
+        peerCertificateDigest = certificate
         self.incomingBidirectional = incomingBidirectional
         self.incomingUnidirectional = incomingUnidirectional
         self.incomingDatagrams = incomingDatagrams

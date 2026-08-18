@@ -69,7 +69,7 @@ struct SpaceSessionTests {
             credentials: DeviceCredentials(
                 identity: who,
                 token: Data("token".utf8),
-                proofSigner: { $0 }
+                deviceKey: nil
             )
         )
     }

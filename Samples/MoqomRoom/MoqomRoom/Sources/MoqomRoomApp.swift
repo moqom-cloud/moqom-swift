@@ -40,13 +40,17 @@ struct JoinScreen: View {
                 InvitationSection(invitation: invitation, model: model)
             }
 
-            Section("You") {
+            Section {
                 TextField("Username", text: $model.username)
                     .textContentType(.username)
                     #if os(iOS)
                         .textInputAutocapitalization(.never)
                     #endif
                     .autocorrectionDisabled()
+            } header: {
+                Text("You")
+            } footer: {
+                DeviceKeyFooter(model: model)
             }
 
             Section {
@@ -139,9 +143,10 @@ struct JoinScreen: View {
                     Text(model.relay.tokenService?.summary ?? "none")
                     Text(
                         "With this filled in, the phone fetches its own token just before "
-                            + "it connects, so nothing here expires. The credential is not a "
-                            + "token: it grants joining rooms in one tenant, never moderation "
-                            + "or ownership, and it is kept in the Keychain."
+                            + "it connects and replaces it mid-call, so neither this nor the "
+                            + "call expires. The credential is not a token: it grants joining "
+                            + "rooms in one tenant, never moderation or ownership, and it is "
+                            + "kept in the Keychain."
                     )
                 }
             }
@@ -208,6 +213,42 @@ struct JoinScreen: View {
             }
         }
         .navigationTitle("MOQOM")
+    }
+}
+
+/// Which key this phone is, and where it is kept.
+///
+/// On screen rather than in a log because it is the value that has to match in
+/// three places — the namespace this device announces under, the `cnf.jkt` of
+/// the token it presents, and the key it signs its proof of possession with —
+/// and a mismatch is refused by the relay with the reason inside a credential
+/// nobody reads. It is also the third argument `deploy/tools/join.sh` wants, and
+/// reading it off the phone is easier than deriving it anywhere else.
+struct DeviceKeyFooter: View {
+    let model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if let problem = model.deviceProblem {
+                // Not fatal, and the sentence says so. A relay that does not
+                // require proofs still admits this phone; one that does will
+                // not, and that is the whole of the consequence.
+                Text("No device key: \(problem). Tokens cannot be bound to this phone.")
+                    .foregroundStyle(.orange)
+            }
+            if let key = model.deviceKey {
+                Text(model.deviceName).font(.caption.monospaced())
+                Text(
+                    key.storage == .secureEnclave
+                        ? "Key in the Secure Enclave, so a copied token is useless without "
+                            + "this phone."
+                        // Said plainly rather than hidden: the fallback passes every check
+                        // the enclave does and makes none of the same promise.
+                        : "Key in the Keychain — the Secure Enclave was unavailable, so this "
+                            + "key could be read off the device."
+                )
+            }
+        }
     }
 }
 

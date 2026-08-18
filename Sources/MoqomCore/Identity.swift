@@ -68,7 +68,18 @@ public struct DeviceID: Hashable, Sendable, Codable {
     /// and the token's `cnf` claim carries the untruncated value, so the
     /// authorisation decision never depends on this string being unique.
     public init(thumbprint: String, prefixLength: Int = 16) throws(NameError) {
-        try self.init(String(thumbprint.prefix(prefixLength)))
+        try self.init(Self.field(of: thumbprint, prefixLength: prefixLength))
+    }
+
+    /// The truncation on its own, for a caller that needs the rendering without
+    /// the value.
+    ///
+    /// Exposed so the rule lives in one place. The control plane checks that the
+    /// device a client names is a prefix of the key it sent, and a client that
+    /// truncated differently here than ``init(thumbprint:prefixLength:)`` does
+    /// would be refused for disagreeing with itself.
+    public static func field(of thumbprint: String, prefixLength: Int = 16) -> String {
+        String(thumbprint.prefix(prefixLength))
     }
 }
 

@@ -50,9 +50,11 @@ public struct RelayEndpoint: Hashable, Sendable {
 
 /// What the client presents to the relay.
 ///
-/// The token is a CAT bound to a hardware key by its `cnf` claim. The SDK never
-/// holds the private key; signing a DPoP proof is a call into the Secure
-/// Enclave, which is why ``proofSigner`` is a closure rather than key material.
+/// The token is a CAT bound to a hardware key by its `cnf` claim, and
+/// ``deviceKey`` is the key it is bound to. Holding the key rather than a
+/// signing closure is deliberate: a proof carries the public half in its header,
+/// so a closure that could only sign was never enough to build one, and the
+/// closure that used to be here was consequently never called.
 public struct DeviceCredentials: Sendable {
     /// The user this device belongs to.
     public let identity: ParticipantIdentity
@@ -60,20 +62,75 @@ public struct DeviceCredentials: Sendable {
     /// The encoded Common Access Token.
     public let token: Data
 
-    /// Produces a DPoP proof over the given challenge.
+    /// The key ``token`` was issued to, which proves the token is this device's.
     ///
-    /// A proof binds to the action and track rather than to the QUIC
-    /// connection, so it is per-request rather than per-session.
-    public let proofSigner: @Sendable (Data) async throws -> Data
+    /// `nil` presents no proof, and the relay then decides what that is worth:
+    /// one in `bearer` or `observed` mode admits the session, one in `required`
+    /// mode refuses it. That is the right answer for a loopback with no tokens
+    /// at all, and the wrong one for anything shipping — see
+    /// ``DeviceKey/installed(label:)``.
+    ///
+    /// It must be the same key across a renewal, because the replacement token
+    /// commits to the same thumbprint. ``replacing(with:)`` keeps it for that
+    /// reason.
+    public let deviceKey: DeviceKey?
+
+    /// When ``token`` stops being accepted, if the caller knows.
+    ///
+    /// Supplied rather than parsed out of the token, for the reason
+    /// ``IssuedToken/expiresAt`` gives: a client that has to decode its own
+    /// credential to find out when to replace it is a client that gets the
+    /// decoding wrong once and then caches the mistake.
+    ///
+    /// `nil` means the SDK will not renew on its own. That is the right answer
+    /// for a relay holding no verification keys, which accepts anything and
+    /// enforces no expiry, and it is what every caller that predates renewal
+    /// gets.
+    public let expiresAt: Date?
+
+    /// Produces a replacement credential, called shortly before the current one
+    /// lapses.
+    ///
+    /// A closure rather than a token because the whole point is to obtain one
+    /// later, and a closure rather than a `TokenService` because the SDK should
+    /// not care where a credential comes from: a caller minting tokens from
+    /// their own backend is the ordinary case, and
+    /// ``TokenService/token(username:room:device:session:)`` is one
+    /// implementation of this signature rather than the only one.
+    ///
+    /// `nil` disables renewal, and a session whose relay enforces expiry will
+    /// then be closed when its token runs out. That is the honest outcome and it
+    /// is why this is worth passing: the relay stopped treating a token's
+    /// lifetime as a property of the handshake alone.
+    public let renew: (@Sendable () async throws -> IssuedToken)?
 
     public init(
         identity: ParticipantIdentity,
         token: Data,
-        proofSigner: @escaping @Sendable (Data) async throws -> Data
+        deviceKey: DeviceKey?,
+        expiresAt: Date? = nil,
+        renew: (@Sendable () async throws -> IssuedToken)? = nil
     ) {
         self.identity = identity
         self.token = token
-        self.proofSigner = proofSigner
+        self.deviceKey = deviceKey
+        self.expiresAt = expiresAt
+        self.renew = renew
+    }
+
+    /// The same credentials carrying a token that has just been issued.
+    ///
+    /// Keeps the identity, the key and the renewal closure, which is what makes
+    /// renewal repeatable: the replacement has to be able to replace itself, and
+    /// to prove itself with the key the new token was issued to.
+    public func replacing(with issued: IssuedToken) -> DeviceCredentials {
+        DeviceCredentials(
+            identity: identity,
+            token: issued.token,
+            deviceKey: deviceKey,
+            expiresAt: issued.expiresAt,
+            renew: renew
+        )
     }
 }
 
@@ -141,6 +198,27 @@ public protocol TransportSession: Sendable, AnyObject {
         _ track: FullTrackName,
         priority: UInt8
     ) async throws(MoqomError) -> any TrackWriter
+
+    /// Hand the relay a replacement credential without reconnecting.
+    ///
+    /// The relay closes a session when the token that admitted it runs out, so
+    /// on a long call this is what keeps it open. Both halves are needed and
+    /// neither is any use alone: enforcing an expiry without renewal would end
+    /// every call at the token's lifetime, and renewing without enforcement
+    /// would be ceremony.
+    ///
+    /// Travels as a `REQUEST_UPDATE` carrying an authorization token parameter,
+    /// which is draft-19's mechanism for it — there is no session-level message
+    /// for a credential, and the update exists precisely because a token is a
+    /// parameter of a request that may outlive it. That has a consequence worth
+    /// knowing: it needs a request stream to write on, so a session that is
+    /// announcing nothing, watching nothing and subscribed to nothing cannot
+    /// renew. In practice every participant watches a namespace to learn who
+    /// else is in the room.
+    ///
+    /// - Throws: ``MoqomError/invalidState(expected:actual:)`` when there is no
+    ///   request stream to carry it.
+    func renewCredential(_ token: Data) async throws(MoqomError)
 
     /// Close the session.
     ///
@@ -275,6 +353,14 @@ public extension TransportSession {
     var offers: AsyncStream<TrackOffer> {
         AsyncStream { $0.finish() }
     }
+
+    /// Accepted and discarded, for a transport with no credentials to replace.
+    ///
+    /// The loopback is the case that matters: it has no tokens and no expiry, so
+    /// a renewal there is satisfied by construction. Succeeding rather than
+    /// throwing is deliberate — a caller that wired up renewal correctly should
+    /// not have to special-case running against an in-memory relay.
+    func renewCredential(_: Data) async throws(MoqomError) {}
 }
 
 /// A track the peer opened on its own.

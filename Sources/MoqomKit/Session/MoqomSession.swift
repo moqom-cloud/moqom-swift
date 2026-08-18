@@ -26,7 +26,16 @@ public actor MoqomSession {
     public nonisolated let logger: MoqomLogger
 
     private let transport: any Transport
-    private let credentials: DeviceCredentials
+
+    /// The credential in force, which is not the one this session was built
+    /// with once anything has been renewed.
+    ///
+    /// A `var` because a relay closes a session when the token that admitted it
+    /// runs out. While that was unenforced this could be a constant and a
+    /// reconnect could present the same token forever; now a token has a
+    /// lifetime that outlives neither the call nor, on a long one, itself.
+    private var credentials: DeviceCredentials
+
     private var machine: SessionStateMachine
     private var connection: (any TransportSession)?
     private var rooms: [RoomID: RoomSession] = [:]
@@ -40,6 +49,7 @@ public actor MoqomSession {
 
     private var reconnect: Task<Void, Never>?
     private var interruptionWatch: Task<Void, Never>?
+    private var renewal: Task<Void, Never>?
 
     private let clock: @Sendable () -> MonotonicTime
     private let sleeper: @Sendable (Duration) async -> Void
@@ -123,6 +133,7 @@ public actor MoqomSession {
             throw error
         }
         logger.info(.session, "connected")
+        scheduleRenewal()
         apply(machine.handle(.connected(at: now)))
     }
 
@@ -144,6 +155,111 @@ public actor MoqomSession {
     }
 
     private nonisolated func now() -> MonotonicTime { clock() }
+
+    // MARK: - Keeping the credential fresh
+
+    /// How long before a token lapses to go and get the next one.
+    ///
+    /// Wide enough to cover a round trip to whoever mints tokens, a retry, and a
+    /// phone that was asleep when the timer should have fired. The cost of being
+    /// early is one extra token; the cost of being late is the relay closing a
+    /// call that was working.
+    private static let renewalMargin: TimeInterval = 120
+
+    /// How long to wait before trying again when a renewal did not work.
+    ///
+    /// Also what stops this loop spinning. A credential already inside
+    /// ``renewalMargin`` computes no wait at all, which is correct for the first
+    /// attempt and would be a request per round trip if it were also correct for
+    /// every attempt after a failure.
+    private static let retryInterval: TimeInterval = 15
+
+    /// Replace the credential before the relay stops accepting it, for as long as
+    /// the session lasts.
+    ///
+    /// Started on connect and restarted on reconnect, because the deadline moves
+    /// with the token rather than with the connection. A session with nothing to
+    /// renew with — no ``DeviceCredentials/renew`` closure, or no expiry to
+    /// renew before — schedules nothing, which is every caller that predates
+    /// this and every session against a relay holding no keys.
+    private func scheduleRenewal() {
+        renewal?.cancel()
+        renewal = nil
+        guard credentials.renew != nil, credentials.expiresAt != nil else { return }
+        renewal = Task { [weak self] in
+            await self?.keepCredentialFresh()
+        }
+    }
+
+    private func keepCredentialFresh() async {
+        while !isClosed, !Task.isCancelled {
+            guard let renew = credentials.renew, let expiresAt = credentials.expiresAt else {
+                return
+            }
+
+            // Deliberately not the injected backoff sleeper. A test that stubs
+            // out reconnection delays should not thereby stub out token
+            // lifetimes and find this minting as fast as the network allows.
+            let wait = expiresAt.timeIntervalSinceNow - Self.renewalMargin
+            if wait > 0 {
+                try? await Task.sleep(for: .seconds(wait))
+                guard !isClosed, !Task.isCancelled else { return }
+            }
+
+            let issued: IssuedToken
+            do {
+                issued = try await renew()
+            } catch {
+                // Retried rather than given up on, because the usual cause is a
+                // network that is briefly unavailable — and the session is still
+                // working, so there is time. Bounded by the token's own
+                // remaining life: when that runs out the relay closes the
+                // session and the reconnect path takes over, which is the right
+                // escalation rather than a second one written here.
+                logger.warning(
+                    .session,
+                    "could not renew the credential",
+                    [LogField("error", .text("\(error)"))]
+                )
+                try? await Task.sleep(for: .seconds(Self.retryInterval))
+                continue
+            }
+
+            credentials = credentials.replacing(with: issued)
+            let remaining = issued.expiresAt.timeIntervalSinceNow
+
+            if let connection {
+                do {
+                    try await connection.renewCredential(issued.token)
+                    logger.debug(
+                        .session,
+                        "credential renewed",
+                        [LogField("expires_in", .number(Int(remaining)))]
+                    )
+                } catch {
+                    // The token is still worth keeping even though it could not
+                    // be handed over: a reconnect presents whatever is current,
+                    // so a renewal that failed on the wire has still spared the
+                    // redial from arriving with an expired credential.
+                    logger.warning(
+                        .session,
+                        "renewed the credential but could not present it",
+                        [LogField("error", .text("\(error)"))]
+                    )
+                }
+            }
+
+            // A replacement that arrives already inside the window it was
+            // fetched for has bought no time, so the next pass would compute no
+            // wait and ask for another immediately, forever. Waiting here is
+            // what bounds that to one attempt per interval, and it is done after
+            // presenting rather than instead of it — the token is still the
+            // freshest one there is.
+            if remaining <= Self.renewalMargin {
+                try? await Task.sleep(for: .seconds(Self.retryInterval))
+            }
+        }
+    }
 
     /// Join a room, or return the session already open on it.
     ///
@@ -270,6 +386,8 @@ public actor MoqomSession {
         reconnect = nil
         interruptionWatch?.cancel()
         interruptionWatch = nil
+        renewal?.cancel()
+        renewal = nil
 
         for room in rooms.values {
             await room.end()
@@ -311,6 +429,8 @@ public actor MoqomSession {
                 reconnect = nil
                 interruptionWatch?.cancel()
                 interruptionWatch = nil
+                renewal?.cancel()
+                renewal = nil
                 if let connection {
                     self.connection = nil
                     Task { await connection.close(code: 0, reason: "session ended") }
@@ -367,6 +487,11 @@ public actor MoqomSession {
             for room in rooms.values {
                 await room.rebind(to: session)
             }
+            // The new connection was dialled with whatever credential is current,
+            // which after a renewal is not the one this session was built with.
+            // Rearmed rather than left running because the deadline belongs to
+            // the token and the old task may be mid-sleep against a stale one.
+            scheduleRenewal()
             logger.info(
                 .session,
                 "reconnected",

@@ -68,7 +68,7 @@ struct ControlTrackTests {
             credentials: DeviceCredentials(
                 identity: who,
                 token: Data("token".utf8),
-                proofSigner: { $0 }
+                deviceKey: nil
             )
         )
         let handle = try await session.announce(

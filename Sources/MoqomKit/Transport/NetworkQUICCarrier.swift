@@ -30,6 +30,7 @@
 
         public let alpn: String
         public let maximumDatagramSize: Int
+        public let peerCertificateDigest: String?
 
         private let bidirectional: AsyncStream<any QUICStream>
         private let unidirectional: AsyncStream<any QUICReceiveStream>
@@ -140,6 +141,11 @@
             return NetworkQUICCarrier(
                 connection: connection,
                 datagrams: datagrams,
+                // Read once, here, rather than on each access. The certificate
+                // cannot change without the connection being replaced, and the
+                // alternative is a metadata call on the setup path of every
+                // session and every renewal.
+                certificate: Self.digest(of: connection),
                 loss: loss,
                 reporter: reporter
             )
@@ -171,6 +177,52 @@
             guard case .pinned = trust.policy else { return quic }
             return quic.tls.certificateValidator { _, secTrust in
                 Self.satisfies(trust, secTrust)
+            }
+        }
+
+        /// base64url SHA-256 of the leaf certificate the handshake settled on.
+        ///
+        /// Read from the connection's security metadata after the fact rather
+        /// than captured inside a validator, and the difference is the whole
+        /// reason this is a separate function. A validator *replaces* platform
+        /// validation, so installing one to observe the certificate would mean
+        /// reimplementing chain and hostname checking for every connection that
+        /// is not pinning — which is the production case. Metadata is read-only
+        /// and costs the platform's verdict nothing.
+        ///
+        /// `nil` where there is no chain to read, which the caller treats as "no
+        /// binding available" rather than as a failure: a relay configured with
+        /// its own certificate refuses the resulting proof, and one without it
+        /// does not care.
+        private static func digest(of connection: NetworkConnection<QUIC>) -> String? {
+            // The handler is invoked once per certificate, leaf first, and only
+            // for the duration of the call. `Leaf` exists because the closure is
+            // typed as escaping even though it does not outlive this scope.
+            let leaf = Leaf()
+            let readable = sec_protocol_metadata_access_peer_certificate_chain(
+                connection.securityProtocolMetadata
+            ) { certificate in
+                leaf.take(sec_certificate_copy_ref(certificate).takeRetainedValue())
+            }
+
+            guard readable, let der = leaf.der, let hash = RelayTrust.hash(of: der) else {
+                return nil
+            }
+            return hash.base64URLEncodedString
+        }
+
+        /// The first certificate offered, and no others.
+        ///
+        /// Only the leaf identifies the relay. An intermediate is shared by
+        /// everything the CA signs, so binding a proof to one would bind it to
+        /// every relay with a certificate from the same issuer — the fleet this
+        /// is meant to separate.
+        private final class Leaf {
+            private(set) var der: Data?
+
+            func take(_ certificate: SecCertificate) {
+                guard der == nil else { return }
+                der = SecCertificateCopyData(certificate) as Data
             }
         }
 
@@ -312,11 +364,13 @@
         private init(
             connection: NetworkConnection<QUIC>,
             datagrams: QUIC.Datagrams<QUICDatagram>?,
+            certificate: String?,
             loss: AsyncStream<TransportFailure>,
             reporter: LossReporter
         ) {
             self.connection = connection
             datagramChannel = datagrams
+            peerCertificateDigest = certificate
             lossStream = loss
             self.reporter = reporter
             alpn = connection.negotiatedALPN ?? ""

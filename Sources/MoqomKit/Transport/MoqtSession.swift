@@ -178,10 +178,18 @@ public actor MoqtSession: TransportSession {
         let control = try await carrier.openBidirectionalStream()
         controlStream = control
 
+        // Kept for the life of the session, because a renewal has to prove
+        // itself too: a proof commits to one token by hash, so the fresh token
+        // needs a fresh proof and there is nowhere else to find the key.
+        deviceKey = credentials.deviceKey
+
         var options = Parameters()
-        // The token goes in a session option rather than per-request because
-        // it authorises the connection; per-request DPoP proofs bind actions
-        // and are carried on the requests themselves.
+        // The token goes in a session option because it authorises the
+        // connection, and the proof goes beside it because it proves the token
+        // is this device's. Both are per-session for the same reason: a session
+        // establishes who the peer is once and checks every later request
+        // against that, so there is nothing a per-request copy of either would
+        // tell a relay that had already stopped asking.
         //
         // Sent only when there is one. An empty token is not a weaker claim, it
         // is a malformed one: a relay that verifies reads an option that cannot
@@ -190,6 +198,10 @@ public actor MoqtSession: TransportSession {
         if !credentials.token.isEmpty,
            let token = try? Parameter.bytes(SetupOption.authorizationToken, credentials.token) {
             options.insert(token)
+            if let proof = prove(credentials.token),
+               let parameter = try? Parameter.bytes(SetupOption.authorizationProof, proof) {
+                options.insert(parameter)
+            }
         }
         if let implementation = try? Parameter.string(
             SetupOption.implementation,
@@ -230,6 +242,31 @@ public actor MoqtSession: TransportSession {
     /// What the peer sent in SETUP, for callers that need an option we do not
     /// model. Empty until the handshake completes.
     public var peerSetupOptions: Parameters { peerOptions }
+
+    // MARK: - Proving possession
+
+    /// The key this session's credential is bound to, if any.
+    private var deviceKey: DeviceKey?
+
+    /// A proof that `token` belongs to this device, or `nil` if it cannot be
+    /// made.
+    ///
+    /// Returning `nil` rather than throwing, and the choice is worth defending
+    /// because it looks like swallowing an error. There are two ways to get here
+    /// without a proof: no key, which is a caller that has said it is not
+    /// proving anything; and a key that refused to sign, which on these devices
+    /// means the enclave was unavailable at that instant. Neither is a decision
+    /// this end is entitled to make. The relay is the only party that knows
+    /// whether a proof is required, and it will say so — clearly, and with a
+    /// reason — where failing here would instead refuse to connect to relays
+    /// that would have been perfectly happy.
+    private func prove(_ token: Data) -> Data? {
+        guard let deviceKey else { return nil }
+        // Empty where the carrier has no certificate to bind to, which is an
+        // in-memory pair. A relay that knows its own certificate refuses the
+        // result; that is the intended outcome and not a case to paper over.
+        return try? deviceKey.proof(over: token, for: carrier.peerCertificateDigest ?? "")
+    }
 
     // MARK: - Reading
 
@@ -633,13 +670,85 @@ public actor MoqtSession: TransportSession {
     /// sessions talk directly, which is how the protocol is tested.
     private var namespaceWatchers: [(prefix: TrackNamespace, stream: any QUICStream)] = []
 
+    // MARK: - Renewing the session's credential
+
+    /// Request streams a credential renewal could be written onto, by the
+    /// request ID that opened each one.
+    ///
+    /// Kept because renewal has nowhere else to go. A token is replaced with a
+    /// `REQUEST_UPDATE`, an update names a request, and a request lives on its
+    /// own stream — so the session has to be able to find a stream it already
+    /// owns. Opening one for the purpose is not available: the first message on
+    /// a request stream says what the request *is*, and an update is not a
+    /// request.
+    ///
+    /// Announcements and namespace watches only, which are the long-lived ones.
+    /// Subscriptions would work as well and are deliberately left out: they come
+    /// and go with what is on screen, and a renewal that raced a viewer
+    /// scrolling would be a renewal that sometimes had nowhere to go.
+    private var renewable: [UInt64: any QUICStream] = [:]
+
+    private func remember(_ stream: any QUICStream, as request: UInt64) {
+        renewable[request] = stream
+    }
+
+    private func forget(_ request: UInt64) {
+        renewable.removeValue(forKey: request)
+    }
+
+    public func renewCredential(_ token: Data) async throws(MoqomError) {
+        guard let parameter = try? Parameter.bytes(
+            RequestParameter.authorizationToken,
+            token
+        ) else {
+            throw MoqomError.invalidState(
+                expected: "a token within the parameter's size",
+                actual: "\(token.count) bytes"
+            )
+        }
+
+        // A fresh proof, over the new token. The one presented at SETUP commits
+        // to the token it accompanied and has already been spent, so reusing it
+        // would be refused as a replay — and a renewal that could carry no proof
+        // would be a way to trade a proven credential for an unproven one.
+        var parameters = Parameters([parameter])
+        if let proof = prove(token),
+           let signed = try? Parameter.bytes(RequestParameter.authorizationProof, proof) {
+            parameters.insert(signed)
+        }
+
+        // Any one of them will do — the relay reads the token off whichever
+        // stream it arrives on and applies it to the session — so the first that
+        // accepts the write is the answer. A stream that fails is one whose
+        // request has ended without this having heard yet, so it is dropped and
+        // the next is tried rather than the renewal being abandoned.
+        for (request, stream) in renewable {
+            do {
+                try await send(
+                    RequestUpdate(requestID: request, parameters: parameters),
+                    on: stream
+                )
+                return
+            } catch {
+                forget(request)
+            }
+        }
+
+        throw MoqomError.invalidState(
+            expected: "an open announcement or namespace watch to renew on",
+            actual: "no request streams"
+        )
+    }
+
     public func announce(
         _ namespace: TrackNamespace
     ) async throws(MoqomError) -> any AnnouncementHandle {
         let stream = try await carrier.openBidirectionalStream()
-        let message = PublishNamespace(requestID: allocateRequestID(), namespace: namespace)
+        let request = allocateRequestID()
+        let message = PublishNamespace(requestID: request, namespace: namespace)
         try await send(message, on: stream)
         announced.insert(namespace)
+        remember(stream, as: request)
 
         for watcher in namespaceWatchers where namespace.starts(with: watcher.prefix) {
             guard let suffix = Self.split(namespace, under: watcher.prefix) else { continue }
@@ -650,6 +759,7 @@ public actor MoqtSession: TransportSession {
             namespace: namespace,
             stream: stream,
             session: self,
+            request: request,
             verdict: Task { await Self.verdict(on: stream, announcing: namespace) }
         )
     }
@@ -711,7 +821,8 @@ public actor MoqtSession: TransportSession {
         }
     }
 
-    func withdraw(_ namespace: TrackNamespace) async {
+    func withdraw(_ namespace: TrackNamespace, announcedAs request: UInt64) async {
+        forget(request)
         guard announced.remove(namespace) != nil else { return }
         for watcher in namespaceWatchers where namespace.starts(with: watcher.prefix) {
             guard let suffix = Self.split(namespace, under: watcher.prefix) else { continue }
@@ -762,10 +873,12 @@ public actor MoqtSession: TransportSession {
         matching prefix: TrackNamespace
     ) async throws(MoqomError) -> AsyncStream<AnnouncementEvent> {
         let stream = try await carrier.openBidirectionalStream()
+        let request = allocateRequestID()
         try await send(
-            SubscribeNamespace(requestID: allocateRequestID(), prefix: prefix),
+            SubscribeNamespace(requestID: request, prefix: prefix),
             on: stream
         )
+        remember(stream, as: request)
 
         let (events, continuation) = AsyncStream.makeStream(
             of: AnnouncementEvent.self,
@@ -801,9 +914,12 @@ public actor MoqtSession: TransportSession {
             continuation.finish()
         }
 
-        continuation.onTermination = { _ in
+        continuation.onTermination = { [weak self] _ in
             reader.cancel()
-            Task { await stream.finish() }
+            Task {
+                await self?.forget(request)
+                await stream.finish()
+            }
         }
         return events
     }
@@ -1430,15 +1546,21 @@ private final class MoqtAnnouncement: AnnouncementHandle {
     private let session: MoqtSession
     private let verdict: Task<MoqomError?, Never>
 
+    /// The ID this announcement was made under, kept so the session can stop
+    /// treating its stream as somewhere a credential renewal could go.
+    private let request: UInt64
+
     init(
         namespace: TrackNamespace,
         stream: any QUICStream,
         session: MoqtSession,
+        request: UInt64,
         verdict: Task<MoqomError?, Never>
     ) {
         self.namespace = namespace
         self.stream = stream
         self.session = session
+        self.request = request
         self.verdict = verdict
     }
 
@@ -1450,7 +1572,7 @@ private final class MoqtAnnouncement: AnnouncementHandle {
         // There is no UNANNOUNCE. Closing the stream *is* the withdrawal, and
         // finishing rather than resetting is what distinguishes "I am done
         // publishing" from "I crashed".
-        await session.withdraw(namespace)
+        await session.withdraw(namespace, announcedAs: request)
         await stream.finish()
     }
 }
