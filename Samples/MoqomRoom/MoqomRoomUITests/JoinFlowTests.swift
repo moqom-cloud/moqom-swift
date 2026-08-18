@@ -26,6 +26,29 @@ final class JoinFlowTests: XCTestCase {
 
     private func launch() -> XCUIApplication {
         let app = XCUIApplication()
+        // Said rather than assumed. The join screen keeps what was typed into it
+        // for the next launch, which is right for a person and wrong for a test:
+        // a runner that keeps its simulator between runs hands the next test a
+        // username and a room somebody else typed, so Join arrived already
+        // enabled where one test asserts it is not, and two others looked for a
+        // room called `demo` while the app rejoined wherever it had last been.
+        //
+        // No test-only path in the app for this. UserDefaults reads `-key value`
+        // from the argument domain ahead of anything on disk, so naming the three
+        // keys the join screen persists is enough, and the app stays a thing that
+        // simply remembers.
+        //
+        // `--loopback` for a second kind of isolation: without it these ran
+        // against the deployed relay and its token service over the internet,
+        // which is slow and makes a failure ambiguous between a view that broke
+        // and a network that did. The in-memory relay is the one thing here that
+        // cannot be someone else's outage.
+        app.launchArguments += [
+            "--loopback",
+            "-username", "",
+            "-roomName", "demo",
+            "-pairingCode", "",
+        ]
         app.launch()
         return app
     }
@@ -58,6 +81,25 @@ final class JoinFlowTests: XCTestCase {
         let join = joinButton(in: app)
         XCTAssertTrue(join.waitForExistence(timeout: 5), "Join never came into view")
         join.tap()
+    }
+
+    /// An item of the room's toolbar menu, brought into view.
+    ///
+    /// The same failure as ``joinButton(in:)`` in a different container. That menu
+    /// carries five pickers and three toggles above its actions now, and iOS
+    /// scrolls a menu too tall to fit rather than shrinking it — so Leave, at the
+    /// bottom of it, is not in the hierarchy when the menu opens.
+    ///
+    /// The menu has to be open already. Opening it here would read better and be
+    /// wrong for the two tests that assert on what is in it before touching one.
+    private func menuItem(_ name: String, in app: XCUIApplication) -> XCUIElement {
+        let item = app.buttons[name]
+        var swipes = 0
+        while !item.exists, swipes < 6 {
+            app.swipeUp()
+            swipes += 1
+        }
+        return item
     }
 
     /// The username field, brought back into view.
@@ -104,7 +146,7 @@ final class JoinFlowTests: XCTestCase {
         // live RoomModel is the point; the destructive item is the one that
         // could not exist in any other phase.
         app.buttons["Room"].tap()
-        XCTAssertTrue(app.buttons["Leave"].waitForExistence(timeout: 5))
+        XCTAssertTrue(menuItem("Leave", in: app).exists, "Leave never came into view")
         XCTAssertTrue(app.buttons["Record session"].exists)
     }
 
@@ -128,13 +170,27 @@ final class JoinFlowTests: XCTestCase {
         XCTAssertTrue(app.buttons["Stop"].waitForExistence(timeout: 10))
         XCTAssertFalse(app.staticTexts["Nobody on stage"].exists)
 
-        // Audio is a separate act from video, and the SDK treats it as one:
-        // there is no path where starting a camera starts a microphone.
+        // Asserted rather than started. Going live brings the microphone up with
+        // the camera, which is the sample's choice and not the SDK's: publishing
+        // video and publishing audio are still two calls, and the button makes
+        // them one gesture because a call where the picture arrives and the voice
+        // does not is not a call. This test used to tap "Audio" here, from back
+        // when it was two gestures, and failed on a button that had already
+        // become "End audio".
         //
         // "End audio" rather than "Mute": ending the publication and muting it
         // are two different buttons here because they are two different things
         // on the wire, and asserting on the wrong one would pass while the
         // publication never started.
+        XCTAssertTrue(app.buttons["End audio"].waitForExistence(timeout: 10))
+
+        // Which leaves the separateness itself to prove, so it is proved the way
+        // round the app now allows: ending audio and starting it again while the
+        // broadcast stays up throughout. A publication shared with the video
+        // would take "Stop" down with it.
+        app.buttons["End audio"].tap()
+        XCTAssertTrue(app.buttons["Audio"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.buttons["Stop"].exists, "ending audio ended the broadcast")
         app.buttons["Audio"].tap()
         XCTAssertTrue(app.buttons["End audio"].waitForExistence(timeout: 10))
 
@@ -168,9 +224,11 @@ final class JoinFlowTests: XCTestCase {
         XCTAssertFalse(app.buttons["Camera off"].isEnabled)
         XCTAssertFalse(app.buttons["Mute"].isEnabled)
 
+        // One tap for both publications, so what this waits for is the second of
+        // them: muting a microphone that is not publishing yet is the thing the
+        // assertions below would not catch.
         app.buttons["Go live"].tap()
         XCTAssertTrue(app.buttons["Stop"].waitForExistence(timeout: 10))
-        app.buttons["Audio"].tap()
         XCTAssertTrue(app.buttons["End audio"].waitForExistence(timeout: 10))
 
         app.buttons["Mute"].tap()
@@ -317,8 +375,8 @@ final class JoinFlowTests: XCTestCase {
         XCTAssertTrue(app.navigationBars["demo"].waitForExistence(timeout: 15))
 
         app.buttons["Room"].tap()
-        let leave = app.buttons["Leave"]
-        XCTAssertTrue(leave.waitForExistence(timeout: 5))
+        let leave = menuItem("Leave", in: app)
+        XCTAssertTrue(leave.exists, "Leave never came into view")
         leave.tap()
 
         XCTAssertTrue(
