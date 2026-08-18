@@ -343,15 +343,17 @@ somebody demonstrates. Both are built and wired; neither has been seen.
 
 ### Not written
 
-- Enforcement of proofs by default. This entry used to say proof of possession
-  was not written at all, and the binding was a placeholder; both have changed
-  and the remaining gap is smaller and worth stating exactly. A relay's
-  `MOQOM_RELAY_POSSESSION` defaults to `observed`, which verifies a proof when
-  one is offered and admits a session that offers none — so a client on an older
-  build still connects, and a deployment that has not set the variable to
-  `required` is still admitting bearer tokens from anything that presents one.
-  Crossing that is a deployment decision rather than a code change, and it is the
-  last step of this.
+- Enforcement of proofs by *default*, which is now the whole of what is left here.
+  This entry has been narrowed twice: it once said proof of possession was not
+  written, then that no deployment enforced it. The dev deployment does —
+  `MOQOM_RELAY_POSSESSION=required` on both relay regions, verified by a token
+  this deployment had just minted being refused for presenting no proof. But the
+  binary still defaults to `observed`, which verifies a proof when one is offered
+  and admits a session that offers none, so any deployment that has not set the
+  variable is still taking bearer tokens from whatever presents one. Changing the
+  default is the remaining step, and it is deliberately not taken while a fleet
+  can still be mid-upgrade: the cost of getting it wrong is an outage, and the
+  cost of leaving it is a setting an operator must know about.
 - Media kinds are not enforced per track. `moqt.pub` distinguishes audio from
   video from screen, and the relay checks only that it is non-empty, so a token
   minted for audio can publish video under a namespace it does own.
@@ -392,13 +394,22 @@ another city. What remains unobserved is narrower than it was, and specific:
   survives. Rotation is not handled at all — `CameraSource` never sets the
   capture connection's rotation angle, so a portrait phone publishes a sideways
   picture.
-- **The Secure Enclave branch of `DeviceKey`.** Every test of it runs on a
-  simulator, where there is no enclave and the code takes its Keychain fallback —
-  so what the tests prove is that the fallback works and that the two produce the
-  same thumbprint and the same proof, not that the enclave path has ever
-  generated a key. That branch differs by two flags and an access control, which
-  is exactly the amount of difference that fails only on hardware. It is
-  observable when it does: the join screen names which of the two it got.
+- **The Secure Enclave branch of `DeviceKey`, under `swift test`.** Every test of
+  it runs on a simulator, where there is no enclave and the code takes its
+  Keychain fallback — so what the tests prove is that the fallback works and that
+  the two produce the same thumbprint and the same proof, not that the enclave
+  path can generate a key. That branch differs by two flags and an access
+  control, which is exactly the amount of difference that fails only on hardware.
+
+  This entry used to say the enclave path had never run at all, and that has
+  changed by deployment rather than by test. Both phones report the enclave on
+  their join screens, and a relay set to `MOQOM_RELAY_POSSESSION=required`
+  admitted both and relayed between them — which it does only after recomputing
+  the RFC 7638 thumbprint of the key that signed the proof and matching it to the
+  token's `cnf.jkt`. So an enclave key was generated, signed, and had its
+  signature verified by another implementation. What is still missing is a check
+  that runs by itself: this was two people-minutes of reading a screen, and it
+  will not notice the day the branch breaks.
 - **A backgrounded app.** Picture in Picture and Live Activities are both
   features about what happens after the user swipes home, and the simulator does
   not enforce the rules that make that interesting: background GPU work is
