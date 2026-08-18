@@ -594,6 +594,31 @@ public actor Broadcast {
         stalls.announce(quiet)
     }
 
+    /// Take back a stall report, because from here nothing can contradict it.
+    ///
+    /// ``judgeTheSilence()`` stops judging the moment capture is stopped on
+    /// purpose, and the only other thing that lowers the flag is a frame arriving
+    /// — which is precisely what is no longer going to happen. So a stall noticed
+    /// in the moment before a mute latches: the room holds an interruption banner
+    /// for a camera that was then switched off deliberately, and holds it through
+    /// the hardware recovering too, since recovery is invisible while the source
+    /// is suspended.
+    ///
+    /// The count is left alone. A stall that happened is a fact about the run,
+    /// and this withdraws the claim that one is happening now, which is a
+    /// different sentence.
+    ///
+    /// Found as a flake rather than as a bug. A test asserting that a force-mute
+    /// is not reported as a fault failed on a loaded machine, where four frames
+    /// took longer to work through the pipeline than the stall threshold and a
+    /// genuine stall was recorded first, then frozen by the mute — the same latch,
+    /// arrived at by a stopwatch instead of by a camera.
+    private func withdrawAnyStall() {
+        guard statistics.captureStalled else { return }
+        statistics.captureStalled = false
+        stalls.announce(false)
+    }
+
     /// Route one encoder's output onto its track, tagged with which session it is.
     private func drain(
         _ encoder: any FrameEncoder,
@@ -722,6 +747,7 @@ public actor Broadcast {
         guard muted != isMuted else { return }
         isMuted = muted
         statistics.isMuted = muted || isRestricted
+        if muted { withdrawAnyStall() }
         guard !muted, !isRestricted else { return }
 
 
@@ -751,6 +777,7 @@ public actor Broadcast {
         statistics.isMuted = restricted || isMuted
 
         guard !restricted else {
+            withdrawAnyStall()
             source.suspend()
             return
         }

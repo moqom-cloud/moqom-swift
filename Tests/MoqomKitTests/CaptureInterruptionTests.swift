@@ -162,6 +162,38 @@ struct CaptureInterruptionTests {
         withExtendedLifetime(session) {}
     }
 
+    @Test("a stall already being reported is withdrawn when the camera is closed on purpose")
+    func aMuteWithdrawsAStallInFlight() async throws {
+        let relay = LoopbackRelay()
+        let (session, room, broadcast, source) = try await broadcasting("gil", relay: relay)
+
+        // A real stall first, established rather than raced: nothing more is
+        // submitted, so this is the same silence ``aStallIsNoticed`` measures.
+        submit(source, count: 4)
+        #expect(await eventually { await broadcast.stats.captureStalled })
+
+        // Now the camera is closed deliberately, which is where the report used
+        // to latch. Judging stops here, and the frame that would otherwise lower
+        // the flag cannot arrive through a suspended source — so a claim nothing
+        // is left to check has to be withdrawn at the point it stops being
+        // checked, or the room reads "interrupted" for the rest of the call.
+        await broadcast.setCaptureRestricted(true)
+        #expect(await broadcast.stats.captureStalled == false)
+
+        // And stays withdrawn, rather than being re-reported by the next sweep of
+        // a watchdog that is meant to be quiet now.
+        #expect(
+            await eventually(timeout: noticesAfter * 4) {
+                await broadcast.stats.captureStalled
+            } == false
+        )
+
+        // The stall itself is not unsaid. It happened, and the count is the run's
+        // history rather than its current state.
+        #expect(await broadcast.stats.captureStalls == 1)
+        withExtendedLifetime((session, room)) {}
+    }
+
     @Test("the room is told, and told that nobody chose it")
     func theRoomFindsOut() async throws {
         let relay = LoopbackRelay()
