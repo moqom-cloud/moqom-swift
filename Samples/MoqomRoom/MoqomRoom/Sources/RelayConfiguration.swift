@@ -165,8 +165,21 @@ struct RelayConfiguration {
     )
 
     /// Whether a script named the relay, rather than leaving the compiled-in GCP one.
+    ///
+    /// `--loopback` counts, because it names one too — the in-memory one.
     static var relayHostOverridden: Bool {
-        ProcessInfo.processInfo.arguments.contains("--relay-host")
+        ProcessInfo.processInfo.arguments.contains("--relay-host") || loopbackRequested
+    }
+
+    /// Whether a script asked for the in-memory relay by name.
+    ///
+    /// Separate from ``relayHostOverridden`` because a nil host is ambiguous and
+    /// this is not. "Nobody said" and "somebody said nowhere" both arrive as nil,
+    /// and ``AppModel/join()`` resolves the first by dialling the deployed relay —
+    /// so without a flag that says which, asking for the loopback and forgetting
+    /// to configure anything are the same request.
+    static var loopbackRequested: Bool {
+        ProcessInfo.processInfo.arguments.contains("--loopback")
     }
 
     /// Point at the compiled-in GCP relay without dropping the token or join service.
@@ -196,11 +209,14 @@ struct RelayConfiguration {
         var joinHashes: [String] = []
         var joinCredential: String?
 
+        var loopback = false
+
         var index = 0
         while index < arguments.count {
             let flag = arguments[index]
             let value: String? = index + 1 < arguments.count ? arguments[index + 1] : nil
             switch flag {
+            case "--loopback": loopback = true
             case "--relay-host": host = value
             case "--relay-port": port = value.flatMap(UInt16.init)
             case "--relay-cert-hash": value.map { hashes.append($0) }
@@ -212,6 +228,26 @@ struct RelayConfiguration {
             default: break
             }
             index += 1
+        }
+
+        // Before anything remembered is consulted, which is the whole point of it:
+        // "run against nothing" has to mean that on an installation which has
+        // joined a real relay before, and a nil host alone cannot say it —
+        // `dialling` falls back to what was saved when the argument is absent, so
+        // absent and blank would be the same request.
+        //
+        // Written for the UI tests. They ran against the deployed relay and its
+        // token service until this existed, over the internet, which made them
+        // slow and made a red run ambiguous between a broken view and a bad
+        // network. No token and no service, so nothing here reaches for either.
+        if loopback {
+            return RelayConfiguration(
+                host: nil,
+                port: 443,
+                certificateHashes: [],
+                token: Data(),
+                tokenService: nil
+            )
         }
 
         // Whether anything was ever saved, rather than whether what was saved is empty. The

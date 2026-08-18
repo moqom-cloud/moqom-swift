@@ -2400,7 +2400,18 @@ final class RoomModel {
                     )
                 )
             } catch {
-                lastError = error as? MoqomError
+                // Journalled, not raised. This used to set `lastError`, which puts
+                // "Something went wrong" over a broadcast that is live and working:
+                // the card is decoration, and ActivityKit refuses it for reasons
+                // that are about the system rather than the room -- no support on
+                // this platform, the app's budget already spent, too many cards
+                // already showing. A simulator refuses every time, which is how
+                // this was found: a UI test tapped Go live, watched the button
+                // become Stop, and then failed on the alert that followed it.
+                //
+                // The failures worth interrupting somebody for are the ones that
+                // mean nobody can see or hear them. This is not one.
+                Journal.shared.say("CARD refused \(error)")
                 return
             }
 

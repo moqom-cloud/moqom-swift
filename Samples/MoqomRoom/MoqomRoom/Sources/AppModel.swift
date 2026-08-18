@@ -1322,7 +1322,16 @@ final class AppModel {
         // The code is the room, not a lookup. The relay is always the compiled-in
         // GCP endpoint unless a script passed `--relay-host`.
         let sharedCode = pairing
-        if !RelayConfiguration.relayHostOverridden || relay.host == nil {
+        // Unless the loopback was asked for by name. The `host == nil` clause below
+        // is what makes a phone with nothing configured reach the deployed relay
+        // instead of talking to itself, and it was also swallowing the one request
+        // that legitimately produces a nil host: the journal said
+        // "JOINING relay=loopback" and then "JOINED relay=35.235.101.37", the
+        // deployed relay refused a publish from a session holding no token, and Go
+        // live failed for a reason nothing on screen connected to the relay it had
+        // actually dialled.
+        if !RelayConfiguration.loopbackRequested,
+           !RelayConfiguration.relayHostOverridden || relay.host == nil {
             relay.useDevelopmentEndpoint()
         }
 
