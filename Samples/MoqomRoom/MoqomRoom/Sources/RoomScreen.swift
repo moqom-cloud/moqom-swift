@@ -686,11 +686,11 @@ struct Scoreboard: View {
                 round
                 standings
             }
-            // The scoreboard gets the width it asks for. Truncating it is never
-            // the right answer: every item in it is a short number whose whole
-            // purpose is to be read at a glance.
+            // No width asked for on behalf of both rows, which is what used to
+            // squeeze the Rematch button: each pill asks for its own — see
+            // ``capsuled()``. Single-line because every item here is a short
+            // number or a short name meant to be read at a glance.
             .lineLimit(1)
-            .fixedSize(horizontal: true, vertical: false)
             .animation(.spring(duration: 0.25), value: room.roundIsOver)
         }
     }
@@ -719,6 +719,10 @@ struct Scoreboard: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.purple)
                 .controlSize(.small)
+                // Its own width, whatever else is going on. A bordered button
+                // measures its title and its capsule together, so a button with a
+                // width to spare is a button with a shortened title.
+                .fixedSize()
                 // Either phone may ask, and the first to ask starts it. Worth
                 // saying, because a button in one player's scoreboard looks
                 // like it only speaks for that player.
@@ -787,9 +791,18 @@ struct Scoreboard: View {
 }
 
 private extension View {
-    /// The scoreboard's chrome: a little material pill.
+    /// The scoreboard's chrome: a little material pill, as wide as its contents.
+    ///
+    /// Sized here, once, per pill — and deliberately not by letting the row
+    /// negotiate. Two attempts at that both ended with the Rematch button
+    /// shortened: first when one width was asked for around both rows of the
+    /// scoreboard, then again when the result text was told to yield before the
+    /// button, which fixed the case with a long name in it and broke the case with
+    /// a short one. A row of things that cannot shrink has exactly one right
+    /// width, and this asks for it rather than arguing about it.
     func capsuled() -> some View {
-        padding(.horizontal, 12)
+        fixedSize(horizontal: true, vertical: false)
+            .padding(.horizontal, 12)
             .padding(.vertical, 6)
             .background(.regularMaterial, in: Capsule())
     }

@@ -125,15 +125,15 @@ final class BubbleField: SpaceSimulation, @unchecked Sendable {
     /// How long a round lasts.
     ///
     /// A field that never ends is a demo rather than a game: nothing is won, so
-    /// there is no reason to hurry, and hurrying is the whole of it. Ninety
-    /// seconds is long enough for a lead to change hands and short enough that
-    /// losing costs nothing to sit through.
+    /// there is no reason to hurry, and hurrying is the whole of it. Thirty
+    /// seconds is long enough for a lead to change hands and short enough to be
+    /// played twice while somebody is still holding the phone.
     ///
     /// Nothing starts the next one but somebody asking. A clock that restarted
     /// by itself would begin a round while both players were still reading the
     /// last one's score, and the first few seconds of a round nobody is looking
     /// at are the ones that decide it.
-    static let roundLength = Duration.seconds(90)
+    static let roundLength = Duration.seconds(30)
 
     private let rules: Rules
     private var sinceSpawn = Duration.zero

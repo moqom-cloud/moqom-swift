@@ -902,7 +902,13 @@ final class RoomModel {
     }
 
     /// The frame rate to publish at.
-    var publishFrameRate: Double = 30
+    ///
+    /// Sixty, which is what every measurement of this application has been taken
+    /// at and what the capture, encode and presentation paths are tuned around.
+    /// ``AppModel`` has set it to this on every join for a while; the default here
+    /// disagreeing only mattered for a launch that turned measurement off, which
+    /// is the one configuration nobody would have thought to check.
+    var publishFrameRate: Double = 60
 
     /// What a rung of ``publishSize`` costs on the wire.
     ///
