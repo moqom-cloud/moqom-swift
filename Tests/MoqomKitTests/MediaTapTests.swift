@@ -479,10 +479,21 @@ struct ReceiveTapTests {
         // Waited on reassembly rather than on the tap, because the tap's own
         // counters are what is under test and polling them would let this
         // assert after the first frame through.
-        _ = await eventually {
+        //
+        // Both results are discarded, which makes these settle-waits rather than
+        // claims: twelve frames submitted need not all arrive, and the assertions
+        // below are about the ratio between decoded and delivered rather than
+        // about reaching any particular count. So they are bounded explicitly —
+        // the shared default is sized for a condition that will come true, and a
+        // wait that is allowed to expire wants the smallest window that lets the
+        // pipeline finish, or the whole suite waits out both of them.
+        let settle = Duration.seconds(2)
+        _ = await eventually(timeout: settle) {
             await room.videoStatistics(for: who)?.framesProduced ?? 0 >= 10
         }
-        _ = await eventually { tap.statistics.skipped + tap.statistics.delivered >= 10 }
+        _ = await eventually(timeout: settle) {
+            tap.statistics.skipped + tap.statistics.delivered >= 10
+        }
 
         let decoded = await decoder.decoded
         let stats = tap.statistics

@@ -7,8 +7,19 @@ import Testing
 
 /// Poll until `condition` holds, so a test does not depend on how many task
 /// hops an announcement takes to propagate.
+///
+/// The default is generous on purpose. Waiting for something that will happen
+/// costs only how long it actually takes — the loop returns on the first true —
+/// so the timeout is not a budget for the fast path, it is the point at which a
+/// test gives up and calls a hang a failure. Two seconds was tight enough that a
+/// busy machine failed "the relay never sees plaintext, and the receiver does" on
+/// a single frame that had not finished encoding, which reports load as a bug.
+///
+/// Tests that mean a deadline rather than an outcome pass their own, and the ones
+/// that want to watch nothing happen for a while have to: for them the timeout is
+/// the whole measurement.
 func eventually(
-    timeout: Duration = .seconds(2),
+    timeout: Duration = .seconds(10),
     _ condition: @Sendable () async -> Bool
 ) async -> Bool {
     let deadline = ContinuousClock.now.advanced(by: timeout)
