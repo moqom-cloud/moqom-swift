@@ -13,6 +13,11 @@ Package.resolved
 # pbxproj is thousands of lines of UUIDs nobody reviews.
 *.xcodeproj/
 
+# Also generated from project.yml, for the same reason and with a sharper edge:
+# two sources for one entitlement means editing the file, watching the next
+# `xcodegen generate` discard it, and looking for the bug in the keychain.
+*.entitlements
+
 # Carries DEVELOPMENT_TEAM, which is personal. Signing.xcconfig holds the shared
 # half and includes this one when it exists.
 Local.xcconfig

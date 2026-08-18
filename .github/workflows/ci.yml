@@ -111,23 +111,37 @@ jobs:
           xcrun simctl boot "$udid" 2>/dev/null || true
           xcrun simctl bootstatus "$udid" -b
 
-      # The only place the SwiftUI layer runs. No signing: a simulator needs
-      # none, and the runner has no team.
+      # The only place the SwiftUI layer runs, and the only place the sample's
+      # own unit tests run at all -- they are an Xcode target, so `swift test`
+      # above never sees them.
+      #
+      # MoqomRoom, not MoqomRoomUITests. Both test bundles hang off the app's
+      # scheme via project.yml's `scheme.testTargets`, and xcodegen generates no
+      # scheme of their own, so the name this used to carry had never existed.
+      # xcodebuild's answer to that is exit 65 and "does not contain a scheme",
+      # which is indistinguishable in a summary from a test that failed -- and
+      # nobody read the summary, because minutes ran out a week later and the
+      # job stopped starting.
+      #
+      # Signing left alone rather than switched off. CODE_SIGNING_ALLOWED=NO
+      # produces a bundle with no entitlements, and with no entitlements there
+      # is no keychain group, so `DeviceKey` cannot store the key it just
+      # generated: the app came up saying it could hold no key at all. A
+      # simulator needs no team, only the ad-hoc identity it gets by default.
       #
       # pipefail is load-bearing. Without it the pipeline reports xcbeautify's
       # exit code, xcodebuild's failure is discarded, and the job goes green on
       # a broken build -- which is worse than having no job at all.
-      - name: Run the sample's UI tests
+      - name: Run the sample's tests
         working-directory: Samples/MoqomRoom
         shell: bash
         run: |
           set -o pipefail
           xcodebuild test \
             -project MoqomRoom.xcodeproj \
-            -scheme MoqomRoomUITests \
+            -scheme MoqomRoom \
             -destination "platform=iOS Simulator,id=${{ steps.sim.outputs.udid }}" \
             -derivedDataPath "$RUNNER_TEMP/DerivedData" \
-            CODE_SIGNING_ALLOWED=NO \
             | xcbeautify --renderer github-actions
         env:
           NSUnbufferedIO: YES

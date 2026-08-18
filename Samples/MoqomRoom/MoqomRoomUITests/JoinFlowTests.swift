@@ -30,6 +30,51 @@ final class JoinFlowTests: XCTestCase {
         return app
     }
 
+    /// Join, brought into view first.
+    ///
+    /// A SwiftUI `Form` is a collection view that instantiates only the cells
+    /// near the viewport, so a button below the fold does not exist to be
+    /// queried at all -- it is not merely present and unhittable, which is why
+    /// `waitForExistence` on it burns its whole timeout and then fails. The join
+    /// screen grew past one screen when the relay and token-service sections
+    /// arrived, and every test in this file had been failing to find a button it
+    /// used to find ever since.
+    ///
+    /// Nothing said so, which is the part worth fixing once rather than eight
+    /// times: the workflow asked for a scheme xcodegen does not generate, so
+    /// this bundle never ran, and then the organisation's Actions minutes ran
+    /// out and no job started anywhere for three weeks.
+    private func joinButton(in app: XCUIApplication) -> XCUIElement {
+        let join = app.buttons["Join"]
+        var swipes = 0
+        while !join.exists, swipes < 8 {
+            app.swipeUp()
+            swipes += 1
+        }
+        return join
+    }
+
+    private func tapJoin(in app: XCUIApplication) {
+        let join = joinButton(in: app)
+        XCTAssertTrue(join.waitForExistence(timeout: 5), "Join never came into view")
+        join.tap()
+    }
+
+    /// The username field, brought back into view.
+    ///
+    /// The counterpart to ``joinButton(in:)`` and needed for the same reason:
+    /// once the form has been scrolled far enough down to reach Join, the field
+    /// at the top of it has been recycled and no longer exists to type into.
+    private func usernameField(in app: XCUIApplication) -> XCUIElement {
+        let username = app.textFields["Username"]
+        var swipes = 0
+        while !username.exists, swipes < 8 {
+            app.swipeDown()
+            swipes += 1
+        }
+        return username
+    }
+
     func testJoiningARoomReachesTheRoomScreen() {
         let app = launch()
 
@@ -42,7 +87,7 @@ final class JoinFlowTests: XCTestCase {
         // The room defaults to "demo", and the room screen titles itself with
         // the room name, so that title is the signal we actually got through
         // connect and join rather than stalling on the progress view.
-        app.buttons["Join"].tap()
+        tapJoin(in: app)
 
         XCTAssertTrue(
             app.navigationBars["demo"].waitForExistence(timeout: 15),
@@ -70,7 +115,7 @@ final class JoinFlowTests: XCTestCase {
         XCTAssertTrue(username.waitForExistence(timeout: 10))
         username.tap()
         username.typeText("elliott")
-        app.buttons["Join"].tap()
+        tapJoin(in: app)
         XCTAssertTrue(app.navigationBars["demo"].waitForExistence(timeout: 15))
 
         // Going live is what puts this device in its own roster, so the empty
@@ -113,7 +158,7 @@ final class JoinFlowTests: XCTestCase {
         XCTAssertTrue(username.waitForExistence(timeout: 10))
         username.tap()
         username.typeText("elliott")
-        app.buttons["Join"].tap()
+        tapJoin(in: app)
         XCTAssertTrue(app.navigationBars["demo"].waitForExistence(timeout: 15))
 
         // Muting is only meaningful against a running publication, and the
@@ -159,7 +204,7 @@ final class JoinFlowTests: XCTestCase {
         XCTAssertTrue(username.waitForExistence(timeout: 10))
         username.tap()
         username.typeText("elliott")
-        app.buttons["Join"].tap()
+        tapJoin(in: app)
         XCTAssertTrue(app.navigationBars["demo"].waitForExistence(timeout: 15))
 
         app.buttons["Go live"].tap()
@@ -187,7 +232,7 @@ final class JoinFlowTests: XCTestCase {
         XCTAssertTrue(username.waitForExistence(timeout: 10))
         username.tap()
         username.typeText("elliott")
-        app.buttons["Join"].tap()
+        tapJoin(in: app)
         XCTAssertTrue(app.navigationBars["demo"].waitForExistence(timeout: 15))
 
         // The audio room is a different session category as well as a different
@@ -213,7 +258,7 @@ final class JoinFlowTests: XCTestCase {
         XCTAssertTrue(username.waitForExistence(timeout: 10))
         username.tap()
         username.typeText("elliott")
-        app.buttons["Join"].tap()
+        tapJoin(in: app)
         XCTAssertTrue(app.navigationBars["demo"].waitForExistence(timeout: 15))
 
         // Picture in Picture itself cannot be driven from a UI test — the
@@ -237,21 +282,27 @@ final class JoinFlowTests: XCTestCase {
     func testJoinIsRefusedUntilThereIsAName() {
         let app = launch()
 
-        let join = app.buttons["Join"]
-        XCTAssertTrue(join.waitForExistence(timeout: 10))
+        XCTAssertTrue(
+            app.textFields["Username"].waitForExistence(timeout: 10),
+            "join screen never appeared"
+        )
+        XCTAssertTrue(joinButton(in: app).exists, "Join never came into view")
+        XCTAssertFalse(joinButton(in: app).isEnabled, "Join was enabled with no username")
 
         // `canJoin` trims before checking, so whitespace has to stay disabled
         // too. This is the assertion that would catch someone "simplifying"
         // that to isEmpty.
-        XCTAssertFalse(join.isEnabled, "Join was enabled with no username")
-
-        let username = app.textFields["Username"]
+        //
+        // Each check re-fetches the button rather than holding one across a
+        // scroll, because the form recycles it: an element captured before
+        // scrolling up to type is stale by the time the assertion reads it.
+        let username = usernameField(in: app)
         username.tap()
         username.typeText("   ")
-        XCTAssertFalse(join.isEnabled, "Join was enabled with only whitespace")
+        XCTAssertFalse(joinButton(in: app).isEnabled, "Join was enabled with only whitespace")
 
-        username.typeText("elliott")
-        XCTAssertTrue(join.isEnabled)
+        usernameField(in: app).typeText("elliott")
+        XCTAssertTrue(joinButton(in: app).isEnabled)
     }
 
     func testLeavingReturnsToTheJoinScreen() {
@@ -261,7 +312,7 @@ final class JoinFlowTests: XCTestCase {
         XCTAssertTrue(username.waitForExistence(timeout: 10))
         username.tap()
         username.typeText("elliott")
-        app.buttons["Join"].tap()
+        tapJoin(in: app)
 
         XCTAssertTrue(app.navigationBars["demo"].waitForExistence(timeout: 15))
 

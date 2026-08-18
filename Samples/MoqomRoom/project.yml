@@ -56,6 +56,23 @@ targets:
       # inside the bundle fails at `Activity.request` with an error that names
       # the attributes type rather than the missing extension.
       - target: MoqomRoomWidgets
+    # Generated like the project file, so the entitlement and the reason for it
+    # live in the same place as everything else about this target.
+    #
+    # Present for one line of it, and that line is what makes the device key
+    # work anywhere but hardware. `DeviceKey` stores both the enclave blob and
+    # the software key as keychain items, and an app with no entitlements has no
+    # application-identifier to derive a keychain group from -- so every call
+    # returned -34018 and the join screen said the phone could hold no key at
+    # all. On hardware the enclave path ran and this was never noticed; the
+    # fallback that exists precisely for simulators was the part that could not
+    # run on one. The group is the default one an app always has rights to, so
+    # this needs nothing enabled on the app ID.
+    entitlements:
+      path: MoqomRoom/MoqomRoom.entitlements
+      properties:
+        keychain-access-groups:
+          - $(AppIdentifierPrefix)$(CFBundleIdentifier)
     info:
       path: MoqomRoom/Info.plist
       properties:
