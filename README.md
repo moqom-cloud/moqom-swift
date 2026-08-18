@@ -395,21 +395,31 @@ another city. What remains unobserved is narrower than it was, and specific:
   capture connection's rotation angle, so a portrait phone publishes a sideways
   picture.
 - **The Secure Enclave branch of `DeviceKey`, under `swift test`.** Every test of
-  it runs on a simulator, where there is no enclave and the code takes its
-  Keychain fallback — so what the tests prove is that the fallback works and that
-  the two produce the same thumbprint and the same proof, not that the enclave
-  path can generate a key. That branch differs by two flags and an access
-  control, which is exactly the amount of difference that fails only on hardware.
+  it constructs its key from material a caller supplies, which is the software
+  branch by definition — so what they prove is that the two kinds produce the
+  same thumbprint and the same proof, not that `installed()` can obtain either.
 
-  This entry used to say the enclave path had never run at all, and that has
-  changed by deployment rather than by test. Both phones report the enclave on
-  their join screens, and a relay set to `MOQOM_RELAY_POSSESSION=required`
-  admitted both and relayed between them — which it does only after recomputing
-  the RFC 7638 thumbprint of the key that signed the proof and matching it to the
-  token's `cnf.jkt`. So an enclave key was generated, signed, and had its
-  signature verified by another implementation. What is still missing is a check
-  that runs by itself: this was two people-minutes of reading a screen, and it
-  will not notice the day the branch breaks.
+  Two claims that stood here were wrong, and both were corrected by running the
+  sample rather than by reading it. The first said the enclave path had never
+  run: it has, on both phones, and a relay set to
+  `MOQOM_RELAY_POSSESSION=required` admitted them and relayed between them —
+  which it does only after recomputing the RFC 7638 thumbprint of the key that
+  signed the proof and matching it to the token's `cnf.jkt`. So an enclave key
+  was generated, signed, and had its signature verified by another
+  implementation.
+
+  The second said a simulator has no enclave and therefore exercises the
+  Keychain fallback. On Apple silicon it reports one and takes that branch: the
+  sample's join screen prints an enclave-backed thumbprint on a simulator, which
+  is how the claim was found to be false. The fallback is the path that has now
+  never run anywhere — and it had never *worked* anywhere either, since the app
+  carried no entitlement and so could store neither kind of key. That is fixed,
+  and the lesson is the one this whole section is about: the branch nobody can
+  reach is the branch nobody notices is broken.
+
+  What is still missing is a check that runs by itself. Reading a thumbprint off
+  a screen is two people-minutes and will not notice the day either branch
+  breaks.
 - **A backgrounded app.** Picture in Picture and Live Activities are both
   features about what happens after the user swipes home, and the simulator does
   not enforce the rules that make that interesting: background GPU work is
