@@ -647,6 +647,7 @@ public actor RoomSession {
         if let audio {
             let publishNamespace = audio.track.namespace
             if let announcement = try? await session.announce(publishNamespace) {
+                watchForRefusal(of: announcement)
                 audioAnnouncement = announcement
             }
             if let writer = try? await protectedWriter(
@@ -707,7 +708,9 @@ public actor RoomSession {
         // the same participant in the roster twice.
         if reopenedAnnouncement == nil {
             do {
-                reopenedAnnouncement = try await session.announce(namespace)
+                let announcement = try await session.announce(namespace)
+                watchForRefusal(of: announcement)
+                reopenedAnnouncement = announcement
             } catch {
                 logger.warning(.publish, "could not re-announce after reconnect", [
                     LogField("error", .text(String(describing: error))),
@@ -765,6 +768,35 @@ public actor RoomSession {
     private func reportPublicationLost() {
         logger.error(.publish, "broadcast could not be restored after reconnect", [
             LogField("room", .text(room.value)),
+        ])
+        eventContinuation.yield(.broadcastInterrupted)
+    }
+
+    /// Wait for a relay to refuse an announcement, and say so if it does.
+    ///
+    /// Started beside the publisher rather than in front of it, because an
+    /// accepted announcement is answered with silence: there is nothing to wait
+    /// for on the way in, and blocking would trade a working `startBroadcast`
+    /// for a timeout.
+    ///
+    /// The consequence of a refusal is the one ``RoomEvent/broadcastInterrupted``
+    /// already describes. The camera runs, the encoder works, the frames go into
+    /// a namespace the relay never registered, and nothing else about the room's
+    /// state looks wrong — so it is reported the same way rather than given a
+    /// case of its own. The cause is almost always a token minted for a
+    /// different tenant or room than the one being published under, which is why
+    /// the namespace is named in the log.
+    private func watchForRefusal(of announcement: any AnnouncementHandle) {
+        Task { [weak self] in
+            guard let refusal = await announcement.refusal else { return }
+            await self?.reportAnnouncementRefused(announcement.namespace, refusal)
+        }
+    }
+
+    private func reportAnnouncementRefused(_ namespace: TrackNamespace, _ error: MoqomError) {
+        logger.error(.publish, "the relay refused this namespace", [
+            LogField("namespace", .text(namespace.description)),
+            LogField("error", .text(String(describing: error))),
         ])
         eventContinuation.yield(.broadcastInterrupted)
     }
@@ -927,6 +959,7 @@ public actor RoomSession {
         }
 
         let announcement = try await connection.announce(publishNamespace)
+        watchForRefusal(of: announcement)
 
         var writers: [LayerID: any TrackWriter] = [:]
         var encoders: [LayerID: any FrameEncoder] = [:]
@@ -1179,6 +1212,7 @@ public actor RoomSession {
         // namespace and withdrawing it is refcounted by the transport, so an
         // audio-only participant appears in the roster the same way.
         let announcement = try await connection.announce(publishNamespace)
+        watchForRefusal(of: announcement)
         audioAnnouncement = announcement
 
         let writer = try await protectedWriter(for: name, priority: configuration.priority)
@@ -1602,7 +1636,9 @@ public actor RoomSession {
         } catch {
             throw MoqomError.invalidName(error)
         }
-        _ = try? await connection.announce(publishNamespace)
+        if let announcement = try? await connection.announce(publishNamespace) {
+            watchForRefusal(of: announcement)
+        }
         try await publishCatalog(under: publishNamespace)
         _ = await refreshCatalog()
     }

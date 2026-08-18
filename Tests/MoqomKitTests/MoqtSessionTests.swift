@@ -232,6 +232,104 @@ struct MoqtSessionTests {
         await subscriber.close(code: 0, reason: "done")
     }
 
+    /// The failure this pairs with is the one nothing used to report: a relay
+    /// answers an announcement it accepts with silence, so the only frame it
+    /// ever writes on that stream is a refusal, and for a long time nobody read
+    /// it. A publisher whose token named a different tenant or room went on
+    /// encoding into a namespace the relay had dropped, and every counter in the
+    /// app agreed it was live.
+    @Test("a refused announcement is reported, and names the namespace")
+    func refusedAnnouncement() async throws {
+        let (clientCarrier, serverCarrier) = MemoryCarrier.pair()
+        let relay = refusingRelay(on: serverCarrier)
+        defer { relay.cancel() }
+
+        let client = try await MoqtSession.connect(
+            over: clientCarrier,
+            credentials: credentials("alice")
+        )
+        let namespace = try MoqomNamespaces.participant(
+            tenant: "acme", room: "room-42", identity: identity("alice")
+        )
+
+        // The handle still comes back. There is nothing to wait for on the way
+        // in, so refusing to return one would mean blocking every announcement
+        // on a timeout to catch the case that usually does not happen.
+        let handle = try await client.announce(namespace)
+
+        // `forbidden` rather than `unauthorized`: the token was good enough to
+        // establish the session, and it is the namespace it does not cover.
+        guard case let .rejected(reason) = await handle.refusal else {
+            Issue.record("the refusal was not reported")
+            return
+        }
+        #expect(reason == .forbidden(namespace))
+
+        await client.close(code: 0, reason: "done")
+    }
+
+    /// The other half, and the reason the accepted case has to be checked too: a
+    /// peer that acknowledges must not be read as a peer that refused, or every
+    /// announcement over a session-to-session link would report a failure.
+    @Test("an acknowledged announcement is not reported as a refusal")
+    func acknowledgedAnnouncement() async throws {
+        let (client, server) = try await connectedPair()
+        let namespace = try MoqomNamespaces.participant(
+            tenant: "acme", room: "room-42", identity: identity("alice")
+        )
+
+        let handle = try await client.announce(namespace)
+        #expect(await handle.refusal == nil)
+
+        await client.close(code: 0, reason: "done")
+        await server.close(code: 0, reason: "done")
+    }
+
+    /// A relay that completes SETUP and then refuses whatever is announced.
+    ///
+    /// Hand-rolled rather than a second `MoqtSession`, because a session
+    /// acknowledges every announcement it is given: a refusal is something only
+    /// a peer with a policy ever sends, and there is no policy on this side of
+    /// the package to borrow.
+    private func refusingRelay(
+        on carrier: MemoryCarrier,
+        code: UInt64 = RequestErrorCode.unauthorized,
+        reason: String = "not your namespace"
+    ) -> Task<Void, Never> {
+        Task {
+            for await stream in carrier.incomingBidirectionalStreams {
+                Task {
+                    var framer = StreamFramer()
+                    while let chunk = try? await stream.read() {
+                        framer.append(chunk)
+                        while let frame = try? framer.next() {
+                            switch frame.type {
+                            case .setup:
+                                try? await Self.write(Setup(), to: stream)
+                            case .publishNamespace:
+                                try? await Self.write(
+                                    RequestError(code: code, reason: reason),
+                                    to: stream
+                                )
+                            default:
+                                break
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private static func write(
+        _ message: some ControlMessage,
+        to stream: any QUICSendStream
+    ) async throws {
+        var writer = WireWriter(capacity: message.encodedLength + 8)
+        try ControlFrame.write(message, to: &writer)
+        try await stream.write(writer.bytes)
+    }
+
     @Test("subscribing to a track nobody publishes is refused")
     func unknownTrack() async throws {
         let (_, subscriber) = try await connectedPair()

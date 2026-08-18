@@ -646,7 +646,69 @@ public actor MoqtSession: TransportSession {
             try? await send(NamespaceAnnounced(suffix: suffix), on: watcher.stream)
         }
 
-        return MoqtAnnouncement(namespace: namespace, stream: stream, session: self)
+        return MoqtAnnouncement(
+            namespace: namespace,
+            stream: stream,
+            session: self,
+            verdict: Task { await Self.verdict(on: stream, announcing: namespace) }
+        )
+    }
+
+    /// Read the one thing a relay ever says on an announcement's own stream.
+    ///
+    /// Silence is consent here, which is what made this easy to leave out: a
+    /// relay that accepts writes nothing, because the stream's job from then on
+    /// is to stay open for as long as the announcement stands, and closing it is
+    /// the withdrawal. The only frame it will ever send is a refusal — so the
+    /// single case worth hearing about was the single case nobody was listening
+    /// for, and a token whose tenant or room disagreed with the namespace
+    /// produced a publisher that encoded happily into a name the relay had
+    /// dropped.
+    ///
+    /// A peer that is another `MoqtSession` acknowledges with `REQUEST_OK`
+    /// instead of staying quiet, so both shapes are understood rather than one.
+    private static func verdict(
+        on stream: any QUICStream,
+        announcing namespace: TrackNamespace
+    ) async -> MoqomError? {
+        var framer = StreamFramer()
+        while true {
+            let chunk: Data?
+            do { chunk = try await stream.read() } catch { return nil }
+
+            // The stream ended without a word, which is the accepted case
+            // reaching its end rather than anything going wrong.
+            guard let chunk else { return nil }
+            framer.append(chunk)
+
+            while let frame = try? framer.next() {
+                guard frame.type == .requestError else { return nil }
+                var body = WireReader(frame.body)
+                let error = (try? RequestError.read(from: &body))
+                    ?? RequestError(code: RequestErrorCode.internalError)
+                return Self.refusal(for: error, announcing: namespace)
+            }
+        }
+    }
+
+    /// Why an announcement was refused, in terms that name the namespace.
+    ///
+    /// `forbidden` rather than `unauthorized` for a denial, because the token
+    /// was already accepted at SETUP: the session is authenticated and the
+    /// namespace is the part it does not cover. Carrying the namespace is what
+    /// makes it actionable, since the usual cause is a tenant or a room that
+    /// disagrees with the one the token was minted for, and naming it is the
+    /// difference between a fix and a bisect.
+    private static func refusal(
+        for error: RequestError,
+        announcing namespace: TrackNamespace
+    ) -> MoqomError {
+        switch error.code {
+        case RequestErrorCode.unauthorized:
+            .rejected(.forbidden(namespace))
+        default:
+            rejection(for: error)
+        }
     }
 
     func withdraw(_ namespace: TrackNamespace) async {
@@ -1366,11 +1428,22 @@ private final class MoqtAnnouncement: AnnouncementHandle {
     let namespace: TrackNamespace
     private let stream: any QUICStream
     private let session: MoqtSession
+    private let verdict: Task<MoqomError?, Never>
 
-    init(namespace: TrackNamespace, stream: any QUICStream, session: MoqtSession) {
+    init(
+        namespace: TrackNamespace,
+        stream: any QUICStream,
+        session: MoqtSession,
+        verdict: Task<MoqomError?, Never>
+    ) {
         self.namespace = namespace
         self.stream = stream
         self.session = session
+        self.verdict = verdict
+    }
+
+    var refusal: MoqomError? {
+        get async { await verdict.value }
     }
 
     func withdraw() async {

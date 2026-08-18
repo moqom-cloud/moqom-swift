@@ -172,7 +172,33 @@ public struct NegotiatedParameters: Hashable, Sendable {
 /// Keeps a namespace announced for as long as it is held.
 public protocol AnnouncementHandle: Sendable, AnyObject {
     var namespace: TrackNamespace { get }
+
+    /// Why the relay refused this announcement, once it has said so.
+    ///
+    /// Suspends until there is an answer, and answers `nil` when the
+    /// announcement ends without ever having been refused — so this is the
+    /// outcome of the announcement rather than a poll, and belongs in a task
+    /// beside the publisher rather than in front of it.
+    ///
+    /// Waiting is the only way to ask. A relay that accepts a namespace sends
+    /// nothing at all, because the stream carrying the announcement stays open
+    /// for exactly as long as the announcement stands; the single frame it will
+    /// ever write there is a refusal. There is no acknowledgement to wait for
+    /// and therefore no way to confirm acceptance quickly, which is why
+    /// ``Transport/announce(_:)`` returns a handle without blocking and reports
+    /// the refusal here instead.
+    var refusal: MoqomError? { get async }
+
     func withdraw() async
+}
+
+public extension AnnouncementHandle {
+    /// Never refused, for transports that cannot refuse. The loopback is the
+    /// case that matters: it has no tokens and no policy, so an announcement
+    /// there is accepted by construction.
+    var refusal: MoqomError? {
+        get async { nil }
+    }
 }
 
 /// A namespace appearing under or leaving a watched prefix.

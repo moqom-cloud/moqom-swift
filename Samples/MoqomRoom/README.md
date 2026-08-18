@@ -29,8 +29,14 @@ locally.
 
 ## What it actually does
 
-It talks to `MoqomLoopback`, an in-memory relay, because `moqom-transport` does
-not exist yet. Everything above the transport is real: the roster is built from
+It dials the compiled-in relay on Compute Engine over QUIC, through
+`NetworkQUICCarrier`, and falls back to `MoqomLoopback` — an in-memory relay —
+only when no host is configured. That is a change from what this paragraph used
+to say, which was that the loopback was all there was because `moqom-transport`
+did not exist. It exists, it runs in Los Angeles, and the figures further down
+were measured through it.
+
+Everything above the transport is real either way: the roster is built from
 namespace announcements, layer selection responds to how large the tiles are,
 per-viewer mute is an unsubscribe that never reaches the relay, and moderation
 is refused when the grants do not allow it.
@@ -530,19 +536,30 @@ under your username, muting the microphone and camera leaves both publications
 running, switching to the audio-room layout reconfigures the audio session,
 choosing a Picture in Picture cast reaches `RoomSession`, and leaving comes back
 to the join screen. That is the only place the SwiftUI layer executes — the
-package's 505 tests drive `RoomSession` directly and never render.
+package's 838 tests drive `RoomSession` directly and never render.
 
 What a green simulator run does **not** cover is everything a simulator does not
 have: the camera, the VideoToolbox encoder, the Metal scene capture, and the
-RealityKit tap. Those compile and are only exercised on hardware — the AR path
-has since been run on two phones through a relay, at 60 frames a second each way
-with nothing skipped, which is the first thing to drive the SDK's RealityKit hook
-end to end. The shared bubble field has been run the same way, with scripted
-pops in place of taps; what remains unexercised on hardware there is the tap
-itself — the raycast into the bubble and the optimistic hide — since everything
-downstream of it is what the scripted run drives. `Broadcast` also
-publishes a per-frame descriptor rather than encoded bytes, so a tile appearing
-means the roster works, not that video moves.
+RealityKit tap. In the simulator `Broadcast` publishes a per-frame descriptor
+rather than encoded bytes, so a tile appearing there means the roster works, not
+that video moves.
+
+All four have since run on hardware. Two phones — a 15 Pro and an iPhone Air —
+have held calls through the Compute Engine relay in Los Angeles with the camera
+publishing, VideoToolbox encoding, and the far end decoding and drawing: the
+readout at the bottom of the room reported 540p at 60 frames a second, 600 kbps,
+and 69 ms glass to glass, which are numbers that cannot exist unless every stage
+between the two ran. The AR path has been driven the same way with nothing
+skipped, which is the first thing to take the SDK's RealityKit hook end to end.
+The bubble field's tap has now been exercised by hand as well as by script — the
+raycast into the bubble and the optimistic hide, which were the last part of that
+path a scripted run could not reach.
+
+Two of those were found only by running them, which is the argument for doing it.
+The RealityKit hook drew the field inside the self tile and clipped it, because a
+camera anchor added to an overlay still binds to the AR session. And the tap
+needed `InputTargetComponent` and a collision shape that no compile-time check
+asks for: the gesture simply never fired.
 
 Camera switching and mirroring are in that untested set, and they are the two
 things above that a simulator cannot say anything about. Muting is covered — the

@@ -63,13 +63,23 @@ top of `Sources/MoqomKit/Transport/Transport.swift`.
 
 ### Verified: builds and is tested
 
-464 tests across 76 suites. All but the three interop tests run on every
+838 tests across 123 suites. All but the three interop tests run on every
 `swift test`; those need a relay binary and skip without one.
 
 - **Namespaces and identity.** Tuple construction, field limits in UTF-8 bytes,
   Unicode canonicalisation, prefix matching, and recovering a participant from
   an announcement. Usernames are strings; there is no numeric UID anywhere and
   no place to add one.
+- **A refused announcement.** That the relay's denial is read rather than
+  dropped, and that it arrives naming the namespace it was about. This one is
+  awkward by construction: a relay accepts by saying nothing, because the stream
+  carrying the announcement stays open for as long as the announcement stands, so
+  the only frame it ever writes there is a refusal. There is nothing to wait for
+  on the way in and no acknowledgement to time out against, and the case is
+  therefore easy to leave unread — which it was, and a publisher whose token
+  named the wrong tenant encoded happily into a namespace the relay had dropped.
+  Both directions are tested, because a peer that does acknowledge must not be
+  mistaken for one that refused.
 - **Session lifecycle.** A pure state machine over connected, reconnecting,
   away, and the four distinguishable terminal reasons, with time injected so
   the deadlines are testable without waiting.
@@ -235,17 +245,28 @@ top of `Sources/MoqomKit/Transport/Transport.swift`.
   the user just pressed, a recorder attaching, the stream ending — skip the
   queue.
 
-### Verified: compiles, never runs
+### Verified on two phones, not by the test suite
 
-Written against the platform frameworks and compiled on every build, but not
-reachable without a GPU, a camera, or a device. Nothing here is covered by
-`swift test`; a couple of entries are partly reached by the simulator, and say
-which part.
+Written against the platform frameworks, compiled on every build, and driven end
+to end on hardware — a 15 Pro and an iPhone Air, in calls through the Compute
+Engine relay in Los Angeles. None of it is covered by `swift test`, and that
+distinction is worth keeping rather than blurring: a run on two phones is an
+observation, not a regression guard. It says these paths worked on that day, on
+those handsets, on that network. It will not tell anybody the day one of them
+stops working.
+
+What the runs produced is in the sample's own readout: 540p at 60 frames a
+second, 600 kbps, and 69 ms from glass to glass, with lip sync stated as a signed
+number beside it. Those figures cannot exist unless capture, encode, the wire,
+decode, and display all ran, which is why they are quoted here instead of a
+claim. This section used to say the whole list had never executed, while two of
+its own entries described measurements taken on two phones — the list had simply
+not been revisited after the phones started working.
 
 - `Platform/VideoEncoder.swift` — VideoToolbox with low-latency rate control,
   frame reordering off, and a temporal base layer. The session creation and its
   fallback do run in the simulator, which has an encoder for both codecs and a
-  low-latency one for neither; encoding itself needs a device.
+  low-latency one for neither; encoding itself took a device, and has had one.
 - `Platform/PlatformAudioEncoder.swift` — Opus through AudioToolbox.
 - `Platform/AudioGraph.swift` — the one `AVAudioEngine` capture and playback
   share, which is what makes echo cancellation possible: the canceller subtracts
@@ -274,15 +295,21 @@ which part.
   format.
 - `Platform/VideoRenderer.swift` — sample buffer assembly and
   `AVSampleBufferDisplayLayer`. The preview path draws in the simulator; the
-  decode path needs a stream from a real encoder.
+  decode path took a stream from a real encoder, and has had one.
 - `Platform/VideoDecoder.swift` — the `VTDecompressionSession` a receive tap
   decodes through, including the rebuild a rung change forces. Exists because
   the display layer decodes privately and returns nothing, so anything wanting
   pixels has to own a session. The tap machinery around it is tested with an
-  injected decoder; this file needs a real bitstream.
+  injected decoder; this file took a real bitstream, and has had one.
 - `Subscribe/LayoutObserver.swift` — the SwiftUI modifier that reports a tile's
   size to the layer selector. The takeover half of it is tested; the modifier
-  needs a hierarchy.
+  took a view hierarchy, and the sample has given it one.
+### Verified: compiles, never runs
+
+The two features whose entire purpose is what happens after the user leaves the
+app, which is exactly what neither a simulator nor a phone on a desk in front of
+somebody demonstrates. Both are built and wired; neither has been seen.
+
 - `Platform/PictureInPictureController.swift` — `AVPictureInPictureController`
   with a video-call content source, and a grid of `AVSampleBufferDisplayLayer`s
   inside it. The layers are borrowed from the renderers the grid was already
@@ -302,9 +329,25 @@ which part.
 
 ### Not written
 
-- Authorisation. Credentials are carried in Setup Options and the relay parses
-  and ignores them, so nothing yet stops a session publishing under a namespace
-  that is not its own. The tokens are a placeholder for CAT+DPoP.
+- Proof of possession. This entry used to say the relay parsed the credentials
+  and ignored them, which stopped being true: a relay holding verification keys
+  checks the Ed25519 signature, the issuer, the expiry and the claims at SETUP,
+  and then checks every announce, watch, subscribe and fetch against the token's
+  tenant, room and participant slot —
+  `moqom-relay/tests/authorisation.rs` refuses publishing as somebody else,
+  into another tenant, and into another room. What is still a placeholder is the
+  binding. The token is a bearer credential: the device thumbprint travels in
+  `cnf.jkt` and is recorded, but nothing proves the holder has the key, so a
+  stolen token works from anywhere until it expires. `DeviceCredentials` carries
+  a `proofSigner` for the DPoP challenge that would close this, and nothing calls
+  it yet.
+- Media kinds are not enforced per track. `moqt.pub` distinguishes audio from
+  video from screen, and the relay checks only that it is non-empty, so a token
+  minted for audio can publish video under a namespace it does own.
+- A relay with no verification keys authorises everything. That is the default,
+  and it is what the loopback and the benchmarks run against. It is the right
+  default for a laptop and the wrong one to ship, and the only thing standing
+  between the two is an environment variable.
 - Datagram media over a real carrier. `MoqtSession` sends and receives object
   datagrams, and the tests for that path all run over `MemoryCarrier`; the relay
   forwards subgroup streams only, so the interop tests do not cover it.
@@ -320,19 +363,24 @@ which part.
 
 ## What still has not run
 
-The iOS branches compile, the sample builds and publishes, and the UI tests
-drive it on a simulator. What remains unobserved is narrower than it was, and
-specific:
+The iOS branches compile, the sample builds and publishes, the UI tests drive it
+on a simulator, and two phones have held camera and AR calls through a relay in
+another city. What remains unobserved is narrower than it was, and specific:
 
-- **Camera, GPU capture, and hardware encode.** `AVCaptureSession`, the Metal
-  scene blit, the RealityKit tap, and VideoToolbox actually compressing a frame
-  have never executed. The simulator publishes a rendered pattern through the
-  same pipeline, which exercises everything downstream of the encoder but is
-  not the same as a camera.
-- **A network with distance in it.** The interop tests put real QUIC packets on
-  the loopback interface, which proves the framing and the handshake and nothing
-  about loss, reordering, or a path that changes mid-session. Every measurement
-  of that kind is still ahead.
+- **A network that misbehaves on purpose.** The runs to Los Angeles put real
+  packets over a real path, which is the thing the loopback interface could never
+  be, and they were measured on a good Wi-Fi connection having a good day. Loss,
+  reordering, and a path that changes mid-session — the walk out of the house
+  that hands a call from Wi-Fi to cellular — are all still unmeasured, and they
+  are what a congestion controller would be judged on. Distance is no longer the
+  gap; adversity is.
+- **Camera switching and rotation.** Flipping between front and back has never
+  been executed, and the parts most likely to be wrong are the ones only hardware
+  reaches: whether the reconfiguration is quick enough not to stall the encoder,
+  whether the two cameras agree on a format, and whether the preview transform
+  survives. Rotation is not handled at all — `CameraSource` never sets the
+  capture connection's rotation angle, so a portrait phone publishes a sideways
+  picture.
 - **A backgrounded app.** Picture in Picture and Live Activities are both
   features about what happens after the user swipes home, and the simulator does
   not enforce the rules that make that interesting: background GPU work is
