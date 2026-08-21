@@ -878,3 +878,199 @@ final class CadenceMeter: @unchecked Sendable {
             + Double(elapsed.components.attoseconds) / 1e18
     }
 }
+
+/// How long a bubble bursting takes to get here.
+///
+/// Two figures, because a burst reaches this phone by two different paths and only one of them
+/// is a question about the network.
+///
+/// **Wire** is a burst somebody else decided: from the instant the authority simulated the tick
+/// to the instant this device applied it. One way, on the shared clock, and so directly
+/// comparable with the `LINK` figure for video — same relay, same two phones, but a track at a
+/// third of video's priority carrying a few bytes instead of two megabits. Comparing them is
+/// the point: it says whether the space track rides along with the picture or is the first
+/// thing to suffer when the link tightens. On whichever device is running the field this is
+/// near zero and rightly so, since its own ticks are handed to it locally with no wire in
+/// between — a reading near zero there is the measurement working, not a fast link.
+///
+/// **Trip** is a burst this device asked for: from the tap to the bubble being gone. On a
+/// follower that is an intent out to the authority, the simulation's own tick, and a removal
+/// back — two crossings of the relay rather than one — and it is the only one of these figures
+/// a player actually feels. Measured on this device's monotonic clock at both ends, which is
+/// what makes it the sturdier number: unlike the wire figure it needs no agreement with
+/// anybody's clock, so it stays meaningful on a run where the trusted clock never settled.
+///
+/// # Which removals count
+///
+/// Not all of them, and counting all of them would flatter the result badly. A bubble that
+/// climbs out of the shot is removed, and so is every bubble still up when the round ends —
+/// ``BubbleField/step(_:at:since:)`` flags both with ``BubbleField/leaving`` on one tick and
+/// removes them on the next. Those are the authority's housekeeping: they happen on a schedule
+/// rather than because anybody did anything, there are far more of them than there are pops,
+/// and nobody is waiting on one. Averaged in, they would swamp the figure being asked for. So a
+/// burst here is the removal of a bubble that was *not* already on its way out, which is
+/// precisely what that flag distinguishes.
+///
+/// A class with a lock rather than an actor, for the reason ``LatencyMeter`` is one: it is
+/// written from the space pump and read from the statistics tick, and the two should not have
+/// to wait for each other.
+final class BurstMeter: @unchecked Sendable {
+    private let lock = NSLock()
+
+    /// Arrival lag of bursts decided elsewhere, in milliseconds.
+    private var wire: [Double] = []
+
+    /// This device's own pops, asked to gone, in milliseconds.
+    private var trips: [Double] = []
+
+    /// Pops asked for and not yet seen to land, by what they were aimed at.
+    ///
+    /// A pop that never comes back stays here, which is deliberate: two people reaching for
+    /// the same bubble means one of them loses and their intent is answered by the bubble
+    /// already being gone. Reported as `awaiting` rather than folded into the trips, because a
+    /// race nobody won is not a slow round trip and averaging it in as one would say the link
+    /// was worse than it was.
+    private var outstanding: [SpaceEntityID: ContinuousClock.Instant] = [:]
+
+    /// Every bubble this device knows of, and whether the authority has flagged it as leaving.
+    ///
+    /// Carried from tick to tick because the event describes the state *after* the removal: by
+    /// the time a removal can be classified, the entity that would have answered the question
+    /// is already gone. A map rather than a bare set of the departing ones so that a removal of
+    /// something that was never a bubble is ignored rather than counted as a burst.
+    private var bubbles: [SpaceEntityID: Bool] = [:]
+
+    private var bursts = 0
+    private var departures = 0
+
+    /// Bursts that arrived without two clocks worth subtracting.
+    ///
+    /// Only the wire figure needs them. The trip figure is measured on one device's own clock
+    /// and is recorded whatever these say.
+    private var untimed = 0
+
+    /// Bursts that arrived before they were simulated.
+    ///
+    /// Impossible, so it is a statement about the clocks and not about the link. Counted rather
+    /// than clamped for the reason ``LatencyMeter`` counts its own: a negative folded in as a
+    /// zero is indistinguishable from a fast arrival, and quietly drags the median towards a
+    /// figure the network never achieved.
+    private var impossible = 0
+
+    /// This device has asked for something to be popped.
+    ///
+    /// Called before the intent goes out rather than after it is acknowledged, because what is
+    /// being measured is the wait a person is having, and that starts at the tap.
+    ///
+    /// - Parameter instant: Defaulted so callers need not think about it, and takeable so a
+    ///   test can drive a round trip without waiting one.
+    func askedFor(_ id: SpaceEntityID, at instant: ContinuousClock.Instant = .now) {
+        lock.withLock { outstanding[id] = instant }
+    }
+
+    /// One tick of the space, classified.
+    ///
+    /// - Parameters:
+    ///   - delta: What the tick changed. Only its removals are read.
+    ///   - state: The space after the tick, for carrying the leaving flags to the next one.
+    ///   - simulated: When the authority produced the tick, from the update itself.
+    ///   - now: This device's reading of the same clock.
+    ///   - arrived: The same moment on this device's own monotonic clock, which is what the
+    ///     round trips are measured against. Defaulted, and takeable for the same reason
+    ///     ``askedFor(_:at:)`` takes one.
+    func observe(
+        _ delta: SpaceDelta,
+        in state: SpaceSnapshot,
+        simulated: Timecode,
+        now: Timecode,
+        arrived: ContinuousClock.Instant = .now
+    ) {
+        lock.withLock {
+            for id in delta.removed {
+                // Not a bubble, or not one this device ever saw. Either way there is no burst
+                // here to time.
+                guard let wasLeaving = bubbles[id] else { continue }
+                guard !wasLeaving else {
+                    departures += 1
+                    continue
+                }
+                bursts += 1
+
+                if let asked = outstanding.removeValue(forKey: id) {
+                    trips.append(Self.milliseconds(from: asked, to: arrived))
+                }
+
+                guard simulated.isTrusted, now.isTrusted else {
+                    untimed += 1
+                    continue
+                }
+                let lag = Double(now.nanoseconds - simulated.nanoseconds) / 1_000_000
+                guard lag >= 0 else {
+                    impossible += 1
+                    continue
+                }
+                wire.append(lag)
+            }
+
+            bubbles = state.entities.reduce(into: [:]) { known, entry in
+                guard entry.value.kind == BubbleField.kind else { return }
+                known[entry.key] = entry.value.facts[BubbleField.leaving] != nil
+            }
+        }
+    }
+
+    /// What the run measured, or `nil` while the field has done nothing at all.
+    ///
+    /// Silent rather than a line of zeroes, because a run with the field switched off should
+    /// not print a report about it every five seconds. Departures count as something having
+    /// happened even though they are not bursts: a field where bubbles are getting away and
+    /// nobody is popping them is a running field with nobody playing, and `bursts=0 · away=41`
+    /// says that where silence would read as the space never having started.
+    func report() -> String? {
+        let (wire, trips, bursts, departures, untimed, impossible, awaiting) = lock
+            .withLock {
+                (
+                    self.wire.sorted(), self.trips.sorted(), self.bursts, self.departures,
+                    self.untimed, self.impossible, self.outstanding.count
+                )
+            }
+        guard bursts > 0 || departures > 0 || awaiting > 0 else { return nil }
+
+        func quote(_ name: String, _ sorted: [Double]) -> String {
+            guard !sorted.isEmpty else { return "" }
+            func percentile(_ fraction: Double) -> Double {
+                sorted[Int((Double(sorted.count - 1) * fraction).rounded())]
+            }
+            return String(
+                format: " %@ p50=%.1f p95=%.1f max=%.1f ms",
+                name,
+                percentile(0.5),
+                percentile(0.95),
+                sorted[sorted.count - 1]
+            )
+        }
+
+        return "bursts=\(bursts)"
+            + quote("wire", wire)
+            + " · mine=\(trips.count)"
+            + quote("trip", trips)
+            // The denominator for both, and the reason a small `bursts` is not a quiet run:
+            // most of what a field removes is bubbles getting away, and the two are worth
+            // seeing side by side.
+            + " · away=\(departures)"
+            + (awaiting > 0 ? " awaiting=\(awaiting)" : "")
+            // Loudly, because either one means the figure in front of it is describing the
+            // clocks rather than the link.
+            + (untimed > 0 ? " · untimed=\(untimed)" : "")
+            + (impossible > 0 ? " · before-they-happened=\(impossible)" : "")
+    }
+
+    private static func milliseconds(
+        from start: ContinuousClock.Instant,
+        to end: ContinuousClock.Instant
+    ) -> Double {
+        let elapsed = end - start
+        return Double(elapsed.components.seconds) * 1000
+            + Double(elapsed.components.attoseconds) / 1e15
+    }
+}

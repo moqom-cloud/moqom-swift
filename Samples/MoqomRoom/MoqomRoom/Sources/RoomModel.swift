@@ -161,6 +161,10 @@ final class RoomModel {
     /// The same, on the frames this device is capturing, so the two can be compared.
     let captureCadence = CadenceMeter()
 
+    /// What a bubble bursting costs to arrive, which is the same link the picture is on
+    /// carrying a track two orders of magnitude smaller. See ``BurstMeter``.
+    let bursts = BurstMeter()
+
     /// Encode one flat layer rather than two temporal ones. See ``LaunchOptions/flatLayers``.
     var flatLayers = false
 
@@ -1906,6 +1910,10 @@ final class RoomModel {
                     switch event {
                     case let .changed(state, delta, at: when):
                         field.apply(state, delta, at: when)
+                        // Before the state is folded into the interface, because the
+                        // classification needs the tick's own timestamp and this is the only
+                        // place that still has it.
+                        bursts.observe(delta, in: state, simulated: when, now: spaceNow)
                         standings = BubbleField.standings(in: state).map {
                             Score(who: $0.who, score: $0.score)
                         }
@@ -1932,6 +1940,7 @@ final class RoomModel {
 
         /// Tell the space this device popped something.
         private func pop(_ id: SpaceEntityID) async {
+            bursts.askedFor(id)
             await space?.act(verb: BubbleField.pop, subject: id)
         }
     #endif
@@ -1959,6 +1968,7 @@ final class RoomModel {
         guard let space else { return false }
         let bubbles = BubbleField.bubbles(in: await space.state)
         guard let target = bubbles.randomElement() else { return false }
+        bursts.askedFor(target.id)
         await space.act(verb: BubbleField.pop, subject: target.id)
         return true
     }

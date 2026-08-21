@@ -34,6 +34,10 @@ This script takes no arguments; everything is an environment variable.
   MOQOM_RESHAPE_EVERY=6  turn the publisher's picture on its side this often, and back
   MOQOM_CALL=1           publish the layout's rung, as a call does, not a pinned one
   MOQOM_EAGER=1          encode for speed rather than power, at the cost of heat
+  MOQOM_BUBBLES=1        join the shared bubble field, which is what BURST reports on
+  MOQOM_POP_EVERY=2      pop a bubble this often, since a scripted run has no finger.
+                         Needs MOQOM_BUBBLES, and it is what fills in `mine` and `trip`
+                         on BURST — without it the only bursts are the other phone's.
   MOQOM_FLOOR_MS / MOQOM_TOLERANCE / MOQOM_STATS_MS / MOQOM_FLAT_LAYERS
   MOQOM_PUBLISHER / MOQOM_VIEWER   device names (default: iPhone Air, 15 Pro)
   MOQOM_MINT=1           mint a token per phone from the deployed control plane
@@ -229,6 +233,57 @@ persist() {
     return 1
 }
 
+# Stopping the app, which takes the process and not the bundle.
+#
+# `devicectl device process terminate` accepts `--pid` and refuses `--bundle-id`. This script
+# asked it for the second, with the usage error sent to /dev/null and `|| true` after it, so
+# the call has never stopped anything. Both places that meant to stop the app were doing
+# nothing at all: every bounded run left the apps capturing, encoding and publishing after it
+# printed its summary, and the only thing that ever ended one was the next run's
+# `--terminate-existing`. That is the abandoned session the comment below the launch loop
+# describes at length — arranged for rather than avoided — and a run interrupted before its
+# teardown left a phone streaming until somebody noticed.
+stop() {
+    xcrun devicectl device info processes --device "$1" 2>/dev/null \
+        | awk '$2 ~ /MoqomRoom\.app\/MoqomRoom$/ { print $1 }' \
+        | while read -r pid; do
+            xcrun devicectl device process terminate \
+                --device "$1" --pid "$pid" >/dev/null 2>&1 || true
+        done
+}
+
+# So does a run that is cut short, which is the case the teardown at the bottom cannot cover.
+# An interrupted sweep left a phone publishing to the relay on its own, and the picture the
+# next run put on screen was judged against it.
+trap 'echo; echo "interrupted — stopping both phones"; for d in "$PUBLISHER" "$VIEWER"; do stop "$d"; done; exit 130' INT TERM
+
+# The log each phone keeps for itself, and where this script leaves its copy.
+JOURNAL="moqom.log"
+journal() { echo "$LOGS-$1.journal.log"; }
+collect() {
+    rm -f "$2"
+    xcrun devicectl device copy from --device "$1" \
+        --domain-type appDataContainer --domain-identifier "$BUNDLE" \
+        --source "Documents/$JOURNAL" --destination "$2" >/dev/null 2>&1 || true
+}
+
+# Whether a phone has gone live, asked of the log in its own container.
+#
+# Not of the console, which on the build this script makes is empty. ``Journal`` prints only
+# under DEBUG — two live console streams over Wi-Fi stalled both phones' transport writes at
+# once, so Release writes the file and sends nothing off the device. Waiting on a console line
+# that cannot arrive is not a slow check, it is a check that always fails: every run spent
+# ninety seconds and then three hundred deciding neither phone had started, printed two empty
+# summaries, and left the numbers on the phones.
+went_live() {
+    rm -f /tmp/moqom-live-probe.log
+    xcrun devicectl device copy from --device "$1" \
+        --domain-type appDataContainer --domain-identifier "$BUNDLE" \
+        --source "Documents/$JOURNAL" --destination /tmp/moqom-live-probe.log \
+        >/dev/null 2>&1 || return 1
+    grep -q ' LIVE ' /tmp/moqom-live-probe.log
+}
+
 for device in "$PUBLISHER" "$VIEWER"; do
     echo "installing on $device"
     persist "install on $device" \
@@ -247,8 +302,7 @@ done
 # The pause is the relay's idle timeout: launching into a room the old sessions have not yet been
 # evicted from reproduces exactly what it is meant to avoid.
 for device in "$PUBLISHER" "$VIEWER"; do
-    xcrun devicectl device process terminate --device "$device" \
-        --bundle-id "$BUNDLE" >/dev/null 2>&1 || true
+    stop "$device"
 done
 sleep 5
 
@@ -310,11 +364,11 @@ launch "$PUBLISHER" publisher "$PUBLISHER_LOG" "$PUBLISHER_TOKEN"
 # long enough to be safe on a slow tunnel is a sleep wasted on every fast one.
 waited=0
 while [ "$waited" -lt 90 ]; do
-    if grep -q '^LIVE' "$PUBLISHER_LOG" 2>/dev/null; then break; fi
-    sleep 2
-    waited=$((waited + 2))
+    if went_live "$PUBLISHER"; then break; fi
+    sleep 5
+    waited=$((waited + 5))
 done
-if ! grep -q '^LIVE' "$PUBLISHER_LOG" 2>/dev/null; then
+if ! went_live "$PUBLISHER"; then
     echo "the publisher never went live — see $PUBLISHER_LOG" >&2
 fi
 
@@ -339,6 +393,10 @@ What each line means:
   SEND   what the publisher did with them. unroutable=0 is the one to watch: anything else
          means frames are being encoded and discarded, which used to be silent.
   VIEW   per publisher — the rung subscribed, the rung offered, and whether anything arrived.
+  BURST  how fast a bubble popping crosses, on the same relay as the picture. wire is a
+         burst the other phone decided, one way; trip is one this phone asked for, there
+         and back. Read wire against LINK: the space track is lower priority than video,
+         so it is the first thing a tight link starves. Only with MOQOM_BUBBLES.
 
 Give it fifteen minutes or more. The failure worth catching only appeared after eleven.
 EOF
@@ -352,11 +410,11 @@ if [ -n "${MOQOM_SECONDS:-}" ]; then
     # does measures nothing and reports it as a result.
     waited=0
     while [ "$waited" -lt 300 ]; do
-        if grep -q '^LIVE' "$VIEWER_LOG" 2>/dev/null; then break; fi
-        sleep 1
-        waited=$((waited + 1))
+        if went_live "$VIEWER"; then break; fi
+        sleep 5
+        waited=$((waited + 5))
     done
-    if ! grep -q '^LIVE' "$VIEWER_LOG" 2>/dev/null; then
+    if ! went_live "$VIEWER"; then
         echo "the late joiner never went live — see $VIEWER_LOG" >&2
     fi
     sleep "$MOQOM_SECONDS"
@@ -368,17 +426,26 @@ if [ -n "${MOQOM_SECONDS:-}" ]; then
     pkill -f "devicectl device process launch.*$BUNDLE" >/dev/null 2>&1 || true
 
     for device in "$PUBLISHER" "$VIEWER"; do
-        xcrun devicectl device process terminate --device "$device" \
-            --bundle-id "$BUNDLE" >/dev/null 2>&1 || true
+        stop "$device"
     done
 
     # Both logs' last report, which is what a short run is for. Printed here so the answer is in
     # the terminal that asked rather than in two files somebody has to go and read.
-    for log in "$PUBLISHER_LOG" "$VIEWER_LOG"; do
+    # Off the phones rather than out of the consoles, which on a Release build are empty. See
+    # ``went_live``. Fetched after the apps are stopped so the last report is in the file.
+    collect "$PUBLISHER" "$(journal publisher)"
+    collect "$VIEWER" "$(journal viewer)"
+
+    for log in "$(journal publisher)" "$(journal viewer)"; do
         echo
         echo "--- $log"
-        grep -E '^(LINK|GLASS|PLAY|TIME|DRAW|SHOW|GRAB|SEEN|HOST|SEND|COST|TALK|HEAR|OUT|  SPKR|  VIEW)' \
-            "$log" | tail -14
+        # The timestamp `Journal` stamps every line with is why this is not anchored at the
+        # start: these lines are prefixed in the file and were not on the console.
+        # Eighteen because that is how many kinds of line one report is now, SPACE and
+        # BURST included. A tail shorter than the report shows part of it and part of the
+        # one before, which reads as a report whose numbers contradict each other.
+        grep -E '^\S+ (LINK|GLASS|PLAY|TIME|DRAW|SHOW|GRAB|SEEN|HOST|SEND|COST|TALK|HEAR|OUT|SPKR|VIEW|SPACE|BURST)' \
+            "$log" 2>/dev/null | tail -18
     done
 
     # A run that changed shape gets its own answer, because the tail above cannot give it: the
@@ -388,11 +455,11 @@ if [ -n "${MOQOM_SECONDS:-}" ]; then
     if [ -n "${MOQOM_RESHAPE_EVERY:-}" ]; then
         echo
         echo "--- shape changes"
-        grep -h '^SHAPE' "$PUBLISHER_LOG" | sed 's/^/publisher: /'
+        grep -h '^\S* SHAPE' "$(journal publisher)" | sed 's/^/publisher: /'
         # Only when it changes, so a run of identical reports collapses to the moments that
         # matter. The stall count comes along because a seam that cost a freeze shows up there
         # and nowhere else.
-        grep -o 'shape=[0-9x]* reshapes=[0-9]*' "$VIEWER_LOG" | awk '
+        grep -o 'shape=[0-9x]* reshapes=[0-9]*' "$(journal viewer)" | awk '
             $0 != last { print "viewer:    " $0; last = $0 }'
     fi
     exit 0

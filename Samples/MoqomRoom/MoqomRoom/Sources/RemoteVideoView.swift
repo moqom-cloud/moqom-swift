@@ -20,6 +20,22 @@ struct RemoteVideoView: View {
     let isSelf: Bool
     let room: RoomModel
 
+    /// How far through covering a frozen last frame this tile has got.
+    ///
+    /// Three numbers rather than a boolean because the cover is a sequence, not
+    /// a cut: blur the picture, fade it onto black, then fade the caption in.
+    /// A last frame sitting under a caption looks like a stall, and snapping
+    /// straight to black looks like the tile went empty.
+    @State private var interruptionBlur = 0.0
+    @State private var interruptionFade = 0.0
+    @State private var interruptionCaption = 0.0
+    @State private var interruptionCover: Task<Void, Never>?
+    /// How long the backdrop should take to blur or unblur. Zero for a snap
+    /// (joining a tile that is already interrupted); the sequenced durations
+    /// once the cover is playing. Passed in rather than read from the
+    /// transaction, because a representable often does not see that animation.
+    @State private var interruptionMotion = 0.0
+
     var body: some View {
         picture
             .background(.black)
@@ -28,26 +44,53 @@ struct RemoteVideoView: View {
                     Image(systemName: "person.crop.circle.badge.clock")
                         .font(.largeTitle)
                         .foregroundStyle(.secondary)
+                } else if isInterrupted || isCoveringLastFrame {
+                    interrupted
                 } else if participant.mute.effective.contains(.video) {
                     // The reason a mute is published rather than inferred from the
                     // objects stopping. Without the catalog saying so, this tile
                     // would show a frozen last frame and no way to tell it from a
                     // stalled uplink.
-                    stopped
+                    Image(systemName: "video.slash.fill")
+                        .font(.largeTitle)
+                        .foregroundStyle(.secondary)
                 }
             }
+            .onChange(of: isInterrupted, initial: true) { was, now in
+                interruptionCover?.cancel()
+                if was == now {
+                    snapInterruption(now)
+                } else {
+                    interruptionCover = Task { await playInterruption(now) }
+                }
+            }
+            .onDisappear { interruptionCover?.cancel() }
     }
 
-    /// Why this tile is not moving.
+    /// The publisher's phone took the camera away — backgrounded, a phone call,
+    /// sharing the screen — rather than anybody in the room turning it off.
+    private var isInterrupted: Bool {
+        participant.presence == .connected
+            && participant.mute.reason(for: .video) == .interrupted
+    }
+
+    /// The cover is still on screen, including while it is reversing.
+    private var isCoveringLastFrame: Bool {
+        interruptionBlur > 0 || interruptionFade > 0 || interruptionCaption > 0
+    }
+
+    /// Blur the last frame, fade it onto black, then the caption.
     ///
-    /// Two icons rather than one, because the two cases ask different things of
-    /// whoever is watching. A camera somebody turned off is settled and needs no
-    /// response; a camera their phone took away is temporary, usually resolves
-    /// by itself, and — the case this was built for — is invisible to the person
-    /// it is happening to, who is looking at another app.
-    @ViewBuilder
-    private var stopped: some View {
-        if participant.mute.reason(for: .video) == .interrupted {
+    /// An overlay rather than a filter on the representable, because
+    /// `AVSampleBufferDisplayLayer` draws through SwiftUI blur and opacity —
+    /// which is why a caption without a fill left the frozen frame showing.
+    /// The backdrop sits on top of that layer and samples it, so the picture
+    /// itself is what goes blurry; the black then covers it, and stays covering it.
+    private var interrupted: some View {
+        ZStack {
+            InterruptionBackdrop(blurred: interruptionBlur > 0, duration: interruptionMotion)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            Color.black.opacity(interruptionFade)
             VStack(spacing: 6) {
                 Image(systemName: "video.badge.ellipsis")
                     .font(.largeTitle)
@@ -55,14 +98,58 @@ struct RemoteVideoView: View {
                     .font(.caption2)
                     .multilineTextAlignment(.center)
             }
-            .foregroundStyle(.orange)
+            .foregroundStyle(.white)
             .padding(6)
-        } else {
-            Image(systemName: "video.slash.fill")
-                .font(.largeTitle)
-                .foregroundStyle(.secondary)
+            .opacity(interruptionCaption)
+        }
+        .allowsHitTesting(false)
+    }
+
+    /// Join a room that is already in this state without playing the sequence.
+    private func snapInterruption(_ interrupted: Bool) {
+        interruptionMotion = 0
+        interruptionBlur = interrupted ? 1 : 0
+        interruptionFade = interrupted ? 1 : 0
+        interruptionCaption = interrupted ? 1 : 0
+    }
+
+    /// Blur, then fade the frame out, then fade the caption in — and the reverse
+    /// on resume, caption first so it is not still sitting on a picture that has
+    /// started moving again.
+    private func playInterruption(_ interrupted: Bool) async {
+        do {
+            if interrupted {
+                interruptionMotion = Self.interruptionBlurDuration
+                withAnimation(.easeIn(duration: Self.interruptionBlurDuration)) {
+                    interruptionBlur = 1
+                }
+                try await Task.sleep(for: .seconds(Self.interruptionBlurDuration))
+                withAnimation(.easeIn(duration: Self.interruptionFadeDuration)) {
+                    interruptionFade = 1
+                }
+                try await Task.sleep(for: .seconds(Self.interruptionFadeDuration))
+                withAnimation(.easeOut(duration: Self.interruptionCaptionDuration)) {
+                    interruptionCaption = 1
+                }
+            } else {
+                withAnimation(.easeIn(duration: Self.interruptionCaptionDuration)) {
+                    interruptionCaption = 0
+                }
+                try await Task.sleep(for: .seconds(Self.interruptionCaptionDuration))
+                interruptionMotion = Self.interruptionFadeDuration
+                withAnimation(.easeOut(duration: Self.interruptionFadeDuration)) {
+                    interruptionFade = 0
+                    interruptionBlur = 0
+                }
+            }
+        } catch {
+            // Cancelled because the camera came back, or the tile went away.
         }
     }
+
+    private static let interruptionBlurDuration = 0.4
+    private static let interruptionFadeDuration = 0.3
+    private static let interruptionCaptionDuration = 0.3
 
     /// The scene itself for a device publishing one, and decoded frames for everything else.
     ///
@@ -95,6 +182,75 @@ struct RemoteVideoView: View {
         )
     }
 }
+
+/// Blurs whatever video is behind it by animating a system visual effect, not
+/// by fading a material on. Fading the effect's alpha looks like a veil;
+/// assigning the effect is what actually tightens the blur on the last frame.
+#if os(iOS) || os(visionOS)
+    private struct InterruptionBackdrop: UIViewRepresentable {
+        var blurred: Bool
+        var duration: TimeInterval
+
+        func makeCoordinator() -> Coordinator { Coordinator() }
+
+        func makeUIView(context _: Context) -> UIVisualEffectView {
+            let view = UIVisualEffectView(effect: nil)
+            view.isUserInteractionEnabled = false
+            view.backgroundColor = .clear
+            return view
+        }
+
+        func updateUIView(_ view: UIVisualEffectView, context: Context) {
+            guard context.coordinator.blurred != blurred else { return }
+            context.coordinator.blurred = blurred
+            let effect: UIVisualEffect? = blurred ? UIBlurEffect(style: .dark) : nil
+            if duration == 0 {
+                view.effect = effect
+            } else {
+                UIView.animate(
+                    withDuration: duration,
+                    delay: 0,
+                    options: [.curveEaseIn, .beginFromCurrentState]
+                ) {
+                    view.effect = effect
+                }
+            }
+        }
+
+        final class Coordinator {
+            var blurred = false
+        }
+    }
+#elseif os(macOS)
+    private struct InterruptionBackdrop: NSViewRepresentable {
+        var blurred: Bool
+        var duration: TimeInterval
+
+        func makeCoordinator() -> Coordinator { Coordinator() }
+
+        func makeNSView(context _: Context) -> NSVisualEffectView {
+            let view = NSVisualEffectView()
+            view.blendingMode = .withinWindow
+            view.material = .hudWindow
+            view.state = .active
+            view.alphaValue = 0
+            return view
+        }
+
+        func updateNSView(_ view: NSVisualEffectView, context: Context) {
+            guard context.coordinator.blurred != blurred else { return }
+            context.coordinator.blurred = blurred
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = duration
+                view.animator().alphaValue = blurred ? 1 : 0
+            }
+        }
+
+        final class Coordinator {
+            var blurred = false
+        }
+    }
+#endif
 
 /// Pumps one participant's frames into one layer.
 ///

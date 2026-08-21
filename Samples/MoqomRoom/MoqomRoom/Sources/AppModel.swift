@@ -1127,6 +1127,15 @@ final class AppModel {
                                 + " bubbles=\(room.bubblesUp)"
                                 + (scores.isEmpty ? "" : " · \(scores)")
                         )
+
+                        // A line of its own rather than more of the one above, because it is
+                        // a latency and belongs beside LINK: the same relay and the same two
+                        // phones, measured on the track the game runs on. Read the two
+                        // together — a space track keeping pace with the picture and one
+                        // falling behind it look identical from either figure alone.
+                        if let bursts = room.bursts.report() {
+                            Journal.shared.say("BURST \(bursts)")
+                        }
                     }
 
                     // The two stages between the camera and the wire, separately. Together they
