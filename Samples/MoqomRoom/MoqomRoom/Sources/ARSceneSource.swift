@@ -88,6 +88,9 @@
         private var captureSize: PixelSize?
         private var pump: Task<Void, Never>?
 
+        /// What the sensor was asked for, once the session has been configured. See ``trim(_:from:)``.
+        private var sensorFormat: CGSize?
+
         /// Scales and converts the drawable into the rung. Built on first use.
         private var transfer: VTPixelTransferSession?
         private var pool: CVPixelBufferPool?
@@ -127,11 +130,18 @@
         /// The drawable is the interesting half. It is chosen by SwiftUI's layout rather
         /// than by anything here, so a tile that shrank is a scene being published from
         /// fewer pixels than the rung asks for, and nothing else in the app would say so.
+        ///
+        /// The sensor is in front of it so the three sizes read as the chain they are. Pixels
+        /// only ever come off the sensor once, and any step where the number falls is work the
+        /// image pipeline did for a renderer that had no use for it — which is the whole
+        /// argument for ``trim(_:from:)`` and the only place it can be checked.
         var status: String {
             lock.withLock {
+                let sensor = sensorFormat.map { "\(Int($0.width))x\(Int($0.height))" } ?? "default"
                 let drawable = captureSize.map { "\($0.width)x\($0.height)" } ?? "not drawn"
                 let rate = interval > 0 ? String(format: "%.1f", 1 / interval) : "—"
-                return "\(drawable)→\(captureFormat.size.width)x\(captureFormat.size.height)"
+                return "sensor=\(sensor)"
+                    + " \(drawable)→\(captureFormat.size.width)x\(captureFormat.size.height)"
                     + " draws=\(rate)fps rendered=\(rendered)"
                     + " published=\(published) skipped=\(skipped)"
             }
@@ -502,9 +512,11 @@
             if ARFaceTrackingConfiguration.isSupported {
                 let configuration = ARFaceTrackingConfiguration()
                 configuration.isWorldTrackingEnabled = false
+                trim(configuration, from: ARFaceTrackingConfiguration.supportedVideoFormats)
                 view.session.run(configuration, options: options)
             } else if ARWorldTrackingConfiguration.isSupported {
                 let configuration = ARWorldTrackingConfiguration()
+                trim(configuration, from: ARWorldTrackingConfiguration.supportedVideoFormats)
                 view.session.run(configuration, options: options)
             } else {
                 throw ARSceneError.unsupported
@@ -520,6 +532,60 @@
             ]
             view.automaticallyConfigureSession = false
             view.environment.background = .cameraFeed()
+        }
+
+        /// Stop the session producing things nothing in this app reads.
+        ///
+        /// Both of these are outputs rather than settings, and that is why they are safe to
+        /// switch off: the scene anchors everything to ``AnchorEntity/camera``, which is the
+        /// render camera and needs no tracking, and the only light in the field is the one
+        /// ``BubbleOverlay`` installs. The face mesh was already kept off the screen by
+        /// `.disableFaceMesh` above, but a render option only stops RealityKit drawing it —
+        /// ARKit still solves for it, because the configuration is what decides that.
+        ///
+        /// The video format is the larger of the two. ARKit picks its highest front-camera
+        /// format when not told otherwise, and this scene renders into a drawable of about
+        /// 594x1056 before being published at 720x1280 — so every pixel above that is read off
+        /// the sensor, carried through the image pipeline and thrown away by the renderer.
+        /// Asked for by coverage rather than by name, because the formats on offer differ
+        /// between devices and a hard-coded size is a magenta frame on the first phone that
+        /// does not have it.
+        ///
+        /// > Note: The frame rate filter comes first and is not negotiable. A smaller format
+        /// > that only reaches thirty would halve the capture rate of a sixty-frame
+        /// > publication, which is a far worse trade than the pixels are worth.
+        @MainActor
+        private func trim(
+            _ configuration: ARConfiguration, from supported: [ARConfiguration.VideoFormat]
+        ) {
+            configuration.isLightEstimationEnabled = false
+
+            let wanted = captureFormat.size
+            let long = Double(max(wanted.width, wanted.height))
+            let short = Double(min(wanted.width, wanted.height))
+
+            let fastEnough = supported.filter {
+                Double($0.framesPerSecond) >= captureFormat.frameRate - 0.5
+            }
+            let covering = fastEnough.filter {
+                let resolution = $0.imageResolution
+                return max(resolution.width, resolution.height) >= long
+                    && min(resolution.width, resolution.height) >= short
+            }
+
+            // The smallest that still covers the publication, or the smallest there is when
+            // nothing covers it — in which case the renderer is upscaling either way and the
+            // cheaper format is the better of two compromises.
+            let candidates = covering.isEmpty ? fastEnough : covering
+            guard
+                let format = candidates.min(by: {
+                    $0.imageResolution.width * $0.imageResolution.height
+                        < $1.imageResolution.width * $1.imageResolution.height
+                })
+            else { return }
+
+            configuration.videoFormat = format
+            lock.withLock { sensorFormat = format.imageResolution }
         }
 
     /// Put a shared bubble field in the scene, and let taps reach it.

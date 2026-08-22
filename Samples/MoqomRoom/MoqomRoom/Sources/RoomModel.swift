@@ -537,6 +537,14 @@ final class RoomModel {
     ///
     /// The overlay can host the field on its own, so a camera broadcast can
     /// still play. The simulator has neither an AR view nor that overlay.
+    /// Whether going live should join the field, for a run that would rather it did not.
+    ///
+    /// Separate from ``canShare``, which asks what the device is capable of. This asks what
+    /// this run wants, and the only caller that turns it off is a measured one: the field is a
+    /// second RealityKit renderer over the whole room, so leaving it on makes every source
+    /// look like an AR source from a power meter's point of view.
+    var joinsTheFieldWhenLive = true
+
     var canShare: Bool {
         #if canImport(ARKit) && !targetEnvironment(simulator)
             return true
@@ -1824,7 +1832,7 @@ final class RoomModel {
             // entities. The field is drawn on an overlay above the whole room now, so any
             // source can host it — and the pairing flow, which goes live for both phones
             // the moment they meet, therefore starts the game for both of them.
-            if canShare { await startSharing() }
+            if canShare, joinsTheFieldWhenLive { await startSharing() }
             await refresh()
         } catch {
             // Written here as well as shown, because the alert is only seen by whoever is

@@ -538,6 +538,10 @@ final class AppModel {
             }
         }
 
+        // Before going live, because that is where the field is joined. Set unconditionally
+        // rather than only when off, so the flag reads the same way round as it is written.
+        room.joinsTheFieldWhenLive = launch.sharesTheField
+
         // Sixty, which is what every measurement of this application has been taken at and what
         // the capture, encode and presentation paths are tuned around. Thirty was the default for
         // as long as the frame rate was only ever set from the command line, and the effect of

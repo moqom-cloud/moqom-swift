@@ -34,7 +34,9 @@ This script takes no arguments; everything is an environment variable.
   MOQOM_RESHAPE_EVERY=6  turn the publisher's picture on its side this often, and back
   MOQOM_CALL=1           publish the layout's rung, as a call does, not a pinned one
   MOQOM_EAGER=1          encode for speed rather than power, at the cost of heat
-  MOQOM_BUBBLES=1        join the shared bubble field, which is what BURST reports on
+  MOQOM_BUBBLES=1        pop bubbles on a timer, which is what BURST reports on. Going
+                         live joins the field on its own, so 0 is the setting that means
+                         something new: no field, and therefore no RealityKit at all
   MOQOM_POP_EVERY=2      pop a bubble this often, since a scripted run has no finger.
                          Needs MOQOM_BUBBLES, and it is what fills in `mine` and `trip`
                          on BURST — without it the only bursts are the other phone's.
@@ -148,7 +150,14 @@ WHERE="$WHERE${MOQOM_VIDEO:+ --video $MOQOM_VIDEO}"
 # and the reason to script it at all is that the state is meant to be identical
 # on both devices, which is a thing to diff two logs for rather than to judge by
 # glancing between two screens.
-WHERE="$WHERE${MOQOM_BUBBLES:+ --bubbles}"
+# Three states, not two. Unset is what the app does on its own — going live joins the field
+# whatever the video source is — so `--bubbles` only adds the scripted popping on top of it,
+# and 0 is the only way to ask for a run with no field and therefore no RealityKit in it.
+case "${MOQOM_BUBBLES:-}" in
+    "") ;;
+    0 | no | off) WHERE="$WHERE --no-bubbles" ;;
+    *) WHERE="$WHERE --bubbles" ;;
+esac
 WHERE="$WHERE${MOQOM_POP_EVERY:+ --pop-every $MOQOM_POP_EVERY}"
 # Turns the publisher's picture on its side and back on a timer, which is a layout change
 # without a thumb. On a timer because the evidence is in the other phone's log and has to be

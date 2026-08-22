@@ -562,6 +562,20 @@ struct LaunchOptions {
     /// Popping still takes a finger; everything before it does not.
     var bubbles = false
 
+    /// Whether going live joins the field at all.
+    ///
+    /// On by default because that is what the app does — ``RoomModel/startBroadcast()`` joins
+    /// the space for anyone who can, and ``bubbles`` above only adds the scripted popping on
+    /// top. So this is not the flag that turns the game on; it is the only one that turns it
+    /// off, which a measured run needs and had no way to ask for.
+    ///
+    /// Worth having because of what the field costs rather than what it does. It is a second
+    /// full-screen `RealityView` with its own display link, drawn over the room whatever the
+    /// video source is, and until this existed there was no way to run this app on a phone
+    /// with no RealityKit in it — which makes the question "how much of the heat is
+    /// RealityKit?" unanswerable rather than merely unanswered.
+    var sharesTheField = true
+
     /// Seconds between scripted pops, where a run has nobody to tap.
     var popEverySeconds: Double?
 
@@ -617,6 +631,7 @@ struct LaunchOptions {
             case "--video": options.video = value ?? "camera"
             case "--locale": options.locale = value
             case "--bubbles": options.bubbles = true
+            case "--no-bubbles": options.sharesTheField = false
             case "--pop-every": options.popEverySeconds = value.flatMap(Double.init)
             case "--reshape-every": options.reshapeEverySeconds = value.flatMap(Double.init)
             case "--quiet-logs": options.quietLogs = true
