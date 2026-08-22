@@ -26,7 +26,7 @@ This script takes no arguments; everything is an environment variable.
 
   MOQOM_ROOM=name        room to join (default: bench)
   MOQOM_SECONDS=20       stop after this long, and print each log's last report
-  MOQOM_FPS=30           capture and publish rate (default: 60)
+  MOQOM_FPS=60           capture and publish rate (default: the app's own, 30)
   MOQOM_KBPS=2000        publish bitrate
   MOQOM_AUDIO=mic        publish audio: mic, or tone for a synthetic source
   MOQOM_VIDEO=camera     publish video: camera, pattern, or scene for the AR orb
@@ -118,12 +118,6 @@ if [ -n "${MOQOM_MINT:-}" ]; then
     VIEWER_TOKEN="$(MOQOM_TENANT=$TENANT "$JOIN" viewer "$ROOM" "$MOQOM_VIEWER_DEVICE")"
 fi
 
-# Sixty, which is what this application is tuned around and what a hand launch
-# now uses too. Thirty was the default here for as long as the two disagreed, and
-# the effect was that the build being measured behaved unlike the build somebody
-# opened — the same binary, half the frames, and nothing on screen saying which.
-FPS="${MOQOM_FPS:-60}"
-
 # Where the relay is. The app already dials the compiled-in GCP endpoint. A host
 # here overrides that; a pairing code is the room, not a lookup.
 if [ -n "${MOQOM_RELAY_HOST:-}" ]; then
@@ -136,7 +130,10 @@ else
     WHERE=""
     echo "relay: compiled-in GCP default"
 fi
-WHERE="$WHERE --fps $FPS${MOQOM_FLAT_LAYERS:+ --flat-layers}"
+# Unset unless asked for, so the rate is the app's own and a measured run cannot drift from a
+# hand-opened one. Naming a default here is what made them disagree before: the same binary,
+# different frame rates, and nothing on any line of output saying which you were reading.
+WHERE="$WHERE${MOQOM_FPS:+ --fps $MOQOM_FPS}${MOQOM_FLAT_LAYERS:+ --flat-layers}"
 WHERE="$WHERE${MOQOM_EAGER:+ --eager-encoding}"
 WHERE="$WHERE${MOQOM_KBPS:+ --kbps $MOQOM_KBPS}"
 WHERE="$WHERE${MOQOM_STATS_MS:+ --stats-ms $MOQOM_STATS_MS}"

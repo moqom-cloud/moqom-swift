@@ -791,6 +791,25 @@ final class RoomModel {
     /// the instruction to turn them.
     static let defaultCaptureSize = PixelSize(width: 720, height: 1280)
 
+    /// What to publish at when a run does not name a rate.
+    ///
+    /// Thirty. Sixty is measurably smoother and is what the capture, encode and presentation
+    /// paths were tuned around, and it was the default here for as long as it looked free. It
+    /// is not: a call with audio on an AR scene took both phones to `serious` inside six and a
+    /// half minutes, and the system's answer was to throttle capture to forty-four frames a
+    /// second with the gaps twice their own median. So sixty asked for is not sixty delivered
+    /// on any call long enough to matter — it is an even sixty for six minutes and an uneven
+    /// forty-four afterwards, and the second half is worse to watch than thirty would have
+    /// been for the whole call.
+    ///
+    /// Halving the rate halves the encode, the decode and the radio, and the bitrate follows
+    /// it down on its own: see ``publishBitrate``, where the budget is a function of this.
+    ///
+    /// One constant because three places used to write it out — here, the rate ``AppModel``
+    /// joins with, and the figure it logs — and each of those comments recorded a bug caused
+    /// by one of them being changed alone.
+    static let defaultFrameRate: Double = 30
+
     /// What to publish, for the layout this call is being drawn in.
     ///
     /// The publisher's decision, and the only one: a receiver takes what arrives. Which means
@@ -935,12 +954,11 @@ final class RoomModel {
 
     /// The frame rate to publish at.
     ///
-    /// Sixty, which is what every measurement of this application has been taken
-    /// at and what the capture, encode and presentation paths are tuned around.
-    /// ``AppModel`` has set it to this on every join for a while; the default here
-    /// disagreeing only mattered for a launch that turned measurement off, which
-    /// is the one configuration nobody would have thought to check.
-    var publishFrameRate: Double = 60
+    /// ``AppModel`` sets this on every join, so the default only shows through on a launch
+    /// that turned measurement off — which is the one configuration nobody would have thought
+    /// to check, and the reason it now names the same constant that launch path does rather
+    /// than writing the number a second time.
+    var publishFrameRate: Double = RoomModel.defaultFrameRate
 
     /// What a rung of ``publishSize`` costs on the wire.
     ///

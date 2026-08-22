@@ -438,7 +438,7 @@ final class AppModel {
                     + " \(live.size.width)x\(live.size.height)@\(Int(live.frameRate))"
                     + " \(live.bitrate / 1000)kbps layers=\(live.temporalLayers)"
                     + " codec=hevc source=\(room.videoInput.rawValue)"
-                    + " fps=\(Int(launch.frameRate ?? 60))"
+                    + " fps=\(Int(launch.frameRate ?? RoomModel.defaultFrameRate))"
                     + " playout=\(launch.playoutMilliseconds.map { "\($0)ms fixed" } ?? "adaptive")"
                     + " layers=\(launch.flatLayers ? "flat" : "temporal")"
                     + " encode=\(launch.eagerEncoding ? "eager" : "efficient")"
@@ -542,13 +542,13 @@ final class AppModel {
         // rather than only when off, so the flag reads the same way round as it is written.
         room.joinsTheFieldWhenLive = launch.sharesTheField
 
-        // Sixty, which is what every measurement of this application has been taken at and what
-        // the capture, encode and presentation paths are tuned around. Thirty was the default for
-        // as long as the frame rate was only ever set from the command line, and the effect of
-        // leaving it there was that the app a person opens by hand behaved unlike the one being
-        // measured — the same build, half the frames, and no indication which one you were
-        // looking at.
-        let fps = launch.frameRate ?? 60
+        // Whatever the app itself publishes at, so that the app a person opens by hand and the
+        // one being measured are the same app. That mattered enough to be worth a bug once
+        // already, in the other direction: the default lived only here, the bench named a rate
+        // on the command line, and the two disagreed for a while with nothing on any line of
+        // output to say which of them you were looking at. The bench now leaves it unset for
+        // the same reason. See ``RoomModel/defaultFrameRate`` for why the rate is what it is.
+        let fps = launch.frameRate ?? RoomModel.defaultFrameRate
 
         // Bitrate with the frame rate, not fixed. Twice the frames at the same budget is half
         // the bits each, and a sixty frame run that looks worse than a thirty frame one has
