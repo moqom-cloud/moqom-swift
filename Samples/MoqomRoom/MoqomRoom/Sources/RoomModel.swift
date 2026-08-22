@@ -127,14 +127,27 @@ final class RoomModel {
     /// swapping the ``FrameSource`` the publication is bound to, which is a stop
     /// and a restart; switching between the two *cameras* is the thing that does
     /// not need one, and that is ``flipCamera()``.
-    /// The shared AR field on a phone that can run one, the camera where it cannot, and the
-    /// pattern in a simulator. Defaulting to the camera meant every hand-driven call started
-    /// as a talking-head tile until somebody found the picker and then the bubbles button —
-    /// two extra taps for the mode this app is actually demonstrating.
+    ///
+    /// The camera on a phone, and the pattern in a simulator. This was the AR scene for a
+    /// while, on the grounds that the shared field is the thing the app demonstrates and a
+    /// plain tile made somebody find the picker and then the bubbles button to reach it. That
+    /// is no longer what happens: ``joinsTheFieldWhenLive`` joins the field on going live, and
+    /// ``bubblesFillScreen`` — which is the default — draws it in ``BubbleOverlayView``, a
+    /// RealityView with no session in it. So the bubbles arrive on their own and they never
+    /// needed the scene to arrive in.
+    ///
+    /// Which left the scene running ARKit to be a camera. There is no front-facing session
+    /// without ``ARFaceTrackingConfiguration``, no way to ask that configuration to stop
+    /// solving faces — the mesh and the blend shapes come with the anchor, and declining to
+    /// read them, which this app already does, does not stop them being computed — and so a
+    /// call was driving the TrueDepth emitter and the face solver for the whole of its length
+    /// to obtain a picture ``CameraSource`` hands over for very much less.
+    ///
+    /// The scene stays selectable, because turning ``bubblesFillScreen`` off puts the field
+    /// back into the encoded picture so the other person sees the bubbles in your tile, and
+    /// that is the one thing the overlay cannot do.
     #if targetEnvironment(simulator)
         var videoInput: VideoInput = .pattern
-    #elseif canImport(ARKit)
-        var videoInput: VideoInput = ARSceneSource.isSupported ? .scene : .camera
     #else
         var videoInput: VideoInput = .camera
     #endif
@@ -442,6 +455,21 @@ final class RoomModel {
     /// phone. Off puts the entities back in the AR scene, which is also what
     /// gets encoded, so the other person sees them in the picture.
     var bubblesFillScreen = true
+
+    /// Whether there is a scene to put the field back into.
+    ///
+    /// The overlay needs no session to draw bubbles, so it works whatever the video source is.
+    /// Compositing them into the encoded picture is the AR scene's job alone — and with any
+    /// other source there is nowhere for ``bubblesFillScreen`` off to put them, so
+    /// ``presentBubbles()`` turns it straight back on. Correct, but it reads as a toggle that
+    /// is broken rather than one that does not apply, which is worth a disabled control.
+    var canPutBubblesInThePicture: Bool {
+        #if canImport(ARKit) && !targetEnvironment(simulator)
+            arScene != nil
+        #else
+            false
+        #endif
+    }
 
     /// Whether this device is the one simulating it.
     ///

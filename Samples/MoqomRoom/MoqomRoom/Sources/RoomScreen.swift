@@ -239,6 +239,7 @@ struct RoomScreen: View {
                             .onChange(of: room.bubblesFillScreen) {
                                 room.presentBubbles()
                             }
+                            .disabled(!room.canPutBubblesInThePicture)
                     }
 
                     // Who stays on screen once the app is not. A rule rather
@@ -1113,6 +1114,7 @@ struct BroadcastControls: View {
                         if room.isSharing {
                             Toggle("Bubbles fill screen", isOn: fillScreen)
                                 .fillsMenuRow()
+                                .disabled(!room.canPutBubblesInThePicture)
                         }
                     } label: {
                         Label("Layout", systemImage: "rectangle.3.group")

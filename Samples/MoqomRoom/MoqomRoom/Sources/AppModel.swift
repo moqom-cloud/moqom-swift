@@ -527,9 +527,9 @@ final class AppModel {
             Journal.shared.say("CLOCK unavailable — latency across devices will be meaningless")
         }
 
-        // Only when asked. Absent `--video` the room keeps its own default — the AR
-        // field on a phone — so a hand launch and a scripted one without the flag
-        // are the same call.
+        // Only when asked. Absent `--video` the room keeps its own default — the camera
+        // on a phone — so a hand launch and a scripted one without the flag are the
+        // same call.
         if let video = launch.video {
             switch video {
             case "pattern": room.videoInput = .pattern
