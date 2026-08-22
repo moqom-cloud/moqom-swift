@@ -193,6 +193,34 @@ enum PlayoutDelay {
         return depth < -mostAnUndershootWorthRiding || straying > graceForTheRateToAnswer
     }
 
+    /// The least lateness worth moving the schedule for.
+    ///
+    /// Above one frame, so ordinary jitter is absorbed by the buffer rather than answered with a
+    /// move, and well below the keyframe interval that used to be the cost of answering it.
+    static let leastLatenessWorthMoving = 0.08
+
+    /// Whether a frame has missed its slot by enough that the schedule, not the frame, is wrong.
+    ///
+    /// A frame or two behind is what a playout buffer is for and is not this. Three intervals
+    /// behind is a schedule running somewhere the stream is not, and no amount of waiting brings
+    /// the two back together — the frames keep arriving on time, into slots that have already
+    /// passed.
+    ///
+    /// The threshold is deliberately the same one that used to trigger discarding every frame
+    /// until the next keyframe. What was wrong there was never the detection, it was the answer:
+    /// one frame eighty milliseconds late cost up to a whole group, and on a sixty frame stream
+    /// with a keyframe every two seconds that is two seconds of nothing to recover eighty
+    /// milliseconds. Measured on the call that prompted this, the receiver discarded five
+    /// thousand four hundred frames and showed four thousand nine hundred, while the link
+    /// delivered all ten thousand of them on time.
+    ///
+    /// - Parameters:
+    ///   - seconds: How far behind the playhead the frame arrived.
+    ///   - interval: The frame interval, so the rule scales with the rate being shown.
+    static func hasMissed(by seconds: Double, interval: Double) -> Bool {
+        seconds > max(interval * 3, leastLatenessWorthMoving)
+    }
+
     /// One move, or none.
     ///
     /// - Parameters:

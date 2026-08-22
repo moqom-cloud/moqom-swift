@@ -436,4 +436,58 @@ struct PlayoutDelayTests {
         #expect(!PlayoutDelay.needsAnchoring(depth: 0.018, allowance: 0.02, straying: nil))
         #expect(!PlayoutDelay.needsAnchoring(depth: -0.01, allowance: 0.02, straying: nil))
     }
+
+    /// A frame or two behind is the ordinary unevenness a buffer exists to absorb, and answering
+    /// it by moving the schedule would mean moving the schedule all call.
+    @Test("ordinary lateness is left to the buffer")
+    func leavesOrdinaryLatenessAlone() {
+        let interval = 1.0 / 60
+        #expect(!PlayoutDelay.hasMissed(by: interval, interval: interval))
+        #expect(!PlayoutDelay.hasMissed(by: interval * 2, interval: interval))
+        #expect(!PlayoutDelay.hasMissed(by: 0.05, interval: interval))
+    }
+
+    /// The schedule is running somewhere the stream is not, and waiting does not bring them back
+    /// together: the frames are arriving on time, into slots that have already passed.
+    @Test("a frame well behind its slot is a schedule that has lost the stream")
+    func noticesAScheduleThatHasLostTheStream() {
+        #expect(PlayoutDelay.hasMissed(by: 0.2, interval: 1.0 / 60))
+        #expect(PlayoutDelay.hasMissed(by: 1.5, interval: 1.0 / 60))
+    }
+
+    /// The rule scales with the rate rather than being a flat figure, so a slow stream is not
+    /// judged by a fast one's idea of late. At fifteen frames a second three intervals is two
+    /// hundred milliseconds, and eighty is barely one.
+    @Test("what counts as behind follows the frame rate")
+    func scalesWithTheFrameRate() {
+        let slow = 1.0 / 15
+        #expect(!PlayoutDelay.hasMissed(by: 0.15, interval: slow))
+        #expect(PlayoutDelay.hasMissed(by: 0.25, interval: slow))
+
+        // And at sixty, where three intervals is only fifty milliseconds, the floor is what
+        // decides — otherwise a fast stream would be judged late by a margin smaller than the
+        // jitter a healthy link routinely shows.
+        let fast = 1.0 / 60
+        #expect(!PlayoutDelay.hasMissed(by: 0.06, interval: fast))
+        #expect(PlayoutDelay.hasMissed(by: 0.09, interval: fast))
+    }
+
+    /// The property the whole change rests on. Answering lateness has to cost less than the
+    /// lateness, and the answer this replaced cost a keyframe interval — two seconds, to recover
+    /// eighty milliseconds — because recovering meant waiting for an independently decodable
+    /// frame. Whatever the threshold is tuned to, it must stay well inside that.
+    @Test("the schedule is moved long before a keyframe interval of video is worth losing")
+    func movesLongBeforeAGroupIsWorthLosing() {
+        let keyFrameInterval = 2.0
+        for rate in [15.0, 24.0, 30.0, 60.0, 120.0] {
+            let interval = 1 / rate
+            let waited = stride(from: 0.0, through: keyFrameInterval, by: 0.001)
+                .first { PlayoutDelay.hasMissed(by: $0, interval: interval) }
+                ?? keyFrameInterval
+            #expect(
+                waited < keyFrameInterval / 4,
+                "at \(rate)fps the schedule waits \(waited)s before moving"
+            )
+        }
+    }
 }

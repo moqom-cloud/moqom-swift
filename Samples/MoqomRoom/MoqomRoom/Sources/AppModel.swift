@@ -730,14 +730,21 @@ final class AppModel {
                 let drawn = room.drawing
                 Journal.shared.say(
                     String(
-                        format: "DRAW shown=%d late=%d undescribed=%d failures=%d"
-                            + " backwards=%d reanchors=%d regrids=%d delivered=%.1f%%"
+                        // `notready` rather than `late`, which is what this field was called while
+                        // it carried `skippedNotReady`. The name belonged to a different counter
+                        // and the counter it belonged to was never printed at all, so a receiver
+                        // discarding more frames for lateness than it showed reported `late=0`
+                        // for the whole call and every reading here looked clean. Rebases is what
+                        // that condition is now, and it is on the line.
+                        format: "DRAW shown=%d notready=%d undescribed=%d failures=%d"
+                            + " backwards=%d rebases=%d reanchors=%d regrids=%d delivered=%.1f%%"
                             + " buffer=%.0fms",
                         drawn.enqueued,
                         drawn.skippedNotReady,
                         drawn.skippedUndescribed,
                         drawn.failures,
                         drawn.outOfOrder,
+                        drawn.rebases,
                         drawn.reanchors,
                         drawn.regrids,
                         drawn.delivered * 100,

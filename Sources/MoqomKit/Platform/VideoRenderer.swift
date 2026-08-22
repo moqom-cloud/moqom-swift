@@ -546,13 +546,6 @@ import MoqomCore
         private var arrived: ContinuousClock.Instant?
         private var evidence = ArrivalEvidence()
 
-        /// Waiting for a keyframe after dropping a late backlog.
-        ///
-        /// Delta frames cannot be shown once their neighbours have been skipped:
-        /// they reference pictures the decoder no longer has. The next keyframe
-        /// is independently decodable and is what snaps the picture back.
-        private var skipUntilKey = false
-
         /// When the delay was last tightened, so tightening happens gradually.
         private var tightened = ContinuousClock.now
 
@@ -759,9 +752,21 @@ import MoqomCore
             /// Normal at the very start of a subscription and a bug if it continues.
             public var skippedUndescribed = 0
 
-            /// Frames dropped because they had already missed the playhead by enough
-            /// that showing them would be a catch-up stutter rather than a picture.
-            public var skippedLate = 0
+            /// Times the schedule was moved to meet frames that had already missed the playhead.
+            ///
+            /// Discarding them until the next keyframe is what this replaced, and the reasoning
+            /// behind that was sound about the wrong thing. Playing a late burst against a
+            /// timebase that has already run past it is a fast-forward stutter; playing it
+            /// against a timebase moved to meet it is just the stream, on time, a little later
+            /// than before. The old path paid up to a whole group to avoid a stutter that moving
+            /// the timeline does not produce — two seconds of nothing, at sixty frames a second
+            /// with a keyframe every two, for one frame eighty milliseconds late.
+            ///
+            /// Measured on the call that prompted this: five thousand four hundred frames
+            /// discarded against four thousand nine hundred shown, on a link that had delivered
+            /// every one of them on time. Frequent rebases still mean the schedule cannot hold
+            /// the stream, which is what this counts; they no longer mean the picture stops.
+            public var rebases = 0
 
             /// Times the display layer failed and was rebuilt.
             public var failures = 0
@@ -948,7 +953,7 @@ import MoqomCore
 
             /// The share of frames that reached the display layer.
             public var delivered: Double {
-                let total = enqueued + skippedNotReady + skippedUndescribed + skippedLate
+                let total = enqueued + skippedNotReady + skippedUndescribed
                 return total > 0 ? Double(enqueued) / Double(total) : 0
             }
         }
@@ -1875,26 +1880,24 @@ import MoqomCore
                 flush()
             }
 
-            // A burst of frames that have already missed the playhead is the
-            // choppy catch-up a person describes as late video. Playing them
-            // all, in order, on the main thread also hitchs the AR scene that
-            // shares it. Drop the backlog, skip until a keyframe, and start
-            // the schedule again from there.
+            // A frame that has already missed the playhead means the schedule is running
+            // somewhere the stream is not. Move the schedule to meet it rather than throw it
+            // away: cleared of its anchor, this frame falls through to the enqueue below, finds
+            // nothing to be measured against, and re-anchors the timeline on itself the usual
+            // delay ahead. The picture keeps moving and the whole cost is the lateness, paid
+            // once, as latency the give-back is already there to reclaim.
+            //
+            // The frames behind it in the same burst are the reason this is worth doing. Against
+            // the old timebase they are all late together and each one trips this again; against
+            // the moved one they are an ordinary run of frames at an ordinary spacing.
             if requestedDelay != nil, anchor != nil, source.isValid {
                 let playhead = synchroniser.currentTime()
                 if playhead.isValid {
                     let lateBy = (playhead - source).seconds
                     let interval = interval(after: source) ?? (1.0 / 30)
-                    let hopeless = lateBy > max(interval * 3, 0.08)
-                    if skipUntilKey || hopeless {
-                        if !frame.isKeyFrame {
-                            if !skipUntilKey { dropLateBacklog() }
-                            skipUntilKey = true
-                            drawing.skippedLate += 1
-                            return
-                        }
-                        dropLateBacklog()
-                        skipUntilKey = false
+                    if PlayoutDelay.hasMissed(by: lateBy, interval: interval) {
+                        drawing.rebases += 1
+                        rebase()
                     }
                 }
             }
@@ -2098,16 +2101,22 @@ import MoqomCore
             slot = 0
             debt = 0
             previousStamp = .invalid
-            skipUntilKey = false
         }
 
-        /// Throw away frames that have already missed, without blanking the last picture.
+        /// Let go of the schedule, so the next frame can put it where the stream actually is.
         ///
-        /// The displayed image stays so a late burst is a still for a moment
-        /// rather than a black tile, then the next keyframe starts a new
-        /// schedule from now.
-        private func dropLateBacklog() {
-            layer.sampleBufferRenderer.flush(removingDisplayedImage: false, completionHandler: nil)
+        /// Everything cleared here describes where the presented timeline sits, and all of it is
+        /// about to be wrong: the frame that prompted this is behind the playhead, so the anchor
+        /// it would be placed against, the grid built on that anchor and the newest timestamps
+        /// measured against it all belong to a timeline the stream has moved on from.
+        ///
+        /// What is deliberately *not* here is a flush, and that absence is the point. The decoded
+        /// pictures the layer is holding are the reference frames every delta frame after this
+        /// one needs. Discarding them is what used to make an independently decodable frame the
+        /// only way back, and so what turned one late frame into a keyframe interval of nothing.
+        /// Nothing queued is lost by moving the timebase: those frames are ahead of this one, and
+        /// a timeline moved back makes them later rather than sooner.
+        private func rebase() {
             anchor = nil
             newest = .invalid
             newestSource = .invalid
