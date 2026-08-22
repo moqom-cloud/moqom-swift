@@ -18,6 +18,10 @@ import MoqomCore
 import MoqomKit
 import Observation
 
+#if canImport(UIKit)
+    import UIKit
+#endif
+
 @MainActor
 @Observable
 final class RoomModel {
@@ -26,7 +30,23 @@ final class RoomModel {
     private(set) var stage = StageState()
     var inviteName = ""
     private(set) var lifecycle: RoomLifecycle = .live
-    private(set) var isBroadcasting = false
+
+    /// Whether this device is live — and, while it is, what keeps the screen alight.
+    ///
+    /// The screen, because on iOS the camera goes with it. A phone that reaches its idle
+    /// timer mid-broadcast suspends the app, and the far end does not see a dimmed picture,
+    /// it sees no picture at all: capture stops, the space hands authority to whoever is
+    /// left, and nothing in either log says why. It went unnoticed because no run had ever
+    /// been long enough to reach the timer — every measured run was under a minute against a
+    /// default of five, and the first fifteen-minute one died at five and a half.
+    ///
+    /// Tied to the broadcast rather than to the room, because that is where the cost is
+    /// earned. Holding a screen awake is a real draw on a phone that is already warm, and a
+    /// device that is only listening can be allowed to lock the way anything else would.
+    private(set) var isBroadcasting = false {
+        didSet { holdTheScreenAwake(isBroadcasting) }
+    }
+
     private(set) var isPublishingAudio = false
     private(set) var lastError: MoqomError?
 
@@ -1627,6 +1647,17 @@ final class RoomModel {
     }
 
     // MARK: - Broadcasting
+
+    /// Hold the idle timer open, or let it go. See ``isBroadcasting``.
+    ///
+    /// Safe to set either way from here because nothing else in the app touches it, which is
+    /// the condition this API quietly has: it is a single flag rather than a count, so two
+    /// owners means whichever released last wins.
+    private func holdTheScreenAwake(_ live: Bool) {
+        #if canImport(UIKit)
+            UIApplication.shared.isIdleTimerDisabled = live
+        #endif
+    }
 
     func startBroadcast() async {
         guard !isBroadcasting else { return }
