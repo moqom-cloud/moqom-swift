@@ -228,6 +228,13 @@ public actor MoqomSession {
             credentials = credentials.replacing(with: issued)
             let remaining = issued.expiresAt.timeIntervalSinceNow
 
+            // A renewed token restates the room's encryption policy, and that is
+            // how an administrator's change reaches a call already in progress.
+            let policy = credentials.encryptionPolicy
+            for room in rooms.values {
+                await room.applyEncryptionPolicy(policy)
+            }
+
             if let connection {
                 do {
                     try await connection.renewCredential(issued.token)
@@ -261,6 +268,62 @@ public actor MoqomSession {
         }
     }
 
+    /// Present a token with different grants on the connection already open.
+    ///
+    /// How a viewer becomes a guest, or a guest returns to the audience,
+    /// without leaving: the backend mints a token for the new role, the app
+    /// hands it here, and the relay applies it to this session. Nothing
+    /// reconnects, the roster is not rebuilt and playback does not stop. What
+    /// the new grants allow can be used at once — a promoted guest calls
+    /// ``RoomSession/startBroadcast(from:configuration:backstage:)`` on the
+    /// room they are already in — and what they no longer allow is ended by the
+    /// relay and reported as ``RoomEvent/publishingRevoked(_:)``.
+    ///
+    /// The token must be for the same person, on this device, in the same room.
+    /// A relay ignores one that is not, and one minted before the token it
+    /// replaces, so a token kept from before a demotion cannot undo it. Moving
+    /// to a different room is ``join(room:seatPolicy:)``.
+    ///
+    /// - Parameters:
+    ///   - issued: the token for the new role.
+    ///   - renew: how to obtain the next one, when it differs from before. The
+    ///     automatic renewal presents whatever this returns, so a closure still
+    ///     minting the old role would put the participant back in it at the next
+    ///     renewal. `nil` keeps the closure the session already has, which is
+    ///     right when that closure asks a backend that already knows the new
+    ///     role.
+    /// - Throws: ``MoqomError/invalidState(expected:actual:)`` when the token
+    ///   could not be handed to the relay. It is kept regardless, and a
+    ///   reconnect presents it.
+    public func updateCredential(
+        _ issued: IssuedToken,
+        renewingWith renew: (@Sendable () async throws -> IssuedToken)? = nil
+    ) async throws(MoqomError) {
+        if let renew {
+            credentials = DeviceCredentials(
+                identity: credentials.identity,
+                token: issued.token,
+                deviceKey: credentials.deviceKey,
+                expiresAt: issued.expiresAt,
+                renew: renew,
+                keyDelivery: credentials.keyDelivery
+            )
+        } else {
+            credentials = credentials.replacing(with: issued)
+        }
+
+        let policy = credentials.encryptionPolicy
+        for room in rooms.values {
+            await room.applyEncryptionPolicy(policy)
+        }
+        // The deadline belongs to the token, and this one has its own.
+        scheduleRenewal()
+
+        guard let connection else { return }
+        try await connection.renewCredential(issued.token)
+        logger.info(.session, "credential updated on the open connection")
+    }
+
     /// Join a room, or return the session already open on it.
     ///
     /// Joining subscribes to the room prefix, which *is* the roster: every
@@ -290,7 +353,16 @@ public actor MoqomSession {
             identity: identity,
             connection: connection,
             logger: logger,
-            seatPolicy: seatPolicy
+            seatPolicy: seatPolicy,
+            encryptionPolicy: credentials.encryptionPolicy,
+            keyDelivery: credentials.keyDelivery,
+            currentToken: { [weak self] in await self?.credentials.token ?? Data() },
+            updateCredential: { [weak self] issued, renew throws(MoqomError) in
+                guard let self else {
+                    throw MoqomError.invalidState(expected: "an open session", actual: "closed")
+                }
+                try await self.updateCredential(issued, renewingWith: renew)
+            }
         )
         rooms[room] = session
         await session.begin()
@@ -338,7 +410,14 @@ public actor MoqomSession {
             connection: connection,
             logger: logger,
             seatPolicy: seatPolicy,
-            channel: username
+            channel: username,
+            encryptionPolicy: credentials.encryptionPolicy,
+            updateCredential: { [weak self] issued, renew throws(MoqomError) in
+                guard let self else {
+                    throw MoqomError.invalidState(expected: "an open session", actual: "closed")
+                }
+                try await self.updateCredential(issued, renewingWith: renew)
+            }
         )
         rooms[room] = session
         await session.begin()

@@ -3,9 +3,61 @@
 The Apple-platform client SDK for [MOQOM](https://github.com/moqom-cloud/moqom),
 the Media Over QUIC Orchestration Mesh. iOS, visionOS, macOS, and tvOS.
 
+Documentation is at [moqom.dev](https://moqom.dev), starting with the
+[iOS & macOS guide](https://moqom.dev/guides/ios-macos/).
+
+## Install
+
+In Xcode, **File → Add Package Dependencies…** and enter
+`https://github.com/moqom-cloud/moqom-swift`, or in `Package.swift`:
+
 ```swift
 .package(url: "https://github.com/moqom-cloud/moqom-swift", from: "0.1.0")
+
+// in your target
+.product(name: "MoqomKit", package: "moqom-swift")
 ```
+
+## Quickstart
+
+Your backend mints a token bound to this device's key (see
+[moqom-go](https://github.com/moqom-cloud/moqom-go) or
+[moqom-rust](https://github.com/moqom-cloud/moqom-rust)); the app connects, joins,
+and goes live.
+
+```swift
+import MoqomKit
+import MoqomCore
+
+let deviceKey = try DeviceKey.installed()   // Secure Enclave where available
+let issued = try await myBackend.moqomToken(room: "demo", thumbprint: deviceKey.thumbprint)
+
+let session = MoqomSession(
+    transport: MoqtTransport.network(),
+    credentials: DeviceCredentials(
+        identity: ParticipantIdentity(
+            username: try Username(issued.username),
+            device: try DeviceID(thumbprint: deviceKey.thumbprint)
+        ),
+        token: issued.token,
+        deviceKey: deviceKey,
+        expiresAt: issued.expiresAt,
+        renew: { try await myBackend.moqomToken(room: "demo", thumbprint: deviceKey.thumbprint) }
+    ),
+    tenant: TenantID("t_3f9a0c1d2e4b5a69")
+)
+try await session.connect(to: RelayEndpoint(host: "relay.example.moqom.cloud"))
+let room = try await session.join(room: RoomID("demo"))
+
+let camera = try CameraSource(format: CaptureFormat(size: PixelSize(width: 1280, height: 720), frameRate: 30))
+camera.start()
+try await room.startBroadcast(from: camera).start()
+```
+
+The full walkthrough, including the backend half, is the
+[quickstart](https://moqom.dev/getting-started/quickstart/).
+
+## Where this came from
 
 This was the first piece to leave the monorepo, and for a reason peculiar to
 SwiftPM: it resolves a git dependency by looking for `Package.swift` at the
@@ -63,7 +115,7 @@ top of `Sources/MoqomKit/Transport/Transport.swift`.
 
 ### Verified: builds and is tested
 
-838 tests across 123 suites. All but the three interop tests run on every
+957 tests across 145 suites. All but the three interop tests run on every
 `swift test`; those need a relay binary and skip without one.
 
 - **Namespaces and identity.** Tuple construction, field limits in UTF-8 bytes,
@@ -178,7 +230,9 @@ top of `Sources/MoqomKit/Transport/Transport.swift`.
   under 1% of a video object and about a third of an Opus packet. And that
   arriving out of order is not mistaken for a replay, since subgroups ride
   separate QUIC streams and a strict counter rule would read reordering as loss.
-- **Proof of possession.** That a session presents a proof beside its token at
+- **Proof of possession.** Relays require it by default
+  (`MOQOM_RELAY_POSSESSION=required`), so a token presented without a proof from
+  the key it is bound to is refused. Tested: that a session presents a proof beside its token at
   SETUP and a fresh one on every renewal, and that the proof verifies: the
   signature is checked under the key the proof carries, the RFC 7638 thumbprint
   of that key is recomputed canonically, and the claims are matched — which is
@@ -258,6 +312,61 @@ top of `Sources/MoqomKit/Transport/Transport.swift`.
   stream. And that the three changes a delay would make actively wrong — a mute
   the user just pressed, a recorder attaching, the stream ending — skip the
   queue.
+- **End-to-end encryption by default.** `EncryptionPolicy` reads the room's
+  `e2ee` claim from the token and nothing else, so there is no client-side
+  switch to forget. A room is encrypted unless its owner's backend relaxed it,
+  and that change is in the room's audit log. An SDK holding no key refuses to
+  publish into a room that requires one.
+- **MLS-managed room keys.** `ManagedRoomKeys` runs group membership for small
+  encrypted rooms so an application never handles a key. Each epoch has its
+  own SFrame keys. Senders switch the moment a removal is ordered, so a removed
+  member's last key stops being used, and an ordinary epoch change drops no
+  frames.
+  `MLSGroup` is a deliberately small subset of MLS (RFC 9420). The primitives
+  and key schedule are RFC 9420 and are checked against its test vectors
+  (`MLSConformanceTests`); the group protocol keeps the RFC's epochs, commits,
+  Welcomes and transcript hashes but uses a flat member list instead of a
+  ratchet tree. The comment at the top of `MLSGroup.swift` lists what differs.
+  `MLSDelivery` is the ordering service: it only ever sees public key packages
+  and sealed commits, never anything that derives a key. The committer is the
+  lowest live leaf, with a fallback, so there is no election.
+- **Direct (peer-to-peer) calls**, in `Sources/MoqomKit/Direct/`. Wire-compatible
+  with the Rust client's `moqom_client::direct`, so either SDK can be either
+  end:
+  - `DirectEligibility`: small, end-to-end encrypted rooms where everyone has
+    agreed and nobody is an audience. Viewers never get a direct path, because
+    it would tell them the publisher's network address.
+  - `CandidateOffer` and `DirectOffers`: addresses and a certificate hash,
+    sealed with AES-256-GCM under a key from the room's MLS group and sent on
+    the participant's own track. The relay carries them and cannot read or
+    forge them.
+  - `DirectEndpoint`: one UDP port, STUN, hole-punching (the lower certificate
+    hash dials), then pinned mutual TLS against the hash in the offer, and a
+    MOQT SETUP carrying the MOQOM token plus a proof bound to the peer's
+    certificate.
+  - `DirectPeerCheck`: a port of the relay's token and possession checks, with
+    the proof required. A refused peer is closed with `0x03`.
+  - `DualSubscription`: the relay subscription stays open as the fallback. Once
+    the direct path keeps up, the relay copy is paused with `FORWARD=0`, and it
+    resumes on loss or after 500 ms of direct silence.
+  - `DirectTicket`: the relay signs a ticket about once a minute while a
+    participant is direct, and meters direct minutes from it. Each side presents
+    its tickets to the other and drops the direct path when the peer's are
+    missing, forged or expired, so one honest app is enough to keep the pair
+    billed.
+
+  `DirectEndpointTests` runs two endpoints over loopback on macOS. It hasn't
+  run across real networks.
+- **Space edits, events and playout.** `SpaceEdit` adds spawn, move, despawn
+  and event without the app writing a simulation; the simulation can still
+  refuse them. `SpaceEvents` delivers moments (a goal, a turn) exactly once and
+  in order, alongside the forgiving state ticks. `SpacePlayout` interpolates
+  ticks for smooth drawing, and can hold the board in step with the video
+  beside it.
+- **Grant changes mid-session** (`GrantChangeTests`). A viewer promoted to
+  guest, or sent back to the audience, stays on the same connection. The new
+  token is presented there, the next renewal mints the new role, and a
+  publication the relay withdraws is stopped instead of encoding into nothing.
 
 ### Verified on two phones, not by the test suite
 
@@ -343,17 +452,8 @@ somebody demonstrates. Both are built and wired; neither has been seen.
 
 ### Not written
 
-- Enforcement of proofs by *default*, which is now the whole of what is left here.
-  This entry has been narrowed twice: it once said proof of possession was not
-  written, then that no deployment enforced it. The dev deployment does —
-  `MOQOM_RELAY_POSSESSION=required` on both relay regions, verified by a token
-  this deployment had just minted being refused for presenting no proof. But the
-  binary still defaults to `observed`, which verifies a proof when one is offered
-  and admits a session that offers none, so any deployment that has not set the
-  variable is still taking bearer tokens from whatever presents one. Changing the
-  default is the remaining step, and it is deliberately not taken while a fleet
-  can still be mid-upgrade: the cost of getting it wrong is an outage, and the
-  cost of leaving it is a setting an operator must know about.
+- Direct mode is not wired into `Room`. An app can drive the pieces above
+  itself, but `Room` does not yet offer or take a direct path on its own.
 - Media kinds are not enforced per track. `moqt.pub` distinguishes audio from
   video from screen, and the relay checks only that it is non-empty, so a token
   minted for audio can publish video under a namespace it does own.
@@ -625,3 +725,24 @@ encode rather than a namespace with no media behind it.
   The uncomfortable part is that the SDK cannot tell an on-device transcriber
   from an upload, and saying so in the doc comment is the whole of the
   mitigation; `Watchdog` is the mechanism if an integrator wants to disclose it.
+
+## Contribute
+
+Bug reports, fixes and examples are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md):
+the first pull request asks you to sign the CLA, and `swift test` runs with no
+account or network.
+
+## Security
+
+Do not open a public issue for a vulnerability. Email
+[security@moqom.cloud](mailto:security@moqom.cloud); see [SECURITY.md](SECURITY.md).
+
+## Donate
+
+The SDKs and samples are free. If they save you time, you can support the
+open-source work at [elliottwave.dev/donate](https://elliottwave.dev/donate/).
+
+## Licence
+
+Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE), which also carries the
+notices for third-party components. © 2026 Elliott Wave LLC.

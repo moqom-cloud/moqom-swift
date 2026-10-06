@@ -25,6 +25,10 @@ jobs:
     # The cost of the fix is that a queued job now waits for a machine that
     # sleeps. An offline runner queues rather than fails, so a red X becomes a
     # pending circle -- quieter and easier to miss than a failure.
+    #
+    # Never for a pull request from a fork: the repository is public, and a
+    # self-hosted runner would execute a stranger's code on that Mac.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v7

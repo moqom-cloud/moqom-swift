@@ -104,18 +104,31 @@ public struct DeviceCredentials: Sendable {
     /// lifetime as a property of the handshake alone.
     public let renew: (@Sendable () async throws -> IssuedToken)?
 
+    /// Where a room's end-to-end encryption keys are agreed, when the SDK is
+    /// to manage them.
+    ///
+    /// Set, in a room whose token says encryption is required, and the room
+    /// keys itself with MLS: no key passes through the application and none
+    /// reaches MOQOM's servers, which only order and forward ciphertext. A key
+    /// given to ``RoomSession/useEncryption(_:)`` overrides it. `nil` keeps the
+    /// earlier behaviour, where a required room publishes nothing until the
+    /// application supplies a key. ``TokenService/keyDelivery`` is MOQOM's.
+    public let keyDelivery: (any MLSDeliveryService)?
+
     public init(
         identity: ParticipantIdentity,
         token: Data,
         deviceKey: DeviceKey?,
         expiresAt: Date? = nil,
-        renew: (@Sendable () async throws -> IssuedToken)? = nil
+        renew: (@Sendable () async throws -> IssuedToken)? = nil,
+        keyDelivery: (any MLSDeliveryService)? = nil
     ) {
         self.identity = identity
         self.token = token
         self.deviceKey = deviceKey
         self.expiresAt = expiresAt
         self.renew = renew
+        self.keyDelivery = keyDelivery
     }
 
     /// The same credentials carrying a token that has just been issued.
@@ -129,7 +142,8 @@ public struct DeviceCredentials: Sendable {
             token: issued.token,
             deviceKey: deviceKey,
             expiresAt: issued.expiresAt,
-            renew: renew
+            renew: renew,
+            keyDelivery: keyDelivery
         )
     }
 }
@@ -390,7 +404,22 @@ public protocol SubscriptionHandle: Sendable, AnyObject {
     /// scroll position without rate-limiting it themselves.
     func updatePriority(_ priority: UInt8) async
 
+    /// Ask the publisher to stop, or resume, sending this subscription's
+    /// objects without ending it: draft-19's FORWARD parameter in a
+    /// REQUEST_UPDATE.
+    ///
+    /// A request rather than a switch. A relay that does not act on it keeps
+    /// sending, and one that does resumes at the start of the next group, not
+    /// mid-group, because it forwards whole subgroups.
+    func updateForwarding(_ forward: Bool) async
+
     func cancel() async
+}
+
+public extension SubscriptionHandle {
+    /// Nothing to pause: a transport with no relay in it delivers only what
+    /// it is given.
+    func updateForwarding(_: Bool) async {}
 }
 
 /// What history to ask for.

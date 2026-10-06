@@ -47,6 +47,17 @@ public enum MoqomError: Error, Sendable {
     /// silently is not one, which is worse than dropping the frame.
     case encryptionFailed(SFrameError)
 
+    /// The room requires end-to-end encryption and this session has no key.
+    ///
+    /// Thrown before anything is announced or opened, so a refused publish
+    /// leaves nothing half-started. Two ways out, and they belong to different
+    /// people: the application calls ``RoomSession/useEncryption(_:)`` before
+    /// publishing, or the room's backend sets its policy to optional through the
+    /// admin API — which is recorded in the room's audit log and reaches this
+    /// device as the `e2ee` claim on its next token. There is deliberately no
+    /// third way from the client.
+    case encryptionRequired
+
     /// The peer sent something the protocol does not allow.
     ///
     /// Distinct from ``transport(_:)`` because the correct response differs: a
@@ -89,6 +100,16 @@ public enum RejectionReason: Hashable, Sendable {
     /// The token is valid but its `moqt` claim does not cover this namespace.
     case forbidden(TrackNamespace)
 
+    /// This namespace was allowed, and the session's grants changed so that it
+    /// no longer is: a moderator returned this participant to the audience, or
+    /// moved them between the queue and the stage.
+    ///
+    /// Distinct from ``forbidden(_:)`` because the right response differs. That
+    /// one is a token minted for the wrong room and wants fixing; this one is the
+    /// room working as intended, and wants the interface to follow it. The
+    /// session is still connected and still watching.
+    case revoked(TrackNamespace)
+
     /// The namespace exists but nothing is publishing under it.
     case trackNotFound(FullTrackName)
 
@@ -125,6 +146,10 @@ extension MoqomError: CustomStringConvertible {
             "unsupported audio codec: \(codec.rawValue)"
         case let .encryptionFailed(reason):
             "encryption failed: \(reason)"
+        case .encryptionRequired:
+            "encryption required: this room requires end-to-end encryption; call "
+                + "RoomSession.useEncryption(_:) before publishing, or have the room's backend "
+                + "set its e2ee policy to optional"
         case let .platform(api, status):
             "\(api) failed with status \(status)"
         }

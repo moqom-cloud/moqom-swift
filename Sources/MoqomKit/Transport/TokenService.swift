@@ -209,13 +209,13 @@ public struct TokenService: Sendable, Hashable {
     }
 
     /// A session and the pin it is enforcing, so the failure can be explained.
-    fileprivate struct Pinned {
+    struct Pinned {
         var session: URLSession
         var trust: PinnedTrust?
     }
 
     /// A session that trusts exactly these certificates, or the platform's.
-    fileprivate static func session(pinning hashes: [String]) -> Pinned {
+    static func session(pinning hashes: [String]) -> Pinned {
         guard !hashes.isEmpty else {
             return Pinned(session: URLSession(configuration: .ephemeral), trust: nil)
         }
@@ -329,7 +329,7 @@ extension TokenServiceError: LocalizedError {
 /// `allowsAnySSLCertificate`-shaped shortcuts: this connection carries the
 /// device's long-lived credential in a header, so accepting any certificate on it
 /// is handing that credential to whoever answers the address.
-private final class PinnedTrust: NSObject, URLSessionDelegate, Sendable {
+final class PinnedTrust: NSObject, URLSessionDelegate, Sendable {
     let hashes: [Data]
 
     /// What the handshake actually offered, for the error message.

@@ -37,6 +37,22 @@ struct PublishSizingTests {
         #expect(PublishSizing.shortSide(for: 4000) == 1080)
     }
 
+    @Test("4K is opt-in, and steps through 1440 on the way")
+    func uhdSteps() {
+        #expect(PublishSizing.shortSide(for: 1300) == 1080)
+        #expect(PublishSizing.shortSide(for: 1300, steps: PublishSizing.uhdSteps) == 1440)
+        #expect(PublishSizing.shortSide(for: 2000, steps: PublishSizing.uhdSteps) == 2160)
+        #expect(PublishSizing.shortSide(for: 4000, steps: PublishSizing.uhdSteps) == 2160)
+    }
+
+    @Test("a 4K camera gets a 2160p rung; a 1080p camera does not")
+    func uhdRung() {
+        let uhd = LayerLadder.defaultCamera(topSize: PixelSize(width: 3840, height: 2160))
+        #expect(uhd.rungs.last?.id == "video/2160p")
+        #expect(uhd.rungs.last?.size == PixelSize(width: 3840, height: 2160))
+        #expect(LayerLadder.defaultCamera().rungs.last?.id == "video/1080p")
+    }
+
     @Test("a box below the bottom takes the bottom")
     func clampsAtTheBottom() {
         #expect(PublishSizing.shortSide(for: 1) == 180)

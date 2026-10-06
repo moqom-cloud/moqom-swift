@@ -261,9 +261,10 @@ struct EncryptedMediaTests {
     @Test("the relay never sees plaintext, and the receiver does")
     func relaySeesOnlyCiphertext() async throws {
         let relay = LoopbackRelay()
+        // No e2ee claim, which is the default a room is in: required.
         let session = MoqomSession(
             transport: LoopbackTransport(relay: relay),
-            credentials: credentials("alice"),
+            credentials: credentials("alice", e2ee: nil),
             tenant: "acme"
         )
         try await session.connect(to: RelayEndpoint(host: "loopback"))

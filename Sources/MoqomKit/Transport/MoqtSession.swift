@@ -359,6 +359,12 @@ public actor MoqtSession: TransportSession {
                     isFirst = false
                     Task { await self.readPeerRequest(stream) }
                 }
+                // The connection ended before the peer opened a control
+                // stream, so its SETUP is never coming and `accept` must not
+                // wait for it.
+                if isFirst, role == .server {
+                    await self.finishSetup(.failure(MoqomError.transport(.closed)))
+                }
             }
         }
     }
@@ -383,6 +389,23 @@ public actor MoqtSession: TransportSession {
             peerOptions = (try? Setup.read(from: &reader))?.options ?? Parameters()
 
             var options = Parameters()
+            if let answer = setupAnswer {
+                // Refused before anything is sent back, so a peer that fails
+                // the check learns nothing about this end but the reason.
+                if let refusal = await answer.admit(peerOptions) {
+                    await carrier.close(code: 0x03, reason: refusal)
+                    finishSetup(.failure(MoqomError.rejected(.unauthorized)))
+                    return
+                }
+                deviceKey = answer.credentials.deviceKey
+                if let token = try? Parameter.bytes(SetupOption.authorizationToken, answer.credentials.token) {
+                    options.insert(token)
+                }
+                if let proof = prove(answer.credentials.token),
+                   let parameter = try? Parameter.bytes(SetupOption.authorizationProof, proof) {
+                    options.insert(parameter)
+                }
+            }
             if let implementation = try? Parameter.string(
                 SetupOption.implementation,
                 "moqom-swift/\(moqomKitVersion)"
@@ -402,6 +425,24 @@ public actor MoqtSession: TransportSession {
             return
         }
         finishSetup(.failure(MoqomError.transport(.closed)))
+    }
+
+    /// How an accepting session answers a peer that has to present itself.
+    ///
+    /// A relay's in-process stand-in answers anyone; a direct path is the one
+    /// place a client accepts a session from another client, and there each end
+    /// checks the other's credentials and sends its own.
+    struct SetupAnswer: Sendable {
+        /// What this end presents, its proof bound to the dialler's certificate.
+        let credentials: DeviceCredentials
+        /// The reason to refuse the peer's SETUP options, or `nil` to admit.
+        let admit: @Sendable (Parameters) async -> String?
+    }
+
+    private var setupAnswer: SetupAnswer?
+
+    private func setSetupAnswer(_ answer: SetupAnswer?) {
+        setupAnswer = answer
     }
 
     private var setupResult: Result<Void, any Error>?
@@ -814,12 +855,22 @@ public actor MoqtSession: TransportSession {
         announcing namespace: TrackNamespace
     ) -> MoqomError {
         switch error.code {
+        case RequestErrorCode.unauthorized where error.reason.hasPrefix(Self.grantsChanged):
+            .rejected(.revoked(namespace))
         case RequestErrorCode.unauthorized:
             .rejected(.forbidden(namespace))
         default:
             rejection(for: error)
         }
     }
+
+    /// How a relay begins the reason for ending a request because the session's
+    /// grants changed, rather than because they never covered it.
+    ///
+    /// Read from the phrase because the code is the same either way — it is the
+    /// answer the request would get if it were made now — and the phrase is
+    /// the part the relay keeps stable for exactly this.
+    static let grantsChanged = "grants changed"
 
     func withdraw(_ namespace: TrackNamespace, announcedAs request: UInt64) async {
         forget(request)
@@ -1087,6 +1138,14 @@ public actor MoqtSession: TransportSession {
             SubscribeParameter.subscriberPriority,
             UInt64(priority)
         ) else { return }
+        try? await send(
+            RequestUpdate(requestID: allocateRequestID(), parameters: Parameters([parameter])),
+            on: stream
+        )
+    }
+
+    func updateForwarding(_ forward: Bool, on stream: any QUICStream) async {
+        guard let parameter = try? Parameter.integer(SubscribeParameter.forward, forward ? 1 : 0) else { return }
         try? await send(
             RequestUpdate(requestID: allocateRequestID(), parameters: Parameters([parameter])),
             on: stream
@@ -1500,7 +1559,16 @@ public extension MoqtSession {
     /// is who dialled. It is also what lets two sessions be tested against each
     /// other with no relay in between.
     static func accept(over carrier: any QUICCarrier) async throws(MoqomError) -> MoqtSession {
+        try await accept(over: carrier, answering: nil)
+    }
+
+    /// Accept, checking the peer's SETUP with `answer` before replying.
+    internal static func accept(
+        over carrier: any QUICCarrier,
+        answering answer: SetupAnswer?
+    ) async throws(MoqomError) -> MoqtSession {
         let session = MoqtSession(carrier: carrier, role: .server)
+        await session.setSetupAnswer(answer)
         await session.startReading()
         do {
             try await session.waitForSetup()
@@ -1522,19 +1590,24 @@ public struct GoawayNotice: Hashable, Sendable {
     public let timeout: Duration
 }
 
-/// Subscribe parameter codes, per draft-19 §15.
+/// Subscribe parameter codes, per draft-19 Table 13 (Message Parameters).
 ///
 /// Not present in `moqom-proto`, which carries subscribe parameters opaquely
 /// because a relay forwards them without interpreting. A client is the one
-/// thing that has to name them.
+/// thing that has to name them, and a conformant relay closes the session on
+/// a code that is not in the registry.
 public enum SubscribeParameter {
-    /// Lower is more urgent.
-    public static let subscriberPriority: UInt64 = 0x0E
+    /// Lower is more urgent. Not `0x0E`, which is the
+    /// `DEFAULT_PUBLISHER_PRIORITY` Track Property (§12.4).
+    public static let subscriberPriority: UInt64 = 0x20
     /// Milliseconds after which an undelivered object is worthless.
     public static let deliveryTimeout: UInt64 = 0x02
     /// Ascending or descending, and on a fetch it changes the delta signs on the
     /// data stream rather than only the delivery order.
     public static let groupOrder: UInt64 = 0x22
+    /// Zero asks the publisher to stop sending objects without ending the
+    /// subscription, one to resume (§10.2.17). Omitted means unchanged.
+    public static let forward: UInt64 = 0x10
 }
 
 // MARK: - Handles
@@ -1601,6 +1674,10 @@ private final class MoqtSubscription: SubscriptionHandle {
 
     func updatePriority(_ priority: UInt8) async {
         await session.updatePriority(priority, on: stream)
+    }
+
+    func updateForwarding(_ forward: Bool) async {
+        await session.updateForwarding(forward, on: stream)
     }
 
     func cancel() async {

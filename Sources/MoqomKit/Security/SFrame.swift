@@ -81,6 +81,12 @@ public enum SFrameError: Error, Hashable, Sendable {
     /// GCM nonce is catastrophic rather than merely weak, so the only correct
     /// response is to stop and rekey.
     case counterExhausted
+
+    /// No key has been established to send under yet.
+    ///
+    /// The group is still being set up. The frame is dropped rather than sent
+    /// in the clear.
+    case noKey
 }
 
 /// The KID and CTR that precede an SFrame ciphertext.
@@ -271,21 +277,55 @@ public struct SFrameKey: Sendable {
 /// One sender per (key, media stream). Sharing one across two streams is safe
 /// and sharing a *key* across two senders is not, because two independent
 /// counters under one key will collide.
+///
+/// Managed key management rotates the key in place with ``rekey(_:)``. The
+/// counter restarts with each key, which is safe because the nonce is the
+/// key's own salt XOR the counter and the key is new.
 public final class SFrameSender: @unchecked Sendable {
-    public let key: SFrameKey
-
     private let lock = NSLock()
+    private var current: SFrameKey?
     private var counter: UInt64 = 0
 
     public init(key: SFrameKey) {
-        self.key = key
+        current = key
     }
 
-    /// Counters issued so far. For deciding when to rekey.
+    /// A sender with no key yet, which refuses to encrypt until it gets one.
+    ///
+    /// For a member whose group has not been established. Refusing is the
+    /// point: the alternative is publishing plaintext into a room that is
+    /// supposed to be end-to-end encrypted.
+    init() {}
+
+    /// The key in force, or `nil` before the first one arrives.
+    public var key: SFrameKey? {
+        lock.withLock { current }
+    }
+
+    /// Counters issued under the current key. For deciding when to rekey.
     public var issuedCounters: UInt64 {
-        lock.lock()
-        defer { lock.unlock() }
-        return counter
+        lock.withLock { counter }
+    }
+
+    /// Switch to a new key. Frames already sealed keep their old KID and
+    /// decrypt for as long as receivers hold the old key.
+    public func rekey(_ key: SFrameKey) {
+        lock.withLock {
+            current = key
+            counter = 0
+        }
+    }
+
+    /// Go back to having no key, so frames are refused rather than sealed.
+    ///
+    /// For a member that has left or lost its group: carrying on under the old
+    /// epoch's key would publish media that members who moved on discard, and
+    /// would keep using a key the group has finished with.
+    func clearKey() {
+        lock.withLock {
+            current = nil
+            counter = 0
+        }
     }
 
     /// Encrypt one frame.
@@ -294,16 +334,20 @@ public final class SFrameSender: @unchecked Sendable {
     ///   relay is allowed to read and must not be able to change.
     public func protect(_ plaintext: Data, metadata: Data = Data()) throws(SFrameError) -> Data {
         lock.lock()
-        let current = counter
-        guard current < UInt64.max else {
+        guard let key = current else {
+            lock.unlock()
+            throw SFrameError.noKey
+        }
+        let issued = counter
+        guard issued < UInt64.max else {
             lock.unlock()
             throw SFrameError.counterExhausted
         }
-        counter = current + 1
+        counter = issued + 1
         lock.unlock()
 
-        let header = SFrameHeader(keyID: key.keyID, counter: current).encoded
-        let ciphertext = try key.seal(plaintext, counter: current, aad: header + metadata)
+        let header = SFrameHeader(keyID: key.keyID, counter: issued).encoded
+        let ciphertext = try key.seal(plaintext, counter: issued, aad: header + metadata)
         return header + ciphertext
     }
 }
@@ -322,9 +366,25 @@ public final class SFrameReceiver: @unchecked Sendable {
     private let lock = NSLock()
     private var keys: [UInt64: SFrameKey] = [:]
     private var seen: [UInt64: ReplayWindow] = [:]
+    private var resolver: (@Sendable (UInt64) -> SFrameKey?)?
 
     public init(replayWindow: UInt64 = 1024) {
         self.replayWindow = replayWindow
+    }
+
+    /// Asked for a key the receiver does not hold, before giving up on a frame.
+    ///
+    /// For key schemes where a receiver can derive a sender's next key without
+    /// being sent it — a sender-key ratchet — so a sender can move forward
+    /// without a distribution message per step. A key it returns is added as
+    /// though ``add(_:)`` had been called.
+    func setResolver(_ resolve: (@Sendable (UInt64) -> SFrameKey?)?) {
+        lock.withLock { resolver = resolve }
+    }
+
+    /// The KIDs currently loaded.
+    public var keyIDs: Set<UInt64> {
+        lock.withLock { Set(keys.keys) }
     }
 
     public func add(_ key: SFrameKey) {
@@ -350,6 +410,15 @@ public final class SFrameReceiver: @unchecked Sendable {
         let (header, length) = try SFrameHeader.read(from: data)
 
         lock.lock()
+        if keys[header.keyID] == nil, let resolver {
+            lock.unlock()
+            let resolved = resolver(header.keyID)
+            lock.lock()
+            if let resolved, resolved.keyID == header.keyID, keys[header.keyID] == nil {
+                keys[header.keyID] = resolved
+                seen[header.keyID] = ReplayWindow(size: replayWindow)
+            }
+        }
         guard let key = keys[header.keyID] else {
             lock.unlock()
             throw SFrameError.unknownKey(header.keyID)

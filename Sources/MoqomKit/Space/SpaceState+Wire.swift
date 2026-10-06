@@ -63,6 +63,23 @@ private enum UpdateTag {
     static let trust: UInt32 = 6
     static let snapshot: UInt32 = 7
     static let delta: UInt32 = 8
+    static let media: UInt32 = 9
+    static let event: UInt32 = 10
+    static let eventSequence: UInt32 = 11
+    static let successor: UInt32 = 12
+}
+
+/// A game event. The epoch is the update's, so it is not repeated.
+private enum EventTag {
+    static let sequence: UInt32 = 1
+    static let name: UInt32 = 2
+    static let subject: UInt32 = 3
+    static let from: UInt32 = 4
+    static let nanoseconds: UInt32 = 5
+    static let uncertainty: UInt32 = 6
+    static let trust: UInt32 = 7
+    static let fact: UInt32 = 8
+    static let media: UInt32 = 9
 }
 
 private enum DeltaTag {
@@ -304,7 +321,8 @@ private struct HandleTable {
     mutating func adopt(_ id: SpaceEntityID, at handle: UInt32) {
         byID[id] = handle
         byHandle[handle] = id
-        next = max(next, handle + 1)
+        // Saturating: the handle is the peer's, and the largest one is legal.
+        if handle < .max { next = max(next, handle + 1) }
     }
 
     func handle(for id: SpaceEntityID) -> UInt32? { byID[id] }
@@ -358,6 +376,40 @@ public struct SpaceEncoder: Sendable {
         case let .delta(delta):
             let body = try encodeDelta(delta)
             writer.bytes(UpdateTag.delta, body)
+        }
+
+        // After the body and only when present, so a plain movement tick costs
+        // what it did before these existed and an older reader skips them.
+        if let media = update.media {
+            writer.varInt(UpdateTag.media, min(media.nanoseconds, varIntMaximum))
+        }
+        for record in update.events.sorted(by: { $0.sequence < $1.sequence }) {
+            writer.bytes(UpdateTag.event, encodeEvent(record))
+        }
+        if update.eventSequence > 0 {
+            writer.varInt(UpdateTag.eventSequence, update.eventSequence)
+        }
+        if let successor = update.successor {
+            writer.identity(UpdateTag.successor, successor)
+        }
+        return writer.bytes
+    }
+
+    private func encodeEvent(_ record: SpaceEventRecord) -> Data {
+        var writer = RecordWriter(capacity: 48)
+        writer.varInt(EventTag.sequence, record.sequence)
+        writer.string(EventTag.name, record.event.name)
+        if let subject = record.event.subject { writer.string(EventTag.subject, subject.rawValue) }
+        if let from = record.from { writer.identity(EventTag.from, from) }
+        writer.fixed64(EventTag.nanoseconds, record.at.nanoseconds)
+        writer.varInt(
+            EventTag.uncertainty,
+            min(UInt64(max(0, record.at.uncertainty.wholeNanoseconds)), varIntMaximum)
+        )
+        writer.varInt(EventTag.trust, UInt64(record.at.trust.wireCode))
+        writer.facts(EventTag.fact, record.event.facts)
+        if let media = record.media {
+            writer.varInt(EventTag.media, min(media.nanoseconds, varIntMaximum))
         }
         return writer.bytes
     }
@@ -516,6 +568,9 @@ public struct SpaceTickView: Sendable {
     public let tick: SpaceTick
     public let at: Timecode
 
+    /// The tick's instant on the authority's capture clock, if it stamps one.
+    public let media: FrameTimestamp?
+
     /// The full update, when the object was a snapshot or carried anything
     /// beyond movement. `nil` for a plain movement tick, which is the case this
     /// type exists to keep cheap.
@@ -528,6 +583,7 @@ public struct SpaceTickView: Sendable {
         version: Int,
         tick: SpaceTick,
         at: Timecode,
+        media: FrameTimestamp? = nil,
         rest: SpaceUpdate?,
         handles: FixedArray?,
         poses: FixedArray?
@@ -535,6 +591,7 @@ public struct SpaceTickView: Sendable {
         self.version = version
         self.tick = tick
         self.at = at
+        self.media = media
         self.rest = rest
         self.handles = handles
         self.poses = poses
@@ -597,16 +654,12 @@ public struct SpaceDecoder: Sendable {
         let header = try readHeader(data)
 
         if let snapshot = header.snapshot {
-            let update = SpaceUpdate(
-                tick: header.tick,
-                at: header.at,
-                body: .snapshot(try decodeSnapshot(snapshot)),
-                version: header.version
-            )
+            let update = header.update(.snapshot(try decodeSnapshot(snapshot)))
             return SpaceTickView(
                 version: header.version,
                 tick: header.tick,
                 at: header.at,
+                media: header.media,
                 rest: update,
                 handles: nil,
                 poses: nil
@@ -622,16 +675,14 @@ public struct SpaceDecoder: Sendable {
         // Only build an update when there is something in it beyond movement.
         // On an ordinary tick there is not, and skipping it is the difference
         // this type exists to make.
-        let rest: SpaceUpdate? = scanned.delta.isEmpty ? nil : SpaceUpdate(
-            tick: header.tick,
-            at: header.at,
-            body: .delta(scanned.delta),
-            version: header.version
-        )
+        let rest: SpaceUpdate? = scanned.delta.isEmpty && !header.carriesMore
+            ? nil
+            : header.update(.delta(scanned.delta))
         return SpaceTickView(
             version: header.version,
             tick: header.tick,
             at: header.at,
+            media: header.media,
             rest: rest,
             handles: scanned.handles,
             poses: scanned.poses
@@ -659,12 +710,7 @@ public struct SpaceDecoder: Sendable {
             throw WireError.invalid("a space update with neither a snapshot nor a delta")
         }
 
-        return SpaceUpdate(
-            tick: header.tick,
-            at: header.at,
-            body: body,
-            version: header.version
-        )
+        return header.update(body)
     }
 
     /// Everything outside the body, plus the body's bytes.
@@ -674,6 +720,26 @@ public struct SpaceDecoder: Sendable {
         var at = Timecode.fallback()
         var snapshot: Data?
         var delta: Data?
+        var media: FrameTimestamp?
+        var events: [SpaceEventRecord] = []
+        var eventSequence: UInt64 = 0
+        var successor: ParticipantIdentity?
+
+        func update(_ body: SpaceUpdate.Body) -> SpaceUpdate {
+            SpaceUpdate(
+                tick: tick,
+                at: at,
+                body: body,
+                version: version,
+                media: media,
+                events: events,
+                eventSequence: eventSequence,
+                successor: successor
+            )
+        }
+
+        /// Whether anything beyond the body needs an update built for it.
+        var carriesMore: Bool { !events.isEmpty || successor != nil }
     }
 
     private func readHeader(_ data: Data) throws -> Header {
@@ -684,9 +750,18 @@ public struct SpaceDecoder: Sendable {
         var nanoseconds: Int64 = 0
         var uncertainty = Duration.zero
         var trust = TimeTrust.fallback
+        var events: [Data] = []
 
         while let key = try reader.nextKey() {
             switch key.tag {
+            case UpdateTag.media:
+                header.media = FrameTimestamp(nanoseconds: try reader.varInt())
+            case UpdateTag.event:
+                events.append(try reader.bytes())
+            case UpdateTag.eventSequence:
+                header.eventSequence = try reader.varInt()
+            case UpdateTag.successor:
+                header.successor = try reader.identity()
             case UpdateTag.version:
                 header.version = Int(try reader.varInt())
             case UpdateTag.epoch:
@@ -722,7 +797,54 @@ public struct SpaceDecoder: Sendable {
             uncertainty: uncertainty,
             trust: trust
         )
+        for data in events {
+            header.events.append(try Self.decodeEvent(data, epoch: epoch))
+        }
         return header
+    }
+
+    private static func decodeEvent(_ data: Data, epoch: UInt32) throws(WireError) -> SpaceEventRecord {
+        var reader = RecordReader(data)
+        var sequence: UInt64?
+        var name: String?
+        var subject: SpaceEntityID?
+        var from: ParticipantIdentity?
+        var nanoseconds: Int64 = 0
+        var uncertainty = Duration.zero
+        var trust = TimeTrust.fallback
+        var facts: [String: SpaceValue] = [:]
+        var media: FrameTimestamp?
+
+        while let key = try reader.nextKey() {
+            switch key.tag {
+            case EventTag.sequence: sequence = try reader.varInt()
+            case EventTag.name: name = try reader.string()
+            case EventTag.subject: subject = SpaceEntityID(try reader.string())
+            case EventTag.from: from = try reader.identity()
+            case EventTag.nanoseconds: nanoseconds = try reader.fixed64()
+            case EventTag.uncertainty: uncertainty = .nanoseconds(try reader.varInt())
+            case EventTag.trust:
+                trust = TimeTrust(wireCode: UInt8(truncatingIfNeeded: try reader.varInt()))
+            case EventTag.fact:
+                let fact = try reader.fact()
+                facts[fact.key] = fact.value
+            case EventTag.media: media = FrameTimestamp(nanoseconds: try reader.varInt())
+            default: try reader.skip(key)
+            }
+        }
+        // Zero is not a sequence: numbering starts at one, so that "nothing
+        // delivered yet" has a value that no event can also have.
+        guard let sequence, sequence > 0, let name else {
+            throw WireError.invalid("a space event missing its number or its name")
+        }
+        return SpaceEventRecord(
+            epoch: epoch,
+            sequence: sequence,
+            event: SpaceGameEvent(name, subject: subject, facts: facts),
+            from: from,
+            at: Timecode(nanoseconds: nanoseconds, uncertainty: uncertainty, trust: trust),
+            media: media
+        )
     }
 
     /// The one check the parallel-array layout costs.

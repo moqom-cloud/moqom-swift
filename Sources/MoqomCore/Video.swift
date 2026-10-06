@@ -259,6 +259,17 @@ public struct LayerLadder: Hashable, Sendable {
                 )
             )
         }
+        if topSize.pixelCount >= 3840 * 2160 {
+            rungs.append(
+                VideoLayer(
+                    id: "video/2160p",
+                    size: sized(3840, 2160),
+                    frameRate: 30,
+                    bitrate: 12_000_000,
+                    temporalLayers: 3
+                )
+            )
+        }
         return LayerLadder(rungs: rungs, kind: .camera)
     }
 }

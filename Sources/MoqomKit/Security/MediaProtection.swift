@@ -75,6 +75,13 @@ public final class ProtectedTrackWriter: TrackWriter {
         let sealed: Data
         do {
             sealed = try sender.protect(object.payload, metadata: metadata)
+        } catch SFrameError.noKey {
+            // A managed group that has not formed yet. Nobody holds a key that
+            // could open this frame, so it is dropped rather than failing the
+            // publication: the first commit or Welcome is a round trip away, and
+            // ending a broadcast for the length of one would make every join
+            // start with an error.
+            return
         } catch {
             // Publishing plaintext because encryption failed would be the worst
             // possible recovery: the caller asked for end-to-end encryption and
@@ -117,31 +124,90 @@ public actor MediaUnprotector {
     /// frame that arrives just before its key is normal rather than an attack.
     public private(set) var objectsAwaitingKey = 0
 
+    /// How long one object may wait for its key before it is dropped.
+    ///
+    /// Zero for a key the application supplied, which never changes and so is
+    /// never late. Non-zero under managed keys, where a sender moves to a new
+    /// epoch the moment its commit is ordered and a receiver a few milliseconds
+    /// behind on the same commit would otherwise drop the first frames of every
+    /// epoch — a keyframe among them, and with it a second of video.
+    ///
+    /// The wait happens inline in the participant's pump, so objects behind the
+    /// held one queue in their subscription rather than overtaking it: order is
+    /// preserved without a reorder buffer.
+    let keyHold: Duration
+
+    /// KIDs that have already been waited for once and did not arrive.
+    ///
+    /// Not waited for again until some key does arrive. A KID that never comes —
+    /// a sender in a group this device is not in — would otherwise cost every
+    /// one of its objects the full hold and back the pump up behind it.
+    private var abandoned: Set<UInt64> = []
+    private var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+
     public init(receiver: SFrameReceiver) {
         self.receiver = receiver
+        keyHold = .zero
     }
 
-    public func unprotect(_ object: TrackObject) -> TrackObject? {
+    init(receiver: SFrameReceiver, keyHold: Duration) {
+        self.receiver = receiver
+        self.keyHold = keyHold
+    }
+
+    /// Keys were added to the receiver; anything waiting for one tries again.
+    func keysChanged() {
+        abandoned.removeAll()
+        let waiting = waiters
+        waiters.removeAll()
+        for continuation in waiting.values { continuation.resume() }
+    }
+
+    public func unprotect(_ object: TrackObject) async -> TrackObject? {
         let metadata = SFrameMetadata.encode(for: object)
-        do {
-            let plaintext = try receiver.unprotect(object.payload, metadata: metadata)
-            objectsDecrypted += 1
-            return TrackObject(
-                group: object.group,
-                object: object.object,
-                priority: object.priority,
-                payload: plaintext,
-                isKeyFrame: object.isKeyFrame,
-                properties: object.properties
-            )
-        } catch let SFrameError.unknownKey(keyID) {
-            _ = keyID
-            objectsAwaitingKey += 1
-            return nil
-        } catch {
-            objectsRejected += 1
-            return nil
+        let deadline = ContinuousClock.now.advanced(by: keyHold)
+        while true {
+            do {
+                let plaintext = try receiver.unprotect(object.payload, metadata: metadata)
+                objectsDecrypted += 1
+                return TrackObject(
+                    group: object.group,
+                    object: object.object,
+                    priority: object.priority,
+                    payload: plaintext,
+                    isKeyFrame: object.isKeyFrame,
+                    properties: object.properties
+                )
+            } catch let SFrameError.unknownKey(keyID) {
+                let now = ContinuousClock.now
+                guard now < deadline, !abandoned.contains(keyID) else {
+                    objectsAwaitingKey += 1
+                    return nil
+                }
+                await waitForKeys(until: deadline)
+                if ContinuousClock.now >= deadline, !receiver.keyIDs.contains(keyID) {
+                    abandoned.insert(keyID)
+                }
+            } catch {
+                objectsRejected += 1
+                return nil
+            }
         }
+    }
+
+    private func waitForKeys(until deadline: ContinuousClock.Instant) async {
+        let id = UUID()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            waiters[id] = continuation
+            Task { [weak self] in
+                try? await Task.sleep(until: deadline, clock: .continuous)
+                await self?.release(id)
+            }
+        }
+    }
+
+    private func release(_ id: UUID) {
+        waiters.removeValue(forKey: id)?.resume()
     }
 
     /// The same stream, decrypted, with undecryptable objects removed.

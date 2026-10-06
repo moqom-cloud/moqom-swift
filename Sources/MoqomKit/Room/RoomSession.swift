@@ -18,6 +18,13 @@
 import Foundation
 import MoqomCore
 
+/// Presents a token, and optionally a new way to renew it, on the connection a
+/// room shares with every other room on its session.
+typealias CredentialUpdate = @Sendable (
+    IssuedToken,
+    (@Sendable () async throws -> IssuedToken)?
+) async throws(MoqomError) -> Void
+
 /// A joined room.
 public actor RoomSession {
     public nonisolated let tenant: TenantID
@@ -52,6 +59,29 @@ public actor RoomSession {
     private var audioAnnouncement: (any AnnouncementHandle)?
     private var encryption: RoomEncryption?
     private var unprotector: MediaUnprotector?
+
+    /// The MLS group keying this room, when the SDK rather than the application
+    /// holds the keys. See ``DeviceCredentials/keyDelivery``.
+    private var managedKeys: ManagedRoomKeys?
+    private let keyDelivery: (any MLSDeliveryService)?
+    private let currentToken: (@Sendable () async -> Data)?
+
+    /// Hands a token to the ``MoqomSession`` this room hangs off, which owns the
+    /// credential because the connection is shared by every room on it.
+    private let presentCredential: CredentialUpdate?
+
+    /// Whether this room insists on end-to-end encryption, as the token says.
+    ///
+    /// ``EncryptionPolicy/required`` unless the control plane minted this
+    /// session's token for a room an administrator set to optional. Not settable
+    /// from here, on purpose: see ``EncryptionPolicy``.
+    public private(set) var encryptionPolicy: EncryptionPolicy
+
+    /// Participants already told about through ``RoomEvent/encryptionRequired(_:)``.
+    ///
+    /// So a publisher sending thirty frames a second produces one event rather
+    /// than thirty, and a fresh one after this device's key arrives and goes away.
+    private var refusedUnencrypted: Set<ParticipantIdentity> = []
     private var catalogPublisher: CatalogPublisher?
     private var catalogRefresh: Task<Void, Never>?
     private var catalogRestatement: Task<Void, Never>?
@@ -191,8 +221,16 @@ public actor RoomSession {
         connection: any TransportSession,
         logger: MoqomLogger = .silent,
         seatPolicy: SeatPolicy = .default,
-        channel: Username? = nil
+        channel: Username? = nil,
+        encryptionPolicy: EncryptionPolicy = .required,
+        keyDelivery: (any MLSDeliveryService)? = nil,
+        currentToken: (@Sendable () async -> Data)? = nil,
+        updateCredential: CredentialUpdate? = nil
     ) {
+        self.encryptionPolicy = encryptionPolicy
+        self.keyDelivery = keyDelivery
+        self.currentToken = currentToken
+        presentCredential = updateCredential
         self.seatPolicy = seatPolicy
         self.tenant = tenant
         self.room = room
@@ -222,15 +260,142 @@ public actor RoomSession {
     /// > its own.
     public nonisolated var events: AsyncStream<RoomEvent> { eventStream }
 
+    /// Change what this participant may do in the room, on the connection
+    /// already open.
+    ///
+    /// Present the token the backend minted for the new role. A promoted viewer
+    /// then goes live on this same session with
+    /// ``startBroadcast(from:configuration:backstage:)`` or
+    /// ``startAudio(from:configuration:backstage:)`` — a grant is permission,
+    /// and starting a camera stays the participant's choice. A demoted guest's
+    /// publications are ended by the relay and reported as
+    /// ``RoomEvent/publishingRevoked(_:)``. Either way the room keeps playing
+    /// and nobody sees this participant leave and come back.
+    ///
+    /// The same call as ``MoqomSession/updateCredential(_:renewingWith:)``, made
+    /// from where the promotion is usually noticed.
+    public func updateCredential(
+        _ issued: IssuedToken,
+        renewingWith renew: (@Sendable () async throws -> IssuedToken)? = nil
+    ) async throws(MoqomError) {
+        guard let presentCredential else {
+            throw MoqomError.invalidState(
+                expected: "a room joined through a MoqomSession",
+                actual: "a room with no session to hold its credential"
+            )
+        }
+        try await presentCredential(issued, renew)
+    }
+
     /// Turn on end-to-end encryption for everything this session publishes and
     /// receives.
     ///
     /// Set before going live. Changing it mid-broadcast would mean some objects
     /// in a group are encrypted and some are not, which no receiver can be
     /// expected to sort out.
+    ///
+    /// Required, not optional, in a room whose ``encryptionPolicy`` is
+    /// ``EncryptionPolicy/required`` — which is every room unless its backend
+    /// said otherwise. Without it ``startBroadcast(from:configuration:backstage:)``
+    /// and ``startAudio(from:configuration:backstage:)`` throw
+    /// ``MoqomError/encryptionRequired`` and incoming media is dropped.
+    ///
+    /// Not needed when the credentials carry a
+    /// ``DeviceCredentials/keyDelivery``: a required room then keys itself.
+    /// Calling this anyway replaces the managed keys with the ones given, which
+    /// is the override for an application that distributes its own.
     public func useEncryption(_ encryption: RoomEncryption) {
+        if let managedKeys {
+            self.managedKeys = nil
+            Task { await managedKeys.stop() }
+        }
         self.encryption = encryption
         unprotector = MediaUnprotector(receiver: encryption.receiver)
+        refusedUnencrypted.removeAll()
+    }
+
+    /// Whether this session has an encryption key configured, or is having one
+    /// agreed for it.
+    public var isEncrypted: Bool { encryption != nil }
+
+    /// The room's MLS group, when its keys are managed and it has formed.
+    ///
+    /// `nil` when the application supplied a key, the room is not encrypted,
+    /// or this device has not been added yet — media it publishes in that
+    /// window is dropped rather than sent, because nobody could open it.
+    public var groupKeys: GroupKeyStatus? {
+        get async { await managedKeys?.status }
+    }
+
+    /// Hand the room's keys to MLS, if the room requires encryption, nobody
+    /// supplied a key, and there is a delivery service to agree them through.
+    ///
+    /// Rooms only. A personal channel is a broadcast to an audience of any
+    /// size, which is the case group key agreement is the wrong tool for.
+    private func startManagedKeysIfNeeded() async {
+        guard encryption == nil, managedKeys == nil, encryptionPolicy == .required, channel == nil,
+              let keyDelivery, let currentToken
+        else { return }
+        let keys = ManagedRoomKeys(
+            identity: identity, delivery: keyDelivery, token: currentToken, logger: logger
+        )
+        managedKeys = keys
+        encryption = keys.encryption
+        unprotector = keys.unprotector
+        refusedUnencrypted.removeAll()
+        await keys.start()
+        logger.info(.room, "end-to-end encryption keys are managed by MLS")
+    }
+
+    /// Take the policy a renewed token states.
+    ///
+    /// Tightening applies at once, including to a publication already going out
+    /// in the clear: it is stopped, and this device is told why through
+    /// ``RoomEvent/encryptionRequired(_:)``. Letting it carry on until the
+    /// broadcast happened to end would make "required" mean "required for
+    /// whoever starts next", which is not what an administrator who tightened a
+    /// room was asking for. Loosening permits later publications and stops
+    /// nothing.
+    func applyEncryptionPolicy(_ policy: EncryptionPolicy) async {
+        guard policy != encryptionPolicy else { return }
+        encryptionPolicy = policy
+        logger.info(.room, "encryption policy changed", [LogField("e2ee", .text(policy.rawValue))])
+        if policy == .required { await startManagedKeysIfNeeded() }
+        guard policy == .required, encryption == nil else { return }
+        let publishing = broadcast != nil || audio != nil
+        await stopBroadcast()
+        await stopAudio()
+        if publishing { eventContinuation.yield(.encryptionRequired(identity)) }
+    }
+
+    /// Refuse to publish in the clear unless the room allows it.
+    private func requireEncryptionIfPolicyDemands() throws(MoqomError) {
+        guard encryption == nil, encryptionPolicy == .required else { return }
+        logger.error(.publish, "refused to publish without end-to-end encryption", [
+            LogField("e2ee", .text(encryptionPolicy.rawValue)),
+        ])
+        throw MoqomError.encryptionRequired
+    }
+
+    /// An incoming object as the application may see it, or `nil` to drop it.
+    ///
+    /// The one place incoming media is opened, so live video, audio, catch-up and
+    /// replay cannot disagree about what a room's policy permits. With a key,
+    /// everything must decrypt — plaintext fails authentication like any other
+    /// forgery. Without one, plaintext is accepted only when the room is
+    /// optional; a required room drops it and says so once per participant.
+    private func open(_ object: TrackObject, from who: ParticipantIdentity) async -> TrackObject? {
+        if let unprotector { return await unprotector.unprotect(object) }
+        guard encryptionPolicy == .optional else {
+            if refusedUnencrypted.insert(who).inserted {
+                logger.warning(.media, "dropping media: the room requires end-to-end encryption", [
+                    LogField("participant", .participant(who)),
+                ])
+                eventContinuation.yield(.encryptionRequired(who))
+            }
+            return nil
+        }
+        return object
     }
 
     /// Media for a participant: metered, decrypted, and ready to decode.
@@ -412,6 +577,7 @@ public actor RoomSession {
     func begin() async {
         watchControl()
         watchPolicy()
+        await startManagedKeysIfNeeded()
         guard prefixTasks.isEmpty else { return }
         watchPrefix(namespace)
         if let channel, let personal = try? MoqomNamespaces.personalPrefix(
@@ -793,12 +959,46 @@ public actor RoomSession {
         }
     }
 
-    private func reportAnnouncementRefused(_ namespace: TrackNamespace, _ error: MoqomError) {
+    private func reportAnnouncementRefused(_ namespace: TrackNamespace, _ error: MoqomError) async {
+        if case .rejected(.revoked) = error {
+            await stopPublishing(under: namespace)
+            return
+        }
         logger.error(.publish, "the relay refused this namespace", [
             LogField("namespace", .text(namespace.description)),
             LogField("error", .text(String(describing: error))),
         ])
         eventContinuation.yield(.broadcastInterrupted)
+    }
+
+    /// Stop what this device publishes under a namespace its grants no longer
+    /// cover, and say so.
+    ///
+    /// The relay has already withdrawn the announcement and stopped asking for
+    /// the media, so nobody is receiving any of it; what is left is a camera and
+    /// a microphone running for nothing, with their indicators lit. Stopping
+    /// them is not the SDK deciding something on the participant's behalf, as
+    /// starting them would be: it is the hardware catching up with a decision
+    /// the room has made. The session, the roster and playback are untouched.
+    private func stopPublishing(under namespace: TrackNamespace) async {
+        var stopped: MediaKind = []
+        if let broadcast, broadcast.namespace == namespace {
+            await stopBroadcast()
+            stopped.insert(.video)
+        }
+        if let audio, audio.track.namespace == namespace {
+            await stopAudio()
+            stopped.insert(.audio)
+        }
+        if broadcast == nil, audio == nil {
+            await catalogPublisher?.finish()
+            catalogPublisher = nil
+        }
+        logger.info(.publish, "publishing stopped: this session's grants changed", [
+            LogField("namespace", .text(namespace.description)),
+            LogField("stopped", .number(stopped.rawValue)),
+        ])
+        eventContinuation.yield(.publishingRevoked(stopped))
     }
 
     /// The layout to put back as participants return after a reconnect.
@@ -870,6 +1070,8 @@ public actor RoomSession {
         broadcast = nil
         await audio?.stop()
         audio = nil
+        await managedKeys?.stop()
+        managedKeys = nil
         await audioAnnouncement?.withdraw()
         audioAnnouncement = nil
         catalogRefresh?.cancel()
@@ -950,6 +1152,10 @@ public actor RoomSession {
         backstage: Bool = false
     ) async throws(MoqomError) -> Broadcast {
         if let broadcast { return broadcast }
+
+        // Before the announcement, so a refusal leaves no roster entry behind
+        // for a participant who is not going to send anything.
+        try requireEncryptionIfPolicyDemands()
 
         let publishNamespace: TrackNamespace
         do {
@@ -1090,7 +1296,7 @@ public actor RoomSession {
             ladder: ladder,
             decoderConfigurations: configurations,
             audio: audio?.configuration,
-            keyID: encryption?.sender.key.keyID,
+            keyID: encryption?.sender.key?.keyID,
             muted: ownMute,
             interrupted: ownInterruption,
             locale: ownLocale,
@@ -1198,6 +1404,8 @@ public actor RoomSession {
         backstage: Bool = false
     ) async throws(MoqomError) -> AudioPublication {
         if let audio { return audio }
+
+        try requireEncryptionIfPolicyDemands()
 
         let publishNamespace: TrackNamespace
         let name: FullTrackName
@@ -3181,13 +3389,7 @@ public actor RoomSession {
         estimator.record(object, at: .nanoseconds(DispatchTime.now().uptimeNanoseconds))
         lastObject[who] = now()
 
-        let plain: TrackObject
-        if let unprotector {
-            guard let decrypted = await unprotector.unprotect(object) else { return }
-            plain = decrypted
-        } else {
-            plain = object
-        }
+        guard let plain = await open(object, from: who) else { return }
 
         let arrival = MonotonicTime.nanoseconds(DispatchTime.now().uptimeNanoseconds)
 
@@ -3451,7 +3653,7 @@ public actor RoomSession {
         replayDepacketisers[id] = depacketiser
         replayTasks[id] = Task { [weak self] in
             for await record in fetch.records {
-                await self?.receiveReplay(record, id: id, into: continuation)
+                await self?.receiveReplay(record, from: who, id: id, into: continuation)
             }
             await self?.endReplay(id: id, continuation: continuation)
         }
@@ -3460,6 +3662,7 @@ public actor RoomSession {
 
     private func receiveReplay(
         _ record: FetchedRecord,
+        from who: ParticipantIdentity,
         id: UUID,
         into continuation: AsyncStream<DepacketisedFrame>.Continuation
     ) async {
@@ -3473,13 +3676,7 @@ public actor RoomSession {
             // as spare capacity.
             estimator.record(object, at: .nanoseconds(DispatchTime.now().uptimeNanoseconds))
 
-            let plain: TrackObject
-            if let unprotector {
-                guard let decrypted = await unprotector.unprotect(object) else { return }
-                plain = decrypted
-            } else {
-                plain = object
-            }
+            guard let plain = await open(object, from: who) else { return }
             if let frame = depacketiser.accept(plain) { continuation.yield(frame) }
         case let .missing(through), let .unknown(through):
             depacketiser.skip(through: through.object)
@@ -3537,13 +3734,7 @@ public actor RoomSession {
         // key mismatch.
         lastObject[who] = now()
 
-        let plain: TrackObject
-        if let unprotector {
-            guard let decrypted = await unprotector.unprotect(object) else { return }
-            plain = decrypted
-        } else {
-            plain = object
-        }
+        guard let plain = await open(object, from: who) else { return }
 
         sink.objectsContinuation.yield(plain)
 
@@ -3672,6 +3863,11 @@ public actor RoomSession {
         for track: FullTrackName,
         priority: UInt8
     ) async throws(MoqomError) -> any TrackWriter {
+        // Checked again here, after the entry points have, because this is the
+        // one door every media writer passes through — a reopen after a
+        // reconnect included — and a policy that could tighten in between has to
+        // be honoured by the writer that is opened second.
+        try requireEncryptionIfPolicyDemands()
         let writer = try await connection.publish(track, priority: priority)
         guard let encryption else { return writer }
         return ProtectedTrackWriter(wrapping: writer, sender: encryption.sender)

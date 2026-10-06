@@ -50,12 +50,33 @@ func framesEncodedOnceSettled(_ broadcast: Broadcast) async -> Int {
     return last
 }
 
-func credentials(_ name: String, device: String = "iphone-0001") -> DeviceCredentials {
+/// Credentials for a loopback session.
+///
+/// The token is shaped like a compact JWS so that its `e2ee` claim is read
+/// exactly as a minted one would be. Optional by default, because most suites
+/// here are about something other than encryption and inspect media bytes on
+/// the loopback relay; the suites that are about encryption pass `.required`
+/// or `nil` (no claim, which the SDK reads as required) and say so.
+func credentials(
+    _ name: String,
+    device: String = "iphone-0001",
+    e2ee: EncryptionPolicy? = .optional
+) -> DeviceCredentials {
     DeviceCredentials(
         identity: identity(name, device: device),
-        token: Data("token-\(name)".utf8),
+        token: testToken(subject: name, e2ee: e2ee),
         deviceKey: nil
     )
+}
+
+/// An unsigned token carrying the claims the SDK reads. The loopback relay
+/// verifies nothing, so the signature segment is a placeholder.
+func testToken(subject: String, e2ee: EncryptionPolicy?) -> Data {
+    var claims = #"{"sub":"\#(subject)""#
+    if let e2ee { claims += #","e2ee":"\#(e2ee.rawValue)""# }
+    claims += "}"
+    let header = Data(#"{"alg":"EdDSA","typ":"MOQT"}"#.utf8).base64URLEncodedString
+    return Data((header + "." + Data(claims.utf8).base64URLEncodedString + ".sig").utf8)
 }
 
 @Suite("Loopback transport")

@@ -268,6 +268,38 @@ struct MoqtSessionTests {
         await client.close(code: 0, reason: "done")
     }
 
+    /// A demotion arrives on the same stream with the same code as a refusal,
+    /// because it is the answer the announcement would get if it were made now.
+    /// The phrase is what tells them apart, and the difference matters to the
+    /// app: one is a token minted for the wrong room, the other is the room
+    /// working as intended.
+    @Test("an announcement withdrawn by a change of grants reads as revoked")
+    func revokedAnnouncement() async throws {
+        let (clientCarrier, serverCarrier) = MemoryCarrier.pair()
+        let relay = refusingRelay(
+            on: serverCarrier,
+            reason: "grants changed: this session was not granted publishing"
+        )
+        defer { relay.cancel() }
+
+        let client = try await MoqtSession.connect(
+            over: clientCarrier,
+            credentials: credentials("alice")
+        )
+        let namespace = try MoqomNamespaces.participant(
+            tenant: "acme", room: "room-42", identity: identity("alice")
+        )
+        let handle = try await client.announce(namespace)
+
+        guard case let .rejected(reason) = await handle.refusal else {
+            Issue.record("the revocation was not reported")
+            return
+        }
+        #expect(reason == .revoked(namespace))
+
+        await client.close(code: 0, reason: "done")
+    }
+
     /// The other half, and the reason the accepted case has to be checked too: a
     /// peer that acknowledges must not be read as a peer that refused, or every
     /// announcement over a session-to-session link would report a failure.
