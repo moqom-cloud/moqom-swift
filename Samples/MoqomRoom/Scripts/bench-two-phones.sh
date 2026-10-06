@@ -27,6 +27,7 @@ This script takes no arguments; everything is an environment variable.
   MOQOM_ROOM=name        room to join (default: bench)
   MOQOM_SECONDS=20       stop after this long, and print each log's last report
   MOQOM_FPS=60           capture and publish rate (default: the app's own, 30)
+  MOQOM_PLAIN_CAPTURE=1  run the sensor at the publish rate, not above it
   MOQOM_KBPS=2000        publish bitrate
   MOQOM_AUDIO=mic        publish audio: mic, or tone for a synthetic source
   MOQOM_VIDEO=camera     publish video: camera, pattern, or scene for the AR orb
@@ -135,6 +136,11 @@ fi
 # different frame rates, and nothing on any line of output saying which you were reading.
 WHERE="$WHERE${MOQOM_FPS:+ --fps $MOQOM_FPS}${MOQOM_FLAT_LAYERS:+ --flat-layers}"
 WHERE="$WHERE${MOQOM_EAGER:+ --eager-encoding}"
+# Run the sensor at the publication rate rather than above it. Oversampling is a latency
+# trade -- a sensor at sixty for a thirty-frame publication halves the wait for the next
+# exposure -- paid for with twice the image-pipeline work, which is a thermal cost this has
+# never been measured against.
+WHERE="$WHERE${MOQOM_PLAIN_CAPTURE:+ --plain-capture}"
 WHERE="$WHERE${MOQOM_KBPS:+ --kbps $MOQOM_KBPS}"
 WHERE="$WHERE${MOQOM_STATS_MS:+ --stats-ms $MOQOM_STATS_MS}"
 WHERE="$WHERE${MOQOM_PLAYOUT_MS:+ --playout-ms $MOQOM_PLAYOUT_MS}"

@@ -738,6 +738,16 @@ import MoqomCore
         /// whether the held one still applies, which it will until the camera is reconfigured.
         private var previewFormat: CMFormatDescription?
 
+        /// The extra places this picture is being drawn, and the machinery for drawing it there.
+        ///
+        /// Empty for almost every track in almost every call, and while it is empty none of this
+        /// runs: frames go to the display layer compressed and it decodes them itself, which is
+        /// the path everything else here was measured against.
+        private var extras: [Presenter] = []
+        private var sharedDecoder: VideoDecodeSession?
+        private var sharedFormat: CMFormatDescription?
+        private var isSharing = false
+
         public struct Drawing: Sendable, Hashable {
             /// Frames handed to the display layer.
             public var enqueued = 0
@@ -751,6 +761,23 @@ import MoqomCore
             /// Frames dropped because no parameter sets had arrived to describe them yet.
             /// Normal at the very start of a subscription and a bug if it continues.
             public var skippedUndescribed = 0
+
+            /// Frames the shared decoder could not turn into a picture.
+            ///
+            /// Only ever counted while a host is on screen more than once, and expected to be
+            /// zero even then: the changeover happens on a keyframe, and everything after a
+            /// keyframe decodes. A steady count is the shared decode failing, and it looks
+            /// different from every other kind of loss — the picture stops in every view of that
+            /// host at once, because there is only one decode behind all of them.
+            public var undecodable = 0
+
+            /// Times this track changed between one decode for every view and letting the display
+            /// layer decode for itself.
+            ///
+            /// Two per extra view opened and closed again. More than that is views being built
+            /// and dismantled behind somebody's back, which is worth knowing about because each
+            /// changeover drops whatever was queued at the moment it happened.
+            public var changeovers = 0
 
             /// Times the schedule was moved to meet frames that had already missed the playhead.
             ///
@@ -953,7 +980,7 @@ import MoqomCore
 
             /// The share of frames that reached the display layer.
             public var delivered: Double {
-                let total = enqueued + skippedNotReady + skippedUndescribed
+                let total = enqueued + skippedNotReady + skippedUndescribed + undecodable
                 return total > 0 ? Double(enqueued) / Double(total) : 0
             }
         }
@@ -963,6 +990,73 @@ import MoqomCore
             layer.videoGravity = .resizeAspectFill
             synchroniser.addRenderer(layer.sampleBufferRenderer)
         }
+
+        /// Another place this renderer's picture is drawn.
+        ///
+        /// One host can be on screen more than once — a gallery tile and the stage, a tile and a
+        /// window — and each of those places needs a layer of its own, because a layer has
+        /// exactly one superlayer. Moving the renderer's own between them is what makes the
+        /// picture appear in whichever view touched it last instead of in both, and it is why
+        /// Picture in Picture blanks the tile it borrows from.
+        ///
+        /// A presenter is not a second renderer. There is one subscription, one decode, one
+        /// schedule and one timebase for the track however many of these exist: the renderer
+        /// decodes each frame once and hands the same picture to every presenter, and they join
+        /// its synchroniser so they show it at the moment it does. Which is why there is nothing
+        /// on this type — no counters, no playout settings, no codec — since a presenter decides
+        /// nothing. It is somewhere to put a layer.
+        ///
+        /// Every view therefore draws the same resolution, and that is the trade being made. The
+        /// alternative is a decode per view, which buys a thumbnail the right to be a thumbnail
+        /// and spends a hardware decoder slot per view to do it.
+        @MainActor
+        public final class Presenter {
+            public let layer = AVSampleBufferDisplayLayer()
+
+            fileprivate init() {
+                layer.videoGravity = .resizeAspectFill
+            }
+
+            fileprivate func enqueue(_ sample: CMSampleBuffer) {
+                let renderer = layer.sampleBufferRenderer
+                if renderer.status == .failed { renderer.flush() }
+                guard renderer.isReadyForMoreMediaData else { return }
+                renderer.enqueue(sample)
+            }
+
+            fileprivate func flush() {
+                layer.sampleBufferRenderer.flush(
+                    removingDisplayedImage: true,
+                    completionHandler: nil
+                )
+            }
+        }
+
+        /// Draw this renderer's picture in another place as well.
+        ///
+        /// The returned presenter's layer is the caller's to parent and lay out, exactly as
+        /// ``layer`` is. Nothing is drawn into it until the next keyframe: see ``Presenter``.
+        public func addPresenter() -> Presenter {
+            let presenter = Presenter()
+            extras.append(presenter)
+            synchroniser.addRenderer(presenter.layer.sampleBufferRenderer)
+            return presenter
+        }
+
+        /// Stop drawing into a presenter. Idempotent, and safe to call from a view teardown.
+        public func remove(_ presenter: Presenter) {
+            guard let index = extras.firstIndex(where: { $0 === presenter }) else { return }
+            extras.remove(at: index)
+            presenter.flush()
+            synchroniser.removeRenderer(
+                presenter.layer.sampleBufferRenderer,
+                at: synchroniser.currentTime(),
+                completionHandler: nil
+            )
+        }
+
+        /// How many extra places this picture is being drawn. Zero for a track shown once.
+        public var presenterCount: Int { extras.count }
 
         /// Present a frame on an even grid rather than at the timestamp it carries.
         ///
@@ -1921,7 +2015,7 @@ import MoqomCore
                 }
             }
 
-            renderer.enqueue(drawn)
+            guard draw(drawn, isKeyFrame: frame.isKeyFrame) else { return }
             drawing.enqueued += 1
 
             if source.isValid { newestSource = source }
@@ -2085,6 +2179,16 @@ import MoqomCore
             // want it: a rung change should not wait on the display pipeline.
             layer.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil)
 
+            // Back to letting the display layer decode for itself, and the presenters wait for
+            // the next keyframe like they did when they were first attached. The shared session
+            // has just lost the references it was working from, and a primary still routed
+            // through it would draw nothing until a keyframe nothing here can promise is coming —
+            // whereas the layer's own decoder recovers on whatever arrives.
+            for presenter in extras { presenter.flush() }
+            sharedDecoder = nil
+            sharedFormat = nil
+            isSharing = false
+
             // Dropped along with the frames it was scheduling. What arrives next is a new
             // keyframe from a group that may be some way from where the timeline had reached,
             // and a schedule anchored to the old one would either sit idle waiting for a time
@@ -2123,6 +2227,109 @@ import MoqomCore
             grid = nil
             slot = 0
             debt = 0
+        }
+
+        /// Hand one frame to the display layer, and to every extra presenter.
+        ///
+        /// Returns whether it was drawn, because the schedule that follows this in ``enqueue(_:)``
+        /// is about frames that reached the screen and a frame that did not is not evidence about
+        /// timing.
+        ///
+        /// With no presenters this is the one line it replaced. Everything below only runs for a
+        /// host who is on screen more than once.
+        private func draw(_ sample: CMSampleBuffer, isKeyFrame: Bool) -> Bool {
+            let renderer = layer.sampleBufferRenderer
+            let wanted = !extras.isEmpty
+
+            // At a keyframe and nowhere else, because both halves of the switch need one. A
+            // decompression session that has not seen an IDR has no references to build a
+            // picture from, and a display layer accepts a new format description — compressed
+            // one frame, raw the next — at a keyframe rather than between two. So a view opened
+            // mid-group changes nothing until the next keyframe comes round: the picture already
+            // on screen carries on decoding itself and the new view waits, which is the right
+            // way round, since the wait belongs to the person who just opened a second view and
+            // not to the one already watching.
+            if isSharing != wanted, isKeyFrame { changeOver(to: wanted) }
+
+            guard isSharing, let decoder = sharedDecoder else {
+                renderer.enqueue(sample)
+                return true
+            }
+
+            guard let picture = try? decoder.decode(sample),
+                  let raw = raw(picture, timedLike: sample)
+            else {
+                drawing.undecodable += 1
+                return false
+            }
+
+            // The same sample buffer to all of them. It is a reference to one IOSurface, so this
+            // is a retain per view and not a copy per view, and handing an already-decoded
+            // picture to a display layer does not start a decode — which is the whole reason
+            // one host in three places costs one decoder slot instead of three.
+            renderer.enqueue(raw)
+            for presenter in extras { presenter.enqueue(raw) }
+            return true
+        }
+
+        /// Move between decoding once for every view and letting the display layer decode alone.
+        private func changeOver(to sharing: Bool) {
+            // What is queued was built the other way round. It is a few frames — tens of
+            // milliseconds of playout — and a keyframe is arriving to replace them, so dropping
+            // them is cheaper than discovering in the field how a display layer feels about
+            // compressed samples queued behind an uncompressed one. The displayed image stays,
+            // so nothing blanks in the meantime.
+            layer.sampleBufferRenderer.flush(removingDisplayedImage: false, completionHandler: nil)
+            sharedDecoder = sharing ? VideoDecodeSession() : nil
+            sharedFormat = nil
+            isSharing = sharing
+            drawing.changeovers += 1
+        }
+
+        /// Wrap a decoded picture so it presents at the moment the frame it came from would have.
+        ///
+        /// Timed from the sample rather than from the frame, because by here the sample may have
+        /// been retimed onto the even grid and the grid is what the schedule is holding.
+        private func raw(
+            _ picture: CVImageBuffer,
+            timedLike sample: CMSampleBuffer
+        ) -> CMSampleBuffer? {
+            if
+                let held = sharedFormat,
+                !CMVideoFormatDescriptionMatchesImageBuffer(held, imageBuffer: picture)
+            {
+                sharedFormat = nil
+            }
+
+            if sharedFormat == nil {
+                var made: CMFormatDescription?
+                guard
+                    CMVideoFormatDescriptionCreateForImageBuffer(
+                        allocator: kCFAllocatorDefault,
+                        imageBuffer: picture,
+                        formatDescriptionOut: &made
+                    ) == noErr
+                else { return nil }
+                sharedFormat = made
+            }
+            guard let format = sharedFormat else { return nil }
+
+            var timing = CMSampleTimingInfo(
+                duration: sample.duration,
+                presentationTimeStamp: sample.presentationTimeStamp,
+                decodeTimeStamp: .invalid
+            )
+            var made: CMSampleBuffer?
+            guard
+                CMSampleBufferCreateReadyWithImageBuffer(
+                    allocator: kCFAllocatorDefault,
+                    imageBuffer: picture,
+                    formatDescription: format,
+                    sampleTiming: &timing,
+                    sampleBufferOut: &made
+                ) == noErr
+            else { return nil }
+            return made
         }
     }
 

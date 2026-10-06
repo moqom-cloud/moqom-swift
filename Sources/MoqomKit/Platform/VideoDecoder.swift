@@ -35,11 +35,14 @@ import MoqomCore
     import VideoToolbox
 
     /// Hardware video decoding, one session per subscribed track.
+    ///
+    /// An actor because a tap runs in its own task and decodes on its own schedule. The decode
+    /// it wraps is not asynchronous and never was — see ``VideoDecodeSession`` — so anything
+    /// that needs the pixels back on the caller's own turn takes the session directly rather
+    /// than paying a hop for isolation it does not want.
     public actor PlatformVideoDecoder: VideoDecoding {
         private let assembler: SampleBufferAssembler
-        private let pixelFormat: OSType
-
-        private var session: Session?
+        private let decoder: VideoDecodeSession
 
         /// - Parameter pixelFormat: what the decoder should produce. The default
         ///   is the biplanar 4:2:0 the hardware already has, which both Vision
@@ -49,21 +52,80 @@ import MoqomCore
             pixelFormat: OSType = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
         ) throws {
             assembler = SampleBufferAssembler(codec: codec)
-            self.pixelFormat = pixelFormat
+            decoder = VideoDecodeSession(pixelFormat: pixelFormat)
         }
 
         public func decode(_ frame: EncodedFrame) async throws(MoqomError) -> VideoFrame? {
             guard let sample = try assembler.sampleBuffer(for: frame) else { return nil }
+            guard let picture = try decoder.decode(sample) else { return nil }
+
+            return VideoFrame(
+                timestamp: frame.timestamp,
+                size: PixelSize(
+                    width: CVPixelBufferGetWidth(picture),
+                    height: CVPixelBufferGetHeight(picture)
+                ),
+                surface: .pixelBuffer(picture)
+            )
+        }
+
+        public func flush() async {
+            decoder.flush()
+        }
+
+        public func close() async {
+            decoder.close()
+        }
+
+        /// Adopt the codec the publisher's catalog names.
+        ///
+        /// Discards the session: an HEVC session is not a starting point for an
+        /// H.264 one, and the parameter sets that would rebuild it have not
+        /// arrived yet.
+        public func setCodec(_ codec: VideoCodec) {
+            assembler.setCodec(codec)
+            decoder.close()
+        }
+    }
+
+    /// The decompression session, and nothing else.
+    ///
+    /// Split out of ``PlatformVideoDecoder`` because the `async` on that type's `decode` is
+    /// actor isolation and nothing else: asynchronous decompression is not enabled, so
+    /// VideoToolbox runs the output handler before `VTDecompressionSessionDecodeFrame` returns.
+    /// A tap does not care, but a renderer does — it draws on the main actor and cannot spend a
+    /// suspension per frame to be handed pixels that were already sitting there, and a display
+    /// path that awaits its own decoder has put a scheduling boundary in the middle of the one
+    /// loop where lateness is the whole problem.
+    ///
+    /// Takes a built sample rather than an ``EncodedFrame`` for the same reason. The caller that
+    /// wants this synchronously has already assembled one in order to hand it to a display
+    /// layer, and assembling it twice to decode it once is work for nothing.
+    ///
+    /// Not `Sendable`. An actor may own one; two callers may not share one.
+    final class VideoDecodeSession {
+        private let pixelFormat: OSType
+
+        private var session: Session?
+
+        init(pixelFormat: OSType = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
+            self.pixelFormat = pixelFormat
+        }
+
+        /// Decode one sample, synchronously.
+        ///
+        /// Returns `nil` when the decoder has nothing to build a picture from yet — most often
+        /// a delta frame whose references were never decoded, which is the ordinary state
+        /// between starting a session and the next keyframe rather than a failure.
+        func decode(_ sample: CMSampleBuffer) throws(MoqomError) -> CVImageBuffer? {
             guard let description = CMSampleBufferGetFormatDescription(sample) else { return nil }
 
             try prepare(for: description)
             guard let session else { return nil }
 
-            // Synchronous: asynchronous decompression is not enabled, so the
-            // handler runs before the call returns. Worth being explicit about,
-            // because reading the box afterwards is only sound because of it.
-            // The box exists because the handler is a block and the compiler
-            // cannot see that it does not outlive the call.
+            // The box exists because the handler is a block and the compiler cannot see that it
+            // does not outlive the call. Reading it afterwards is only sound because the decode
+            // is synchronous, which is the point of this type.
             let output = Output()
             let status = VTDecompressionSessionDecodeFrame(
                 session.handle,
@@ -79,23 +141,15 @@ import MoqomCore
             // recovery is the next keyframe rather than anything a caller could
             // do.
             guard status == noErr, let decoded = output.image else { return nil }
-
-            return VideoFrame(
-                timestamp: frame.timestamp,
-                size: PixelSize(
-                    width: CVPixelBufferGetWidth(decoded),
-                    height: CVPixelBufferGetHeight(decoded)
-                ),
-                surface: .pixelBuffer(decoded)
-            )
+            return decoded
         }
 
-        public func flush() async {
+        func flush() {
             guard let session else { return }
             VTDecompressionSessionFinishDelayedFrames(session.handle)
         }
 
-        public func close() async {
+        func close() {
             session = nil
         }
 
@@ -144,25 +198,15 @@ import MoqomCore
 
             session = Session(handle: created)
         }
-
-        /// Adopt the codec the publisher's catalog names.
-        ///
-        /// Discards the session: an HEVC session is not a starting point for an
-        /// H.264 one, and the parameter sets that would rebuild it have not
-        /// arrived yet.
-        public func setCodec(_ codec: VideoCodec) {
-            assembler.setCodec(codec)
-            session = nil
-        }
     }
 
     /// Owns the session's lifetime.
     ///
     /// A box rather than a stored `VTDecompressionSession`, because invalidation
     /// has to happen when the decoder goes away and an actor's `deinit` cannot
-    /// touch isolated state. Tying it to a reference the actor holds means a
+    /// touch isolated state. Tying it to a reference the decoder holds means a
     /// dropped decoder releases its hardware session without anyone remembering
-    /// to call ``PlatformVideoDecoder/close()``.
+    /// to call ``VideoDecodeSession/close()``.
     private final class Session: @unchecked Sendable {
         let handle: VTDecompressionSession
 

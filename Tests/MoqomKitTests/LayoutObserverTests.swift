@@ -47,6 +47,76 @@ import Testing
             #expect(observer.current[who] == nil)
         }
 
+        @Test("one host drawn twice is subscribed for the larger view")
+        func theBiggestBoxWins() {
+            // The same person in a gallery tile and on the stage at once. A rung chosen for the
+            // 320pt view serves the 100pt one by downscaling; the other way round fills the
+            // stage with a thumbnail, which is the whole reason size is reported at all.
+            let observer = LayoutObserver()
+            let who = identity("alice")
+
+            observer.report(box(100), for: who, from: UUID())
+            observer.report(box(320), for: who, from: UUID())
+
+            #expect(observer.current[who] == box(320))
+            #expect(observer.reportCount[who] == 2)
+        }
+
+        @Test("losing the larger view leaves the smaller one still drawn")
+        func theSurvivorKeepsTheSubscription() {
+            // Closing the stage must not unsubscribe somebody still visible in the gallery, and
+            // it must drop to the rung the gallery actually needs rather than keeping the
+            // stage's. Order matters here: the box that goes is the one that was being served.
+            let observer = LayoutObserver()
+            let who = identity("alice")
+            let tile = UUID()
+            let stage = UUID()
+
+            observer.report(box(100), for: who, from: tile)
+            observer.report(box(320), for: who, from: stage)
+            observer.withdraw(who, from: stage)
+
+            #expect(observer.current[who] == box(100))
+        }
+
+        @Test("a host nobody can see is not kept alive by a large stale box")
+        func visibilityOutranksSize() {
+            // A view scrolled out of a list keeps the size it had, so comparing area alone
+            // would let a big box nobody is looking at outrank a small one somebody is. The
+            // planner drops video for anything not visible, so getting this backwards spends a
+            // large rung on a tile that is not on screen.
+            let observer = LayoutObserver()
+            let who = identity("alice")
+            let scrolledAway = RenderBox(
+                width: 320, height: 569, scale: 3, visibility: .offScreen
+            )
+
+            observer.report(scrolledAway, for: who, from: UUID())
+            observer.report(box(100), for: who, from: UUID())
+
+            #expect(observer.current[who] == box(100))
+        }
+
+        @Test("the last view to leave stops the subscription")
+        func theLastWithdrawalStands() {
+            // Two views and two withdrawals. The participant survives the first, because
+            // somebody is still drawing them, and goes on the second — otherwise a gallery that
+            // once showed somebody twice pays for their video for the rest of the call.
+            let observer = LayoutObserver()
+            let who = identity("alice")
+            let tile = UUID()
+            let stage = UUID()
+
+            observer.report(box(100), for: who, from: tile)
+            observer.report(box(320), for: who, from: stage)
+
+            observer.withdraw(who, from: tile)
+            #expect(observer.current[who] == box(320))
+
+            observer.withdraw(who, from: stage)
+            #expect(observer.current[who] == nil)
+        }
+
         @Test("a caller with no token still withdraws")
         func anUntokenedWithdrawalStands() {
             // The public API predates the token and is used by callers that own the whole
