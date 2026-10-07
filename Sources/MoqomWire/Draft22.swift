@@ -539,6 +539,23 @@ public struct MessageParameters: Hashable, Sendable, ExpressibleByArrayLiteral {
         return nil
     }
 
+    public var locationFilter: LocationFilter? {
+        if case let .locationFilter(filter) = first(.locationFilter) { return filter }
+        return nil
+    }
+
+    public var groupOrder: GroupOrder? {
+        if case let .groupOrder(order) = first(.groupOrder) { return order }
+        return nil
+    }
+
+    /// FILL_PARAMETERS' contents, if present. Present and empty is still a
+    /// request for a fill.
+    public var fill: MessageParameters? {
+        if case let .fillParameters(inner) = first(.fillParameters) { return inner }
+        return nil
+    }
+
     public func write(to writer: inout WireWriter) {
         writer.varInt(UInt64(items.count))
         var previous: UInt64 = 0

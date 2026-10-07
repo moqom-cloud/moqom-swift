@@ -38,10 +38,12 @@ public struct RelayEndpoint: Hashable, Sendable {
     ///
     /// Version negotiation is ALPN — moq-wg PR #499 removed it from SETUP
     /// entirely — so this list is the version list. Drafts use `moqt-NN`; the
-    /// final RFC will use bare `moqt`.
+    /// final RFC will use bare `moqt`. The default offers draft-22 first and
+    /// falls back to MOQOM's draft-19 profile for relays not yet upgraded;
+    /// the session speaks whichever the relay picks.
     public let alpn: [String]
 
-    public init(host: String, port: UInt16 = 443, alpn: [String] = ["moqt-19"]) {
+    public init(host: String, port: UInt16 = 443, alpn: [String] = ["moqt-22", "moqt-19"]) {
         self.host = host
         self.port = port
         self.alpn = alpn
