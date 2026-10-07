@@ -742,7 +742,7 @@ public struct Goaway: ControlMessage {
     }
 }
 
-private extension String {
+extension String {
     /// Truncate to a UTF-8 byte budget without splitting a scalar.
     func truncatedUTF8(to limit: Int) -> String {
         guard utf8.count > limit else { return self }
