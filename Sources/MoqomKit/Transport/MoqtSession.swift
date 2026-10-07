@@ -85,10 +85,12 @@ public actor MoqtSession: TransportSession {
     private let role: SessionRole
 
     /// The draft's bytes, from the negotiated ALPN: draft-19 or draft-22.
-    let dialect: SessionDialect
+    /// Finished by the peer's SETUP, which says whether MOQOM's private
+    /// parameters may travel; nothing copies it before then.
+    private(set) var dialect: SessionDialect
 
     /// The draft this session speaks.
-    public nonisolated var draft: MoqtDraft { dialect.draft }
+    public nonisolated let draft: MoqtDraft
 
     private var parameters: NegotiatedParameters
     private var nextRequestID: UInt64
@@ -135,6 +137,7 @@ public actor MoqtSession: TransportSession {
         self.carrier = carrier
         self.role = role
         dialect = SessionDialect(alpn: carrier.alpn)
+        draft = dialect.draft
         nextRequestID = role.firstRequestID
         parameters = NegotiatedParameters(
             alpn: carrier.alpn,
@@ -380,6 +383,8 @@ public actor MoqtSession: TransportSession {
     /// stream of its own. `false` if the session ended here.
     private func setupArrived(_ options: Parameters) async -> Bool {
         peerOptions = options
+        // This end always declares it in draft-22, so the peer's word decides.
+        dialect.moqomParameters = options.integer(SetupOption.moqomParameters) == 1
         guard role == .server else {
             finishSetup(.success(()))
             return true
@@ -937,9 +942,10 @@ public actor MoqtSession: TransportSession {
         // would be refused as a replay — and a renewal that could carry no proof
         // would be a way to trade a proven credential for an unproven one.
         //
-        // Draft-22 cannot carry it: the proof is a private Message Parameter,
-        // and §9.20 closes the session over one it does not define. A draft-22
-        // renewal is the token alone.
+        // Draft-22 carries it only to a peer that declared MOQOM_PARAMETERS:
+        // the proof is a private Message Parameter, and §9.20 closes the
+        // session over one the receiver does not define. To any other
+        // draft-22 peer the renewal is the token alone.
         let change = RequestChange.token(token, proof: prove(token))
 
         // Any one of them will do — the relay reads the token off whichever

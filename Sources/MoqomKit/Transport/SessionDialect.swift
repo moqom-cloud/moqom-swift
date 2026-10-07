@@ -71,6 +71,12 @@ enum RequestChange: Sendable {
 struct SessionDialect: Sendable {
     let draft: MoqtDraft
 
+    /// Draft-22: both SETUPs declared ``SetupOption/moqomParameters``, so
+    /// MOQOM's private Message Parameters and NAMESPACE_DONE's reason may
+    /// travel. Set by the session once the peer's SETUP is read; until then,
+    /// and with any peer that did not declare it, neither end may use them.
+    var moqomParameters = false
+
     init(_ draft: MoqtDraft) {
         precondition(draft != .draft16, "draft-16 is Draft16Session, not a dialect")
         self.draft = draft
@@ -175,8 +181,10 @@ struct SessionDialect: Sendable {
             // ignores setup options it does not know (§9.3.1), so a relay that
             // does not check proofs never sees a reason to refuse.
             let structured = token.map { AuthorizationToken.useValue(type: 0, value: $0).encoded(in: .vi64) }
+            var options = setupOptions(token: structured, proof: proof)
+            if let value = try? Parameter.integer(SetupOption.moqomParameters, 1) { options.insert(value) }
             try ControlFrame.write(
-                Setup(options: setupOptions(token: structured, proof: proof)),
+                Setup(options: options),
                 as: Draft22.MessageCode.setup.rawValue,
                 to: &writer
             )
@@ -208,26 +216,32 @@ struct SessionDialect: Sendable {
             try ControlFrame.write(Draft22.SubscribeNamespace(requestID: requestID, prefix: prefix), to: &writer)
         case let .namespace(suffix):
             try ControlFrame.write(NamespaceAnnounced(suffix: suffix), as: Draft22.MessageCode.namespace.rawValue, to: &writer)
-        case let .namespaceDone(suffix, _):
-            // Without MOQOM's trailing reason: draft-22 §9 makes a body
-            // longer than its fields a PROTOCOL_VIOLATION, so the extension
-            // that draft-19 receivers skip would close a draft-22 session.
+        case let .namespaceDone(suffix, reason):
+            // MOQOM's trailing reason only to a peer that agreed to it:
+            // draft-22 §9 makes a body longer than its fields a
+            // PROTOCOL_VIOLATION, so the extension draft-19 receivers skip
+            // would close any other draft-22 session.
             try ControlFrame.write(
-                NamespaceDone(suffix: suffix),
+                NamespaceDone(suffix: suffix, reason: moqomParameters ? reason : nil),
                 as: Draft22.MessageCode.namespaceDone.rawValue,
                 to: &writer
             )
         case let .update(requestID, change):
-            let parameter: MessageParameter = switch change {
-            case let .priority(priority): .subscriberPriority(priority)
-            case let .forward(forward): .forward(forward)
-            // The token alone. MOQOM's proof is a private Message Parameter
-            // in draft-19, and draft-22 closes the session over any Message
-            // Parameter it does not define.
-            case let .token(token, _): .authorizationToken(.useValue(type: 0, value: token))
-            case let .fill(filter): .fillParameters([.locationFilter(filter)])
+            let parameters: [MessageParameter] = switch change {
+            case let .priority(priority): [.subscriberPriority(priority)]
+            case let .forward(forward): [.forward(forward)]
+            // The proof beside the token only where MOQOM_PARAMETERS was
+            // agreed: draft-22 closes the session over a Message Parameter the
+            // peer does not define, so elsewhere the token goes alone.
+            case let .token(token, proof?) where moqomParameters:
+                [.authorizationToken(.useValue(type: 0, value: token)), .authorizationProof(proof)]
+            case let .token(token, _): [.authorizationToken(.useValue(type: 0, value: token))]
+            case let .fill(filter): [.fillParameters([.locationFilter(filter)])]
             }
-            try ControlFrame.write(Draft22.RequestUpdate(requestID: requestID, parameters: [parameter]), to: &writer)
+            try ControlFrame.write(
+                Draft22.RequestUpdate(requestID: requestID, parameters: MessageParameters(parameters)),
+                to: &writer
+            )
         case let .fetch(requestID, kind, priority, order):
             guard case let .standalone(track, start, end) = kind else {
                 preconditionFailure("draft-22 joins with a fill, not a fetch")
@@ -349,24 +363,30 @@ struct SessionDialect: Sendable {
             return .goaway(newSessionURI: goaway.newSessionURI, timeoutMilliseconds: goaway.timeoutMilliseconds)
         case .subscribe:
             let request = try Draft22.Subscribe.decode(frame.body, draft)
+            try admit(request.parameters)
             return .subscribe(requestID: request.requestID, track: request.track, fill: request.parameters.fill.map {
                 $0.locationFilter ?? .none
             })
         case .subscribeOk:
-            return .subscribeOk(alias: try Draft22.SubscribeOk.decode(frame.body, draft).trackAlias)
+            let ok = try Draft22.SubscribeOk.decode(frame.body, draft)
+            try admit(ok.parameters)
+            return .subscribeOk(alias: ok.trackAlias)
         case .requestOk:
-            _ = try Draft22.RequestOk.decode(frame.body, draft)
+            try admit(try Draft22.RequestOk.decode(frame.body, draft).parameters)
             return .requestOk
         case .requestError:
             return .requestError(try RequestError.decode(frame.body, draft))
         case .publish:
             let offer = try Draft22.Publish.decode(frame.body, draft)
+            try admit(offer.parameters)
             return .publish(track: offer.track, alias: offer.trackAlias)
         case .publishNamespace:
-            _ = try Draft22.PublishNamespace.decode(frame.body, draft)
+            try admit(try Draft22.PublishNamespace.decode(frame.body, draft).parameters)
             return .publishNamespace
         case .subscribeNamespace:
-            return .subscribeNamespace(prefix: try Draft22.SubscribeNamespace.decode(frame.body, draft).prefix)
+            let request = try Draft22.SubscribeNamespace.decode(frame.body, draft)
+            try admit(request.parameters)
+            return .subscribeNamespace(prefix: request.prefix)
         case .namespace:
             return .namespace(suffix: try NamespaceAnnounced.decode(frame.body, draft).suffix)
         case .namespaceDone:
@@ -377,6 +397,7 @@ struct SessionDialect: Sendable {
             return .namespaceDone(suffix: done.suffix, reason: done.reason)
         case .fetch:
             let request = try Draft22.Fetch.decode(frame.body, draft)
+            try admit(request.parameters)
             let kind: Fetch.Kind? = switch request.locationFilter {
             case let .absoluteStart(start)?:
                 .standalone(track: request.track, start: start, end: .endOfGroup(.max))
@@ -389,28 +410,42 @@ struct SessionDialect: Sendable {
             }
             return .fetch(requestID: request.requestID, kind: kind, order: request.groupOrder ?? .ascending)
         case .fetchOk:
-            return .fetchOk(.through(try Draft22.FetchOk.decode(frame.body, draft).end))
+            let ok = try Draft22.FetchOk.decode(frame.body, draft)
+            try admit(ok.parameters)
+            return .fetchOk(.through(ok.end))
         case .publishDone:
             _ = try PublishDone.decode(frame.body, draft)
             return .publishDone
         case .requestUpdate:
             let update = try Draft22.RequestUpdate.decode(frame.body, draft)
+            try admit(update.parameters)
             return .requestUpdate(requestID: update.requestID, fill: update.parameters.fill.map {
                 $0.locationFilter ?? .none
             })
         case .publishStateNotify:
-            _ = try Draft22.PublishStateNotify.decode(frame.body, draft)
+            try admit(try Draft22.PublishStateNotify.decode(frame.body, draft).parameters)
             return .unhandled
         case .trackStatus:
-            _ = try Draft22.TrackStatus.decode(frame.body, draft)
+            try admit(try Draft22.TrackStatus.decode(frame.body, draft).parameters)
             return .unhandled
         case .subscribeTracks:
-            _ = try Draft22.SubscribeTracks.decode(frame.body, draft)
+            try admit(try Draft22.SubscribeTracks.decode(frame.body, draft).parameters)
             return .unhandled
         case .publishSkipped:
             _ = try Draft22.PublishSkipped.decode(frame.body, draft)
             return .unhandled
         }
+    }
+
+    /// Refuse MOQOM's private Message Parameters from a peer that has not
+    /// agreed to them, in the words §9.20 uses for any parameter a receiver
+    /// does not define. The codec reads them regardless; see
+    /// ``MessageParameter/Kind/isPrivate`` for why the check lives here.
+    private func admit(_ parameters: MessageParameters) throws(WireError) {
+        guard !moqomParameters, let found = parameters.firstPrivate else { return }
+        throw WireError.invalid(
+            "unknown message parameter 0x\(String(found.type, radix: 16)) (MOQOM_PARAMETERS not negotiated)"
+        )
     }
 }
 

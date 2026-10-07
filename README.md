@@ -540,6 +540,15 @@ The draft is chosen by ALPN during the QUIC handshake. Three are spoken:
 `RelayEndpoint(host:)` offers `moqt-22` then `moqt-19`. `DirectEndpoint` speaks
 `moqt-19` only. Draft-16 is never offered to a MOQOM relay.
 
+Draft-22 makes any Message Parameter the receiver does not define a protocol
+violation, so MOQOM's extras are negotiated there. Each end's SETUP carries the
+private option MOQOM_PARAMETERS (0x4D50) = 1. Once both have declared it, a
+session sends NAMESPACE_DONE's withdrawal reason and a renewal's
+AUTHORIZATION_PROOF (0x4D51), and accepts RELAY_HOPS (0x4D50) and
+AUTHORIZATION_PROOF from the peer. With any other draft-22 peer, neither end
+sends them, and receiving one ends the session. Draft-19 needs no
+negotiation, and the Cloudflare profile never declares it.
+
 ### Cloudflare
 
 ```swift

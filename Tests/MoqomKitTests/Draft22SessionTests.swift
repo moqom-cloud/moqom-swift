@@ -100,8 +100,8 @@ struct Draft22SessionTests {
         #expect(await iterator.next() == .announced(namespace))
 
         await announcement.withdraw()
-        // No reason: draft-22 has nowhere to put MOQOM's, so it is not sent.
-        #expect(await iterator.next() == .withdrawn(namespace, nil))
+        // With its reason: both ends declared MOQOM_PARAMETERS.
+        #expect(await iterator.next() == .withdrawn(namespace, .stopped))
 
         await client.close(code: 0, reason: "done")
         await server.close(code: 0, reason: "done")
@@ -155,7 +155,8 @@ struct Draft22SessionTests {
     }
 
     /// §9.20: a Message Parameter the receiver does not define closes the
-    /// session. MOQOM's own draft-19 proof parameter is the realistic case.
+    /// session. MOQOM's own proof parameter, from a peer that never declared
+    /// MOQOM_PARAMETERS, is the realistic case.
     @Test("an unknown Message Parameter ends the session")
     func unknownParameterCloses() async throws {
         let (raw, serverCarrier) = MemoryCarrier.pair(alpn: "moqt-22")
@@ -186,6 +187,117 @@ struct Draft22SessionTests {
         }
         #expect(code == 0x3)
         #expect(reason.contains("unknown message parameter"))
+    }
+
+    @Test("two MOQOM ends declare MOQOM_PARAMETERS and both record it")
+    func moqomParametersNegotiated() async throws {
+        let (client, server) = try await connectedPair()
+        #expect(await server.peerSetupOptions.integer(SetupOption.moqomParameters) == 1)
+        #expect(await client.peerSetupOptions.integer(SetupOption.moqomParameters) == 1)
+        #expect(await client.dialect.moqomParameters)
+        #expect(await server.dialect.moqomParameters)
+
+        await client.close(code: 0, reason: "done")
+        await server.close(code: 0, reason: "done")
+    }
+
+    /// A raw draft-22 peer: its SETUP, then one SUBSCRIBE carrying MOQOM's
+    /// private parameters on the stream returned.
+    private func subscribeWithPrivateParameters(
+        declaring: Bool
+    ) async throws -> (server: MoqtSession, request: any QUICStream) {
+        let (raw, serverCarrier) = MemoryCarrier.pair(alpn: "moqt-22")
+        async let accepted = MoqtSession.accept(over: serverCarrier)
+
+        var options = Parameters()
+        if declaring { options.insert(try Parameter.integer(SetupOption.moqomParameters, 1)) }
+        let control = try await raw.openUnidirectionalStream()
+        var setup = MoqtDraft.draft22.writer()
+        try ControlFrame.write(Setup(options: options), as: Draft22.MessageCode.setup.rawValue, to: &setup)
+        try await control.write(setup.bytes)
+        let server = try await accepted
+
+        // What a relay forwarding a subscription to its publisher sends.
+        let subscribe = Draft22.Subscribe(requestID: 0, track: try track("video/360p"), parameters: [
+            .subscriberPriority(10), .relayHops(1), .authorizationProof(Data([1, 2, 3])),
+        ])
+        var frame = MoqtDraft.draft22.writer()
+        try ControlFrame.write(subscribe, to: &frame)
+        let request = try await raw.openBidirectionalStream()
+        try await request.write(frame.bytes)
+        return (server, request)
+    }
+
+    @Test("a peer that declared MOQOM_PARAMETERS may send RELAY_HOPS and AUTHORIZATION_PROOF")
+    func privateParametersAccepted() async throws {
+        let (server, request) = try await subscribeWithPrivateParameters(declaring: true)
+        #expect(await server.dialect.moqomParameters)
+        var framer = StreamFramer(draft: .draft22)
+        var reply: RawFrame?
+        while reply == nil, let chunk = try await request.read() {
+            framer.append(chunk)
+            reply = try framer.nextRaw()
+        }
+        // Answered as any SUBSCRIBE for a track nobody publishes, which is
+        // the point: it was read, not refused.
+        #expect(reply?.code == Draft22.MessageCode.requestError.rawValue)
+        await server.close(code: 0, reason: "done")
+    }
+
+    @Test("a peer that did not declare MOQOM_PARAMETERS may not")
+    func privateParametersRefused() async throws {
+        let (server, _) = try await subscribeWithPrivateParameters(declaring: false)
+        #expect(await !server.dialect.moqomParameters)
+        var interruptions = server.interruptions.makeAsyncIterator()
+        guard case let .closedByPeer(code, reason)? = await interruptions.next() else {
+            Issue.record("expected the session to end")
+            return
+        }
+        #expect(code == 0x3)
+        #expect(reason.contains("unknown message parameter 0x4d50"))
+    }
+
+    /// Encoding, both ways round: NAMESPACE_DONE's reason and a renewal's
+    /// proof go only to a peer that agreed to them, and SETUP declares the
+    /// agreement only in draft-22.
+    @Test("MOQOM's extras are written only once MOQOM_PARAMETERS is agreed")
+    func moqomParametersEncoding() throws {
+        func frame(_ dialect: SessionDialect, _ message: OutgoingMessage) throws -> RawFrame {
+            var framer = dialect.framer()
+            framer.append(try dialect.bytes(message))
+            return try #require(try framer.nextRaw())
+        }
+        let suffix = try TrackNamespace(["alice"])
+        let renewal = OutgoingMessage.update(requestID: 3, .token(Data("fresh".utf8), proof: Data("proof".utf8)))
+
+        let plain = SessionDialect(.draft22)
+        var moqom = SessionDialect(.draft22)
+        moqom.moqomParameters = true
+
+        guard case let .namespaceDone(_, reason) = try plain.decode(
+            try frame(plain, .namespaceDone(suffix: suffix, reason: .vanished))
+        ) else { Issue.record("not NAMESPACE_DONE"); return }
+        #expect(reason == nil)
+        guard case let .namespaceDone(_, reason) = try moqom.decode(
+            try frame(moqom, .namespaceDone(suffix: suffix, reason: .vanished))
+        ) else { Issue.record("not NAMESPACE_DONE"); return }
+        #expect(reason == .vanished)
+
+        let bare = try Draft22.RequestUpdate.decode(try frame(plain, renewal).body, .draft22)
+        #expect(bare.parameters == [.authorizationToken(.useValue(type: 0, value: Data("fresh".utf8)))])
+        let proven = try frame(moqom, renewal)
+        #expect(try Draft22.RequestUpdate.decode(proven.body, .draft22).parameters == [
+            .authorizationToken(.useValue(type: 0, value: Data("fresh".utf8))),
+            .authorizationProof(Data("proof".utf8)),
+        ])
+        // And a session that agreed nothing refuses what one that did sends.
+        #expect(throws: WireError.self) { try plain.decode(proven) }
+
+        let setup22 = try Setup.decode(try frame(plain, .setup(token: nil, proof: nil)).body, .draft22)
+        #expect(setup22.options.integer(SetupOption.moqomParameters) == 1)
+        let draft19 = SessionDialect(.draft19)
+        let setup19 = try Setup.decode(try frame(draft19, .setup(token: nil, proof: nil)).body, .draft19)
+        #expect(setup19.options.integer(SetupOption.moqomParameters) == nil)
     }
 
     @Test("a draft-19 peer and a draft-22 one cannot be confused")
