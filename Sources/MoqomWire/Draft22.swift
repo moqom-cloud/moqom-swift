@@ -348,6 +348,13 @@ public enum MessageParameter: Hashable, Sendable {
     case trackNamespacePrefix(TrackNamespace)
     /// 0x35, uint8 0 or 1. Defaults to 1.
     case includeProperties(Bool)
+    /// 0x4D50, varint: how many relays a request has already crossed. MOQOM's,
+    /// not the draft's; see ``Kind/isPrivate``.
+    case relayHops(UInt64)
+    /// 0x4D51, length-prefixed bytes: a proof that the sender holds the key its
+    /// token names, the same number as ``SetupOption/authorizationProof``.
+    /// MOQOM's, not the draft's; see ``Kind/isPrivate``.
+    case authorizationProof(Data)
 
     public enum Kind: UInt64, CaseIterable, Sendable {
         case objectDeliveryTimeout = 0x02
@@ -370,6 +377,23 @@ public enum MessageParameter: Hashable, Sendable {
         case newGroupRequest = 0x32
         case trackNamespacePrefix = 0x34
         case includeProperties = 0x35
+        case relayHops = 0x4D50
+        case authorizationProof = 0x4D51
+
+        /// MOQOM's private-use parameters, which §9.20 says a peer that did
+        /// not agree to them must treat as unknown.
+        ///
+        /// The codec reads them unconditionally and the session decides,
+        /// rather than the codec taking a flag. Whether they are allowed is a
+        /// fact about the session (both SETUPs declared
+        /// ``SetupOption/moqomParameters``), not about the bytes, and one parse
+        /// that the session then judges keeps every message's reader free of
+        /// session state and keeps fixtures decodable on their own. The cost is
+        /// that a caller decoding outside a session has to remember to check;
+        /// `SessionDialect` is the only one, and it does.
+        public var isPrivate: Bool {
+            self == .relayHops || self == .authorizationProof
+        }
 
         /// Types a message may carry more than once (§9.20, §3.3.2).
         var mayRepeat: Bool {
@@ -405,6 +429,8 @@ public enum MessageParameter: Hashable, Sendable {
         case .newGroupRequest: .newGroupRequest
         case .trackNamespacePrefix: .trackNamespacePrefix
         case .includeProperties: .includeProperties
+        case .relayHops: .relayHops
+        case .authorizationProof: .authorizationProof
         }
     }
 
@@ -414,8 +440,10 @@ public enum MessageParameter: Hashable, Sendable {
         switch self {
         case let .objectDeliveryTimeout(value), let .rendezvousTimeout(value),
              let .subgroupDeliveryTimeout(value), let .expires(value), let .fillTimeout(value),
-             let .newGroupRequest(value):
+             let .newGroupRequest(value), let .relayHops(value):
             writer.varInt(value)
+        case let .authorizationProof(proof):
+            writer.lengthPrefixed(proof)
         case let .authorizationToken(token):
             writer.lengthPrefixed { token.write(to: &$0) }
         case let .largestObject(location):
@@ -446,6 +474,8 @@ public enum MessageParameter: Hashable, Sendable {
         case .expires: return .expires(try reader.varInt())
         case .fillTimeout: return .fillTimeout(try reader.varInt())
         case .newGroupRequest: return .newGroupRequest(try reader.varInt())
+        case .relayHops: return .relayHops(try reader.varInt())
+        case .authorizationProof: return .authorizationProof(try reader.lengthPrefixed())
         case .authorizationToken:
             var value = try lengthPrefixed(&reader)
             return .authorizationToken(try AuthorizationToken.read(from: &value))
@@ -556,6 +586,12 @@ public struct MessageParameters: Hashable, Sendable, ExpressibleByArrayLiteral {
         return nil
     }
 
+    /// The first of MOQOM's private parameters here, if any. FILL_PARAMETERS
+    /// needs no look inside: ``insideFill`` already refuses them.
+    public var firstPrivate: MessageParameter? {
+        items.first { $0.kind.isPrivate }
+    }
+
     public func write(to writer: inout WireWriter) {
         writer.varInt(UInt64(items.count))
         var previous: UInt64 = 0
@@ -618,7 +654,7 @@ extension Draft22 {
             .objectDeliveryTimeout, .authorizationToken, .rendezvousTimeout, .subgroupDeliveryTimeout,
             .forward, .subscriberPriority, .locationFilter, .groupOrder, .fillParameters,
             .subgroupFilter, .objectIDFilter, .priorityFilter, .objectPropertyFilter,
-            .newGroupRequest, .includeProperties,
+            .newGroupRequest, .includeProperties, .relayHops, .authorizationProof,
         ]
 
         public var requestID: UInt64
@@ -652,7 +688,9 @@ extension Draft22 {
     /// layout, with only the parameters that do not govern delivery.
     public struct TrackStatus: DraftControlMessage {
         public static let typeCode = MessageCode.trackStatus.rawValue
-        static let allowed: Set<MessageParameter.Kind> = [.authorizationToken, .includeProperties]
+        static let allowed: Set<MessageParameter.Kind> = [
+            .authorizationToken, .includeProperties, .relayHops, .authorizationProof,
+        ]
 
         public var requestID: UInt64
         public var track: FullTrackName
@@ -722,6 +760,7 @@ extension Draft22 {
         static let allowed: Set<MessageParameter.Kind> = [
             .objectDeliveryTimeout, .authorizationToken, .subgroupDeliveryTimeout, .expires,
             .largestObject, .forward, .subscriberPriority, .locationFilter, .groupOrder,
+            .authorizationProof,
         ]
 
         public var requestID: UInt64
@@ -802,6 +841,7 @@ extension Draft22 {
         static let allowed: Set<MessageParameter.Kind> = [
             .authorizationToken, .fillTimeout, .subscriberPriority, .locationFilter, .groupOrder,
             .subgroupFilter, .objectIDFilter, .priorityFilter, .objectPropertyFilter, .includeProperties,
+            .relayHops, .authorizationProof,
         ]
 
         public var requestID: UInt64
@@ -910,7 +950,7 @@ extension Draft22 {
                 namespace: try TrackNamespace.read(from: &reader),
                 parameters: try MessageParameters.read(from: &reader)
             )
-            try message.parameters.validate(allowing: [.authorizationToken], in: "PUBLISH_NAMESPACE")
+            try message.parameters.validate(allowing: [.authorizationToken, .authorizationProof], in: "PUBLISH_NAMESPACE")
             return message
         }
     }
@@ -941,7 +981,7 @@ extension Draft22 {
                 prefix: try TrackNamespace.read(from: &reader),
                 parameters: try MessageParameters.read(from: &reader)
             )
-            try message.parameters.validate(allowing: [.authorizationToken], in: "SUBSCRIBE_NAMESPACE")
+            try message.parameters.validate(allowing: [.authorizationToken, .authorizationProof], in: "SUBSCRIBE_NAMESPACE")
             return message
         }
     }
@@ -953,6 +993,7 @@ extension Draft22 {
         static let allowed: Set<MessageParameter.Kind> = [
             .authorizationToken, .forward, .groupOrder, .subgroupFilter, .objectIDFilter,
             .priorityFilter, .objectPropertyFilter, .trackPropertyFilter, .includeProperties,
+            .authorizationProof,
         ]
 
         public var requestID: UInt64
@@ -1044,7 +1085,7 @@ extension Draft22 {
             .objectDeliveryTimeout, .authorizationToken, .subgroupDeliveryTimeout, .forward,
             .subscriberPriority, .locationFilter, .fillParameters, .subgroupFilter, .objectIDFilter,
             .priorityFilter, .objectPropertyFilter, .trackPropertyFilter, .newGroupRequest,
-            .trackNamespacePrefix,
+            .trackNamespacePrefix, .authorizationProof,
         ]
 
         public var requestID: UInt64

@@ -1,0 +1,3 @@
+# REQUEST_UPDATE 0x2: request 16; AUTHORIZATION_TOKEN (USE_VALUE, type 0, "ticket"), AUTHORIZATION_PROOF (private 0x4D51) "proof". A credential renewal between MOQOM_PARAMETERS peers.
+02 00 15 10 02 03 08 03 00 74 69 63 6b 65 74 c0
+4d 4e 05 70 72 6f 6f 66

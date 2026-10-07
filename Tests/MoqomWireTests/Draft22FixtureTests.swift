@@ -116,6 +116,15 @@ private let vectors: [Vector] = [
         .setup
     ),
     shared(
+        "setup-moqom-parameters",
+        "SETUP 0x2F00: MOQT_IMPLEMENTATION \"moqom\" and MOQOM_PARAMETERS (private 0x4D50, even so a varint) = 1.",
+        Setup(options: Parameters([
+            try! Parameter.string(SetupOption.implementation, "moqom"),
+            try! Parameter.integer(SetupOption.moqomParameters, 1),
+        ])),
+        .setup
+    ),
+    shared(
         "goaway",
         "GOAWAY 0x10: URI \"moqt://relay.example/x\", timeout 5000 ms.",
         Goaway(newSessionURI: "moqt://relay.example/x", timeoutMilliseconds: 5000),
@@ -223,6 +232,12 @@ private let vectors: [Vector] = [
         NamespaceDone(suffix: try! TrackNamespace(["alice"])),
         .namespaceDone
     ),
+    shared(
+        "namespace-done-reason",
+        "NAMESPACE_DONE 0xE: suffix alice, then MOQOM's trailing reason 1 (vanished). Only between peers that both declared MOQOM_PARAMETERS.",
+        NamespaceDone(suffix: try! TrackNamespace(["alice"]), reason: .vanished),
+        .namespaceDone
+    ),
     message(
         "publish-skipped",
         "PUBLISH_SKIPPED 0xF: suffix bob, track name video.",
@@ -240,6 +255,14 @@ private let vectors: [Vector] = [
         "REQUEST_UPDATE 0x2: request 14; FILL_PARAMETERS {FILL_TIMEOUT 500, LOCATION_FILTER relative StartGroup 2}.",
         Draft22.RequestUpdate(requestID: 14, parameters: [
             .fillParameters([.fillTimeout(500), .locationFilter(.relativeStart(groups: 2))]),
+        ])
+    ),
+    message(
+        "request-update-proof",
+        "REQUEST_UPDATE 0x2: request 16; AUTHORIZATION_TOKEN (USE_VALUE, type 0, \"ticket\"), AUTHORIZATION_PROOF (private 0x4D51) \"proof\". A credential renewal between MOQOM_PARAMETERS peers.",
+        Draft22.RequestUpdate(requestID: 16, parameters: [
+            .authorizationToken(.useValue(type: 0, value: Data("ticket".utf8))),
+            .authorizationProof(Data("proof".utf8)),
         ])
     ),
     message(
@@ -350,6 +373,12 @@ private let vectors: [Vector] = [
         .trackNamespacePrefix(try! TrackNamespace(["a", "b"]))
     ),
     parameter("include-properties", "0x35 uint8 0.", .includeProperties(false)),
+    parameter("relay-hops", "0x4D50 varint 3. MOQOM private: only between MOQOM_PARAMETERS peers.", .relayHops(3)),
+    parameter(
+        "authorization-proof",
+        "0x4D51 length-prefixed bytes \"proof\". MOQOM private: only between MOQOM_PARAMETERS peers.",
+        .authorizationProof(Data("proof".utf8))
+    ),
 
     // Data plane.
     Vector(
@@ -532,16 +561,40 @@ struct Draft22StrictnessTests {
 
     @Test("an unknown Message Parameter is a violation, not skipped")
     func unknownParameter() {
-        // 0x4D51 is MOQOM's private proof in the draft-19 profile.
+        // Next door to MOQOM's two private numbers, and defined by nobody.
         var writer = draft.writer()
         writer.varInt(1)
-        writer.varInt(0x4D51)
+        writer.varInt(0x4D52)
         writer.varInt(0)
         #expect(throws: WireError.self) {
             var reader = draft.reader(writer.bytes)
             _ = try MessageParameters.read(from: &reader)
         }
         #expect(throws: WireError.self) { try parse("01 07 00") }
+    }
+
+    /// The codec reads MOQOM's private parameters whatever the session agreed,
+    /// and the session refuses them when it agreed nothing; the codec alone
+    /// cannot know. Only where `typed.rs` allows them, though, and never in a
+    /// fill.
+    @Test("MOQOM's private parameters parse, and only where they may appear")
+    func privateParameters() throws {
+        let block = try parse("02 c0 4d 50 02 01 05 70 72 6f 6f 66")
+        #expect(block == [.relayHops(2), .authorizationProof(Data("proof".utf8))])
+        #expect(block.firstPrivate == .relayHops(2))
+        #expect(throws: Never.self) { try block.validate(allowing: Draft22.Subscribe.allowed, in: "SUBSCRIBE") }
+        #expect(throws: Never.self) { try block.validate(allowing: Draft22.Fetch.allowed, in: "FETCH") }
+        #expect(throws: Never.self) { try block.validate(allowing: Draft22.TrackStatus.allowed, in: "TRACK_STATUS") }
+        #expect(throws: WireError.self) { try block.validate(allowing: Draft22.Publish.allowed, in: "PUBLISH") }
+        #expect(throws: WireError.self) { try block.validate(allowing: Draft22.RequestUpdate.allowed, in: "REQUEST_UPDATE") }
+        #expect(throws: WireError.self) { try block.validate(allowing: Draft22.SubscribeOk.allowed, in: "SUBSCRIBE_OK") }
+        #expect(throws: WireError.self) { try block.validate(allowing: MessageParameters.insideFill, in: "FILL_PARAMETERS") }
+
+        let proof: MessageParameters = [.authorizationProof(Data("p".utf8))]
+        #expect(throws: Never.self) { try proof.validate(allowing: Draft22.Publish.allowed, in: "PUBLISH") }
+        #expect(throws: Never.self) { try proof.validate(allowing: Draft22.RequestUpdate.allowed, in: "REQUEST_UPDATE") }
+        #expect(throws: Never.self) { try proof.validate(allowing: Draft22.SubscribeTracks.allowed, in: "SUBSCRIBE_TRACKS") }
+        #expect(throws: WireError.self) { try proof.validate(allowing: Draft22.RequestOk.allowed, in: "REQUEST_OK") }
     }
 
     @Test("a parameter the message does not allow is a violation")

@@ -283,6 +283,15 @@ public enum SetupOption {
     /// proving possession to a relay that had stopped asking, at the price of a
     /// Secure Enclave signature per subscribe.
     public static let authorizationProof: UInt64 = 0x4D51
+
+    /// Draft-22 only: the sender understands MOQOM's private Message
+    /// Parameters (0x4D50 RELAY_HOPS, 0x4D51 AUTHORIZATION_PROOF) and the
+    /// trailing reason on NAMESPACE_DONE. Even, so a varint; 1 declares it.
+    ///
+    /// Draft-22 makes any parameter a receiver does not define a protocol
+    /// violation, so neither end may use them until both SETUPs have said
+    /// this. Draft-19 skips what it does not know and never needed asking.
+    public static let moqomParameters: UInt64 = 0x4D50
 }
 
 /// Request parameter type codes, per draft-19's own registry for them.
