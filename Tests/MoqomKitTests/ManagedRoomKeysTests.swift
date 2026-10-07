@@ -36,10 +36,29 @@ actor FakeKeyDelivery {
         guard rows[caller]?.member == true, var held = packages[who] else {
             throw MLSDeliveryError.refused(status: 404, reason: "no key package")
         }
-        if held.oneTime.isEmpty { return held.last }
-        let first = held.oneTime.removeFirst()
-        packages[who] = held
-        return first
+        let package: Data
+        if held.oneTime.isEmpty {
+            package = held.last
+        } else {
+            package = held.oneTime.removeFirst()
+            packages[who] = held
+        }
+        // As the control plane does: a package in another suite than the
+        // group's is consumed and refused.
+        if let group, let suite = try? MLSKeyPackage.decode(package).cipherSuite,
+           suite.identifier != group.cipherSuite {
+            refusedClaims += 1
+            throw MLSDeliveryError.refused(status: 409, reason: "key package is for another cipher suite")
+        }
+        return package
+    }
+
+    private(set) var refusedClaims = 0
+
+    /// Found a group nobody in the test holds, in any suite at all.
+    func foundElsewhere(_ id: Data, suite: UInt16, by who: String) {
+        group = .init(id: id, epoch: 0, cipherSuite: suite)
+        rows[who, default: Row()].member = true
     }
 
     func sync(_ who: String, after: UInt64) -> MLSDeliverySnapshot {
@@ -60,9 +79,9 @@ actor FakeKeyDelivery {
         )
     }
 
-    func create(_ id: Data, by who: String) -> Bool {
+    func create(_ id: Data, suite: MLSCipherSuite, by who: String) -> Bool {
         guard group == nil else { return false }
-        group = .init(id: id, epoch: 0)
+        group = .init(id: id, epoch: 0, cipherSuite: suite.identifier)
         rows[who, default: Row()].member = true
         return true
     }
@@ -80,7 +99,7 @@ actor FakeKeyDelivery {
             sequence += 1
             messages.append((sequence, .welcome, welcome, Set(commit.joiners)))
         }
-        group = .init(id: current.id, epoch: current.epoch + 1)
+        group = .init(id: current.id, epoch: current.epoch + 1, cipherSuite: current.cipherSuite)
         for gone in commit.removed { rows[gone]?.member = false }
         for joiner in commit.joiners { rows[joiner, default: Row()].member = true }
         return .accepted(sequence: seq)
@@ -105,8 +124,8 @@ actor FakeKeyDelivery {
             await service.sync(identity, after: cursor)
         }
 
-        func createGroup(_ id: Data, token _: Data) async throws -> Bool {
-            await service.create(id, by: identity)
+        func createGroup(_ id: Data, cipherSuite: MLSCipherSuite, token _: Data) async throws -> Bool {
+            await service.create(id, suite: cipherSuite, by: identity)
         }
 
         func submitCommit(_ commit: MLSDeliveryCommit, token _: Data) async throws -> MLSCommitReceipt {
@@ -120,11 +139,17 @@ actor FakeKeyDelivery {
 
 @Suite("Managed room keys")
 struct ManagedRoomKeysTests {
-    private func keys(_ name: String, _ device: String, _ service: FakeKeyDelivery) async -> ManagedRoomKeys {
+    private func keys(
+        _ name: String,
+        _ device: String,
+        _ service: FakeKeyDelivery,
+        cipherSuite: MLSCipherSuite = .default
+    ) async -> ManagedRoomKeys {
         ManagedRoomKeys(
             identity: identity(name, device: device),
             delivery: await service.client(identity(name, device: device)),
             token: { Data() },
+            cipherSuite: cipherSuite,
             sleep: { try? await Task.sleep(for: min($0, .milliseconds(5))) }
         )
     }
@@ -159,7 +184,42 @@ struct ManagedRoomKeysTests {
         let base = try #require(await alice.status).epochAuthenticator
         for blob in await service.everything { #expect(blob.range(of: base) == nil) }
 
+        // Founded in the hybrid suite, and everybody is in it.
+        #expect(await service.group?.cipherSuite == MLSCipherSuite.mls128MLKEM768X25519.identifier)
+        for keys in [alice, bob, carol] {
+            #expect(await keys.status?.cipherSuite == .mls128MLKEM768X25519)
+        }
+
         for keys in [alice, bob, carol] { await keys.stop() }
+    }
+
+    @Test("a device joining a group founded in suite 0x0001 republishes its key packages in that suite")
+    func joinsClassicalGroup() async throws {
+        let service = FakeKeyDelivery()
+        let alice = await keys("alice", "iphone-a", service, cipherSuite: .mls128DHKEMX25519)
+        let bob = await keys("bob", "iphone-b", service)
+        await alice.start()
+        #expect(await eventually { await alice.status != nil })
+        await bob.start()
+        #expect(await eventually { await sameEpoch([alice, bob], members: 2) })
+        #expect(await bob.status?.cipherSuite == .mls128DHKEMX25519)
+        #expect(await service.group?.cipherSuite == 0x0001)
+
+        let sealed = try bob.encryption.sender.protect(Data("classical".utf8))
+        #expect(try alice.encryption.receiver.unprotect(sealed) == Data("classical".utf8))
+
+        for keys in [alice, bob] { await keys.stop() }
+    }
+
+    @Test("a group in a suite this build does not implement is not joined")
+    func unknownSuiteNotJoined() async throws {
+        let service = FakeKeyDelivery()
+        await service.foundElsewhere(Data("future".utf8), suite: 0x7A7A, by: "zed/z")
+        let bob = await keys("bob", "iphone-b", service)
+        await bob.start()
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(await bob.status == nil)
+        await bob.stop()
     }
 
     @Test("a member that leaves is removed in a new epoch it cannot read")

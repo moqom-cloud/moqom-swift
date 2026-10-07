@@ -31,6 +31,16 @@
 // processed the commit yet, is absorbed by the unprotector holding that frame
 // until the key arrives; see ``MediaUnprotector/keyHold``. Neither direction
 // drops a frame across an ordinary epoch change.
+//
+// # Cipher suites
+//
+// A device founds in its own suite, the hybrid one unless it was built to do
+// otherwise, and joins in whichever suite the room's group is in. It publishes
+// key packages in its own suite before it knows; when a snapshot shows a group
+// in another suite it implements, it replaces them with packages in that one,
+// and is added on the committer's next pass. A group in a suite this build
+// does not implement cannot be joined, and the device waits for it to be
+// dropped rather than asking to be added.
 
 import Foundation
 import MoqomCore
@@ -39,6 +49,9 @@ import MoqomCore
 public struct GroupKeyStatus: Sendable, Hashable {
     /// The MLS epoch media is currently sent under.
     public let epoch: UInt64
+
+    /// The suite the group was founded in.
+    public let cipherSuite: MLSCipherSuite
 
     /// Every device in the group, as `username/device`.
     public let members: [String]
@@ -75,11 +88,16 @@ actor ManagedRoomKeys {
     private let delivery: any MLSDeliveryService
     private let token: @Sendable () async -> Data
     private let suite: SFrameCipherSuite
+    private let foundingSuite: MLSCipherSuite
     private let logger: MoqomLogger
     private let sleep: @Sendable (Duration) async -> Void
 
     private var bundles: [Data: MLSKeyPackageBundle] = [:]
     private var lastResort: Data?
+    /// The suite of the key packages in ``bundles``.
+    private var packageSuite: MLSCipherSuite
+    /// A group suite already reported as not implemented, so it is said once.
+    private var refusedSuite: UInt16?
     private var group: MLSGroup?
     private var cursor: UInt64 = 0
     private var currentKeys: Set<UInt64> = []
@@ -93,6 +111,7 @@ actor ManagedRoomKeys {
         delivery: any MLSDeliveryService,
         token: @escaping @Sendable () async -> Data,
         suite: SFrameCipherSuite = .aes256GcmSha512,
+        cipherSuite: MLSCipherSuite = .default,
         logger: MoqomLogger = .silent,
         sleep: @escaping @Sendable (Duration) async -> Void = { try? await Task.sleep(for: $0) }
     ) {
@@ -100,6 +119,8 @@ actor ManagedRoomKeys {
         self.delivery = delivery
         self.token = token
         self.suite = suite
+        foundingSuite = cipherSuite
+        packageSuite = cipherSuite
         self.logger = logger
         self.sleep = sleep
         let receiver = SFrameReceiver()
@@ -117,6 +138,7 @@ actor ManagedRoomKeys {
         guard let group else { return nil }
         return GroupKeyStatus(
             epoch: group.epoch,
+            cipherSuite: group.cipherSuite,
             members: group.roster.map(\.member.identityString),
             epochAuthenticator: group.epochAuthenticator
         )
@@ -147,7 +169,7 @@ actor ManagedRoomKeys {
         var backoff: Duration = .seconds(1)
         while !Task.isCancelled {
             do {
-                if bundles.isEmpty { try await publishPackages() }
+                if bundles.isEmpty { try await publishPackages(in: packageSuite) }
                 let snapshot = try await delivery.sync(
                     after: cursor, wait: Self.pollWait, token: token()
                 )
@@ -202,6 +224,21 @@ actor ManagedRoomKeys {
         cursor = max(cursor, snapshot.cursor)
 
         guard let group else {
+            guard let roomSuite = MLSCipherSuite(identifier: current.cipherSuite) else {
+                if refusedSuite != current.cipherSuite {
+                    refusedSuite = current.cipherSuite
+                    logger.warning(.room, "the room's encryption group uses a cipher suite this build does not implement", [
+                        LogField("suite", .number(Int(current.cipherSuite))),
+                    ])
+                }
+                return
+            }
+            if roomSuite != packageSuite {
+                // Packages in another suite can never be added to this group.
+                // Replaced, so the committer finds ones it can use.
+                try await publishPackages(in: roomSuite)
+                return
+            }
             // Counted as a member and holding nothing to be one with: the
             // Welcome was for a key package whose private half this process
             // never had, or did not open. Ask to be added again.
@@ -213,28 +250,32 @@ actor ManagedRoomKeys {
 
     // MARK: - Joining
 
-    private func publishPackages() async throws {
+    /// Replace this device's key packages with fresh ones in `cipherSuite`.
+    private func publishPackages(in cipherSuite: MLSCipherSuite) async throws {
         var fresh: [Data: MLSKeyPackageBundle] = [:]
         var oneTime: [Data] = []
         for _ in 0 ..< Self.oneTimePackages {
-            let bundle = try MLSKeyPackageBundle.generate(identity: identity)
+            let bundle = try MLSKeyPackageBundle.generate(identity: identity, cipherSuite: cipherSuite)
             fresh[bundle.keyPackage.reference] = bundle
             oneTime.append(bundle.keyPackage.encoded)
         }
-        let last = try MLSKeyPackageBundle.generate(identity: identity)
+        let last = try MLSKeyPackageBundle.generate(identity: identity, cipherSuite: cipherSuite)
         fresh[last.keyPackage.reference] = last
         try await delivery.publishKeyPackages(oneTime, lastResort: last.keyPackage.encoded, token: token())
         bundles = fresh
         lastResort = last.keyPackage.reference
+        packageSuite = cipherSuite
     }
 
     private func found() async throws {
-        let bundle = try MLSKeyPackageBundle.generate(identity: identity)
+        let bundle = try MLSKeyPackageBundle.generate(identity: identity, cipherSuite: foundingSuite)
         let id = MLSCipherSuite.randomSecret(16)
         let founded = try MLSGroup.create(groupID: id, bundle: bundle)
-        guard try await delivery.createGroup(id, token: token()) else { return }
+        guard try await delivery.createGroup(id, cipherSuite: foundingSuite, token: token()) else { return }
         adopt(founded)
-        logger.info(.room, "founded the room's encryption group")
+        logger.info(.room, "founded the room's encryption group", [
+            LogField("suite", .number(Int(foundingSuite.identifier))),
+        ])
     }
 
     private func accept(welcome data: Data) {
@@ -257,9 +298,10 @@ actor ManagedRoomKeys {
     }
 
     private func requestRejoin() async throws {
+        let suite = group?.cipherSuite ?? packageSuite
         forget()
         bundles.removeAll()
-        try await publishPackages()
+        try await publishPackages(in: suite)
         try await delivery.rejoin(token: token())
     }
 
@@ -325,9 +367,12 @@ actor ManagedRoomKeys {
 
         var packages: [MLSKeyPackage] = []
         for who in pending.sorted() {
+            // A package in another suite is skipped, not an error: its device
+            // replaces it once it sees the group's suite.
             guard
                 let data = try? await delivery.claimKeyPackage(for: who, token: token()),
                 let package = try? MLSKeyPackage.decode(data),
+                package.cipherSuite == group.cipherSuite,
                 package.isValid, package.identityString == who
             else { continue }
             packages.append(package)

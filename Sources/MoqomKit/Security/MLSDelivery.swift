@@ -42,10 +42,20 @@ public struct MLSDeliverySnapshot: Sendable, Hashable {
     public struct Group: Sendable, Hashable {
         public var id: Data
         public var epoch: UInt64
+        /// The identifier of the suite the group was founded in, as the
+        /// founder declared it. A raw value, since the service may know of
+        /// suites this build does not. A device publishes key packages in this
+        /// suite to be added.
+        public var cipherSuite: UInt16
 
-        public init(id: Data, epoch: UInt64) {
+        public init(
+            id: Data,
+            epoch: UInt64,
+            cipherSuite: UInt16 = MLSCipherSuite.mls128DHKEMX25519.identifier
+        ) {
             self.id = id
             self.epoch = epoch
+            self.cipherSuite = cipherSuite
         }
     }
 
@@ -126,8 +136,14 @@ public protocol MLSDeliveryService: Sendable {
     /// Everything after `cursor`, waiting up to `wait` for there to be something.
     func sync(after cursor: UInt64, wait: Duration, token: Data) async throws -> MLSDeliverySnapshot
 
-    /// Found the room's group. `false` when somebody else founded it first.
-    func createGroup(_ id: Data, token: Data) async throws -> Bool
+    /// Found the room's group in `cipherSuite`. `false` when somebody else
+    /// founded it first.
+    ///
+    /// The service records the suite and reports it in every snapshot's
+    /// ``MLSDeliverySnapshot/Group/cipherSuite``, which is how a device that
+    /// is not yet a member knows which suite to publish key packages in. It
+    /// should refuse to hand out a key package in any other suite.
+    func createGroup(_ id: Data, cipherSuite: MLSCipherSuite, token: Data) async throws -> Bool
 
     func submitCommit(_ commit: MLSDeliveryCommit, token: Data) async throws -> MLSCommitReceipt
 
@@ -189,7 +205,14 @@ public final class HTTPMLSDelivery: MLSDeliveryService {
         )
         let body = try decode(SyncResponse.self, data)
         return MLSDeliverySnapshot(
-            group: body.group.map { MLSDeliverySnapshot.Group(id: $0.id, epoch: $0.epoch) },
+            group: body.group.map {
+                // A service that does not report a suite predates suites, and
+                // every group it holds is in 0x0001.
+                MLSDeliverySnapshot.Group(
+                    id: $0.id, epoch: $0.epoch,
+                    cipherSuite: $0.cipherSuite ?? MLSCipherSuite.mls128DHKEMX25519.identifier
+                )
+            },
             messages: (body.messages ?? []).map {
                 MLSDeliverySnapshot.Message(sequence: $0.seq, kind: $0.kind, data: $0.data)
             },
@@ -199,9 +222,12 @@ public final class HTTPMLSDelivery: MLSDeliveryService {
         )
     }
 
-    public func createGroup(_ id: Data, token: Data) async throws -> Bool {
+    public func createGroup(_ id: Data, cipherSuite: MLSCipherSuite, token: Data) async throws -> Bool {
         do {
-            _ = try await call("POST", "/mls/v1/group", body: GroupBody(groupId: id), token: token)
+            _ = try await call(
+                "POST", "/mls/v1/group",
+                body: GroupBody(groupId: id, cipherSuite: cipherSuite.identifier), token: token
+            )
             return true
         } catch MLSDeliveryError.refused(status: 409, _) {
             return false
@@ -243,7 +269,10 @@ public final class HTTPMLSDelivery: MLSDeliveryService {
 
     private struct ClaimBody: Encodable { var device: String }
     private struct ClaimResponse: Decodable { var keyPackage: Data }
-    private struct GroupBody: Encodable { var groupId: Data }
+    private struct GroupBody: Encodable {
+        var groupId: Data
+        var cipherSuite: UInt16
+    }
 
     private struct CommitBody: Encodable {
         var epoch: UInt64
@@ -259,6 +288,7 @@ public final class HTTPMLSDelivery: MLSDeliveryService {
         struct Group: Decodable {
             var id: Data
             var epoch: UInt64
+            var cipherSuite: UInt16?
         }
 
         struct Message: Decodable {
