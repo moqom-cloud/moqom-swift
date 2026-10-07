@@ -251,19 +251,50 @@ public struct FetchOk: ControlMessage {
 public enum StreamType {
     public static let fetchHeader: UInt64 = 0x5
 
+    /// A draft-22 control stream, whose type is the SETUP message it begins
+    /// with (§6.4.1).
+    public static let setup: UInt64 = MessageType.setup.rawValue
+
+    /// A draft-22 padding stream (§11.5.1), read and discarded.
+    public static let padding: UInt64 = 0x132B_3E28
+
     /// Which kind of stream this is, from its leading varint, without consuming
     /// it — the header parsers each want the code themselves.
-    public static func peek(_ data: Data) -> Kind? {
-        var reader = WireReader(data)
+    ///
+    /// `nil` means more bytes are needed, or that the leading varint names no
+    /// stream type in `draft`; ``isUnknown(_:draft:)`` tells the two apart.
+    public static func peek(_ data: Data, draft: MoqtDraft = .draft19) -> Kind? {
+        var reader = draft.reader(data)
         guard let code = try? reader.varInt() else { return nil }
+        return kind(of: code, draft: draft)
+    }
+
+    /// Whether `data` begins with a complete varint that names no stream type
+    /// in `draft`, which draft-22 §6.4.1 makes a reason to close the session.
+    public static func isUnknown(_ data: Data, draft: MoqtDraft) -> Bool {
+        var reader = draft.reader(data)
+        guard let code = try? reader.varInt() else { return false }
+        return kind(of: code, draft: draft) == nil
+    }
+
+    private static func kind(of code: UInt64, draft: MoqtDraft) -> Kind? {
         if code == fetchHeader { return .fetch }
-        if let byte = UInt8(exactly: code), byte & SubgroupType.marker != 0 { return .subgroup }
+        if let byte = UInt8(exactly: code), byte & SubgroupType.marker != 0, byte < 0x80 {
+            return .subgroup
+        }
+        guard draft.controlStreamsAreUnidirectional else { return nil }
+        if code == setup { return .control }
+        if code == padding { return .padding }
         return nil
     }
 
     public enum Kind: Hashable, Sendable {
         case fetch
         case subgroup
+        /// The peer's control stream (draft-22).
+        case control
+        /// Padding to discard (draft-22).
+        case padding
     }
 }
 
@@ -288,6 +319,9 @@ public struct FetchHeader: Hashable, Sendable {
         writer.varInt(requestID)
     }
 
+    /// Reads in the reader's encoding. A draft-22 fill fetch stream's header
+    /// carries the Request ID of the SUBSCRIBE or REQUEST_UPDATE that asked for
+    /// the fill, not of a FETCH (§3.4).
     public static func read(from reader: inout WireReader) throws(WireError) -> FetchHeader {
         let code = try reader.varInt()
         guard code == StreamType.fetchHeader else {
@@ -339,6 +373,14 @@ public enum FetchRecord: Hashable, Sendable {
     /// know" lead a subscriber to different decisions, and collapsing them
     /// would have a cache miss look like a deleted object.
     case endOfUnknownRange(Location)
+
+    /// Everything from after the previous record up to and including this
+    /// location timed out: a relay waited the FILL_TIMEOUT for them upstream
+    /// and gave up. Draft-22 only (§11.4.1.2).
+    ///
+    /// Not the same as unknown: these were asked for and did not come in time,
+    /// so asking again later may succeed where an unknown range would not.
+    case endOfTimedOutRange(Location)
 }
 
 /// A protocol violation specific to fetch streams.
@@ -355,6 +397,10 @@ public enum FetchError: Error, Hashable, Sendable {
     /// An End of Range referred to a prior object's subgroup or priority when
     /// there had not been one.
     case rangeWithoutPriorObject
+
+    /// A marker the stream's draft does not define: End of Timed-Out Range
+    /// before draft-22.
+    case markerNotInDraft
 }
 
 /// Bit layout of a fetch record's Serialization Flags.
@@ -379,10 +425,13 @@ public struct FetchFlags: Hashable, Sendable {
 
     public static let endOfNonExistentRange: UInt64 = 0x8C
     public static let endOfUnknownRange: UInt64 = 0x10C
+    /// Draft-22 only.
+    public static let endOfTimedOutRange: UInt64 = 0x20C
 
     /// The markers as flag values, without a throwing initialiser in the way.
     static let nonExistentMarker = FetchFlags(unchecked: endOfNonExistentRange)
     static let unknownMarker = FetchFlags(unchecked: endOfUnknownRange)
+    static let timedOutMarker = FetchFlags(unchecked: endOfTimedOutRange)
 
     /// How a record names its subgroup.
     public enum Subgroup: UInt64, Sendable, Hashable {
@@ -411,10 +460,11 @@ public struct FetchFlags: Hashable, Sendable {
         self.value = value
     }
 
-    public init(code: UInt64) throws(WireError) {
+    public init(code: UInt64, draft: MoqtDraft = .draft19) throws(WireError) {
         guard code < 128
             || code == Self.endOfNonExistentRange
             || code == Self.endOfUnknownRange
+            || (code == Self.endOfTimedOutRange && draft >= .draft22)
         else {
             throw WireError.invalid(
                 "serialization flags 0x\(String(code, radix: 16)) is neither flags nor a marker"
@@ -428,7 +478,9 @@ public struct FetchFlags: Hashable, Sendable {
     }
 
     public var isEndOfRange: Bool {
-        value == Self.endOfNonExistentRange || value == Self.endOfUnknownRange
+        value == Self.endOfNonExistentRange
+            || value == Self.endOfUnknownRange
+            || value == Self.endOfTimedOutRange
     }
 
     public var hasObjectDelta: Bool { value & Self.objectDelta != 0 }
@@ -492,12 +544,14 @@ private struct FetchState: Sendable {
 public struct FetchWriter: Sendable {
     public let header: FetchHeader
     public let order: GroupOrder
+    public let draft: MoqtDraft
 
     private var state = FetchState()
 
-    public init(header: FetchHeader, order: GroupOrder = .ascending) {
+    public init(header: FetchHeader, order: GroupOrder = .ascending, draft: MoqtDraft = .draft19) {
         self.header = header
         self.order = order
+        self.draft = draft
     }
 
     /// The encoding decisions for one record, made once so that
@@ -641,6 +695,9 @@ public struct FetchWriter: Sendable {
             return try plan(marker: .nonExistentMarker, at: location)
         case let .endOfUnknownRange(location):
             return try plan(marker: .unknownMarker, at: location)
+        case let .endOfTimedOutRange(location):
+            guard draft >= .draft22 else { throw FetchError.markerNotInDraft }
+            return try plan(marker: .timedOutMarker, at: location)
         }
     }
 
@@ -680,7 +737,7 @@ public struct FetchWriter: Sendable {
         if let objectDelta = plan.objectDelta { writer.varInt(objectDelta) }
         if let priority = plan.priority { writer.byte(priority) }
         if !plan.properties.isEmpty {
-            writer.varInt(UInt64(plan.properties.encodedLength))
+            writer.varInt(UInt64(plan.properties.encodedLength(in: writer.encoding)))
             plan.properties.write(to: &writer)
         }
         let payload = plan.payload ?? Data()
@@ -699,16 +756,18 @@ public struct FetchWriter: Sendable {
 public struct FetchReader: Sendable {
     public let header: FetchHeader
     public let order: GroupOrder
+    public let draft: MoqtDraft
 
     private var state = FetchState()
 
-    public init(header: FetchHeader, order: GroupOrder = .ascending) {
+    public init(header: FetchHeader, order: GroupOrder = .ascending, draft: MoqtDraft = .draft19) {
         self.header = header
         self.order = order
+        self.draft = draft
     }
 
     public mutating func read(from reader: inout WireReader) throws(WireError) -> FetchRecord {
-        let flags = try FetchFlags(code: try reader.varInt())
+        let flags = try FetchFlags(code: try reader.varInt(), draft: draft)
 
         guard !state.isEmpty || !flags.referencesPrior else {
             throw WireError.invalid("first fetch record refers to a prior object")
@@ -727,9 +786,11 @@ public struct FetchReader: Sendable {
                 throw WireError.invalid("end of range marker carried a payload")
             }
             state.advance(to: location)
-            return flags.value == FetchFlags.endOfNonExistentRange
-                ? .endOfNonExistentRange(location)
-                : .endOfUnknownRange(location)
+            switch flags.value {
+            case FetchFlags.endOfNonExistentRange: return .endOfNonExistentRange(location)
+            case FetchFlags.endOfTimedOutRange: return .endOfTimedOutRange(location)
+            default: return .endOfUnknownRange(location)
+            }
         }
 
         let group: UInt64
@@ -788,7 +849,10 @@ public struct FetchReader: Sendable {
         if flags.hasProperties {
             let length = try reader.varInt()
             if length > 0 {
-                var body = WireReader(try reader.take(Int(length)))
+                guard let length = Int(exactly: length) else {
+                    throw WireError.invalid("properties longer than addressable memory")
+                }
+                var body = try reader.nested(length)
                 properties = try Parameters.readToEnd(from: &body)
             }
         }

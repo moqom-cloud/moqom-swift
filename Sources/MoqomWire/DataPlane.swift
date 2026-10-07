@@ -7,6 +7,10 @@
 // the reason the type codes are bit layouts rather than an enumeration, and the
 // reason they are modelled as such: an invalid combination should be
 // unconstructible rather than rejected at the socket.
+//
+// Draft-16 and draft-22 use the same layouts. What differs is the varint, which
+// the reader or writer carries, and which bits exist: draft-16 has no
+// FIRST_OBJECT bit, so ``SubgroupType`` takes the draft when validating.
 
 import Foundation
 import MoqomCore
@@ -120,6 +124,10 @@ public struct DatagramType: Hashable, Sendable {
 
 /// A single object delivered unreliably.
 public struct ObjectDatagram: Sendable {
+    /// The type of a draft-22 padding datagram (§11.5.2), which carries
+    /// nothing and is discarded. In no other draft.
+    public static let paddingType: UInt64 = 0x132B_3E29
+
     public var trackAlias: UInt64
     public var group: UInt64
     public var object: UInt64
@@ -219,7 +227,7 @@ public struct ObjectDatagram: Sendable {
         if let priority { writer.byte(priority) }
         let properties = effectiveProperties
         if !properties.isEmpty {
-            writer.varInt(UInt64(properties.encodedLength))
+            writer.varInt(UInt64(properties.encodedLength(in: writer.encoding)))
             properties.write(to: &writer)
         }
         switch content {
@@ -242,7 +250,10 @@ public struct ObjectDatagram: Sendable {
             guard length > 0 else {
                 throw WireError.invalid("properties bit set with a zero-length set")
             }
-            var body = WireReader(try reader.take(Int(length)))
+            guard let length = Int(exactly: length) else {
+                throw WireError.invalid("properties longer than addressable memory")
+            }
+            var body = try reader.nested(length)
             properties = try Parameters.readToEnd(from: &body)
         }
 
@@ -320,11 +331,19 @@ public struct SubgroupType: Hashable, Sendable {
         self.bits = bits
     }
 
-    public init(code: UInt64) throws(WireError) {
+    /// Validate a received type code.
+    ///
+    /// Draft-16's form is `0b00X1XXXX`: FIRST_OBJECT (0x40) arrived in a later
+    /// draft, so a draft-16 peer setting it is sending a code that does not
+    /// exist in its own registry.
+    public init(code: UInt64, draft: MoqtDraft = .draft19) throws(WireError) {
         guard code <= UInt64(Self.mask), UInt8(code) & ~Self.mask == 0 else {
             throw WireError.invalid("subgroup type is outside the form 0b0XX1XXXX")
         }
         let bits = UInt8(code)
+        if draft == .draft16, bits & Self.firstObject != 0 {
+            throw WireError.invalid("subgroup type 0x\(String(code, radix: 16)) has a bit draft-16 does not define")
+        }
         guard bits & Self.marker != 0 else {
             throw WireError.invalid("subgroup type must have bit 4 set")
         }
@@ -422,8 +441,11 @@ public struct SubgroupHeader: Hashable, Sendable {
         if let priority { writer.byte(priority) }
     }
 
-    public static func read(from reader: inout WireReader) throws(WireError) -> SubgroupHeader {
-        let type = try SubgroupType(code: try reader.varInt())
+    public static func read(
+        from reader: inout WireReader,
+        draft: MoqtDraft = .draft19
+    ) throws(WireError) -> SubgroupHeader {
+        let type = try SubgroupType(code: try reader.varInt(), draft: draft)
         let trackAlias = try reader.varInt()
         let group = try reader.varInt()
 
@@ -556,7 +578,7 @@ public struct SubgroupWriter: Sendable {
         if header.propertiesPresent {
             switch object.content {
             case .payload:
-                writer.varInt(UInt64(object.properties.encodedLength))
+                writer.varInt(UInt64(object.properties.encodedLength(in: writer.encoding)))
                 object.properties.write(to: &writer)
             case .terminal:
                 // A terminal object still needs the field the header promised.
@@ -623,7 +645,10 @@ public struct SubgroupReader: Sendable {
         if header.propertiesPresent {
             let length = try reader.varInt()
             if length > 0 {
-                var body = WireReader(try reader.take(Int(length)))
+                guard let length = Int(exactly: length) else {
+                    throw WireError.invalid("properties longer than addressable memory")
+                }
+                var body = try reader.nested(length)
                 properties = try Parameters.readToEnd(from: &body)
             }
         }

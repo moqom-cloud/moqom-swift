@@ -480,9 +480,12 @@ public struct PublishDone: ControlMessage {
             + WireSize.lengthPrefixed(reason)
     }
 
+    /// "Not counted" is the encoding's largest value: `2^62 - 1` under QUIC
+    /// varints and `2^64 - 1` under draft-22's, which is why the sentinel comes
+    /// from the writer rather than a constant.
     public func write(to writer: inout WireWriter) {
         writer.varInt(status)
-        writer.varInt(streamCount ?? varIntMaximum)
+        writer.varInt(streamCount ?? writer.encoding.maximum)
         writer.lengthPrefixed(reason)
     }
 
@@ -491,7 +494,7 @@ public struct PublishDone: ControlMessage {
         let count = try reader.varInt()
         return PublishDone(
             status: status,
-            streamCount: count == varIntMaximum ? nil : count,
+            streamCount: count == reader.encoding.maximum ? nil : count,
             reason: try reader.lengthPrefixedString()
         )
     }

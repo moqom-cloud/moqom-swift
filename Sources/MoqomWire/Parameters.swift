@@ -81,12 +81,12 @@ public struct Parameter: Hashable, Sendable {
         return nil
     }
 
-    fileprivate func size(after previous: UInt64) -> Int {
-        WireSize.varInt(type - previous)
+    fileprivate func size(after previous: UInt64, _ encoding: VarIntEncoding = .quic) -> Int {
+        WireSize.varInt(type - previous, encoding)
             + {
                 switch value {
-                case let .integer(v): WireSize.varInt(v)
-                case let .bytes(b): WireSize.lengthPrefixed(b.count)
+                case let .integer(v): WireSize.varInt(v, encoding)
+                case let .bytes(b): WireSize.varInt(UInt64(b.count), encoding) + b.count
                 }
             }()
     }
@@ -144,11 +144,15 @@ public struct Parameters: Hashable, Sendable, ExpressibleByArrayLiteral {
     }
 
     /// Size of the bare sequence, with no count or length prefix.
-    public var encodedLength: Int {
+    public var encodedLength: Int { encodedLength(in: .quic) }
+
+    /// Size of the bare sequence in a given varint encoding, which is what a
+    /// length prefix in front of it has to say.
+    public func encodedLength(in encoding: VarIntEncoding) -> Int {
         var previous: UInt64 = 0
         var total = 0
         for item in items {
-            total += item.size(after: previous)
+            total += item.size(after: previous, encoding)
             previous = item.type
         }
         return total

@@ -497,6 +497,7 @@ public actor MoqtSession: TransportSession {
                 switch kind {
                 case .fetch: await readFetchStream(stream, first: buffer)
                 case .subgroup: await readSubgroup(stream, first: buffer)
+                case .control, .padding: break
                 }
                 return
             }
@@ -1307,7 +1308,7 @@ public actor MoqtSession: TransportSession {
                     )
                 case let .endOfNonExistentRange(location):
                     sink.continuation.yield(.missing(through: location))
-                case let .endOfUnknownRange(location):
+                case let .endOfUnknownRange(location), let .endOfTimedOutRange(location):
                     sink.continuation.yield(.unknown(through: location))
                 }
             }
