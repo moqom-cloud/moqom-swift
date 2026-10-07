@@ -82,7 +82,7 @@ SDK.
 | Target | What it is |
 | --- | --- |
 | `MoqomCore` | Namespaces, identity, layer ladders, frame and audio types, logging |
-| `MoqomWire` | The `draft-ietf-moq-transport-19` codec: varints, parameters, control messages, datagrams, subgroup streams |
+| `MoqomWire` | The MoQ Transport codecs for drafts 16, 19 and 22: varints, parameters, control messages, datagrams, subgroup streams |
 | `MoqomKit` | Session, MOQT transport, rooms, publishing, subscribing, layer selection, SFrame, platform capture |
 | `MoqomLoopback` | An in-memory relay and an in-memory QUIC carrier, so the tests exercise the whole stack |
 
@@ -526,6 +526,59 @@ another city. What remains unobserved is narrower than it was, and specific:
   allowed there, and the ActivityKit budget is not applied. The selection and
   the throttling are tested; that the window keeps drawing and the card keeps
   updating on a real device for a real hour is not.
+
+## MoQ Transport drafts
+
+The draft is chosen by ALPN during the QUIC handshake. Three are spoken:
+
+| ALPN | Session | Used for |
+| --- | --- | --- |
+| `moqt-22` | `MoqtSession` | MOQOM relays, preferred |
+| `moqt-19` | `MoqtSession` | MOQOM relays not yet on draft-22, and direct calls |
+| `moqt-16` | `Draft16Session` | Cloudflare's relay |
+
+`RelayEndpoint(host:)` offers `moqt-22` then `moqt-19`. `DirectEndpoint` speaks
+`moqt-19` only. Draft-16 is never offered to a MOQOM relay.
+
+### Cloudflare
+
+```swift
+let session = try await MoqtTransport.network().connect(
+    to: .cloudflare(token: jwt),          // draft-16.cloudflare.mediaoverquic.com:443
+    credentials: credentials              // identity only; the token is not sent
+)
+let initSegment = try await session.subscribe(
+    SubscribeRequest(track: FullTrackName(namespace: TrackNamespace(["bbb"]), name: TrackName("0.mp4")),
+                     start: .latestGroup)
+)
+```
+
+The token is sent as the draft-16 PATH setup parameter (`/<token>`), next to
+AUTHORITY and MAX_REQUEST_ID. MOQOM's own setup options, token and proof are
+not sent. `RelayEndpoint.description` does not print the path.
+
+Cloudflare's relay does not support the following, and the SDK behaves as
+listed:
+
+| Feature | On Cloudflare |
+| --- | --- |
+| FETCH, so catch-up on join and seeking back | `fetch` throws `MoqomError.unsupportedByRelay(feature: .fetch, …)`; a room skips catch-up and waits for the next group |
+| REQUEST_UPDATE, so priority changes and pause/resume | `updatePriority` and `updateForwarding` do nothing |
+| Credential renewal | `renewCredential` throws `.unsupportedByRelay(feature: .credentialRenewal, …)`; the session ends when the token does |
+| GOAWAY | Not sent. One received is reported as an interruption |
+
+End-to-end encryption works the same on every draft: payloads are sealed above
+the transport and the object properties it authenticates go through unchanged.
+Publishing to Cloudflare is covered by unit tests against a scripted relay,
+not against Cloudflare.
+
+`CloudflareLiveTests` subscribes to `bbb` on the public relay. It is skipped
+unless asked for:
+
+```sh
+MOQOM_CF_DEMO_TOKEN=fetch swift test --filter CloudflareLiveTests   # reads the demo token from Cloudflare's docs
+MOQOM_CF_DEMO_TOKEN=<jwt> swift test --filter CloudflareLiveTests
+```
 
 ## Interop
 
