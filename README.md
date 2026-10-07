@@ -421,10 +421,10 @@ top of `Sources/MoqomKit/Transport/Transport.swift`.
   yet direct. Paths already up are kept. `RoomSession.directPaths` gives each
   participant's state and how many objects came over each path.
 
-  The offer key is the managed group's epoch authenticator, run through
-  `DirectRoomSecret`'s HKDF. The design calls for an MLS exporter secret, and
-  `ManagedRoomKeys` doesn't expose one yet. A room keyed by the app instead
-  (`useEncryption`) passes `offerSecret`, or it reports `awaitingKeys`.
+  The offer key is an MLS exporter secret from the managed group
+  (`MLS-Exporter("MOQOM direct offer", "", 32)`), run through
+  `DirectRoomSecret`'s HKDF. A room keyed by the app instead (`useEncryption`)
+  passes `offerSecret`, or it reports `awaitingKeys`.
 
   `DirectEndpointTests` runs two endpoints over loopback on macOS, and
   `DirectRoomTests` runs whole rooms on the loopback relay with a stand-in
@@ -598,9 +598,8 @@ somebody demonstrates. Both are built and wired; neither has been seen.
 ### Not written
 
 - Direct paths in a room are partial:
-  - The offer key comes from the epoch authenticator, not an MLS exporter. The
-    Rust client isn't wired into a room, so nothing on that side derives the key
-    this way yet.
+  - The Rust client isn't wired into a room, so nothing on that side derives
+    the offer key from the MLS exporter yet.
   - Backstage publishing counts as audience.
   - On the loopback relay `FORWARD=0` does nothing, so the 500 ms quiet resume
     is covered only by the `DualSubscription` tests in `DirectTests`.

@@ -492,7 +492,7 @@ public actor RoomSession {
                 view.members = Set(status.members)
                 // Every device in the group derives the same value for the same
                 // epoch, and nobody outside it can.
-                view.secret = direct?.offerSecret ?? status.epochAuthenticator
+                view.secret = direct?.offerSecret ?? status.directOfferSecret
             } else {
                 view.secret = direct?.offerSecret
             }

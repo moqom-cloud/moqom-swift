@@ -526,6 +526,11 @@ public struct MLSGroup: Sendable {
     /// the group that the other cannot see.
     public var epochAuthenticator: Data { secrets.epochAuthenticator }
 
+    /// `MLS-Exporter`, RFC 9420 §8.5, for this epoch.
+    public func export(label: String, context: Data = Data(), length: Int) -> Data {
+        secrets.export(label: label, context: context, length: length)
+    }
+
     /// The leaf a given identity occupies, if any.
     public func leaf(of identity: String) -> UInt32? {
         let bytes = Data(identity.utf8)

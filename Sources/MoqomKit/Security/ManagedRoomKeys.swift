@@ -60,6 +60,12 @@ public struct GroupKeyStatus: Sendable, Hashable {
     /// the same value to each other know that nobody is in the group that one
     /// of them cannot see — including anybody a compromised server added.
     public let epochAuthenticator: Data
+
+    /// The key direct-path candidate offers are sealed under for this epoch.
+    ///
+    /// Exported rather than taken from ``epochAuthenticator``, which is meant
+    /// to be read aloud and so is not a secret.
+    let directOfferSecret: Data
 }
 
 actor ManagedRoomKeys {
@@ -140,7 +146,8 @@ actor ManagedRoomKeys {
             epoch: group.epoch,
             cipherSuite: group.cipherSuite,
             members: group.roster.map(\.member.identityString),
-            epochAuthenticator: group.epochAuthenticator
+            epochAuthenticator: group.epochAuthenticator,
+            directOfferSecret: group.export(label: "MOQOM direct offer", length: 32)
         )
     }
 
