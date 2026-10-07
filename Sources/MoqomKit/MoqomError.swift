@@ -156,9 +156,8 @@ extension MoqomError: CustomStringConvertible {
         case let .encryptionFailed(reason):
             "encryption failed: \(reason)"
         case .encryptionRequired:
-            "encryption required: this room requires end-to-end encryption; call "
-                + "RoomSession.useEncryption(_:) before publishing, or have the room's backend "
-                + "set its e2ee policy to optional"
+            "encryption required: every room is end-to-end encrypted; pass credentials with a "
+                + "keyDelivery, or call RoomSession.useEncryption(_:) before publishing"
         case let .unsupportedByRelay(feature, relay):
             "\(relay) does not support \(feature.description)"
         case let .platform(api, status):
