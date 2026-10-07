@@ -3,6 +3,7 @@
 // 6.2 rather than 6.0 because `.v26` is not a platform SwiftPM 6.0 can name.
 // Raising the floor therefore raises the toolchain floor with it.
 
+import Foundation
 import PackageDescription
 
 // Swift 6 language mode is not negotiable here: the SDK hands frames between a
@@ -69,3 +70,64 @@ let package = Package(
         ),
     ]
 )
+
+// The Rust direct backend, from moqom-engine's moqom-direct-ffi.
+//
+// The xcframework is a build artefact of the sibling repository, not something
+// this one carries, so the targets that link it exist only when asked for:
+//
+// - `Scripts/direct-ffi.sh` builds it and copies it to `Artifacts/`, which is
+//   ignored by git. Its presence there turns the targets on, in SwiftPM and in
+//   Xcode alike.
+// - MOQOM_DIRECT_RUST=1 turns them on without a copy, linking
+//   `../moqom-engine/target/MoqomDirectFFI.xcframework`, or the path in
+//   MOQOM_DIRECT_FFI_XCFRAMEWORK (relative to this directory), which turns
+//   them on by itself.
+//
+// An environment switch as well as a file check because the manifest is
+// sandboxed and cannot see outside this directory, so it cannot notice the
+// sibling build by itself. Without either, the package is what it was and
+// `.networkFramework` is the only backend.
+let environment = ProcessInfo.processInfo.environment
+let copiedFFI = "Artifacts/MoqomDirectFFI.xcframework"
+let directFFI: String? =
+    if let path = environment["MOQOM_DIRECT_FFI_XCFRAMEWORK"] {
+        path
+    } else if FileManager.default.fileExists(atPath: Context.packageDirectory + "/" + copiedFFI) {
+        copiedFFI
+    } else if environment["MOQOM_DIRECT_RUST"] == "1" {
+        "../moqom-engine/target/MoqomDirectFFI.xcframework"
+    } else {
+        nil
+    }
+
+if let directFFI {
+    package.products.append(.library(name: "MoqomDirectRust", targets: ["MoqomDirectRust"]))
+    package.targets += [
+        // SwiftPM wants a path relative to this directory; `..` is allowed.
+        .binaryTarget(name: "MoqomDirectFFI", path: directFFI),
+        // Compiles to an empty module where there is no slice (visionOS, tvOS):
+        // everything in it is under `#if canImport(MoqomDirectFFI)`.
+        .target(
+            name: "MoqomDirectRust",
+            dependencies: [
+                "MoqomKit",
+                .target(name: "MoqomDirectFFI", condition: .when(platforms: [.iOS, .macOS])),
+            ],
+            swiftSettings: strict,
+            // What the Rust standard library and rustls reach for on Apple
+            // platforms.
+            linkerSettings: [
+                .linkedFramework("Security"),
+                .linkedFramework("CoreFoundation"),
+                .linkedFramework("SystemConfiguration", .when(platforms: [.iOS, .macOS])),
+                .linkedLibrary("resolv"),
+            ]
+        ),
+        .testTarget(
+            name: "MoqomDirectRustTests",
+            dependencies: ["MoqomDirectRust", "MoqomKit", "MoqomCore", "MoqomLoopback", "MoqomDirectTesting"],
+            swiftSettings: strict
+        ),
+    ]
+}
