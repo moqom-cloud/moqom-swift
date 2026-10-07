@@ -131,30 +131,23 @@ public struct DirectSession: Sendable {
         /// The MOQT session close code for refused credentials, as the relay
         /// uses it.
         static let unauthorized: UInt64 = 0x03
-        /// A probe's payload, matching the Rust puncher's so a capture shows
-        /// both the same.
-        static let probe = Data("MQDP".utf8)
-        /// How many rounds of probes the accepting side sends; see `punch`.
-        static let probeBurst = 3
 
         public let configuration: DirectConfiguration
-        let certificate: DirectCertificate
         /// The addresses this endpoint offers, best first.
         public let candidates: [DirectCandidate]
         /// The local port.
         public let port: UInt16
 
-        private let listener: NetworkListener<QUIC>
-        private let pin: Pin
-        private let arrivals: AsyncStream<Inbound>
-        private let arrivalsIn: AsyncStream<Inbound>.Continuation
+        private let socket: any DirectSocket
         private let lock = NSLock()
-        private var listening: Task<Void, Never>?
         private var busy = false
 
         /// This endpoint's certificate identity: base64url SHA-256 of its leaf
         /// certificate, which a peer's proof of possession must name.
-        public var certificateIdentity: String { certificate.identity }
+        public var certificateIdentity: String { socket.certificateIdentity }
+
+        /// SHA-256 of this endpoint's leaf certificate, which its offers carry.
+        public var certificateFingerprint: Data { socket.certificateFingerprint }
 
         /// Bind a port, find its candidate addresses, and make a certificate.
         ///
@@ -163,110 +156,62 @@ public struct DirectSession: Sendable {
         /// peer will learn the addresses this finds. A STUN server that does
         /// not answer is not an error: the endpoint is still useful on a local
         /// network.
+        ///
+        /// - Parameter backend: which socket to run on. Either can reach either.
         public static func bind(
             _ configuration: DirectConfiguration,
             eligibility: DirectEligibility,
-            exposure _: DirectIPExposure
+            exposure _: DirectIPExposure,
+            backend: DirectBackend = .networkFramework
         ) async throws(DirectEndpointError) -> DirectEndpoint {
             do { try eligibility.check() } catch { throw .ineligible(error) }
-            let certificate = try DirectCertificate.generate()
-            let pin = Pin()
-            let (arrivals, arrivalsIn) = AsyncStream.makeStream(of: Inbound.self, bufferingPolicy: .bufferingNewest(8))
-
-            let listener: NetworkListener<QUIC>
-            do {
-                listener = try Self.listener(configuration, certificate: certificate, pin: pin)
-            } catch {
-                throw .bind("\(error)")
+            let socket = try await backend.provider.bind(DirectSocketOptions(
+                port: configuration.port,
+                alpn: alpn,
+                idleTimeout: configuration.idleTimeout,
+                stun: configuration.stun,
+                patience: configuration.patience
+            ))
+            guard socket.certificateFingerprint.count == 32 else {
+                socket.close()
+                throw .identity("the certificate fingerprint is not SHA-256")
             }
-            let patience = configuration.patience
-            let listening = Task {
-                _ = try? await listener.run { connection in
-                    let inbound = Inbound(connection)
-                    arrivalsIn.yield(inbound)
-                    await inbound.held(unlessAdoptedWithin: patience)
-                }
-            }
-
-            var port: UInt16 = 0
-            for _ in 0 ..< 100 {
-                if let bound = listener.port?.rawValue, bound != 0 {
-                    port = bound
-                    break
-                }
-                try? await Task.sleep(for: .milliseconds(10))
-            }
-            guard port != 0 else {
-                listening.cancel()
-                throw .bind("the listener never reported a port")
-            }
+            let port = socket.port
 
             var candidates: [DirectCandidate] = []
             if let host = configuration.advertisedHost {
                 guard let candidate = DirectCandidate(host: host, port: port) else {
-                    listening.cancel()
+                    socket.close()
                     throw .bind("\(host) is not a numeric address")
                 }
                 candidates.append(candidate)
             } else {
                 candidates.append(Self.routedAddress(port: port))
             }
-            if let stun = configuration.stun,
-               let reflexive = await Self.reflexive(from: port, server: stun),
-               !candidates.contains(reflexive) {
+            if let reflexive = socket.reflexive, !candidates.contains(reflexive) {
                 candidates.append(reflexive)
             }
-
-            return DirectEndpoint(
-                configuration: configuration,
-                certificate: certificate,
-                candidates: candidates,
-                port: port,
-                listener: listener,
-                pin: pin,
-                arrivals: arrivals,
-                arrivalsIn: arrivalsIn,
-                listening: listening
-            )
+            return DirectEndpoint(configuration: configuration, socket: socket, candidates: candidates)
         }
 
-        private init(
-            configuration: DirectConfiguration,
-            certificate: DirectCertificate,
-            candidates: [DirectCandidate],
-            port: UInt16,
-            listener: NetworkListener<QUIC>,
-            pin: Pin,
-            arrivals: AsyncStream<Inbound>,
-            arrivalsIn: AsyncStream<Inbound>.Continuation,
-            listening: Task<Void, Never>
-        ) {
+        private init(configuration: DirectConfiguration, socket: any DirectSocket, candidates: [DirectCandidate]) {
             self.configuration = configuration
-            self.certificate = certificate
+            self.socket = socket
             self.candidates = candidates
-            self.port = port
-            self.listener = listener
-            self.pin = pin
-            self.arrivals = arrivals
-            self.arrivalsIn = arrivalsIn
-            self.listening = listening
+            port = socket.port
         }
 
         deinit {
-            listening?.cancel()
-            arrivalsIn.finish()
+            socket.close()
         }
 
         /// Stop listening. A session already established is unaffected on the
-        /// dialling side and ends on the accepting side, whose connection the
-        /// listener owns.
+        /// dialling side; on the accepting side that depends on the backend,
+        /// and on Network.framework's it ends, because the listener owns its
+        /// connection.
         public func close() {
-            lock.withLock {
-                busy = true
-                listening?.cancel()
-                listening = nil
-            }
-            arrivalsIn.finish()
+            lock.withLock { busy = true }
+            socket.close()
         }
 
         /// An offer telling `peer` how to reach this endpoint.
@@ -274,7 +219,7 @@ public struct DirectSession: Sendable {
             CandidateOffer(
                 from: configuration.me,
                 to: peer,
-                certificate: certificate.fingerprint,
+                certificate: socket.certificateFingerprint,
                 candidates: candidates
             )
         }
@@ -295,8 +240,9 @@ public struct DirectSession: Sendable {
             credentials: DeviceCredentials,
             verifier: any DirectPeerVerifying
         ) async throws(DirectEndpointError) -> DirectSession {
+            let fingerprint = socket.certificateFingerprint
             guard offer.to == configuration.me else { throw .offer("addressed to another participant") }
-            guard offer.certificate != certificate.fingerprint else { throw .offer("this is our own offer") }
+            guard offer.certificate != fingerprint else { throw .offer("this is our own offer") }
             guard offer.certificate.count == 32 else { throw .offer("the certificate fingerprint is not SHA-256") }
             let claimed = lock.withLock {
                 if busy { return false }
@@ -305,7 +251,7 @@ public struct DirectSession: Sendable {
             }
             guard claimed else { throw .busy }
 
-            let dialling = certificate.fingerprint.lexicographicallyPrecedes(offer.certificate)
+            let dialling = fingerprint.lexicographicallyPrecedes(offer.certificate)
             let attempt = Attempt()
             let patience = configuration.patience
             let (result, timedOut) = await withTaskGroup(
@@ -351,6 +297,19 @@ public struct DirectSession: Sendable {
             }
         }
 
+        /// Probe the peer's candidates for as long as `body` runs, where this
+        /// side should and the socket can.
+        private func punching<T>(
+            _ offer: CandidateOffer,
+            dialling: Bool,
+            _ body: () async -> T
+        ) async -> T {
+            let probing = configuration.punching && (!dialling || socket.probesWhileDialling)
+            if probing { socket.startPunching(offer.candidates, interval: configuration.punchInterval) }
+            defer { if probing { socket.stopPunching() } }
+            return await body()
+        }
+
         // MARK: - Dialling
 
         private func dial(
@@ -359,76 +318,47 @@ public struct DirectSession: Sendable {
             verifier: any DirectPeerVerifying,
             attempt: Attempt
         ) async -> Result<DirectSession, DirectEndpointError> {
-            // Released first: a live listener on the port takes the peer's
-            // replies to the dial, and the handshake never completes.
-            lock.withLock {
-                listening?.cancel()
-                listening = nil
-            }
-            try? await Task.sleep(for: .milliseconds(50))
-
-            guard let raw = await firstReady(offer) else { return .failure(.unreachable) }
-            let usage = DirectUsage()
-            let carrier = DirectCarrier(raw, awaitingAdmission: false, usage: usage)
-            await attempt.hold(carrier)
-
-            let session = MoqtSession(carrier: carrier, role: .client)
-            do {
-                try await session.performSetup(credentials: credentials)
-            } catch {
-                await carrier.close(code: 0, reason: "setup failed")
-                return .failure(Task.isCancelled ? .unreachable : .peerRejected)
-            }
-
-            let peer: VerifiedDirectPeer
-            do {
-                peer = try check(await session.peerSetupOptions, offer: offer, verifier: verifier)
-            } catch {
-                await carrier.close(code: Self.unauthorized, reason: error.description)
-                return .failure(.peerUnverified(error))
-            }
-
-            do {
-                let admission = try await carrier.openUnidirectionalStream()
-                await admission.finish()
-            } catch {
-                await carrier.close(code: 0, reason: "lost")
-                return .failure(.unreachable)
-            }
-            await session.startReading()
-            await attempt.release()
-            return .success(DirectSession(session: session, peer: peer, usage: usage))
-        }
-
-        /// Every candidate at once, from this endpoint's port; the first to
-        /// complete a handshake wins and the rest are closed.
-        private func firstReady(_ offer: CandidateOffer) async -> DirectDialCarrier? {
-            await withTaskGroup(of: DirectDialCarrier?.self) { group in
-                for candidate in offer.candidates {
-                    guard let port = NWEndpoint.Port(rawValue: candidate.port) else { continue }
-                    let remote = NWEndpoint.hostPort(host: NWEndpoint.Host(candidate.host), port: port)
-                    group.addTask { [certificate, configuration, port = self.port] in
-                        try? await DirectDialCarrier.dial(
-                            remote,
-                            from: port,
-                            certificate: certificate,
-                            pinning: offer.certificate,
-                            idleTimeout: configuration.idleTimeout,
-                            timeout: configuration.patience
-                        )
-                    }
+            await punching(offer, dialling: true) {
+                let raw: any QUICCarrier
+                do {
+                    raw = try await socket.dial(
+                        offer.candidates,
+                        pinning: offer.certificate,
+                        timeout: configuration.patience
+                    )
+                } catch {
+                    return .failure(.unreachable)
                 }
-                var winner: DirectDialCarrier?
-                for await carrier in group {
-                    guard let carrier else { continue }
-                    if winner == nil {
-                        winner = carrier
-                        group.cancelAll()
-                    } else {
-                        await carrier.close(code: 0, reason: "another path won")
-                    }
+                let usage = DirectUsage()
+                let carrier = DirectCarrier(raw, awaitingAdmission: false, usage: usage)
+                await attempt.hold(carrier)
+
+                let session = MoqtSession(carrier: carrier, role: .client)
+                do {
+                    try await session.performSetup(credentials: credentials)
+                } catch {
+                    await carrier.close(code: 0, reason: "setup failed")
+                    return .failure(Task.isCancelled ? .unreachable : .peerRejected)
                 }
-                return winner
+
+                let peer: VerifiedDirectPeer
+                do throws(DirectPeerRefusal) {
+                    peer = try check(await session.peerSetupOptions, offer: offer, verifier: verifier)
+                } catch {
+                    await carrier.close(code: Self.unauthorized, reason: error.description)
+                    return .failure(.peerUnverified(error))
+                }
+
+                do {
+                    let admission = try await carrier.openUnidirectionalStream()
+                    await admission.finish()
+                } catch {
+                    await carrier.close(code: 0, reason: "lost")
+                    return .failure(.unreachable)
+                }
+                await session.startReading()
+                await attempt.release()
+                return .success(DirectSession(session: session, peer: peer, usage: usage))
             }
         }
 
@@ -440,37 +370,15 @@ public struct DirectSession: Sendable {
             verifier: any DirectPeerVerifying,
             attempt: Attempt
         ) async -> Result<DirectSession, DirectEndpointError> {
-            // Only the offered certificate completes a handshake, and only
-            // while this runs: outside it the validator refuses everyone.
-            pin.set(offer.certificate)
-            defer { pin.set(nil) }
-
-            let puncher = configuration.punching ? punch(offer.candidates) : nil
-            defer { puncher?.cancel() }
-
-            for await inbound in arrivals {
-                // A probe opens a flow to the peer's address, and a flow that
-                // exists when the peer's packets arrive takes them from the
-                // listener. The first packet from anyone means the probes
-                // have done what they can.
-                puncher?.cancel()
-                guard inbound.adopt() else { continue }
-                let raw: NetworkQUICCarrier
+            await punching(offer, dialling: false) {
+                let raw: any QUICCarrier
                 do {
-                    raw = try await NetworkQUICCarrier.accepted(
-                        inbound.connection,
-                        alpn: Self.alpn,
-                        peerCertificate: offer.certificate.base64URLEncodedString,
-                        within: configuration.patience
-                    )
+                    raw = try await socket.accept(pinning: offer.certificate, timeout: configuration.patience)
                 } catch {
-                    // Not the peer: a probe the listener took for a connection,
-                    // or a handshake the pin refused. Keep waiting.
-                    inbound.release()
-                    continue
+                    return .failure(.unreachable)
                 }
                 let usage = DirectUsage()
-                let carrier = DirectCarrier(raw, awaitingAdmission: true, usage: usage) { inbound.release() }
+                let carrier = DirectCarrier(raw, awaitingAdmission: true, usage: usage)
                 await attempt.hold(carrier)
 
                 let verdict = Verdict()
@@ -503,36 +411,6 @@ public struct DirectSession: Sendable {
                 await attempt.release()
                 return .success(DirectSession(session: session, peer: peer, usage: usage))
             }
-            return .failure(.unreachable)
-        }
-
-        /// A short burst of probes to every candidate from this endpoint's
-        /// port, so this side's NAT expects the dialler's packets.
-        ///
-        /// A burst rather than the Rust SDK's probing for as long as it takes,
-        /// because a probe here cannot share the listener's socket: each one is
-        /// a flow of its own, and a flow to the peer's address that exists
-        /// when the peer's QUIC arrives takes those packets from the listener.
-        /// Probing throughout would keep catching the handshake. A NAT mapping
-        /// outlives the burst by far, and a packet a probe did catch is one
-        /// QUIC sends again.
-        private func punch(_ candidates: [DirectCandidate]) -> Task<Void, Never> {
-            let port = port
-            let interval = configuration.punchInterval
-            return Task {
-                guard let local = NWEndpoint.Port(rawValue: port) else { return }
-                for _ in 0 ..< Self.probeBurst where !Task.isCancelled {
-                    for candidate in candidates {
-                        guard let remote = NWEndpoint.Port(rawValue: candidate.port) else { continue }
-                        let probe = NetworkConnection(
-                            to: .hostPort(host: NWEndpoint.Host(candidate.host), port: remote),
-                            using: .parameters { UDP() }.localPort(local).localEndpointReuseAllowed(true)
-                        )
-                        try? await probe.send(Self.probe)
-                    }
-                    try? await Task.sleep(for: interval)
-                }
-            }
         }
 
         // MARK: - Checking the peer
@@ -545,7 +423,7 @@ public struct DirectSession: Sendable {
             let peer = try verifier.verify(
                 token: options.bytes(SetupOption.authorizationToken) ?? Data(),
                 proof: options.bytes(SetupOption.authorizationProof),
-                localCertificate: certificate.identity,
+                localCertificate: socket.certificateIdentity,
                 now: Date()
             )
             try directAdmissible(
@@ -557,37 +435,7 @@ public struct DirectSession: Sendable {
             return peer
         }
 
-        // MARK: - Binding
-
-        private static func listener(
-            _ configuration: DirectConfiguration,
-            certificate: DirectCertificate,
-            pin: Pin
-        ) throws -> NetworkListener<QUIC> {
-            guard let identity = sec_identity_create(certificate.secIdentity) else {
-                throw DirectEndpointError.identity("the identity could not be wrapped")
-            }
-            // No datagrams offered, matching the dialling side, which cannot
-            // read them: a peer told there are none sends audio on streams
-            // rather than into a channel nobody reads.
-            let quic = QUIC(alpn: [alpn])
-                .idleTimeout(configuration.idleTimeout.milliseconds)
-                .initialMaxBidirectionalStreams(256)
-                .initialMaxUnidirectionalStreams(1024)
-                .tls.localIdentity(identity)
-                .tls.peerAuthentication(.required)
-                .tls.certificateValidator { _, trust in
-                    guard let expected = pin.value else { return false }
-                    return DirectCertificate.leaf(of: trust, matches: expected)
-                }
-            var parameters = NWParametersBuilder.parameters { quic }
-                .localEndpointReuseAllowed(true)
-                .serviceClass(NetworkQUICCarrier.serviceClass)
-            if configuration.port != 0, let port = NWEndpoint.Port(rawValue: configuration.port) {
-                parameters = parameters.localPort(port)
-            }
-            return try NetworkListener(using: parameters)
-        }
+        // MARK: - Addresses
 
         /// The address the system would route the internet through, with this
         /// endpoint's port; loopback if there is none.
@@ -597,7 +445,7 @@ public struct DirectSession: Sendable {
         /// read which local address the kernel chose.
         static func routedAddress(port: UInt16) -> DirectCandidate {
             let loopback = DirectCandidate(address: [127, 0, 0, 1], port: port)!
-            let fd = socket(AF_INET, SOCK_DGRAM, 0)
+            let fd = Darwin.socket(AF_INET, SOCK_DGRAM, 0)
             guard fd >= 0 else { return loopback }
             defer { Darwin.close(fd) }
             var remote = sockaddr_in()
@@ -618,114 +466,6 @@ public struct DirectSession: Sendable {
             guard named == 0, local.sin_addr.s_addr != 0 else { return loopback }
             let address = withUnsafeBytes(of: local.sin_addr) { Array($0) }
             return DirectCandidate(address: address, port: port) ?? loopback
-        }
-
-        /// This port's public address, asked of a STUN server: three attempts,
-        /// each waiting a third of a second, as the Rust SDK does.
-        static func reflexive(from port: UInt16, server: (host: String, port: UInt16)) async -> DirectCandidate? {
-            guard let local = NWEndpoint.Port(rawValue: port),
-                  let remote = NWEndpoint.Port(rawValue: server.port)
-            else { return nil }
-            var random = [UInt8](repeating: 0, count: 12)
-            guard SecRandomCopyBytes(kSecRandomDefault, 12, &random) == errSecSuccess else { return nil }
-            let transaction = random
-            let request = DirectSTUN.request(transaction: transaction)
-
-            // One flow for the whole exchange, dropped on return: while it
-            // exists it takes every packet from the server's address.
-            let connection = NetworkConnection(
-                to: .hostPort(host: NWEndpoint.Host(server.host), port: remote),
-                using: .parameters { UDP() }.localPort(local).localEndpointReuseAllowed(true)
-            )
-            for _ in 0 ..< 3 {
-                guard (try? await connection.send(request)) != nil else { return nil }
-                let answer = await withTaskGroup(of: DirectCandidate?.self) { group in
-                    group.addTask {
-                        while !Task.isCancelled {
-                            guard let message = try? await connection.receive() else { return nil }
-                            if let address = DirectSTUN.parse(message.content, transaction: transaction) {
-                                return address
-                            }
-                        }
-                        return nil
-                    }
-                    group.addTask {
-                        try? await Task.sleep(for: .milliseconds(333))
-                        return nil
-                    }
-                    let first = await group.next() ?? nil
-                    group.cancelAll()
-                    return first
-                }
-                if let answer { return answer }
-            }
-            return nil
-        }
-    }
-
-    /// The certificate the listener's validator accepts, set only while an
-    /// acceptance is under way.
-    private final class Pin: @unchecked Sendable {
-        private let lock = NSLock()
-        private var expected: Data?
-
-        var value: Data? { lock.withLock { expected } }
-
-        func set(_ fingerprint: Data?) {
-            lock.withLock { expected = fingerprint }
-        }
-    }
-
-    /// One connection the listener accepted, held open by the listener's
-    /// handler for as long as something uses it.
-    private final class Inbound: @unchecked Sendable {
-        let connection: NetworkConnection<QUIC>
-        private let lock = NSLock()
-        private var adopted = false
-        private var released = false
-        private var waiter: CheckedContinuation<Void, Never>?
-
-        init(_ connection: NetworkConnection<QUIC>) {
-            self.connection = connection
-        }
-
-        /// Claim it, once.
-        func adopt() -> Bool {
-            lock.withLock {
-                if adopted || released { return false }
-                adopted = true
-                return true
-            }
-        }
-
-        func release() {
-            let waiter: CheckedContinuation<Void, Never>? = lock.withLock {
-                released = true
-                defer { self.waiter = nil }
-                return self.waiter
-            }
-            waiter?.resume()
-        }
-
-        /// Suspend until released, or until `patience` passes with nobody
-        /// having adopted it: a connection nobody is waiting for is a probe,
-        /// or a peer whose establishment already gave up.
-        func held(unlessAdoptedWithin patience: Duration) async {
-            let expiry = Task { [weak self] in
-                try? await Task.sleep(for: patience)
-                guard let self, !Task.isCancelled else { return }
-                let unclaimed = lock.withLock { !adopted }
-                if unclaimed { release() }
-            }
-            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                let already = lock.withLock {
-                    if released { return true }
-                    waiter = continuation
-                    return false
-                }
-                if already { continuation.resume() }
-            }
-            expiry.cancel()
         }
     }
 

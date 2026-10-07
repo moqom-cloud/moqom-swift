@@ -46,6 +46,7 @@
         static func dial(
             _ remote: NWEndpoint,
             from localPort: UInt16,
+            alpn: String,
             certificate: DirectCertificate,
             pinning fingerprint: Data,
             idleTimeout: Duration,
@@ -56,7 +57,7 @@
             else { throw MoqomError.transport(.unreachable) }
 
             let queue = DispatchQueue(label: "dev.moqom.direct.dial")
-            let options = NWProtocolQUIC.Options(alpn: [DirectEndpoint.alpn])
+            let options = NWProtocolQUIC.Options(alpn: [alpn])
             options.idleTimeout = Int(idleTimeout.milliseconds)
             options.initialMaxStreamsBidirectional = 256
             options.initialMaxStreamsUnidirectional = 1024
@@ -68,7 +69,7 @@
             )
             let parameters = NWParameters(quic: options)
             // From the advertised port, shared with nothing else by the time
-            // this runs: the endpoint releases its own listener first, because
+            // this runs: the socket releases its own listener first, because
             // a live listener on the port takes the peer's replies.
             parameters.requiredLocalEndpoint = .hostPort(host: "0.0.0.0", port: port)
             parameters.allowLocalEndpointReuse = true
@@ -78,16 +79,17 @@
             let carrier = DirectDialCarrier(
                 group: group,
                 queue: queue,
+                alpn: alpn,
                 certificate: fingerprint.base64URLEncodedString
             )
             try await carrier.start(within: timeout)
             return carrier
         }
 
-        private init(group: NWConnectionGroup, queue: DispatchQueue, certificate: String) {
+        private init(group: NWConnectionGroup, queue: DispatchQueue, alpn: String, certificate: String) {
             self.group = group
             self.queue = queue
-            alpn = DirectEndpoint.alpn
+            self.alpn = alpn
             peerCertificateDigest = certificate
             (lossStream, lossIn) = AsyncStream.makeStream(
                 of: TransportFailure.self,
