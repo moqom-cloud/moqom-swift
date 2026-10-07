@@ -66,6 +66,15 @@ public enum MoqomError: Error, Sendable {
     /// turns one bug into a loop.
     case protocolViolation(String)
 
+    /// The relay this session is connected to does not implement what the
+    /// call needs.
+    ///
+    /// Thrown before anything is sent, so the session is unaffected. Not a
+    /// rejection: asking again will not help, and neither will a new token —
+    /// the remedy is a relay that has the feature, which for every case today
+    /// means a MOQOM relay rather than a third-party one.
+    case unsupportedByRelay(feature: RelayFeature, relay: String)
+
     /// A platform framework returned a failure the SDK cannot interpret.
     ///
     /// The `OSStatus` is preserved verbatim because VideoToolbox status codes
@@ -150,6 +159,8 @@ extension MoqomError: CustomStringConvertible {
             "encryption required: this room requires end-to-end encryption; call "
                 + "RoomSession.useEncryption(_:) before publishing, or have the room's backend "
                 + "set its e2ee policy to optional"
+        case let .unsupportedByRelay(feature, relay):
+            "\(relay) does not support \(feature.description)"
         case let .platform(api, status):
             "\(api) failed with status \(status)"
         }

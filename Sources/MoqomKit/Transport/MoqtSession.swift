@@ -49,6 +49,12 @@ public struct MoqtTransport: Transport {
             throw MoqomError.transport(.unreachable)
         }
 
+        // Draft-16 is a different session rather than a dialect of this one:
+        // its requests share the control stream instead of owning streams.
+        if MoqtDraft(alpn: carrier.alpn) == .draft16 {
+            return try await Draft16Session.connect(over: carrier, endpoint: endpoint)
+        }
+
         let session = MoqtSession(carrier: carrier, role: .client)
         try await session.performSetup(credentials: credentials)
         await session.startReading()
@@ -1030,7 +1036,7 @@ public actor MoqtSession: TransportSession {
     /// makes it actionable, since the usual cause is a tenant or a room that
     /// disagrees with the one the token was minted for, and naming it is the
     /// difference between a fix and a bisect.
-    private static func refusal(
+    static func refusal(
         for error: RequestError,
         announcing namespace: TrackNamespace
     ) -> MoqomError {
@@ -1294,7 +1300,7 @@ public actor MoqtSession: TransportSession {
         }
     }
 
-    private static func rejection(for error: RequestError) -> MoqomError {
+    static func rejection(for error: RequestError) -> MoqomError {
         switch error.code {
         case RequestErrorCode.unauthorized,
              RequestErrorCode.expiredAuthToken,
@@ -2071,15 +2077,28 @@ private final class MoqtTrackWriter: TrackWriter {
 actor PublishedTrack {
     private struct Subscriber {
         let alias: UInt64
-        let control: any QUICStream
+        /// The subscription's own request stream, finished with the track.
+        /// `nil` in draft-16, where the request lives on the shared control
+        /// stream and is ended by a PUBLISH_DONE the session sends instead.
+        let control: (any QUICStream)?
         var stream: (any QUICSendStream)?
         var writer: SubgroupWriter?
+        /// Subgroup streams opened for this subscriber, which draft-16's
+        /// PUBLISH_DONE has to state.
+        var streamsOpened: UInt64 = 0
+    }
+
+    /// A subscriber is its request stream where it has one, and its request ID
+    /// where it shares the control stream.
+    private enum SubscriberKey: Hashable {
+        case stream(ObjectIdentifier)
+        case request(UInt64)
     }
 
     private let track: FullTrackName
     private let priority: UInt8
     private let draft: MoqtDraft
-    private var subscribers: [ObjectIdentifier: Subscriber] = [:]
+    private var subscribers: [SubscriberKey: Subscriber] = [:]
     private var carrier: (any QUICCarrier)?
     private var currentGroup: UInt64 = 0
 
@@ -2176,13 +2195,24 @@ actor PublishedTrack {
 
     func addSubscriber(alias: UInt64, stream: any QUICStream, carrier: any QUICCarrier) {
         self.carrier = carrier
-        subscribers[ObjectIdentifier(stream)] = Subscriber(alias: alias, control: stream)
+        subscribers[.stream(ObjectIdentifier(stream))] = Subscriber(alias: alias, control: stream)
+    }
+
+    func addSubscriber(alias: UInt64, request: UInt64, carrier: any QUICCarrier) {
+        self.carrier = carrier
+        subscribers[.request(request)] = Subscriber(alias: alias, control: nil)
     }
 
     func removeSubscriber(stream: any QUICStream) async {
-        guard let subscriber = subscribers.removeValue(forKey: ObjectIdentifier(stream)) else {
-            return
-        }
+        await removeSubscriber(.stream(ObjectIdentifier(stream)))
+    }
+
+    func removeSubscriber(request: UInt64) async {
+        await removeSubscriber(.request(request))
+    }
+
+    private func removeSubscriber(_ key: SubscriberKey) async {
+        guard let subscriber = subscribers.removeValue(forKey: key) else { return }
         await subscriber.stream?.finish()
     }
 
@@ -2238,6 +2268,7 @@ actor PublishedTrack {
                 var writer = draft.writer(capacity: header.encodedLength)
                 header.write(to: &writer)
                 try await stream.write(writer.bytes)
+                subscriber.streamsOpened += 1
                 subscriber.stream = stream
                 subscriber.writer = SubgroupWriter(header: header)
             }
@@ -2267,12 +2298,18 @@ actor PublishedTrack {
         }
     }
 
-    func finish() async {
-        for subscriber in subscribers.values {
+    /// End the track for everyone, returning the subscribers that share a
+    /// control stream so the session can tell them in a message.
+    @discardableResult
+    func finish() async -> [(request: UInt64, streams: UInt64)] {
+        var ended: [(request: UInt64, streams: UInt64)] = []
+        for (key, subscriber) in subscribers {
             await subscriber.stream?.finish()
-            await subscriber.control.finish()
+            await subscriber.control?.finish()
+            if case let .request(request) = key { ended.append((request, subscriber.streamsOpened)) }
         }
         subscribers.removeAll()
+        return ended
     }
 }
 

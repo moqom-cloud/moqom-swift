@@ -43,10 +43,115 @@ public struct RelayEndpoint: Hashable, Sendable {
     /// the session speaks whichever the relay picks.
     public let alpn: [String]
 
-    public init(host: String, port: UInt16 = 443, alpn: [String] = ["moqt-22", "moqt-19"]) {
+    /// Whose relay this is, which decides what a session may ask of it.
+    public let profile: RelayProfile
+
+    /// The draft-16 PATH setup parameter: the path, with any query, a raw-QUIC
+    /// client would have put in a URL. `nil` for relays that take their
+    /// credential from the token instead.
+    ///
+    /// May hold a bearer credential, which is why ``description`` does not
+    /// print it.
+    public let path: String?
+
+    public init(
+        host: String,
+        port: UInt16 = 443,
+        alpn: [String] = ["moqt-22", "moqt-19"],
+        profile: RelayProfile = .moqom,
+        path: String? = nil
+    ) {
         self.host = host
         self.port = port
         self.alpn = alpn
+        self.profile = profile
+        self.path = path
+    }
+
+    /// A Cloudflare MoQ relay, which speaks draft-16 and authorises by a token
+    /// in the setup PATH.
+    ///
+    /// - Parameter token: the JWT Cloudflare issued, sent as PATH `/<token>`.
+    /// - Parameter host: the relay; the default is Cloudflare's public
+    ///   draft-16 endpoint.
+    public static func cloudflare(
+        token: String,
+        host: String = "draft-16.cloudflare.mediaoverquic.com",
+        draft: CloudflareDraft = .draft16
+    ) -> RelayEndpoint {
+        RelayEndpoint(host: host, port: 443, alpn: [draft.alpn], profile: .cloudflare, path: "/" + token)
+    }
+}
+
+extension RelayEndpoint: CustomStringConvertible {
+    public var description: String {
+        "\(host):\(port) \(alpn.joined(separator: ",")) \(profile)" + (path == nil ? "" : " path=<redacted>")
+    }
+}
+
+/// The drafts Cloudflare's relay is reachable on that this SDK speaks.
+///
+/// Its own enumeration, rather than ``MoqtDraft``, so that asking for a draft
+/// Cloudflare runs and this SDK does not is a compile error rather than a
+/// failed handshake. Adding draft-18 is a case here and a dialect for it.
+public enum CloudflareDraft: Sendable, CaseIterable {
+    case draft16
+
+    var alpn: String {
+        switch self {
+        case .draft16: "moqt-16"
+        }
+    }
+}
+
+/// Whose relay an endpoint is, and so which features a session can use.
+public enum RelayProfile: Hashable, Sendable, CustomStringConvertible {
+    /// A MOQOM relay: every feature this SDK has.
+    case moqom
+    /// Cloudflare's MoQ relay, as of its draft-16 deployment.
+    case cloudflare
+
+    /// What this relay does not implement, and so what a session refuses to
+    /// ask of it.
+    public var unsupported: Set<RelayFeature> {
+        switch self {
+        case .moqom:
+            []
+        case .cloudflare:
+            // From Cloudflare's published draft-16 support matrix: no FETCH,
+            // no REQUEST_UPDATE, no GOAWAY. MOQOM's admission (its token and
+            // proof) and in-session renewal are MOQOM's own.
+            [.fetch, .requestUpdate, .credentialRenewal, .goaway]
+        }
+    }
+
+    public var description: String {
+        switch self {
+        case .moqom: "MOQOM relay"
+        case .cloudflare: "Cloudflare relay"
+        }
+    }
+}
+
+/// A capability a relay may lack.
+public enum RelayFeature: Hashable, Sendable, CaseIterable, CustomStringConvertible {
+    /// FETCH, and with it catch-up on join and seeking back through a track.
+    case fetch
+    /// REQUEST_UPDATE, which is how a live subscription is paused and resumed
+    /// (FORWARD) and how its priority is changed.
+    case requestUpdate
+    /// Replacing the session's credential without reconnecting.
+    case credentialRenewal
+    /// GOAWAY, the relay asking a client to move.
+    case goaway
+
+    public var description: String {
+        switch self {
+        case .fetch: "FETCH (catch-up and history)"
+        case .requestUpdate: "REQUEST_UPDATE (pausing a subscription or changing its priority)"
+        case .credentialRenewal: "renewing a credential in-session"
+        case .goaway: "GOAWAY"
+        }
     }
 }
 
