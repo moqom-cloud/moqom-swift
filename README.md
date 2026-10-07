@@ -85,6 +85,7 @@ SDK.
 | `MoqomWire` | The MoQ Transport codecs for drafts 16, 19 and 22: varints, parameters, control messages, datagrams, subgroup streams |
 | `MoqomKit` | Session, MOQT transport, rooms, publishing, subscribing, layer selection, SFrame, platform capture |
 | `MoqomLoopback` | An in-memory relay and an in-memory QUIC carrier, so the tests exercise the whole stack |
+| `MoqomDirectRust` | Optional. Direct paths over the Rust `moqom-direct-ffi` instead of `Network.framework`; present only when its xcframework is (see [Direct backends](#direct-backends)) |
 
 ## Status
 
@@ -357,6 +358,75 @@ top of `Sources/MoqomKit/Transport/Transport.swift`.
 
   `DirectEndpointTests` runs two endpoints over loopback on macOS. It hasn't
   run across real networks.
+
+  #### Direct backends
+
+  `DirectEndpoint` is the MOQT half of a direct path. The socket under it —
+  the port, the certificate, probing, dialling and accepting — sits behind
+  `DirectSocketProvider` and `DirectSocket`, and is chosen when the SDK is
+  made:
+
+  ```swift
+  import MoqomDirectRust
+
+  let session = MoqomSession(
+      transport: transport, credentials: credentials, tenant: tenant,
+      directBackend: .rust
+  )
+  let endpoint = try await session.bindDirectEndpoint(configuration, eligibility: eligibility, exposure: exposure)
+  ```
+
+  - `.networkFramework`, the default, is the code that was there before,
+    moved rather than rewritten: the accepting side probes in a burst only,
+    and the listener is cancelled before dialling. `DirectEndpointTests` runs
+    on it unchanged.
+  - `.rust`, from `MoqomDirectRust`, is quinn behind `moqom-direct-ffi` in
+    `moqom-engine`. One socket listens and dials at once, so it probes on
+    both sides for the whole of establishment, and it carries QUIC datagrams.
+    `RustDirectBackend.isCompatible` checks the library's ABI version; a
+    mismatch fails `bind` instead of calling into it.
+  - `.custom(_:)` takes any other `DirectSocketProvider`.
+
+  The module exists only when the xcframework does, so a checkout without it
+  builds exactly as before. `Scripts/direct-ffi.sh` runs the engine's
+  `build-apple.sh` and copies `MoqomDirectFFI.xcframework` into `Artifacts/`
+  (ignored by git), which the manifest looks for; `--copy` skips the build
+  and `--remove` takes it out again. The manifest is sandboxed and cannot see
+  the sibling repository, so the alternatives are environment variables:
+  `MOQOM_DIRECT_RUST=1` uses `../moqom-engine/target/MoqomDirectFFI.xcframework`,
+  and `MOQOM_DIRECT_FFI_XCFRAMEWORK` names any relative path. SwiftPM caches
+  the manifest's answer, so after the framework appears or goes, run
+  `swift package purge-cache` (the script does). iOS and macOS only: the
+  engine builds no visionOS or tvOS slices, and the Rust target links the
+  framework on those two platforms alone.
+
+  `MoqomDirectRustTests` establishes a direct session for every pairing —
+  Rust to Rust, `Network.framework` dialling Rust, and Rust dialling
+  `Network.framework` — and in each sends media both ways and refuses a
+  viewer, an impostor and the wrong certificate. Below MOQT it checks
+  bidirectional and 300 KB unidirectional streams, finish, reset, datagrams,
+  and that a deliberate close is not reported as loss. All of it passes on
+  macOS, from both the `Artifacts/` copy and `MOQOM_DIRECT_RUST=1`. Three
+  things it found:
+
+  - `NWConnectionGroup` opens a bidirectional stream of its own and never
+    writes to it, and quinn hands that stream to the acceptor first, ahead
+    of the control stream. `RustQUICCarrier` therefore offers an inbound
+    bidirectional stream only once it has carried a byte or ended. The Rust
+    client's `moqom_client::direct` accepting from this SDK's
+    `Network.framework` backend should have the same problem, and that has not
+    been tested.
+  - A reset from a `NetworkQUICCarrier` stream, on the side that accepted,
+    never reaches a Rust reader while the stream is open. It is recorded as a
+    known issue, not a pass.
+  - On the iOS Simulator, the refusal scenarios crash inside
+    `NetworkQUICCarrier.close`, which sets the application error on a
+    connection the peer has already closed, and `Network.framework` traps.
+    It happens with `Network.framework` on both ends as well, so the Rust
+    backend did not cause it, but nothing had run those paths on iOS
+    before. The scenarios without a `Network.framework` acceptor pass
+    there. `MoqomDirectRust` builds for iOS devices and the simulator, and
+    has not run on a phone.
 - **Space edits, events and playout.** `SpaceEdit` adds spawn, move, despawn
   and event without the app writing a simulation; the simulation can still
   refuse them. `SpaceEvents` delivers moments (a goal, a turn) exactly once and
@@ -454,6 +524,8 @@ somebody demonstrates. Both are built and wired; neither has been seen.
 
 - Direct mode is not wired into `Room`. An app can drive the pieces above
   itself, but `Room` does not yet offer or take a direct path on its own.
+  `MoqomSession.directBackend` and `bindDirectEndpoint` are as far as the
+  session goes.
 - Media kinds are not enforced per track. `moqt.pub` distinguishes audio from
   video from screen, and the relay checks only that it is non-empty, so a token
   minted for audio can publish video under a namespace it does own.
@@ -707,6 +779,17 @@ encode rather than a namespace with no media behind it.
   and a build that cross-compiles for four Apple platforms — to reach a QUIC
   stack that `Network.framework` already provides. The mitigation is that the
   tests pin bytes the Rust side produced rather than bytes we produced.
+- **A Rust runtime after all, for direct paths only, and optional.** The
+  argument above holds for the relay, where one connection is dialled and
+  `Network.framework` is enough. A direct path is different. It needs one port
+  that listens and dials at once and keeps probing until somebody gets
+  through, and `Network.framework` can do this only by cancelling its listener
+  before dialling and limiting the accepting side to a burst of probes. The
+  Rust backend has neither limit, and it is the same QUIC stack as the Rust
+  client at the other end. It sits behind `DirectSocket`, so the MOQT, the
+  token checks and the tickets stay in one Swift implementation. It is opt-in
+  per session, and absent from any build that has not fetched its
+  framework, so an app that never asks for it carries no Rust at all.
 - **Time is injected into the session state machine.** `MonotonicTime` is a
   parameter on every transition and there is no clock inside the SDK. It makes
   the reconnect windows testable in microseconds, and it means an app with a
