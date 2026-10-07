@@ -83,7 +83,10 @@ struct DirectPeerCheckTests {
                 == .failure(.proofWrongKey)
         )
         var tampered = [UInt8](try proof(token))
-        tampered[tampered.count - 3] ^= 0x01
+        // Swapped for another base64url character: flipping a bit can leave the
+        // alphabet, which is a malformed proof rather than a bad signature.
+        let index = tampered.count - 3
+        tampered[index] = tampered[index] == UInt8(ascii: "A") ? UInt8(ascii: "B") : UInt8(ascii: "A")
         #expect(verify(token, proof: Data(tampered), check: check) == .failure(.proofBadSignature))
 
         let good = try proof(token)

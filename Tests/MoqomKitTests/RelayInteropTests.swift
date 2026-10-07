@@ -23,7 +23,10 @@
 // Skipping rather than failing when it is absent is the right trade for a client
 // SDK whose CI has no Rust toolchain — but it does mean a green run here is not
 // evidence of interop unless that variable was set.
+//
+// macOS only: it launches the relay with `Process`, which iOS doesn't have.
 
+#if os(macOS)
 import Foundation
 import Synchronization
 import Testing
@@ -498,3 +501,4 @@ private extension String {
         hasPrefix(prefix) ? String(dropFirst(prefix.count)) : nil
     }
 }
+#endif
