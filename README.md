@@ -331,6 +331,21 @@ top of `Sources/MoqomKit/Transport/Transport.swift`.
   `MLSDelivery` is the ordering service: it only ever sees public key packages
   and sealed commits, never anything that derives a key. The committer is the
   lowest live leaf, with a fallback, so there is no election.
+  Groups are founded in a hybrid post-quantum suite,
+  `MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519` from
+  draft-ietf-mls-pq-ciphersuites (the X-Wing KEM: ML-KEM-768 with X25519).
+  The draft has no code point yet, so MoqomKit uses `0xF0A1` from RFC 9420's
+  private-use range, and no other MLS implementation will recognise it. Every
+  commit secret and joiner secret is sealed to X-Wing, so the epoch secrets
+  and the SFrame keys derived from them stay confidential unless both
+  ML-KEM-768 and X25519 are broken. Signatures are not post-quantum: MLS
+  signatures are Ed25519, device proofs are ES256, and tokens are EdDSA. They
+  authenticate members during a call, and breaking one later would not
+  decrypt recorded traffic. Suite `0x0001` still works for existing groups. A
+  group keeps one suite for its whole life, and a key package in another suite
+  is refused. X-Wing makes a key package about 2.5 KB and adds about 1.2 KB per
+  member to each commit and Welcome. `MLSHybridSuiteTests` checks CryptoKit's
+  X-Wing against the HPKE working group's KEM `0x647a` test vector.
 - **Direct (peer-to-peer) calls**, in `Sources/MoqomKit/Direct/`. Wire-compatible
   with the Rust client's `moqom_client::direct`, so either SDK can be either
   end:
