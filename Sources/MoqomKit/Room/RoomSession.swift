@@ -70,11 +70,9 @@ public actor RoomSession {
     /// credential because the connection is shared by every room on it.
     private let presentCredential: CredentialUpdate?
 
-    /// Whether this room insists on end-to-end encryption, as the token says.
-    ///
-    /// ``EncryptionPolicy/required`` unless the control plane minted this
-    /// session's token for a room an administrator set to optional. Not settable
-    /// from here, on purpose: see ``EncryptionPolicy``.
+    /// Whether this room insists on end-to-end encryption:
+    /// ``EncryptionPolicy/required``. Not settable, on purpose: see
+    /// ``EncryptionPolicy``.
     public private(set) var encryptionPolicy: EncryptionPolicy
 
     /// Participants already told about through ``RoomEvent/encryptionRequired(_:)``.
@@ -320,9 +318,7 @@ public actor RoomSession {
     /// in a group are encrypted and some are not, which no receiver can be
     /// expected to sort out.
     ///
-    /// Required, not optional, in a room whose ``encryptionPolicy`` is
-    /// ``EncryptionPolicy/required`` — which is every room unless its backend
-    /// said otherwise. Without it ``startBroadcast(from:configuration:backstage:)``
+    /// Required in every room. Without it ``startBroadcast(from:configuration:backstage:)``
     /// and ``startAudio(from:configuration:backstage:)`` throw
     /// ``MoqomError/encryptionRequired`` and incoming media is dropped.
     ///
@@ -478,7 +474,7 @@ public actor RoomSession {
 
         private func directView() async -> DirectRoomView {
             var view = DirectRoomView()
-            view.encrypted = encryption != nil && encryptionPolicy == .required
+            view.encrypted = encryption != nil && !encryptionPolicy.allowsPlaintext
             // Direct offers travel on the stage slot, so a publication backstage
             // leaves this device in the audience as far as direct paths go.
             let stage = try? slotNamespace(backstage: false)
@@ -601,7 +597,7 @@ public actor RoomSession {
     /// Rooms only. A personal channel is a broadcast to an audience of any
     /// size, which is the case group key agreement is the wrong tool for.
     private func startManagedKeysIfNeeded() async {
-        guard encryption == nil, managedKeys == nil, encryptionPolicy == .required, channel == nil,
+        guard encryption == nil, managedKeys == nil, !encryptionPolicy.allowsPlaintext, channel == nil,
               let keyDelivery, let currentToken
         else { return }
         let keys = ManagedRoomKeys(
@@ -615,21 +611,16 @@ public actor RoomSession {
         logger.info(.room, "end-to-end encryption keys are managed by MLS")
     }
 
-    /// Take the policy a renewed token states.
-    ///
-    /// Tightening applies at once, including to a publication already going out
-    /// in the clear: it is stopped, and this device is told why through
-    /// ``RoomEvent/encryptionRequired(_:)``. Letting it carry on until the
-    /// broadcast happened to end would make "required" mean "required for
-    /// whoever starts next", which is not what an administrator who tightened a
-    /// room was asking for. Loosening permits later publications and stops
-    /// nothing.
+    /// Take the policy renewed credentials state, which outside this package's
+    /// tests is always ``EncryptionPolicy/required``. Moving to required stops
+    /// a publication going out in the clear, and this device is told why
+    /// through ``RoomEvent/encryptionRequired(_:)``.
     func applyEncryptionPolicy(_ policy: EncryptionPolicy) async {
         guard policy != encryptionPolicy else { return }
         encryptionPolicy = policy
         logger.info(.room, "encryption policy changed", [LogField("e2ee", .text(policy.rawValue))])
-        if policy == .required { await startManagedKeysIfNeeded() }
-        guard policy == .required, encryption == nil else { return }
+        if !policy.allowsPlaintext { await startManagedKeysIfNeeded() }
+        guard !policy.allowsPlaintext, encryption == nil else { return }
         let publishing = broadcast != nil || audio != nil
         await stopBroadcast()
         await stopAudio()
@@ -638,7 +629,7 @@ public actor RoomSession {
 
     /// Refuse to publish in the clear unless the room allows it.
     private func requireEncryptionIfPolicyDemands() throws(MoqomError) {
-        guard encryption == nil, encryptionPolicy == .required else { return }
+        guard encryption == nil, !encryptionPolicy.allowsPlaintext else { return }
         logger.error(.publish, "refused to publish without end-to-end encryption", [
             LogField("e2ee", .text(encryptionPolicy.rawValue)),
         ])
@@ -650,11 +641,11 @@ public actor RoomSession {
     /// The one place incoming media is opened, so live video, audio, catch-up and
     /// replay cannot disagree about what a room's policy permits. With a key,
     /// everything must decrypt — plaintext fails authentication like any other
-    /// forgery. Without one, plaintext is accepted only when the room is
-    /// optional; a required room drops it and says so once per participant.
+    /// forgery. Without one, everything is dropped, and said so once per
+    /// participant.
     private func open(_ object: TrackObject, from who: ParticipantIdentity) async -> TrackObject? {
         if let unprotector { return await unprotector.unprotect(object) }
-        guard encryptionPolicy == .optional else {
+        guard encryptionPolicy.allowsPlaintext else {
             if refusedUnencrypted.insert(who).inserted {
                 logger.warning(.media, "dropping media: the room requires end-to-end encryption", [
                     LogField("participant", .participant(who)),

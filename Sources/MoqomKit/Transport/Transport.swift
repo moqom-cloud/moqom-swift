@@ -214,13 +214,14 @@ public struct DeviceCredentials: Sendable {
     /// Where a room's end-to-end encryption keys are agreed, when the SDK is
     /// to manage them.
     ///
-    /// Set, in a room whose token says encryption is required, and the room
-    /// keys itself with MLS: no key passes through the application and none
+    /// Set, and the room keys itself with MLS: no key passes through the application and none
     /// reaches MOQOM's servers, which only order and forward ciphertext. A key
-    /// given to ``RoomSession/useEncryption(_:)`` overrides it. `nil` keeps the
-    /// earlier behaviour, where a required room publishes nothing until the
-    /// application supplies a key. ``TokenService/keyDelivery`` is MOQOM's.
+    /// given to ``RoomSession/useEncryption(_:)`` overrides it. `nil` and the room
+    /// publishes nothing until the application supplies a key. ``TokenService/keyDelivery`` is MOQOM's.
     public let keyDelivery: (any MLSDeliveryService)?
+
+    /// See ``EncryptionPolicy/plaintextForTesting``.
+    var plaintextForTesting = false
 
     public init(
         identity: ParticipantIdentity,
@@ -244,7 +245,7 @@ public struct DeviceCredentials: Sendable {
     /// renewal repeatable: the replacement has to be able to replace itself, and
     /// to prove itself with the key the new token was issued to.
     public func replacing(with issued: IssuedToken) -> DeviceCredentials {
-        DeviceCredentials(
+        var replaced = DeviceCredentials(
             identity: identity,
             token: issued.token,
             deviceKey: deviceKey,
@@ -252,6 +253,8 @@ public struct DeviceCredentials: Sendable {
             renew: renew,
             keyDelivery: keyDelivery
         )
+        replaced.plaintextForTesting = plaintextForTesting
+        return replaced
     }
 }
 

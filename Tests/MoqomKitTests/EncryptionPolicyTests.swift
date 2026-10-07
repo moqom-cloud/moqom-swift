@@ -7,31 +7,30 @@ import Testing
 
 @Suite("Encryption policy from the token")
 struct EncryptionPolicyClaimTests {
-    @Test("a token with no e2ee claim requires encryption")
-    func absentClaimIsRequired() {
-        #expect(EncryptionPolicy(token: testToken(subject: "alice", e2ee: nil)) == .required)
+    private func policy(_ token: Data) -> EncryptionPolicy {
+        DeviceCredentials(identity: identity("alice"), token: token, deviceKey: nil).encryptionPolicy
     }
 
-    @Test("only an exact optional claim relaxes it")
-    func onlyOptionalRelaxes() {
-        #expect(EncryptionPolicy(token: testToken(subject: "alice", e2ee: .optional)) == .optional)
-        #expect(EncryptionPolicy(token: testToken(subject: "alice", e2ee: .required)) == .required)
-
-        // A value this build does not know — a stricter mode a newer control
-        // plane invented, or a typo — must not read as permission.
+    @Test("every token requires encryption, including one that claims optional")
+    func everyTokenIsRequired() {
+        #expect(policy(testToken(subject: "alice", e2ee: nil)) == .required)
+        #expect(policy(testToken(subject: "alice", e2ee: .required)) == .required)
         let header = Data(#"{"alg":"EdDSA"}"#.utf8).base64URLEncodedString
-        for value in ["OPTIONAL", "off", "", "none"] {
+        for value in ["optional", "OPTIONAL", "off", "", "none", "plaintext-for-testing"] {
             let claims = Data(#"{"e2ee":"\#(value)"}"#.utf8).base64URLEncodedString
-            let token = Data("\(header).\(claims).sig".utf8)
-            #expect(EncryptionPolicy(token: token) == .required, "\(value)")
+            #expect(policy(Data("\(header).\(claims).sig".utf8)) == .required, "\(value)")
+        }
+        for raw in ["", "token-alice", "a.b.c", "a.b", "a.!!!.c"] {
+            #expect(policy(Data(raw.utf8)) == .required, "\(raw)")
         }
     }
 
-    @Test("a token that is not a compact JWS requires encryption")
-    func unreadableTokensFailClosed() {
-        for raw in ["", "token-alice", "a.b.c", "a.b", "a.!!!.c"] {
-            #expect(EncryptionPolicy(token: Data(raw.utf8)) == .required, "\(raw)")
-        }
+    @Test("a renewed credential keeps the policy it had")
+    func renewalKeepsPolicy() {
+        let issued = IssuedToken(
+            token: testToken(subject: "alice", e2ee: nil), expiresAt: Date(), username: "alice", room: "room-42"
+        )
+        #expect(credentials("alice", e2ee: .required).replacing(with: issued).encryptionPolicy == .required)
     }
 }
 
@@ -143,7 +142,7 @@ struct EncryptionPolicyMediaTests {
     @Test("unencrypted media is dropped by a required room with no key, and it says so")
     func unencryptedIncomingRefusedWithoutKey() async throws {
         let relay = LoopbackRelay()
-        let hostRoom = try await join("alice", e2ee: .optional, relay: relay)
+        let hostRoom = try await join("alice", e2ee: .plaintextForTesting, relay: relay)
         let viewerRoom = try await join("bob", e2ee: .required, relay: relay)
 
         let who = identity("alice")
@@ -184,7 +183,7 @@ struct EncryptionPolicyMediaTests {
     @Test("unencrypted media fails authentication in a room holding a key")
     func unencryptedIncomingRejectedWithKey() async throws {
         let relay = LoopbackRelay()
-        let hostRoom = try await join("alice", e2ee: .optional, relay: relay)
+        let hostRoom = try await join("alice", e2ee: .plaintextForTesting, relay: relay)
         let viewerRoom = try await join("bob", e2ee: .required, relay: relay)
         await viewerRoom.useEncryption(.sharedKey(Data(repeating: 0x5A, count: 32), keyID: 1))
 
@@ -211,9 +210,9 @@ struct EncryptionPolicyMediaTests {
     @Test("an optional room carries media in the clear between sessions with no key")
     func optionalPolicyAllowsClear() async throws {
         let relay = LoopbackRelay()
-        let hostRoom = try await join("alice", e2ee: .optional, relay: relay)
-        let viewerRoom = try await join("bob", e2ee: .optional, relay: relay)
-        #expect(await hostRoom.encryptionPolicy == .optional)
+        let hostRoom = try await join("alice", e2ee: .plaintextForTesting, relay: relay)
+        let viewerRoom = try await join("bob", e2ee: .plaintextForTesting, relay: relay)
+        #expect(await hostRoom.encryptionPolicy == .plaintextForTesting)
 
         let who = identity("alice")
         let source = FrameRelay(format: CaptureFormat(size: rung.size, frameRate: 30), depth: 16)
@@ -241,7 +240,7 @@ struct EncryptionPolicyMediaTests {
     @Test("a policy tightened mid-call stops a publication going out in the clear")
     func tighteningStopsClearPublication() async throws {
         let relay = LoopbackRelay()
-        let room = try await join("alice", e2ee: .optional, relay: relay)
+        let room = try await join("alice", e2ee: .plaintextForTesting, relay: relay)
         let me = identity("alice")
         let told = Task {
             for await event in room.events {

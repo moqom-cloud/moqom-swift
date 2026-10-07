@@ -52,21 +52,23 @@ func framesEncodedOnceSettled(_ broadcast: Broadcast) async -> Int {
 
 /// Credentials for a loopback session.
 ///
-/// The token is shaped like a compact JWS so that its `e2ee` claim is read
-/// exactly as a minted one would be. Optional by default, because most suites
-/// here are about something other than encryption and inspect media bytes on
-/// the loopback relay; the suites that are about encryption pass `.required`
-/// or `nil` (no claim, which the SDK reads as required) and say so.
+/// The token is shaped like a compact JWS, as a minted one is. In the clear
+/// by default (``EncryptionPolicy/plaintextForTesting``, which no token or
+/// application can ask for), because most suites here are about something
+/// other than encryption and inspect media bytes on the loopback relay; the
+/// suites that are about encryption pass `.required` or `nil` and say so.
 func credentials(
     _ name: String,
     device: String = "iphone-0001",
-    e2ee: EncryptionPolicy? = .optional
+    e2ee: EncryptionPolicy? = .plaintextForTesting
 ) -> DeviceCredentials {
-    DeviceCredentials(
+    var credentials = DeviceCredentials(
         identity: identity(name, device: device),
-        token: testToken(subject: name, e2ee: e2ee),
+        token: testToken(subject: name, e2ee: e2ee == nil ? nil : .required),
         deviceKey: nil
     )
+    credentials.plaintextForTesting = e2ee == .plaintextForTesting
+    return credentials
 }
 
 /// An unsigned token carrying the claims the SDK reads. The loopback relay

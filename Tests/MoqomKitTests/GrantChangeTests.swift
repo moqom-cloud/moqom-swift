@@ -43,7 +43,7 @@ private actor Wire {
 /// A token for the new role, with the claims the SDK reads.
 private func issued(_ name: String, lasting seconds: TimeInterval = 900) -> IssuedToken {
     IssuedToken(
-        token: testToken(subject: name, e2ee: .optional),
+        token: testToken(subject: name, e2ee: .required),
         expiresAt: Date().addingTimeInterval(seconds),
         username: name,
         room: "room-42"
@@ -117,13 +117,17 @@ struct GrantChangeTests {
         let wire = Wire()
         let session = MoqomSession(
             transport: WireTransport(relay: LoopbackRelay(), wire: wire),
-            credentials: DeviceCredentials(
-                identity: identity("bob"),
-                token: testToken(subject: "bob", e2ee: .optional),
-                deviceKey: nil,
-                expiresAt: Date().addingTimeInterval(3600),
-                renew: { issued("viewer") }
-            ),
+            credentials: {
+                var credentials = DeviceCredentials(
+                    identity: identity("bob"),
+                    token: testToken(subject: "bob", e2ee: .required),
+                    deviceKey: nil,
+                    expiresAt: Date().addingTimeInterval(3600),
+                    renew: { issued("viewer") }
+                )
+                credentials.plaintextForTesting = true
+                return credentials
+            }(),
             tenant: "acme",
             clock: { .zero },
             sleeper: { _ in }
