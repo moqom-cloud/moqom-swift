@@ -25,6 +25,10 @@ public actor MoqomSession {
     /// application's own logging rather than Xcode's console.
     public nonisolated let logger: MoqomLogger
 
+    /// Which socket direct (peer-to-peer) paths run on; see
+    /// ``bindDirectEndpoint(_:eligibility:exposure:)``.
+    public nonisolated let directBackend: DirectBackend
+
     private let transport: any Transport
 
     /// The credential in force, which is not the one this session was built
@@ -65,12 +69,16 @@ public actor MoqomSession {
     ///   - sleeper: waits out a backoff. Injected for the same reason and one
     ///     more: a test for a retry that succeeds on the third attempt should
     ///     not take as long as three real backoffs.
+    ///   - directBackend: the socket direct paths run on. Network.framework by
+    ///     default; `.rust` from the `MoqomDirectRust` module where it is
+    ///     built.
     public init(
         transport: any Transport,
         credentials: DeviceCredentials,
         tenant: TenantID,
         reconnectPolicy: ReconnectPolicy = .default,
         logger: MoqomLogger = .silent,
+        directBackend: DirectBackend = .networkFramework,
         clock: @escaping @Sendable () -> MonotonicTime = MoqomSession.systemClock,
         sleeper: @escaping @Sendable (Duration) async -> Void = MoqomSession.systemSleeper
     ) {
@@ -78,6 +86,7 @@ public actor MoqomSession {
         self.credentials = credentials
         self.tenant = tenant
         self.logger = logger
+        self.directBackend = directBackend
         self.clock = clock
         self.sleeper = sleeper
         identity = credentials.identity
@@ -102,6 +111,25 @@ public actor MoqomSession {
 
     /// Where the session is.
     public var state: SessionState { machine.state }
+
+    #if canImport(Network)
+        /// A direct endpoint on this session's ``directBackend``.
+        ///
+        /// Not used by ``Room`` yet: an app that wants a direct path drives the
+        /// endpoint itself.
+        public nonisolated func bindDirectEndpoint(
+            _ configuration: DirectConfiguration,
+            eligibility: DirectEligibility,
+            exposure: DirectIPExposure
+        ) async throws(DirectEndpointError) -> DirectEndpoint {
+            try await DirectEndpoint.bind(
+                configuration,
+                eligibility: eligibility,
+                exposure: exposure,
+                backend: directBackend
+            )
+        }
+    #endif
 
     /// State as it changes.
     ///
