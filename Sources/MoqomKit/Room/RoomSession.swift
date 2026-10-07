@@ -213,6 +213,32 @@ public actor RoomSession {
     /// from carrying on as though nothing happened.
     private var held: [ParticipantIdentity: Task<Void, Never>] = [:]
 
+    /// What this room may do with direct paths, while it may. See ``setDirect(_:)``.
+    private var direct: DirectRoomOptions?
+
+    /// Copies every media track this device publishes onto its direct sessions.
+    /// Empty, and costing a lock per object, while there are none.
+    private let directFanout = DirectFanout()
+
+    /// Participants whose catalog says they opted in to direct paths.
+    private var directOptedIn: Set<ParticipantIdentity> = []
+    private var directStates: [ParticipantIdentity: DirectPathState] = [:]
+    private var directCounters: [ParticipantIdentity: DirectCounter] = [:]
+    private var directSessions: [ParticipantIdentity: MoqtSession] = [:]
+    private var directAttaches: [ParticipantIdentity: [Task<Void, Never>]] = [:]
+
+    /// Subscriptions read through a merge, beside the relay handles in
+    /// ``subscriptions`` and ``audioSubscriptions`` that they wrap.
+    private var videoDuals: [ParticipantIdentity: DirectMergedSubscription] = [:]
+    private var audioDuals: [ParticipantIdentity: DirectMergedSubscription] = [:]
+    private var videoPriorities: [ParticipantIdentity: UInt8] = [:]
+
+    #if canImport(Network)
+        private var directHooks: RoomDirectHooks?
+        private var directPathsController: RoomDirectPaths?
+        private var directTicker: Task<Void, Never>?
+    #endif
+
     init(
         tenant: TenantID,
         room: RoomID,
@@ -325,6 +351,248 @@ public actor RoomSession {
     /// window is dropped rather than sent, because nobody could open it.
     public var groupKeys: GroupKeyStatus? {
         get async { await managedKeys?.status }
+    }
+
+    // MARK: - Direct paths
+
+    /// Let this room carry media directly between participants where it may,
+    /// with the relay as the fallback; `nil` turns it off again.
+    ///
+    /// Off by default, and the acknowledgement in ``DirectRoomOptions/exposure``
+    /// is the reason: a direct path tells each peer this device's IP addresses.
+    /// Turning it on publishes the opt-in on this device's catalog and changes
+    /// nothing else until the room qualifies under ``DirectEligibility``:
+    /// end-to-end encrypted, at most four participants counting everyone
+    /// holding the room's keys, no watchdog, this device publishing on stage,
+    /// and every other participant opted in too. A viewer is never offered a
+    /// path and never offers one.
+    ///
+    /// Every participant's media keeps arriving over the relay throughout.
+    /// Where a direct path opens, each of their tracks is read over both and
+    /// merged (``DualSubscription``), so a path that fails costs nothing but
+    /// the time to notice. ``directPaths`` and
+    /// ``RoomEvent/directPathChanged(_:_:)`` say where each participant stands.
+    ///
+    /// Throws for a personal channel, which is a broadcast to an audience of
+    /// any size, for a room not joined through a ``MoqomSession``, which has
+    /// no backend to bind a direct endpoint on, and for an
+    /// ``DirectRoomOptions/offerSecret`` shorter than 16 bytes.
+    public func setDirect(_ options: DirectRoomOptions?) async throws(MoqomError) {
+        if options != nil {
+            guard channel == nil else {
+                throw MoqomError.invalidState(
+                    expected: "a room", actual: "a personal channel, which has no direct mode"
+                )
+            }
+            if let secret = options?.offerSecret, secret.count < 16 {
+                throw MoqomError.invalidState(
+                    expected: "an offer secret of at least 16 bytes", actual: "\(secret.count) bytes"
+                )
+            }
+        }
+        #if canImport(Network)
+            guard options == nil || directHooks != nil else {
+                throw MoqomError.invalidState(
+                    expected: "a room joined through a MoqomSession",
+                    actual: "a room with no session to bind a direct endpoint on"
+                )
+            }
+            let wasOn = direct != nil
+            directTicker?.cancel()
+            directTicker = nil
+            if let controller = directPathsController {
+                directPathsController = nil
+                await controller.stop()
+            }
+            direct = options
+            directStates.removeAll()
+            if let options, let directHooks {
+                directPathsController = RoomDirectPaths(
+                    options: options,
+                    tenant: tenant,
+                    room: room,
+                    identity: identity,
+                    relay: connection,
+                    hooks: directHooks,
+                    fanout: directFanout,
+                    owner: self,
+                    logger: logger
+                )
+                // Most of what decides eligibility -- the MLS group's members and
+                // epoch above all -- changes without telling the room, so it is
+                // looked at four times a second as well as on the changes that do.
+                directTicker = Task { [weak self] in
+                    while !Task.isCancelled {
+                        await self?.refreshDirect()
+                        try? await Task.sleep(for: .milliseconds(250))
+                    }
+                }
+            }
+            if wasOn != (options != nil) {
+                await refreshCatalog()
+                await resubscribeForDirect()
+            }
+        #else
+            guard options == nil else {
+                throw MoqomError.invalidState(
+                    expected: "a platform with Network.framework", actual: "no direct endpoint"
+                )
+            }
+        #endif
+    }
+
+    /// Whether direct paths are turned on for this room. See ``setDirect(_:)``.
+    public var isDirectEnabled: Bool { direct != nil }
+
+    /// How each other participant's media is reaching this device, while direct
+    /// paths are turned on. Empty while they are off.
+    ///
+    /// Changes are reported as ``RoomEvent/directPathChanged(_:_:)``; the
+    /// object counts are not, and are read here.
+    public var directPaths: [ParticipantIdentity: DirectPathStatus] {
+        directStates.reduce(into: [:]) { paths, entry in
+            var status = DirectPathStatus(state: entry.value)
+            if let counts = directCounters[entry.key]?.counts {
+                status.objectsOverDirect = counts.direct
+                status.objectsOverRelay = counts.relay
+            }
+            paths[entry.key] = status
+        }
+    }
+
+    #if canImport(Network)
+        /// Given by the ``MoqomSession`` that joined this room.
+        func provideDirectHooks(_ hooks: RoomDirectHooks) {
+            directHooks = hooks
+        }
+
+        /// The direct session open to `who`, if any. For tests.
+        func directSession(with who: ParticipantIdentity) async -> DirectSession? {
+            await directPathsController?.session(with: who)
+        }
+
+        private func refreshDirect() async {
+            guard let directPathsController else { return }
+            await directPathsController.update(directView())
+        }
+
+        private func directView() async -> DirectRoomView {
+            var view = DirectRoomView()
+            view.encrypted = encryption != nil && encryptionPolicy == .required
+            // Direct offers travel on the stage slot, so a publication backstage
+            // leaves this device in the audience as far as direct paths go.
+            let stage = try? slotNamespace(backstage: false)
+            view.publishing = stage != nil && (broadcast?.namespace == stage || audio?.track.namespace == stage)
+            view.watchdogs = !state.watchdogs.all.isEmpty
+            view.peers = Set(
+                state.roster.participants.filter { $0.id != identity && !$0.slot.isBackstage }.map(\.id)
+            )
+            view.optedIn = directOptedIn.intersection(view.peers)
+            if let managedKeys, let status = await managedKeys.status {
+                view.members = Set(status.members)
+                // Every device in the group derives the same value for the same
+                // epoch, and nobody outside it can.
+                view.secret = direct?.offerSecret ?? status.epochAuthenticator
+            } else {
+                view.secret = direct?.offerSecret
+            }
+            return view
+        }
+
+        func directStateChanged(_ who: ParticipantIdentity, _ path: DirectPathState) {
+            guard direct != nil, state.roster[who] != nil, directStates[who] != path else { return }
+            directStates[who] = path
+            eventContinuation.yield(.directPathChanged(who, path))
+        }
+
+        func directSessionChanged(_ who: ParticipantIdentity, _ session: MoqtSession?) async {
+            directSessions[who] = session
+            for task in directAttaches.removeValue(forKey: who) ?? [] { task.cancel() }
+            let merged = [videoDuals[who], audioDuals[who]].compactMap { $0 }
+            if session != nil {
+                for subscription in merged { attachDirect(to: subscription, from: who) }
+            } else {
+                // Straight back to the relay rather than waiting for the merge to
+                // notice the direct subscription has ended.
+                for subscription in merged { await subscription.dual.networkChanged() }
+            }
+        }
+    #else
+        private func refreshDirect() async {}
+    #endif
+
+    /// `relay`, read through a merge when direct paths are on.
+    private func merging(
+        _ relay: any SubscriptionHandle,
+        priority: UInt8,
+        from who: ParticipantIdentity
+    ) -> DirectMergedSubscription? {
+        guard let direct else { return nil }
+        let counter = directCounters[who] ?? DirectCounter()
+        directCounters[who] = counter
+        let merged = DirectMergedSubscription(
+            relay: relay, priority: priority, settings: direct.path, counter: counter
+        )
+        attachDirect(to: merged, from: who)
+        return merged
+    }
+
+    /// Subscribe to the same track on the direct session to `who`, if there is
+    /// one, and hand it to the merge.
+    ///
+    /// Retried for a while, because the peer opens its tracks on a new direct
+    /// session as this side does, and a subscription that arrives first is told
+    /// the track does not exist.
+    private func attachDirect(to merged: DirectMergedSubscription, from who: ParticipantIdentity) {
+        guard let session = directSessions[who] else { return }
+        let request = SubscribeRequest(track: merged.track, priority: merged.priority)
+        let task = Task {
+            for _ in 0 ..< 50 {
+                if Task.isCancelled { return }
+                if let subscription = try? await session.subscribe(request) {
+                    if Task.isCancelled {
+                        await subscription.cancel()
+                    } else {
+                        await merged.dual.attachDirect(subscription)
+                    }
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+        }
+        directAttaches[who, default: []].append(task)
+    }
+
+    /// Open every subscription again, through a merge or without one, after
+    /// direct paths were turned on or off.
+    private func resubscribeForDirect() async {
+        for (who, layer) in subscribedLayers {
+            guard let priority = videoPriorities[who] else { continue }
+            await apply(.subscribe(who, layer, priority: priority))
+        }
+        for who in Array(audioSubscriptions.keys) {
+            await cancelAudio(who)
+            if let catalog = await catalogs[who]?.current { await followAudio(of: who, in: catalog) }
+        }
+    }
+
+    private func cancelVideo(_ who: ParticipantIdentity) async {
+        let relay = subscriptions.removeValue(forKey: who)
+        if let merged = videoDuals.removeValue(forKey: who) {
+            await merged.cancel()
+        } else {
+            await relay?.cancel()
+        }
+    }
+
+    private func cancelAudio(_ who: ParticipantIdentity) async {
+        audioPumps.removeValue(forKey: who)?.cancel()
+        let relay = audioSubscriptions.removeValue(forKey: who)
+        if let merged = audioDuals.removeValue(forKey: who) {
+            await merged.cancel()
+        } else {
+            await relay?.cancel()
+        }
     }
 
     /// Hand the room's keys to MLS, if the room requires encryption, nobody
@@ -685,6 +953,18 @@ public actor RoomSession {
         audioSubscriptions.removeAll()
         for pump in audioPumps.values { pump.cancel() }
         audioPumps.removeAll()
+        let merged = Array(videoDuals.values) + Array(audioDuals.values)
+        videoDuals.removeAll()
+        audioDuals.removeAll()
+        if !merged.isEmpty {
+            Task { for subscription in merged { await subscription.cancel() } }
+        }
+
+        // Offers and tickets were opened on the dead relay session, and a
+        // direct path is not kept without them, so every one starts over.
+        #if canImport(Network)
+            await directPathsController?.rebind(to: session)
+        #endif
 
         await rebindPublications(to: session)
         await begin()
@@ -1046,6 +1326,19 @@ public actor RoomSession {
         for timer in held.values { timer.cancel() }
         held.removeAll()
 
+        // The direct sessions, and the ticket subscriptions the relay meters
+        // them by, end with the room.
+        #if canImport(Network)
+            directTicker?.cancel()
+            directTicker = nil
+            if let controller = directPathsController {
+                directPathsController = nil
+                await controller.stop()
+            }
+        #endif
+        for tasks in directAttaches.values { for task in tasks { task.cancel() } }
+        directAttaches.removeAll()
+
         rosterTask?.cancel()
         rosterTask = nil
         for task in prefixTasks { task.cancel() }
@@ -1106,15 +1399,13 @@ public actor RoomSession {
         subscribedLayers.removeAll()
         for pump in audioPumps.values { pump.cancel() }
         audioPumps.removeAll()
-        for subscription in audioSubscriptions.values { await subscription.cancel() }
-        audioSubscriptions.removeAll()
+        for who in Array(audioSubscriptions.keys) { await cancelAudio(who) }
         for sink in audioSinks.values { sink.continuation.finish() }
         audioSinks.removeAll()
         receivers.removeAll()
-        for subscription in subscriptions.values {
-            await subscription.cancel()
-        }
-        subscriptions.removeAll()
+        for who in Array(subscriptions.keys) { await cancelVideo(who) }
+        directSessions.removeAll()
+        directStates.removeAll()
         eventContinuation.finish()
     }
 
@@ -1301,7 +1592,8 @@ public actor RoomSession {
             interrupted: ownInterruption,
             locale: ownLocale,
             references: ownReferences,
-            invitations: ownInvitations.filter(\.isOpen)
+            invitations: ownInvitations.filter(\.isOpen),
+            direct: direct != nil
         )
         _ = try? await publisher.publish(catalog)
         return configurations.count >= ladder.rungs.count
@@ -3048,6 +3340,7 @@ public actor RoomSession {
             ]
         )
         eventContinuation.yield(.participantLeft(who, reason))
+        await refreshDirect()
         await refreshGallery()
     }
 
@@ -3084,6 +3377,18 @@ public actor RoomSession {
         audioSubscriptions.removeValue(forKey: who)
         audioSinks.removeValue(forKey: who)?.continuation.finish()
         receivers.removeValue(forKey: who)
+
+        // A merge also holds a direct subscription, which nothing else ends.
+        directOptedIn.remove(who)
+        directStates.removeValue(forKey: who)
+        directCounters.removeValue(forKey: who)
+        directSessions.removeValue(forKey: who)
+        videoPriorities.removeValue(forKey: who)
+        for task in directAttaches.removeValue(forKey: who) ?? [] { task.cancel() }
+        let merged = [videoDuals.removeValue(forKey: who), audioDuals.removeValue(forKey: who)].compactMap { $0 }
+        if !merged.isEmpty {
+            Task { for subscription in merged { await subscription.cancel() } }
+        }
     }
 
     /// Subscribe to a participant's catalog track and follow it.
@@ -3223,6 +3528,11 @@ public actor RoomSession {
         adoptSelfMute(catalog.muted, of: who)
         adoptInterruption(catalog.interrupted, of: who)
         adoptLocale(catalog.locale, of: who)
+        if catalog.direct {
+            directOptedIn.insert(who)
+        } else {
+            directOptedIn.remove(who)
+        }
 
         await followAudio(of: who, in: catalog)
         await followReferences(in: catalog, hop: 0)
@@ -3359,20 +3669,23 @@ public actor RoomSession {
         receivers[who] = receiver
 
         guard audioSubscriptions[who] == nil else { return }
+        let priority = AudioPublicationConfiguration().priority
         guard
             let participant = state.roster[who],
             let name = try? TrackName(track.name),
             let full = try? FullTrackName(namespace: participant.slot.namespace, name: name),
             let subscription = try? await connection.subscribe(
-                SubscribeRequest(track: full, priority: AudioPublicationConfiguration().priority)
+                SubscribeRequest(track: full, priority: priority)
             )
         else { return }
 
         audioSubscriptions[who] = subscription
+        let merged = merging(subscription, priority: priority, from: who)
+        audioDuals[who] = merged
         let sink = audioSinks[who] ?? AudioSink()
         audioSinks[who] = sink
 
-        let objects = subscription.objects
+        let objects = (merged ?? subscription).objects
         audioPumps[who] = Task { [weak self] in
             for await object in objects {
                 guard let self else { return }
@@ -3457,10 +3770,7 @@ public actor RoomSession {
     }
 
     private func stopAudioSubscription(for who: ParticipantIdentity) async {
-        audioPumps.removeValue(forKey: who)?.cancel()
-        if let subscription = audioSubscriptions.removeValue(forKey: who) {
-            await subscription.cancel()
-        }
+        await cancelAudio(who)
         receivers[who]?.reset()
         for pipe in audioTaps.removeValue(forKey: who) ?? [] {
             pipe.tap.stop()
@@ -3868,7 +4178,13 @@ public actor RoomSession {
         // reconnect included — and a policy that could tighten in between has to
         // be honoured by the writer that is opened second.
         try requireEncryptionIfPolicyDemands()
-        let writer = try await connection.publish(track, priority: priority)
+        let relay = try await connection.publish(track, priority: priority)
+        // Under the encryption, so a direct peer gets the same ciphertext.
+        let writer = DirectTeeWriter(
+            relay: relay,
+            fanout: directFanout,
+            registration: await directFanout.register(track, priority: priority)
+        )
         guard let encryption else { return writer }
         return ProtectedTrackWriter(wrapping: writer, sender: encryption.sender)
     }
@@ -3877,9 +4193,7 @@ public actor RoomSession {
         switch change {
         case let .subscribe(who, layer, priority):
             guard let participant = state.roster[who] else { return }
-            if let existing = subscriptions[who] {
-                await existing.cancel()
-            }
+            await cancelVideo(who)
             pumps.removeValue(forKey: who)?.cancel()
             catchUps.removeValue(forKey: who)?.cancel()
             guard
@@ -3904,6 +4218,9 @@ public actor RoomSession {
                 return
             }
             subscriptions[who] = subscription
+            videoPriorities[who] = priority
+            let merged = merging(subscription, priority: priority, from: who)
+            videoDuals[who] = merged
 
             // A rung change is a different bitstream with its own parameter
             // sets and its own object numbering, so reassembly starts over
@@ -3912,7 +4229,7 @@ public actor RoomSession {
             depacketisers[who] = VideoDepacketiser()
             configureDepacketiser(for: who, from: await catalogs[who]?.current)
 
-            startPump(subscription, for: who)
+            startPump(merged ?? subscription, for: who)
             await catchUp(on: subscription, for: who)
         case let .unsubscribeVideo(who):
             pumps.removeValue(forKey: who)?.cancel()
@@ -3927,10 +4244,10 @@ public actor RoomSession {
                 await pipe.close()
             }
 
-            if let existing = subscriptions.removeValue(forKey: who) {
-                await existing.cancel()
-            }
+            await cancelVideo(who)
+            videoPriorities.removeValue(forKey: who)
         case let .reprioritise(who, priority):
+            videoPriorities[who] = priority
             await subscriptions[who]?.updatePriority(priority)
         }
     }

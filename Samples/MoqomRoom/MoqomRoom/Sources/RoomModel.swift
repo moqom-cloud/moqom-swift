@@ -1362,6 +1362,9 @@ final class RoomModel {
         case .participantJoined, .presenceChanged,
              .grantsChanged, .spotlightChanged:
             await refresh()
+        case .directPathChanged:
+            // This sample leaves direct paths off.
+            break
         case .terminated:
             await leave()
         }

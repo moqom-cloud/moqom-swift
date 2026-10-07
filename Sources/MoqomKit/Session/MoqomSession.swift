@@ -115,8 +115,9 @@ public actor MoqomSession {
     #if canImport(Network)
         /// A direct endpoint on this session's ``directBackend``.
         ///
-        /// Not used by ``Room`` yet: an app that wants a direct path drives the
-        /// endpoint itself.
+        /// What a room with direct paths turned on binds its endpoints with
+        /// (``RoomSession/setDirect(_:)``). For an app driving a direct path
+        /// itself, outside a room.
         public nonisolated func bindDirectEndpoint(
             _ configuration: DirectConfiguration,
             eligibility: DirectEligibility,
@@ -358,6 +359,25 @@ public actor MoqomSession {
     /// participant on stage arrives through namespace announcement, including
     /// ones who join later, with no roster protocol to keep in agreement with
     /// who is actually publishing.
+    /// - Parameters:
+    ///   - seatPolicy: how long a participant whose session vanishes keeps
+    ///     their place in the roster. See ``SeatPolicy``.
+    ///   - direct: direct (peer-to-peer) paths for this room, where it
+    ///     qualifies; `nil` keeps everything on the relay. The same as calling
+    ///     ``RoomSession/setDirect(_:)`` once joined, and applied to a room
+    ///     already open too.
+    public func join(
+        room: RoomID,
+        seatPolicy: SeatPolicy = .default,
+        direct: DirectRoomOptions?
+    ) async throws(MoqomError) -> RoomSession {
+        let session = try await join(room: room, seatPolicy: seatPolicy)
+        try await session.setDirect(direct)
+        return session
+    }
+
+    /// Join a room, or return the session already open on it, with every
+    /// participant's media on the relay.
     /// - Parameter seatPolicy: how long a participant whose session vanishes
     ///   keeps their place in the roster. See ``SeatPolicy``.
     public func join(
@@ -393,6 +413,17 @@ public actor MoqomSession {
             }
         )
         rooms[room] = session
+        #if canImport(Network)
+            await session.provideDirectHooks(RoomDirectHooks(
+                credentials: { [weak self] in await self?.credentials },
+                bind: { [weak self] configuration, eligibility, exposure throws(DirectEndpointError) in
+                    guard let self else { throw DirectEndpointError.busy }
+                    return try await self.bindDirectEndpoint(
+                        configuration, eligibility: eligibility, exposure: exposure
+                    )
+                }
+            ))
+        #endif
         await session.begin()
         logger.info(.room, "joined", [LogField("room", .text(room.value))])
         return session

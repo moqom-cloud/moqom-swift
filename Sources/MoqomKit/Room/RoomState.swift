@@ -296,6 +296,11 @@ public enum RoomEvent: Sendable {
     /// would be battery spent on a number nobody wanted.
     case qualityChanged(ParticipantIdentity, ConnectionQuality)
 
+    /// How a participant's media reaches this device changed: relay, a direct
+    /// path being set up, or a direct path. Only while direct paths are turned
+    /// on; see ``RoomSession/setDirect(_:)`` and ``RoomSession/directPaths``.
+    case directPathChanged(ParticipantIdentity, DirectPathState)
+
     /// The stream is over. Arrives as media, before the transport winds down.
     case terminated(TerminalEvent)
 }
