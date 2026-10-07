@@ -73,7 +73,16 @@
                             next.second.map { moqom_direct_recv_free($0.pointer) }
                             break
                         }
-                        bidirectionalIn.yield(RustBiStream(send: RustSendStream(send), receive: RustReceiveStream(recv)))
+                        let stream = RustBiStream(send: RustSendStream(send), receive: RustReceiveStream(recv))
+                        // Offered once it has said something. Network.framework's
+                        // connection group opens a bidirectional stream of its
+                        // own that it never writes to, and a session above that
+                        // took it for the control stream would wait forever.
+                        // Every MOQT bidirectional stream starts with a message
+                        // from whoever opened it, so nothing else waits longer.
+                        Task {
+                            if await stream.primed() { bidirectionalIn.yield(stream) }
+                        }
                     }
                     bidirectionalIn.finish()
                 },
@@ -275,6 +284,8 @@
         private let handle: RawHandle
         private let lock = NSLock()
         private var ended = false
+        /// A chunk read ahead by ``primed()``.
+        private var buffered: Data?
 
         init(_ handle: RawHandle) {
             self.handle = handle
@@ -284,12 +295,33 @@
             moqom_direct_recv_free(handle.pointer)
         }
 
-        func read() async throws(MoqomError) -> Data? {
-            if lock.withLock({ ended }) { return nil }
-            let handle = handle
-            let next = await awaitBytes { context in
-                moqom_direct_recv_read(handle.pointer, Self.chunk, context, bytesTrampoline)
+        /// Wait for the first chunk, or the end, and keep it for the first
+        /// read. `false` if the stream was reset or the connection went first.
+        func primed() async -> Bool {
+            let next = await next()
+            switch next.status {
+            case MOQOM_DIRECT_OK:
+                lock.withLock { buffered = next.data ?? Data() }
+                return true
+            case MOQOM_DIRECT_END:
+                lock.withLock { ended = true }
+                return true
+            default:
+                lock.withLock { ended = true }
+                return false
             }
+        }
+
+        func read() async throws(MoqomError) -> Data? {
+            let early: Data?? = lock.withLock {
+                if let chunk = buffered {
+                    buffered = nil
+                    return .some(chunk)
+                }
+                return ended ? .some(nil) : nil
+            }
+            if let early { return early }
+            let next = await next()
             // End of stream, a reset, and a connection gone all read the same
             // to everything above: stop.
             guard next.status == MOQOM_DIRECT_OK else {
@@ -301,6 +333,13 @@
 
         func stopReceiving(code: UInt64) async {
             _ = moqom_direct_recv_stop(handle.pointer, code)
+        }
+
+        private func next() async -> (status: Int32, data: Data?, code: UInt64) {
+            let handle = handle
+            return await awaitBytes { context in
+                moqom_direct_recv_read(handle.pointer, Self.chunk, context, bytesTrampoline)
+            }
         }
     }
 
@@ -319,5 +358,7 @@
         func reset(code: UInt64) async { await send.reset(code: code) }
         func read() async throws(MoqomError) -> Data? { try await receive.read() }
         func stopReceiving(code: UInt64) async { await receive.stopReceiving(code: code) }
+
+        func primed() async -> Bool { await receive.primed() }
     }
 #endif
