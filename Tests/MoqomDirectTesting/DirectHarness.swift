@@ -60,7 +60,7 @@ public enum DirectTokens {
 }
 
 /// One person's device, as a direct path sees it.
-public struct DirectDevice {
+public struct DirectDevice: Sendable {
     public let user: String
     public let key = DeviceKey.ephemeral()
 
