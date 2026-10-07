@@ -72,6 +72,9 @@ public struct MLSGroupContext: Hashable, Sendable {
 
 /// Everything one epoch of the key schedule produces.
 public struct MLSEpochSecrets: Sendable {
+    /// The suite every secret here was derived with, and which the exporter
+    /// goes on deriving with.
+    public let cipherSuite: MLSCipherSuite
     public let joinerSecret: Data
     public let welcomeSecret: Data
     public let epochSecret: Data
@@ -86,40 +89,66 @@ public struct MLSEpochSecrets: Sendable {
     /// The next epoch's `init_secret`.
     public let initSecret: Data
 
-    /// One epoch, from the previous epoch's init secret and this commit's secret.
+    /// One epoch, from the previous epoch's init secret and this commit's
+    /// secret. `pskSecret` defaults to the suite's all-zero secret.
     public static func derive(
         initSecret previous: Data,
         commitSecret: Data,
-        pskSecret: Data = Data(count: MLSCipherSuite.hashLength),
+        pskSecret: Data? = nil,
         context: MLSGroupContext
     ) -> MLSEpochSecrets {
-        let joiner = MLSCipherSuite.expandWithLabel(
-            MLSCipherSuite.extract(salt: previous, ikm: commitSecret),
-            label: "joiner",
-            context: context.encoded,
-            length: MLSCipherSuite.hashLength
+        derive(
+            initSecret: previous, commitSecret: commitSecret, pskSecret: pskSecret,
+            suite: context.cipherSuite, encodedContext: context.encoded
         )
-        return derive(joinerSecret: joiner, pskSecret: pskSecret, context: context)
     }
 
     /// One epoch from its joiner secret, which is where a member arriving by
     /// Welcome starts.
     public static func derive(
         joinerSecret joiner: Data,
-        pskSecret: Data = Data(count: MLSCipherSuite.hashLength),
+        pskSecret: Data? = nil,
         context: MLSGroupContext
     ) -> MLSEpochSecrets {
-        let member = MLSCipherSuite.extract(salt: joiner, ikm: pskSecret)
-        let epoch = MLSCipherSuite.expandWithLabel(
+        derive(joinerSecret: joiner, pskSecret: pskSecret, suite: context.cipherSuite, encodedContext: context.encoded)
+    }
+
+    /// The same, over a GroupContext already serialised, which is how the
+    /// tests run another suite's vectors through the same hash and KDF.
+    static func derive(
+        initSecret previous: Data,
+        commitSecret: Data,
+        pskSecret: Data?,
+        suite: MLSCipherSuite,
+        encodedContext: Data
+    ) -> MLSEpochSecrets {
+        let joiner = suite.expandWithLabel(
+            suite.extract(salt: previous, ikm: commitSecret),
+            label: "joiner",
+            context: encodedContext,
+            length: suite.hashLength
+        )
+        return derive(joinerSecret: joiner, pskSecret: pskSecret, suite: suite, encodedContext: encodedContext)
+    }
+
+    static func derive(
+        joinerSecret joiner: Data,
+        pskSecret: Data?,
+        suite: MLSCipherSuite,
+        encodedContext: Data
+    ) -> MLSEpochSecrets {
+        let member = suite.extract(salt: joiner, ikm: pskSecret ?? Data(count: suite.hashLength))
+        let epoch = suite.expandWithLabel(
             member,
             label: "epoch",
-            context: context.encoded,
-            length: MLSCipherSuite.hashLength
+            context: encodedContext,
+            length: suite.hashLength
         )
-        func derived(_ label: String) -> Data { MLSCipherSuite.deriveSecret(epoch, label: label) }
+        func derived(_ label: String) -> Data { suite.deriveSecret(epoch, label: label) }
         return MLSEpochSecrets(
+            cipherSuite: suite,
             joinerSecret: joiner,
-            welcomeSecret: MLSCipherSuite.deriveSecret(member, label: "welcome"),
+            welcomeSecret: suite.deriveSecret(member, label: "welcome"),
             epochSecret: epoch,
             senderDataSecret: derived("sender data"),
             encryptionSecret: derived("encryption"),
@@ -136,20 +165,21 @@ public struct MLSEpochSecrets: Sendable {
     /// The welcome secret for a joiner secret, without deriving the epoch.
     static func welcomeSecret(
         joinerSecret: Data,
-        pskSecret: Data = Data(count: MLSCipherSuite.hashLength)
+        pskSecret: Data? = nil,
+        suite: MLSCipherSuite
     ) -> Data {
-        MLSCipherSuite.deriveSecret(
-            MLSCipherSuite.extract(salt: joinerSecret, ikm: pskSecret),
+        suite.deriveSecret(
+            suite.extract(salt: joinerSecret, ikm: pskSecret ?? Data(count: suite.hashLength)),
             label: "welcome"
         )
     }
 
     /// `MLS-Exporter`, RFC 9420 §8.5.
     public func export(label: Data, context: Data, length: Int) -> Data {
-        MLSCipherSuite.expandWithLabel(
-            MLSCipherSuite.deriveSecret(exporterSecret, rawLabel: label),
+        cipherSuite.expandWithLabel(
+            cipherSuite.deriveSecret(exporterSecret, rawLabel: label),
             label: "exported",
-            context: MLSCipherSuite.hash(context),
+            context: cipherSuite.hash(context),
             length: length
         )
     }

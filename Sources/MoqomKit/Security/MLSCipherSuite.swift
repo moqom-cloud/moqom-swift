@@ -1,38 +1,41 @@
 // The RFC 9420 primitives MOQOM's group key management is built from.
 //
-// Two cipher suites, which differ only in their KEM:
+// Three cipher suites:
 //
-// - `MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519`, the default for every
-//   group founded by this SDK. draft-ietf-mls-pq-ciphersuites-06 §3.1 defines
-//   it as its first suite (HPKE KEM 0x647a, which draft-ietf-hpke-pq-05 names
-//   MLKEM768-X25519 and which is the X-Wing KEM of
-//   draft-connolly-cfrg-xwing-kem; HKDF-SHA256; AES-128-GCM; Ed25519). The
-//   draft's value is still "TBD1", so the identifier below is one from RFC 9420
-//   §17.1's private-use range and has to change to the IANA value once one is
-//   assigned. A peer that implements the draft would not recognise it.
+// - `MLS_192_MLKEM768_AES256GCM_SHA384_MLDSA65`, the suite every group founded
+//   by this SDK uses. draft-ietf-mls-pq-ciphersuites-06 §3.1 defines it as
+//   "TBD10": HPKE KEM 0x0041 (pure ML-KEM-768, draft-ietf-hpke-pq-05),
+//   HKDF-SHA384, AES-256-GCM, and ML-DSA-65 signatures (FIPS 204, as
+//   draft-ietf-tls-mldsa uses it: pure, empty context). Both the secrets a
+//   group carries and the signatures that say who sent them are post-quantum.
+//   The draft's value is not assigned yet, so the identifier below is from
+//   RFC 9420 §17.1's private-use range and has to change to the IANA value
+//   once there is one. A peer that implements the draft would not recognise
+//   it.
+// - `MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519`, the draft's "TBD1"
+//   (X-Wing, HKDF-SHA256, AES-128-GCM, Ed25519), also private-use. Groups
+//   founded with it before the ML-DSA suite existed still work; no new group
+//   uses it. Its secrets are post-quantum, its signatures are not.
 // - `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` (0x0001), the one every MLS
 //   implementation must support, kept so that groups founded with it still
-//   work.
+//   work and so the working group's vectors keep checking the code below.
 //
 // Everything a group derives — the key schedule, the exporter, and so SFrame
-// keys — depends on the hash, KDF and AEAD, which are the same in both, and on
-// the secrets the KEM carries, which is the only place the suites differ. The
-// hybrid KEM is what makes those secrets post-quantum: a commit secret or a
-// joiner secret sealed to X-Wing stays secret unless both ML-KEM-768 and
-// X25519 are broken. Signatures are Ed25519 in both, as the draft's suite
-// specifies; they authenticate members and are not post-quantum.
+// keys — goes through the suite's hash and KDF, so every function here is a
+// method on the suite rather than a constant.
 //
-// Each function here is the RFC's definition and nothing more. Suite 0x0001 is
+// Each function is the RFC's definition and nothing more. Suite 0x0001 is
 // checked against the MLS working group's published test vectors
-// (`crypto-basics.json`); the hybrid KEM inside HPKE is checked against the
-// HPKE working group's vectors for KEM 0x647a (draft-ietf-hpke-pq), which is
-// the only basis on which this file claims to match either draft. What is
-// built on top of these primitives is MOQOM's own and is described in
-// `MLSGroup.swift`.
+// (`crypto-basics.json`); the X-Wing KEM against the HPKE working group's
+// vectors for KEM 0x647a; HPKE over pure ML-KEM-768, and ML-DSA-65 signing,
+// against Go's `crypto/hpke` and `crypto/mldsa`, which is the only basis on
+// which this file claims to match either draft. What is built on top of these
+// primitives is MOQOM's own and is described in `MLSGroup.swift`.
 //
-// Everything is CryptoKit. HPKE (RFC 9180) is CryptoKit's, composed from the
-// KEM, KDF and AEAD each suite names; there is no hand-rolled cryptography
-// below this line, only encodings.
+// Everything is CryptoKit. HPKE (RFC 9180) is CryptoKit's for the two KEMs it
+// offers. CryptoKit has no HPKE KEM for pure ML-KEM, so for 0x0041 the RFC 9180
+// key schedule is composed below from CryptoKit's ML-KEM-768, HKDF-SHA384 and
+// AES-256-GCM: no primitive is hand-rolled, only the schedule that joins them.
 
 import CryptoKit
 import Foundation
@@ -47,31 +50,62 @@ public struct MLSCipherSuite: Hashable, Sendable, CustomStringConvertible {
     public let identifier: UInt16
 
     private let kem: KEM
+    private let symmetric: Symmetric
+    private let signer: Signer
 
     private enum KEM: Hashable, Sendable {
         case x25519
         case xWing
+        case mlKEM768
     }
 
-    private init(identifier: UInt16, kem: KEM) {
+    /// The hash, KDF, MAC and AEAD, which the draft's suites pair.
+    private enum Symmetric: Hashable, Sendable {
+        case aes128SHA256
+        case aes256SHA384
+    }
+
+    private enum Signer: Hashable, Sendable {
+        case ed25519
+        case mlDSA65
+    }
+
+    private init(identifier: UInt16, kem: KEM, symmetric: Symmetric, signer: Signer) {
         self.identifier = identifier
         self.kem = kem
+        self.symmetric = symmetric
+        self.signer = signer
     }
 
     /// `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`, RFC 9420's mandatory suite.
-    public static let mls128DHKEMX25519 = MLSCipherSuite(identifier: 0x0001, kem: .x25519)
+    public static let mls128DHKEMX25519 = MLSCipherSuite(
+        identifier: 0x0001, kem: .x25519, symmetric: .aes128SHA256, signer: .ed25519
+    )
 
     /// `MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519`, draft-ietf-mls-pq-ciphersuites' "TBD1".
     ///
     /// 0xF0A1 is a private-use value (RFC 9420 §17.1), standing in until IANA
     /// assigns one. Only MOQOM's own SDK and control plane know it.
-    public static let mls128MLKEM768X25519 = MLSCipherSuite(identifier: 0xF0A1, kem: .xWing)
+    public static let mls128MLKEM768X25519 = MLSCipherSuite(
+        identifier: 0xF0A1, kem: .xWing, symmetric: .aes128SHA256, signer: .ed25519
+    )
 
-    /// The suite a newly founded group uses.
-    public static let `default` = mls128MLKEM768X25519
+    /// `MLS_192_MLKEM768_AES256GCM_SHA384_MLDSA65`, draft-ietf-mls-pq-ciphersuites' "TBD10".
+    ///
+    /// 0xF0AA is a private-use value (RFC 9420 §17.1), standing in until IANA
+    /// assigns one. Only MOQOM's own SDK and control plane know it.
+    public static let mls192MLKEM768MLDSA65 = MLSCipherSuite(
+        identifier: 0xF0AA, kem: .mlKEM768, symmetric: .aes256SHA384, signer: .mlDSA65
+    )
+
+    /// The suite a newly founded group uses. There is no other choice: a group
+    /// is founded post-quantum in both its secrets and its signatures.
+    public static let `default` = mls192MLKEM768MLDSA65
 
     /// Every suite implemented, the default first.
-    public static let supported: [MLSCipherSuite] = [.mls128MLKEM768X25519, .mls128DHKEMX25519]
+    public static let supported: [MLSCipherSuite] = [
+        .mls192MLKEM768MLDSA65, .mls128MLKEM768X25519, .mls128DHKEMX25519,
+    ]
 
     /// The suite with this identifier, or `nil` if it is not one implemented here.
     public init?(identifier: UInt16) {
@@ -84,6 +118,7 @@ public struct MLSCipherSuite: Hashable, Sendable, CustomStringConvertible {
         switch kem {
         case .x25519: "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519"
         case .xWing: "MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519"
+        case .mlKEM768: "MLS_192_MLKEM768_AES256GCM_SHA384_MLDSA65"
         }
     }
 
@@ -92,49 +127,65 @@ public struct MLSCipherSuite: Hashable, Sendable, CustomStringConvertible {
     }
 
     /// Whether the KEM, and so every secret a commit or Welcome carries, is
-    /// meant to resist a quantum computer. Signatures are classical either way.
-    public var hasPostQuantumKEM: Bool { kem == .xWing }
+    /// meant to resist a quantum computer.
+    public var hasPostQuantumKEM: Bool { kem != .x25519 }
+
+    /// Whether signatures, and so who a commit or key package says it is from,
+    /// are meant to resist a quantum computer.
+    public var hasPostQuantumSignatures: Bool { signer == .mlDSA65 }
 
     /// The protocol version, `mls10`.
     public static let version: UInt16 = 0x0001
 
-    // MARK: - Shared by both suites
+    // MARK: - Hash, KDF and MAC
 
-    // HKDF-SHA256, HMAC-SHA256, AES-128-GCM and Ed25519 are the same in every
-    // suite implemented, so they are not per-suite. A suite that differed in
-    // any of them would have to move them onto the value.
+    /// Hash output length, `KDF.Nh`: 32 for SHA-256, 48 for SHA-384.
+    public var hashLength: Int {
+        switch symmetric {
+        case .aes128SHA256: 32
+        case .aes256SHA384: 48
+        }
+    }
 
-    /// Hash output length, `KDF.Nh`.
-    public static let hashLength = 32
+    /// AEAD key length, `AEAD.Nk`: 16 for AES-128-GCM, 32 for AES-256-GCM.
+    var aeadKeyLength: Int {
+        switch symmetric {
+        case .aes128SHA256: 16
+        case .aes256SHA384: 32
+        }
+    }
 
-    /// AEAD key and nonce lengths for AES-128-GCM.
-    static let aeadKeyLength = 16
+    /// AEAD nonce length, `AEAD.Nn`, the same for both AES-GCM sizes.
     static let aeadNonceLength = 12
 
-    /// Ed25519 public key length.
-    static let signatureKeyLength = 32
-
-    static func hash(_ data: Data) -> Data {
-        Data(SHA256.hash(data: data))
+    func hash(_ data: Data) -> Data {
+        switch symmetric {
+        case .aes128SHA256: Data(SHA256.hash(data: data))
+        case .aes256SHA384: Data(SHA384.hash(data: data))
+        }
     }
 
     /// `KDF.Extract(salt, ikm)`.
-    static func extract(salt: Data, ikm: Data) -> Data {
-        let prk = HKDF<SHA256>.extract(inputKeyMaterial: SymmetricKey(data: ikm), salt: salt)
-        return Data(prk)
+    func extract(salt: Data, ikm: Data) -> Data {
+        let ikm = SymmetricKey(data: ikm)
+        switch symmetric {
+        case .aes128SHA256: return Data(HKDF<SHA256>.extract(inputKeyMaterial: ikm, salt: salt))
+        case .aes256SHA384: return Data(HKDF<SHA384>.extract(inputKeyMaterial: ikm, salt: salt))
+        }
     }
 
     /// `KDF.Expand(secret, info, length)`.
-    static func expand(_ secret: Data, info: Data, length: Int) -> Data {
-        HKDF<SHA256>.expand(
-            pseudoRandomKey: SymmetricKey(data: secret),
-            info: info,
-            outputByteCount: length
-        ).withUnsafeBytes { Data($0) }
+    func expand(_ secret: Data, info: Data, length: Int) -> Data {
+        let prk = SymmetricKey(data: secret)
+        let key = switch symmetric {
+        case .aes128SHA256: HKDF<SHA256>.expand(pseudoRandomKey: prk, info: info, outputByteCount: length)
+        case .aes256SHA384: HKDF<SHA384>.expand(pseudoRandomKey: prk, info: info, outputByteCount: length)
+        }
+        return key.withUnsafeBytes { Data($0) }
     }
 
     /// `ExpandWithLabel`, RFC 9420 §5.1.3.
-    static func expandWithLabel(_ secret: Data, label: String, context: Data, length: Int) -> Data {
+    func expandWithLabel(_ secret: Data, label: String, context: Data, length: Int) -> Data {
         var info = MLSWriter()
         info.uint16(UInt16(length))
         info.vector(Data("MLS 1.0 \(label)".utf8))
@@ -143,12 +194,12 @@ public struct MLSCipherSuite: Hashable, Sendable, CustomStringConvertible {
     }
 
     /// `DeriveSecret`, RFC 9420 §5.1.3.
-    static func deriveSecret(_ secret: Data, label: String) -> Data {
+    func deriveSecret(_ secret: Data, label: String) -> Data {
         expandWithLabel(secret, label: label, context: Data(), length: hashLength)
     }
 
     /// `DeriveSecret` with a label that is not UTF-8 text, for the exporter.
-    static func deriveSecret(_ secret: Data, rawLabel: Data) -> Data {
+    func deriveSecret(_ secret: Data, rawLabel: Data) -> Data {
         var info = MLSWriter()
         info.uint16(UInt16(hashLength))
         info.vector(Data("MLS 1.0 ".utf8) + rawLabel)
@@ -157,19 +208,53 @@ public struct MLSCipherSuite: Hashable, Sendable, CustomStringConvertible {
     }
 
     /// `RefHash`, RFC 9420 §5.2.
-    static func refHash(label: String, value: Data) -> Data {
+    func refHash(label: String, value: Data) -> Data {
         var input = MLSWriter()
         input.vector(Data(label.utf8))
         input.vector(value)
         return hash(input.bytes)
     }
 
-    /// `MAC`, which for both suites is HMAC-SHA256.
-    static func mac(key: Data, data: Data) -> Data {
-        Data(HMAC<SHA256>.authenticationCode(for: data, using: SymmetricKey(data: key)))
+    /// `MAC`: HMAC with the suite's hash.
+    func mac(key: Data, data: Data) -> Data {
+        let key = SymmetricKey(data: key)
+        switch symmetric {
+        case .aes128SHA256: return Data(HMAC<SHA256>.authenticationCode(for: data, using: key))
+        case .aes256SHA384: return Data(HMAC<SHA384>.authenticationCode(for: data, using: key))
+        }
     }
 
+    /// A fresh secret of the hash's length, which is what a commit secret,
+    /// an init secret and a path secret are.
+    func randomSecret() -> Data { Self.randomSecret(hashLength) }
+
     // MARK: - Signatures
+
+    /// A signature public key's length: 32 for Ed25519, 1952 for ML-DSA-65.
+    public var signatureKeyLength: Int {
+        switch signer {
+        case .ed25519: 32
+        case .mlDSA65: 1952
+        }
+    }
+
+    /// A fresh signature key pair: the private half as this type stores it
+    /// (Ed25519's 32-byte key, or ML-DSA-65's 32-byte FIPS 204 seed) and the
+    /// public half as it travels.
+    func generateSignatureKeyPair() throws(MLSError) -> (privateKey: Data, publicKey: Data) {
+        switch signer {
+        case .ed25519:
+            let key = Curve25519.Signing.PrivateKey()
+            return (key.rawRepresentation, key.publicKey.rawRepresentation)
+        case .mlDSA65:
+            do {
+                let key = try MLDSA65.PrivateKey()
+                return (key.seedRepresentation, key.publicKey.rawRepresentation)
+            } catch {
+                throw MLSError.cryptoFailure
+            }
+        }
+    }
 
     private static func signContent(label: String, content: Data) -> Data {
         var tbs = MLSWriter()
@@ -178,75 +263,88 @@ public struct MLSCipherSuite: Hashable, Sendable, CustomStringConvertible {
         return tbs.bytes
     }
 
-    /// `SignWithLabel`, RFC 9420 §5.1.2.
-    static func signWithLabel(
-        _ key: Curve25519.Signing.PrivateKey,
-        label: String,
-        content: Data
-    ) throws(MLSError) -> Data {
+    /// `SignWithLabel`, RFC 9420 §5.1.2, with a private key as
+    /// ``generateSignatureKeyPair()`` returns it.
+    func signWithLabel(_ privateKey: Data, label: String, content: Data) throws(MLSError) -> Data {
+        let message = Self.signContent(label: label, content: content)
         do {
-            return try key.signature(for: signContent(label: label, content: content))
+            switch signer {
+            case .ed25519:
+                return try Curve25519.Signing.PrivateKey(rawRepresentation: privateKey).signature(for: message)
+            case .mlDSA65:
+                return try MLDSA65.PrivateKey(seedRepresentation: privateKey, publicKey: nil)
+                    .signature(for: message)
+            }
         } catch {
             throw MLSError.cryptoFailure
         }
     }
 
     /// `VerifyWithLabel`, RFC 9420 §5.1.2.
-    static func verifyWithLabel(
-        _ publicKey: Data,
-        label: String,
-        content: Data,
-        signature: Data
-    ) -> Bool {
-        guard let key = try? Curve25519.Signing.PublicKey(rawRepresentation: publicKey) else {
-            return false
+    func verifyWithLabel(_ publicKey: Data, label: String, content: Data, signature: Data) -> Bool {
+        guard publicKey.count == signatureKeyLength else { return false }
+        let message = Self.signContent(label: label, content: content)
+        switch signer {
+        case .ed25519:
+            guard let key = try? Curve25519.Signing.PublicKey(rawRepresentation: publicKey) else { return false }
+            return key.isValidSignature(signature, for: message)
+        case .mlDSA65:
+            guard let key = try? MLDSA65.PublicKey(rawRepresentation: publicKey) else { return false }
+            return key.isValidSignature(signature, for: message)
         }
-        return key.isValidSignature(signature, for: signContent(label: label, content: content))
     }
 
-    // MARK: - Per suite: the KEM
+    // MARK: - The KEM
 
-    /// The HPKE suite `EncryptWithLabel` uses.
-    var hpke: HPKE.Ciphersuite {
+    /// CryptoKit's HPKE suite, for the two KEMs CryptoKit implements. `nil`
+    /// for pure ML-KEM-768, which ``MLKEMHPKE`` composes instead.
+    var hpke: HPKE.Ciphersuite? {
         switch kem {
         case .x25519: HPKE.Ciphersuite(kem: .Curve25519_HKDF_SHA256, kdf: .HKDF_SHA256, aead: .AES_GCM_128)
         case .xWing: HPKE.Ciphersuite(kem: .XWingMLKEM768X25519, kdf: .HKDF_SHA256, aead: .AES_GCM_128)
+        case .mlKEM768: nil
         }
     }
 
     /// `Npk`: an init key's or leaf encryption key's length. 32 for X25519,
-    /// 1216 for X-Wing (ML-KEM-768's 1184 then X25519's 32).
+    /// 1216 for X-Wing (ML-KEM-768's 1184 then X25519's 32), 1184 for
+    /// ML-KEM-768.
     public var publicKeyLength: Int {
         switch kem {
         case .x25519: 32
         case .xWing: 1216
+        case .mlKEM768: 1184
         }
     }
 
     /// `Nenc`: the KEM output in every HPKE ciphertext. 32 for X25519, 1120
-    /// for X-Wing (ML-KEM-768's 1088 then X25519's 32).
+    /// for X-Wing (ML-KEM-768's 1088 then X25519's 32), 1088 for ML-KEM-768.
     public var encapsulationLength: Int {
         switch kem {
         case .x25519: 32
         case .xWing: 1120
+        case .mlKEM768: 1088
         }
     }
 
     /// A fresh KEM key pair: the private half as this type stores it (the
-    /// X25519 scalar, or X-Wing's 32-byte seed) and the public half as it
-    /// travels.
+    /// X25519 scalar, X-Wing's 32-byte seed, or ML-KEM-768's 64-byte seed)
+    /// and the public half as it travels.
     func generateKeyPair() throws(MLSError) -> (privateKey: Data, publicKey: Data) {
-        switch kem {
-        case .x25519:
-            let key = Curve25519.KeyAgreement.PrivateKey()
-            return (key.rawRepresentation, key.publicKey.rawRepresentation)
-        case .xWing:
-            do {
+        do {
+            switch kem {
+            case .x25519:
+                let key = Curve25519.KeyAgreement.PrivateKey()
+                return (key.rawRepresentation, key.publicKey.rawRepresentation)
+            case .xWing:
                 let key = try XWingMLKEM768X25519.PrivateKey.generate()
                 return (key.seedRepresentation, key.publicKey.rawRepresentation)
-            } catch {
-                throw MLSError.cryptoFailure
+            case .mlKEM768:
+                let key = try MLKEM768.PrivateKey.generate()
+                return (key.seedRepresentation, key.publicKey.rawRepresentation)
             }
+        } catch {
+            throw MLSError.cryptoFailure
         }
     }
 
@@ -271,10 +369,12 @@ public struct MLSCipherSuite: Hashable, Sendable, CustomStringConvertible {
             switch kem {
             case .x25519:
                 let recipient = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: publicKey)
-                sender = try HPKE.Sender(recipientKey: recipient, ciphersuite: hpke, info: info)
+                sender = try HPKE.Sender(recipientKey: recipient, ciphersuite: hpke!, info: info)
             case .xWing:
                 let recipient = try XWingMLKEM768X25519.PublicKey(rawRepresentation: publicKey)
-                sender = try HPKE.Sender(recipientKey: recipient, ciphersuite: hpke, info: info)
+                sender = try HPKE.Sender(recipientKey: recipient, ciphersuite: hpke!, info: info)
+            case .mlKEM768:
+                return try MLKEMHPKE.seal(to: publicKey, info: info, plaintext: plaintext)
             }
             let ciphertext = try sender.seal(plaintext, authenticating: Data())
             return HPKECiphertext(kemOutput: sender.encapsulatedKey, ciphertext: ciphertext)
@@ -299,13 +399,15 @@ public struct MLSCipherSuite: Hashable, Sendable, CustomStringConvertible {
             case .x25519:
                 recipient = try HPKE.Recipient(
                     privateKey: try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: privateKey),
-                    ciphersuite: hpke, info: info, encapsulatedKey: ciphertext.kemOutput
+                    ciphersuite: hpke!, info: info, encapsulatedKey: ciphertext.kemOutput
                 )
             case .xWing:
                 recipient = try HPKE.Recipient(
                     privateKey: try XWingMLKEM768X25519.PrivateKey(seedRepresentation: privateKey, publicKey: nil),
-                    ciphersuite: hpke, info: info, encapsulatedKey: ciphertext.kemOutput
+                    ciphersuite: hpke!, info: info, encapsulatedKey: ciphertext.kemOutput
                 )
+            case .mlKEM768:
+                return try MLKEMHPKE.open(ciphertext, seed: privateKey, info: info)
             }
             return try recipient.open(ciphertext.ciphertext, authenticating: Data())
         } catch {
@@ -314,6 +416,8 @@ public struct MLSCipherSuite: Hashable, Sendable, CustomStringConvertible {
     }
 
     // MARK: - Symmetric
+
+    // AES-GCM takes its size from the key, so these serve both AEADs.
 
     static func aeadSeal(key: Data, nonce: Data, plaintext: Data, aad: Data) throws(MLSError) -> Data {
         do {
@@ -344,8 +448,63 @@ public struct MLSCipherSuite: Hashable, Sendable, CustomStringConvertible {
         }
     }
 
-    static func randomSecret(_ count: Int = hashLength) -> Data {
+    static func randomSecret(_ count: Int) -> Data {
         SymmetricKey(size: SymmetricKeySize(bitCount: count * 8)).withUnsafeBytes { Data($0) }
+    }
+}
+
+/// HPKE (RFC 9180) base mode for KEM 0x0041, KDF 0x0002, AEAD 0x0002:
+/// ML-KEM-768, HKDF-SHA384, AES-256-GCM.
+///
+/// draft-ietf-hpke-pq-05 makes ML-KEM an HPKE KEM unchanged: `Encap` is
+/// ML-KEM's encapsulation, the shared secret is ML-KEM's 32 bytes, and `enc`
+/// is its 1088-byte ciphertext. What follows is RFC 9180 §5.1's key schedule
+/// over that secret, for one message (sequence number 0), which is all
+/// `EncryptWithLabel` sends.
+enum MLKEMHPKE {
+    /// `suite_id = "HPKE" || I2OSP(kem_id, 2) || I2OSP(kdf_id, 2) || I2OSP(aead_id, 2)`.
+    private static let suiteID = Data("HPKE".utf8) + Data([0x00, 0x41, 0x00, 0x02, 0x00, 0x02])
+
+    private static func labeledExtract(salt: Data, label: String, ikm: Data) -> Data {
+        let labeled = Data("HPKE-v1".utf8) + suiteID + Data(label.utf8) + ikm
+        return Data(HKDF<SHA384>.extract(inputKeyMaterial: SymmetricKey(data: labeled), salt: salt))
+    }
+
+    private static func labeledExpand(_ prk: Data, label: String, info: Data, length: Int) -> Data {
+        let labeled = Data([UInt8(length >> 8), UInt8(length & 0xFF)])
+            + Data("HPKE-v1".utf8) + suiteID + Data(label.utf8) + info
+        return HKDF<SHA384>.expand(
+            pseudoRandomKey: SymmetricKey(data: prk), info: labeled, outputByteCount: length
+        ).withUnsafeBytes { Data($0) }
+    }
+
+    /// `KeySchedule(mode_base, shared_secret, info, "", "")`: the key and base nonce.
+    static func keySchedule(sharedSecret: Data, info: Data) -> (key: Data, nonce: Data) {
+        let pskIDHash = labeledExtract(salt: Data(), label: "psk_id_hash", ikm: Data())
+        let infoHash = labeledExtract(salt: Data(), label: "info_hash", ikm: info)
+        let context = Data([0x00]) + pskIDHash + infoHash
+        let secret = labeledExtract(salt: sharedSecret, label: "secret", ikm: Data())
+        return (
+            labeledExpand(secret, label: "key", info: context, length: 32),
+            labeledExpand(secret, label: "base_nonce", info: context, length: MLSCipherSuite.aeadNonceLength)
+        )
+    }
+
+    static func seal(to publicKey: Data, info: Data, plaintext: Data) throws -> HPKECiphertext {
+        let encapsulation = try MLKEM768.PublicKey(rawRepresentation: publicKey).encapsulate()
+        let shared = encapsulation.sharedSecret.withUnsafeBytes { Data($0) }
+        let (key, nonce) = keySchedule(sharedSecret: shared, info: info)
+        let ciphertext = try MLSCipherSuite.aeadSeal(key: key, nonce: nonce, plaintext: plaintext, aad: Data())
+        return HPKECiphertext(kemOutput: encapsulation.encapsulated, ciphertext: ciphertext)
+    }
+
+    static func open(_ ciphertext: HPKECiphertext, seed: Data, info: Data) throws -> Data {
+        let key = try MLKEM768.PrivateKey(seedRepresentation: seed, publicKey: nil)
+        let shared = try key.decapsulate(ciphertext.kemOutput).withUnsafeBytes { Data($0) }
+        let schedule = keySchedule(sharedSecret: shared, info: info)
+        return try MLSCipherSuite.aeadOpen(
+            key: schedule.key, nonce: schedule.nonce, ciphertext: ciphertext.ciphertext, aad: Data()
+        )
     }
 }
 

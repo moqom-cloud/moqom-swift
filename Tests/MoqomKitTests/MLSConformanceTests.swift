@@ -15,7 +15,7 @@ struct MLSConformanceTests {
     @Test("ExpandWithLabel")
     func expandWithLabel() {
         let v = vector("expand_with_label")
-        let out = MLSCipherSuite.expandWithLabel(
+        let out = MLSCipherSuite.mls128DHKEMX25519.expandWithLabel(
             hex(v["secret"]!),
             label: v["label"]!,
             context: hex(v["context"]!),
@@ -27,7 +27,7 @@ struct MLSConformanceTests {
     @Test("DeriveSecret")
     func deriveSecret() {
         let v = vector("derive_secret")
-        #expect(MLSCipherSuite.deriveSecret(hex(v["secret"]!), label: v["label"]!) == hex(v["out"]!))
+        #expect(MLSCipherSuite.mls128DHKEMX25519.deriveSecret(hex(v["secret"]!), label: v["label"]!) == hex(v["out"]!))
     }
 
     @Test("DeriveTreeSecret: ExpandWithLabel over a big-endian generation")
@@ -37,7 +37,7 @@ struct MLSConformanceTests {
         let v = vector("derive_tree_secret")
         var generation = MLSWriter()
         generation.uint32(UInt32(v["generation"]!)!)
-        let out = MLSCipherSuite.expandWithLabel(
+        let out = MLSCipherSuite.mls128DHKEMX25519.expandWithLabel(
             hex(v["secret"]!), label: v["label"]!, context: generation.bytes, length: Int(v["length"]!)!
         )
         #expect(out == hex(v["out"]!))
@@ -46,7 +46,7 @@ struct MLSConformanceTests {
     @Test("RefHash")
     func refHash() {
         let v = vector("ref_hash")
-        #expect(MLSCipherSuite.refHash(label: v["label"]!, value: hex(v["value"]!)) == hex(v["out"]!))
+        #expect(MLSCipherSuite.mls128DHKEMX25519.refHash(label: v["label"]!, value: hex(v["value"]!)) == hex(v["out"]!))
     }
 
     @Test("SignWithLabel: the published signature verifies, and ours does too")
@@ -55,16 +55,16 @@ struct MLSConformanceTests {
         // compared byte for byte; verifying both directions is the check.
         let v = vector("sign_with_label")
         let content = hex(v["content"]!)
-        #expect(MLSCipherSuite.verifyWithLabel(
+        #expect(MLSCipherSuite.mls128DHKEMX25519.verifyWithLabel(
             hex(v["pub"]!), label: v["label"]!, content: content, signature: hex(v["signature"]!)
         ))
         let key = try Curve25519.Signing.PrivateKey(rawRepresentation: hex(v["priv"]!))
         #expect(key.publicKey.rawRepresentation == hex(v["pub"]!))
-        let ours = try MLSCipherSuite.signWithLabel(key, label: v["label"]!, content: content)
-        #expect(MLSCipherSuite.verifyWithLabel(
+        let ours = try MLSCipherSuite.mls128DHKEMX25519.signWithLabel(key.rawRepresentation, label: v["label"]!, content: content)
+        #expect(MLSCipherSuite.mls128DHKEMX25519.verifyWithLabel(
             hex(v["pub"]!), label: v["label"]!, content: content, signature: ours
         ))
-        #expect(!MLSCipherSuite.verifyWithLabel(
+        #expect(!MLSCipherSuite.mls128DHKEMX25519.verifyWithLabel(
             hex(v["pub"]!), label: "Other", content: content, signature: ours
         ))
     }
@@ -126,7 +126,8 @@ struct MLSConformanceTests {
             #expect(secrets.initSecret == hex(v["init_secret"]!), "init, epoch \(index)")
             #expect(
                 MLSEpochSecrets.welcomeSecret(
-                    joinerSecret: secrets.joinerSecret, pskSecret: hex(v["psk_secret"]!)
+                    joinerSecret: secrets.joinerSecret, pskSecret: hex(v["psk_secret"]!),
+                    suite: .mls128DHKEMX25519
                 ) == hex(v["welcome_secret"]!)
             )
 
@@ -180,6 +181,74 @@ struct MLSConformanceTests {
             var reader = MLSReader(hex(header))
             #expect(try reader.length() == length, "decode \(header)")
             #expect(reader.isAtEnd)
+        }
+    }
+}
+
+/// MLS_192_MLKEM768_AES256GCM_SHA384_MLDSA65 shares HKDF-SHA384 and
+/// HMAC-SHA384 with RFC 9420's suite 7, so suite 7's published vectors are what
+/// hold its key schedule to the RFC. The GroupContext is taken as the vector
+/// serialises it, since it names suite 7.
+@Suite("MLS conformance (RFC 9420 test vectors, suite 7's SHA-384 key schedule)")
+struct MLSSHA384ConformanceTests {
+    private let suite = MLSCipherSuite.mls192MLKEM768MLDSA65
+
+    private func vector(_ name: String) -> [String: String] {
+        MLSSuite7Vectors.cryptoBasics[name]!
+    }
+
+    @Test("ExpandWithLabel, DeriveSecret, DeriveTreeSecret and RefHash")
+    func basics() {
+        var v = vector("expand_with_label")
+        #expect(suite.expandWithLabel(
+            hex(v["secret"]!), label: v["label"]!, context: hex(v["context"]!), length: Int(v["length"]!)!
+        ) == hex(v["out"]!))
+
+        v = vector("derive_secret")
+        #expect(suite.deriveSecret(hex(v["secret"]!), label: v["label"]!) == hex(v["out"]!))
+
+        v = vector("derive_tree_secret")
+        var generation = MLSWriter()
+        generation.uint32(UInt32(v["generation"]!)!)
+        #expect(suite.expandWithLabel(
+            hex(v["secret"]!), label: v["label"]!, context: generation.bytes, length: Int(v["length"]!)!
+        ) == hex(v["out"]!))
+
+        v = vector("ref_hash")
+        #expect(suite.refHash(label: v["label"]!, value: hex(v["value"]!)) == hex(v["out"]!))
+    }
+
+    @Test("key schedule: five epochs, every derived secret and the exporter")
+    func keySchedule() {
+        var initSecret = hex(MLSSuite7Vectors.initialInitSecret)
+        for (index, v) in MLSSuite7Vectors.epochs.enumerated() {
+            let secrets = MLSEpochSecrets.derive(
+                initSecret: initSecret,
+                commitSecret: hex(v["commit_secret"]!),
+                pskSecret: hex(v["psk_secret"]!),
+                suite: suite,
+                encodedContext: hex(v["group_context"]!)
+            )
+            #expect(secrets.joinerSecret == hex(v["joiner_secret"]!), "joiner, epoch \(index)")
+            #expect(secrets.welcomeSecret == hex(v["welcome_secret"]!), "welcome, epoch \(index)")
+            #expect(secrets.senderDataSecret == hex(v["sender_data_secret"]!))
+            #expect(secrets.encryptionSecret == hex(v["encryption_secret"]!))
+            #expect(secrets.exporterSecret == hex(v["exporter_secret"]!))
+            #expect(secrets.externalSecret == hex(v["external_secret"]!))
+            #expect(secrets.confirmationKey == hex(v["confirmation_key"]!))
+            #expect(secrets.membershipKey == hex(v["membership_key"]!))
+            #expect(secrets.resumptionPSK == hex(v["resumption_psk"]!))
+            #expect(secrets.epochAuthenticator == hex(v["epoch_authenticator"]!))
+            #expect(secrets.initSecret == hex(v["init_secret"]!), "init, epoch \(index)")
+
+            let exported = secrets.export(
+                label: v["exporter_label"]!,
+                context: hex(v["exporter_context"]!),
+                length: Int(v["exporter_length"]!)!
+            )
+            #expect(exported == hex(v["exporter_out"]!), "exporter, epoch \(index)")
+
+            initSecret = secrets.initSecret
         }
     }
 }

@@ -24,7 +24,7 @@
 // and `PrivateMessage` (application data is SFrame, keyed from the exporter as
 // RFC 9605 §5.2 says), PSKs, external commits and external proposals, ReInit,
 // extensions, credentials other than a bare identity, key package lifetimes,
-// and every cipher suite but the two in `MLSCipherSuite.swift`. Do not
+// and every cipher suite but the three in `MLSCipherSuite.swift`. Do not
 // describe this as RFC 9420 conformant; it is not.
 //
 // Proposals are Add and Remove, always carried by value inside the commit
@@ -37,26 +37,28 @@
 // # Cipher suites
 //
 // A group has one suite for its whole life, fixed when it is founded and
-// carried in its GroupContext; new groups use the hybrid X-Wing suite (see
-// `MLSCipherSuite.swift`). Every key package names its suite, a commit refuses
-// to add a package in another, and a joiner refuses a Welcome whose group is
-// in another. There is no migrating a group between suites: a room that
-// should change suite founds a new group.
+// carried in its GroupContext; new groups use
+// MLS_192_MLKEM768_AES256GCM_SHA384_MLDSA65 (see `MLSCipherSuite.swift`), and
+// no other. Every key package names its suite, a commit refuses to add a
+// package in another, and a joiner refuses a Welcome whose group is in
+// another. There is no migrating a group between suites: a room that should
+// change suite founds a new group.
 //
-// X-Wing because a commit secret or joiner secret recorded today is otherwise
-// only as safe as X25519, and everything later in the epoch, SFrame keys
-// included, is derived from those secrets. The signatures stay Ed25519, which
-// is what the draft's suite specifies: they authenticate the members of a
-// live call and are not what a recording adversary needs to break.
+// ML-KEM-768 because a commit secret or joiner secret recorded today is
+// otherwise only as safe as X25519, and everything later in the epoch, SFrame
+// keys included, is derived from those secrets. ML-DSA-65 because the
+// signatures are what say which member sent a commit and who is in the group:
+// classical signatures would let whoever can break them later forge history,
+// and, while a call is live, would be the one part of the group a quantum
+// attacker could impersonate.
 //
-// # Why Ed25519, and not the Secure Enclave
+// # Why software keys, and not the Secure Enclave
 //
-// Both suites sign with Ed25519, which CryptoKit has, as it has every other
-// primitive they name, including HPKE. The Secure Enclave would want suite
-// 0x0002 (P-256), and it was not chosen: the
-// MLS signature key signs every commit and GroupInfo this member makes and is
-// thrown away with the session, and the enclave key is the device's one
-// long-lived identity. Binding the two is the delivery service's job instead:
+// The MLS signature key signs every commit and GroupInfo this member makes and
+// is thrown away with the session, so it is a CryptoKit software key (ML-DSA-65
+// for new groups, Ed25519 in the older suites), not the enclave key, which is
+// the device's one long-lived identity. Binding the two is the delivery
+// service's job instead:
 // it accepts a key package only from a token whose subject and device are the
 // identity inside it, and that token is itself bound to the enclave key.
 //
@@ -72,8 +74,8 @@
 //   commit by anyone. A member's own leaf key refreshes only when that member
 //   commits; ``MLSGroup/commit(adding:removing:)`` with nothing to add or
 //   remove is how a member rotates it.
-// - Commits and group information are signed by the committer's Ed25519 key
-//   and bound to the epoch's GroupContext, and a confirmation tag proves every
+// - Commits and group information are signed by the committer's signature key
+//   (ML-DSA-65 in new groups) and bound to the epoch's GroupContext, and a confirmation tag proves every
 //   member derived the same epoch.
 //
 // What it does not guarantee: that the identity in a key package belongs to
@@ -180,18 +182,18 @@ public struct MLSKeyPackage: Hashable, Sendable {
     /// Whether the package is signed by the key it carries, and its keys are
     /// the size its suite says.
     public var isValid: Bool {
-        signatureKey.count == MLSCipherSuite.signatureKeyLength
+        signatureKey.count == cipherSuite.signatureKeyLength
             && initKey.count == cipherSuite.publicKeyLength
             && encryptionKey.count == cipherSuite.publicKeyLength
             && initKey != encryptionKey
-            && MLSCipherSuite.verifyWithLabel(
+            && cipherSuite.verifyWithLabel(
                 signatureKey, label: "KeyPackageTBS", content: toBeSigned, signature: signature
             )
     }
 
     /// `KeyPackageRef`, RFC 9420 §5.2.
     public var reference: Data {
-        MLSCipherSuite.refHash(label: "MLS 1.0 KeyPackage Reference", value: encoded)
+        cipherSuite.refHash(label: "MLS 1.0 KeyPackage Reference", value: encoded)
     }
 
     public var identityString: String { String(decoding: identity, as: UTF8.self) }
@@ -216,19 +218,19 @@ public struct MLSKeyPackageBundle: Sendable {
         identity: String,
         cipherSuite: MLSCipherSuite = .default
     ) throws(MLSError) -> MLSKeyPackageBundle {
-        let signing = Curve25519.Signing.PrivateKey()
+        let signing = try cipherSuite.generateSignatureKeyPair()
         let initKey = try cipherSuite.generateKeyPair()
         let encryption = try cipherSuite.generateKeyPair()
         let unsigned = MLSKeyPackage(
             cipherSuite: cipherSuite,
             identity: Data(identity.utf8),
-            signatureKey: signing.publicKey.rawRepresentation,
+            signatureKey: signing.publicKey,
             initKey: initKey.publicKey,
             encryptionKey: encryption.publicKey,
             signature: Data()
         )
-        let signature = try MLSCipherSuite.signWithLabel(
-            signing, label: "KeyPackageTBS", content: unsigned.toBeSigned
+        let signature = try cipherSuite.signWithLabel(
+            signing.privateKey, label: "KeyPackageTBS", content: unsigned.toBeSigned
         )
         return MLSKeyPackageBundle(
             keyPackage: MLSKeyPackage(
@@ -241,13 +243,8 @@ public struct MLSKeyPackageBundle: Sendable {
             ),
             initPrivate: initKey.privateKey,
             encryptionPrivate: encryption.privateKey,
-            signaturePrivate: signing.rawRepresentation
+            signaturePrivate: signing.privateKey
         )
-    }
-
-    var signingKey: Curve25519.Signing.PrivateKey {
-        // Constructed from bytes this type wrote, so cannot fail.
-        try! Curve25519.Signing.PrivateKey(rawRepresentation: signaturePrivate)
     }
 }
 
@@ -310,8 +307,8 @@ struct MLSMembers: Hashable, Sendable {
 
     /// The GroupContext's `tree_hash` slot. Not the RFC's tree hash, since
     /// there is no tree; a hash of the whole member list in its place.
-    var hash: Data {
-        MLSCipherSuite.refHash(label: "MOQOM 1.0 Member List", value: encoded)
+    func hash(in suite: MLSCipherSuite) -> Data {
+        suite.refHash(label: "MOQOM 1.0 Member List", value: encoded)
     }
 
     func leaf(_ index: UInt32) -> MLSLeaf? {
@@ -554,46 +551,43 @@ public struct MLSGroup: Sendable {
         bundle: MLSKeyPackageBundle
     ) throws(MLSError) -> MLSGroup {
         guard bundle.keyPackage.isValid else { throw MLSError.badSignature }
+        let suite = bundle.keyPackage.cipherSuite
         let members = MLSMembers(leaves: [bundle.keyPackage.leaf])
         let context = MLSGroupContext(
-            cipherSuite: bundle.keyPackage.cipherSuite,
-            groupID: groupID, epoch: 0, treeHash: members.hash, confirmedTranscriptHash: Data()
+            cipherSuite: suite,
+            groupID: groupID, epoch: 0, treeHash: members.hash(in: suite), confirmedTranscriptHash: Data()
         )
         let secrets = MLSEpochSecrets.derive(
-            initSecret: MLSCipherSuite.randomSecret(),
-            commitSecret: MLSCipherSuite.randomSecret(),
+            initSecret: suite.randomSecret(),
+            commitSecret: suite.randomSecret(),
             context: context
         )
-        let tag = MLSCipherSuite.mac(key: secrets.confirmationKey, data: Data())
+        let tag = suite.mac(key: secrets.confirmationKey, data: Data())
         return MLSGroup(
             groupID: groupID,
             ownLeaf: 0,
             members: members,
             context: context,
             secrets: secrets,
-            interimTranscriptHash: Self.interim(confirmed: Data(), tag: tag),
+            interimTranscriptHash: Self.interim(confirmed: Data(), tag: tag, suite: suite),
             encryptionPrivate: bundle.encryptionPrivate,
             signaturePrivate: bundle.signaturePrivate
         )
     }
 
-    private static func interim(confirmed: Data, tag: Data) -> Data {
+    private static func interim(confirmed: Data, tag: Data, suite: MLSCipherSuite) -> Data {
         var writer = MLSWriter()
         writer.raw(confirmed)
         writer.vector(tag)
-        return MLSCipherSuite.hash(writer.bytes)
+        return suite.hash(writer.bytes)
     }
 
-    private static func confirmed(interim: Data, content: Data, signature: Data) -> Data {
+    private func confirmed(content: Data, signature: Data) -> Data {
         var writer = MLSWriter()
-        writer.raw(interim)
+        writer.raw(interimTranscriptHash)
         writer.raw(content)
         writer.vector(signature)
-        return MLSCipherSuite.hash(writer.bytes)
-    }
-
-    private var signingKey: Curve25519.Signing.PrivateKey {
-        try! Curve25519.Signing.PrivateKey(rawRepresentation: signaturePrivate)
+        return cipherSuite.hash(writer.bytes)
     }
 
     // MARK: - Committing
@@ -623,12 +617,12 @@ public struct MLSGroup: Sendable {
             encryptionKey: encryption.publicKey
         )
 
-        let commitSecret = MLSCipherSuite.randomSecret()
+        let commitSecret = cipherSuite.randomSecret()
         let provisional = MLSGroupContext(
             cipherSuite: cipherSuite,
             groupID: groupID,
             epoch: epoch + 1,
-            treeHash: next.hash,
+            treeHash: next.hash(in: cipherSuite),
             confirmedTranscriptHash: context.confirmedTranscriptHash
         )
         var sealed: [(UInt32, HPKECiphertext)] = []
@@ -656,21 +650,19 @@ public struct MLSGroup: Sendable {
             groupID: groupID, epoch: epoch, sender: ownLeaf,
             commit: body.encoded, signature: Data(), confirmationTag: Data()
         )
-        let signature = try MLSCipherSuite.signWithLabel(
-            signingKey, label: "FramedContentTBS", content: context.encoded + unsigned.content
+        let signature = try cipherSuite.signWithLabel(
+            signaturePrivate, label: "FramedContentTBS", content: context.encoded + unsigned.content
         )
 
-        let confirmed = Self.confirmed(
-            interim: interimTranscriptHash, content: unsigned.content, signature: signature
-        )
+        let confirmed = confirmed(content: unsigned.content, signature: signature)
         let newContext = MLSGroupContext(
             cipherSuite: cipherSuite,
-            groupID: groupID, epoch: epoch + 1, treeHash: next.hash, confirmedTranscriptHash: confirmed
+            groupID: groupID, epoch: epoch + 1, treeHash: next.hash(in: cipherSuite), confirmedTranscriptHash: confirmed
         )
         let newSecrets = MLSEpochSecrets.derive(
             initSecret: secrets.initSecret, commitSecret: commitSecret, context: newContext
         )
-        let tag = MLSCipherSuite.mac(key: newSecrets.confirmationKey, data: confirmed)
+        let tag = cipherSuite.mac(key: newSecrets.confirmationKey, data: confirmed)
 
         let message = MLSCommitMessage(
             groupID: groupID, epoch: epoch, sender: ownLeaf,
@@ -682,7 +674,7 @@ public struct MLSGroup: Sendable {
             members: next,
             context: newContext,
             secrets: newSecrets,
-            interimTranscriptHash: Self.interim(confirmed: confirmed, tag: tag),
+            interimTranscriptHash: Self.interim(confirmed: confirmed, tag: tag, suite: cipherSuite),
             encryptionPrivate: encryption.privateKey,
             signaturePrivate: signaturePrivate
         )
@@ -708,12 +700,15 @@ public struct MLSGroup: Sendable {
         return writer.bytes
     }
 
-    private static func welcomeKeys(_ welcomeSecret: Data) -> (key: Data, nonce: Data) {
+    private static func welcomeKeys(
+        _ welcomeSecret: Data,
+        suite: MLSCipherSuite
+    ) -> (key: Data, nonce: Data) {
         (
-            MLSCipherSuite.expandWithLabel(
-                welcomeSecret, label: "key", context: Data(), length: MLSCipherSuite.aeadKeyLength
+            suite.expandWithLabel(
+                welcomeSecret, label: "key", context: Data(), length: suite.aeadKeyLength
             ),
-            MLSCipherSuite.expandWithLabel(
+            suite.expandWithLabel(
                 welcomeSecret, label: "nonce", context: Data(), length: MLSCipherSuite.aeadNonceLength
             )
         )
@@ -723,9 +718,9 @@ public struct MLSGroup: Sendable {
         let tbs = groupInfoToBeSigned(tag: tag)
         var info = MLSWriter()
         info.raw(tbs)
-        info.vector(try MLSCipherSuite.signWithLabel(signingKey, label: "GroupInfoTBS", content: tbs))
+        info.vector(try cipherSuite.signWithLabel(signaturePrivate, label: "GroupInfoTBS", content: tbs))
 
-        let (key, nonce) = Self.welcomeKeys(secrets.welcomeSecret)
+        let (key, nonce) = Self.welcomeKeys(secrets.welcomeSecret, suite: cipherSuite)
         let encrypted = try MLSCipherSuite.aeadSeal(
             key: key, nonce: nonce, plaintext: info.bytes, aad: Data()
         )
@@ -755,7 +750,7 @@ public struct MLSGroup: Sendable {
         guard message.sender != ownLeaf, let sender = members.leaf(message.sender) else {
             throw MLSError.unknownSender
         }
-        guard MLSCipherSuite.verifyWithLabel(
+        guard cipherSuite.verifyWithLabel(
             sender.signatureKey,
             label: "FramedContentTBS",
             content: context.encoded + message.content,
@@ -784,7 +779,7 @@ public struct MLSGroup: Sendable {
             cipherSuite: cipherSuite,
             groupID: groupID,
             epoch: epoch + 1,
-            treeHash: next.hash,
+            treeHash: next.hash(in: cipherSuite),
             confirmedTranscriptHash: context.confirmedTranscriptHash
         )
         guard let mine = body.secrets.first(where: { $0.leaf == ownLeaf }) else {
@@ -794,17 +789,15 @@ public struct MLSGroup: Sendable {
             encryptionPrivate, label: "UpdatePathNode", context: provisional.encoded, ciphertext: mine.ciphertext
         )
 
-        let confirmed = Self.confirmed(
-            interim: interimTranscriptHash, content: message.content, signature: message.signature
-        )
+        let confirmed = confirmed(content: message.content, signature: message.signature)
         let newContext = MLSGroupContext(
             cipherSuite: cipherSuite,
-            groupID: groupID, epoch: epoch + 1, treeHash: next.hash, confirmedTranscriptHash: confirmed
+            groupID: groupID, epoch: epoch + 1, treeHash: next.hash(in: cipherSuite), confirmedTranscriptHash: confirmed
         )
         let newSecrets = MLSEpochSecrets.derive(
             initSecret: secrets.initSecret, commitSecret: commitSecret, context: newContext
         )
-        let tag = MLSCipherSuite.mac(key: newSecrets.confirmationKey, data: confirmed)
+        let tag = cipherSuite.mac(key: newSecrets.confirmationKey, data: confirmed)
         guard tag == message.confirmationTag else { throw MLSError.confirmationMismatch }
 
         return .advanced(MLSGroup(
@@ -813,7 +806,7 @@ public struct MLSGroup: Sendable {
             members: next,
             context: newContext,
             secrets: newSecrets,
-            interimTranscriptHash: Self.interim(confirmed: confirmed, tag: tag),
+            interimTranscriptHash: Self.interim(confirmed: confirmed, tag: tag, suite: cipherSuite),
             encryptionPrivate: encryptionPrivate,
             signaturePrivate: signaturePrivate
         ))
@@ -835,7 +828,9 @@ public struct MLSGroup: Sendable {
         let joinerSecret = try suite.decryptWithLabel(
             bundle.initPrivate, label: "Welcome", context: welcome.encryptedGroupInfo, ciphertext: entry.ciphertext
         )
-        let (key, nonce) = welcomeKeys(MLSEpochSecrets.welcomeSecret(joinerSecret: joinerSecret))
+        let (key, nonce) = welcomeKeys(
+            MLSEpochSecrets.welcomeSecret(joinerSecret: joinerSecret, suite: suite), suite: suite
+        )
         let info = try MLSCipherSuite.aeadOpen(
             key: key, nonce: nonce, ciphertext: welcome.encryptedGroupInfo, aad: Data()
         )
@@ -857,13 +852,13 @@ public struct MLSGroup: Sendable {
         tbs.raw(members.encoded)
         tbs.vector(tag)
         tbs.uint32(signer)
-        guard MLSCipherSuite.verifyWithLabel(
+        guard suite.verifyWithLabel(
             signerLeaf.signatureKey, label: "GroupInfoTBS", content: tbs.bytes, signature: signature
         ) else { throw MLSError.badSignature }
-        guard members.hash == context.treeHash else { throw MLSError.confirmationMismatch }
+        guard members.hash(in: suite) == context.treeHash else { throw MLSError.confirmationMismatch }
 
         let secrets = MLSEpochSecrets.derive(joinerSecret: joinerSecret, context: context)
-        guard MLSCipherSuite.mac(
+        guard suite.mac(
             key: secrets.confirmationKey, data: context.confirmedTranscriptHash
         ) == tag else { throw MLSError.confirmationMismatch }
 
@@ -876,7 +871,7 @@ public struct MLSGroup: Sendable {
             members: members,
             context: context,
             secrets: secrets,
-            interimTranscriptHash: interim(confirmed: context.confirmedTranscriptHash, tag: tag),
+            interimTranscriptHash: interim(confirmed: context.confirmedTranscriptHash, tag: tag, suite: suite),
             encryptionPrivate: bundle.encryptionPrivate,
             signaturePrivate: bundle.signaturePrivate
         )

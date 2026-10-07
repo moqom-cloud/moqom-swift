@@ -35,9 +35,9 @@ struct MLSHybridSuiteTests {
         }
     }
 
-    @Test("identifiers: the hybrid suite is the default, both are known, nothing else is")
+    @Test("identifiers: the hybrid suite is known, and is not what a new group uses")
     func identifiers() {
-        #expect(MLSCipherSuite.default == hybrid)
+        #expect(MLSCipherSuite.default != hybrid)
         #expect(hybrid.hasPostQuantumKEM && !classical.hasPostQuantumKEM)
         #expect(MLSCipherSuite(identifier: 0x0001) == classical)
         #expect(MLSCipherSuite(identifier: 0xF0A1) == hybrid)
@@ -49,10 +49,11 @@ struct MLSHybridSuiteTests {
         #expect(hybrid.name == "MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519")
     }
 
-    @Test("X-Wing keys and encapsulations are the sizes the draft gives", arguments: MLSCipherSuite.supported)
+    @Test("KEM keys and encapsulations are the sizes the drafts give", arguments: MLSCipherSuite.supported)
     func sizes(suite: MLSCipherSuite) throws {
         let pair = try suite.generateKeyPair()
-        #expect(pair.privateKey.count == 32)
+        // ML-KEM-768's seed is FIPS 203's d || z; X-Wing's and X25519's are 32 bytes.
+        #expect(pair.privateKey.count == (suite == .mls192MLKEM768MLDSA65 ? 64 : 32))
         #expect(pair.publicKey.count == suite.publicKeyLength)
         let sealed = try suite.encryptWithLabel(
             pair.publicKey, label: "UpdatePathNode", context: Data(), plaintext: Data(count: 32)
@@ -67,7 +68,7 @@ struct MLSHybridSuiteTests {
     @Test("EncryptWithLabel round-trips under X-Wing and is bound to its label and context")
     func encryptWithLabel() throws {
         let pair = try hybrid.generateKeyPair()
-        let secret = MLSCipherSuite.randomSecret()
+        let secret = MLSCipherSuite.randomSecret(32)
         let sealed = try hybrid.encryptWithLabel(
             pair.publicKey, label: "Welcome", context: Data("ctx".utf8), plaintext: secret
         )
@@ -93,7 +94,7 @@ struct MLSHybridSuiteTests {
 
     @Test("a key package names its suite, and one in a suite not implemented does not decode")
     func keyPackageSuite() throws {
-        let package = try MLSKeyPackageBundle.generate(identity: "bob/b").keyPackage
+        let package = try MLSKeyPackageBundle.generate(identity: "bob/b", cipherSuite: hybrid).keyPackage
         #expect(package.cipherSuite == hybrid)
         #expect(package.initKey.count == 1216 && package.encryptionKey.count == 1216)
         #expect(package.isValid)
@@ -117,7 +118,9 @@ struct MLSHybridSuiteTests {
 
     @Test("a group never mixes suites: a commit refuses a key package in the other one")
     func mixedSuitesRefused() throws {
-        let hybridGroup = try MLSGroup.create(groupID: room, bundle: .generate(identity: "alice/a"))
+        let hybridGroup = try MLSGroup.create(
+            groupID: room, bundle: .generate(identity: "alice/a", cipherSuite: hybrid)
+        )
         #expect(hybridGroup.cipherSuite == hybrid)
         let classicalBob = try MLSKeyPackageBundle.generate(identity: "bob/b", cipherSuite: classical)
         #expect(throws: MLSError.cipherSuiteMismatch(group: 0xF0A1, other: 0x0001)) {
@@ -128,7 +131,7 @@ struct MLSHybridSuiteTests {
             groupID: room, bundle: .generate(identity: "alice/a", cipherSuite: classical)
         )
         #expect(classicalGroup.cipherSuite == classical)
-        let hybridBob = try MLSKeyPackageBundle.generate(identity: "bob/b")
+        let hybridBob = try MLSKeyPackageBundle.generate(identity: "bob/b", cipherSuite: hybrid)
         #expect(throws: MLSError.cipherSuiteMismatch(group: 0x0001, other: 0xF0A1)) {
             _ = try classicalGroup.commit(adding: [hybridBob.keyPackage])
         }
@@ -161,11 +164,11 @@ struct MLSHybridSuiteTests {
     func wireSizes() throws {
         // Members two to five, added one at a time, so each commit seals one
         // more secret than the last and each Welcome carries one more leaf.
-        var group = try MLSGroup.create(groupID: room, bundle: .generate(identity: "alice/a"))
+        var group = try MLSGroup.create(groupID: room, bundle: .generate(identity: "alice/a", cipherSuite: hybrid))
         var commits: [Int] = []
         var welcomes: [Int] = []
         for index in 0 ..< 4 {
-            let joiner = try MLSKeyPackageBundle.generate(identity: "member/\(index)")
+            let joiner = try MLSKeyPackageBundle.generate(identity: "member/\(index)", cipherSuite: hybrid)
             #expect(joiner.keyPackage.encoded.count < 2_700)
             let add = try group.commit(adding: [joiner.keyPackage])
             commits.append(add.message.encoded.count)

@@ -185,9 +185,9 @@ struct ManagedRoomKeysTests {
         for blob in await service.everything { #expect(blob.range(of: base) == nil) }
 
         // Founded in the hybrid suite, and everybody is in it.
-        #expect(await service.group?.cipherSuite == MLSCipherSuite.mls128MLKEM768X25519.identifier)
+        #expect(await service.group?.cipherSuite == MLSCipherSuite.mls192MLKEM768MLDSA65.identifier)
         for keys in [alice, bob, carol] {
-            #expect(await keys.status?.cipherSuite == .mls128MLKEM768X25519)
+            #expect(await keys.status?.cipherSuite == .mls192MLKEM768MLDSA65)
         }
 
         for keys in [alice, bob, carol] { await keys.stop() }
