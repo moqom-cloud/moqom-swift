@@ -2,77 +2,18 @@
 // Network.framework, real certificates, real tokens signed and checked the way
 // a relay checks them.
 //
-// The tokens are minted here with the Rust suite's test key (an Ed25519 seed of
-// sevens, kid `test-key`) and the same claims, so a vector that passes in one
-// SDK's tests is one the other's would mint.
+// The tokens are minted with the Rust suite's test key and the same claims; see
+// MoqomDirectTesting, which MoqomDirectRustTests shares.
 
 import CryptoKit
 import Foundation
 import Testing
 
 @testable import MoqomCore
+import MoqomDirectTesting
 @testable import MoqomKit
 @testable import MoqomLoopback
 import MoqomWire
-
-// MARK: - Minting
-
-enum DirectTokens {
-    static let signer = try! Curve25519.Signing.PrivateKey(rawRepresentation: Data(repeating: 7, count: 32))
-    static let keys = [DirectVerificationKey(id: "test-key", key: signer.publicKey.rawRepresentation)]
-
-    static func jws(_ header: [String: Any], _ claims: [String: Any], sign: (Data) -> Data) -> Data {
-        func segment(_ object: [String: Any]) -> String {
-            let json = try! JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
-            return json.base64URLEncodedString
-        }
-        let signed = segment(header) + "." + segment(claims)
-        return Data((signed + "." + sign(Data(signed.utf8)).base64URLEncodedString).utf8)
-    }
-
-    /// A token as the control plane mints one, with any claim overridable.
-    static func mint(
-        user: String,
-        key: DeviceKey,
-        tenant: String = "acme",
-        room: String = "room-42",
-        publish: Int = 0x0F,
-        capabilities: Int = 0,
-        expires: Date = Date().addingTimeInterval(3600),
-        issued: Date? = nil,
-        kid: String = "test-key",
-        signer: Curve25519.Signing.PrivateKey = DirectTokens.signer,
-        extraScope: [String: Any] = [:]
-    ) -> Data {
-        var scope: [String: Any] = ["room": room, "pub": publish, "cap": capabilities, "own": true, "bs": false]
-        scope.merge(extraScope) { $1 }
-        var claims: [String: Any] = [
-            "sub": user,
-            "aud": tenant,
-            "exp": Int(expires.timeIntervalSince1970),
-            "cnf": ["jkt": key.thumbprint],
-            "moqt": scope,
-        ]
-        if let issued { claims["iat"] = Int(issued.timeIntervalSince1970) }
-        return jws(["alg": "EdDSA", "typ": "MOQT", "kid": kid], claims) { try! signer.signature(for: $0) }
-    }
-}
-
-/// One person's device, as a direct path sees it.
-struct DirectDevice {
-    let user: String
-    let key = DeviceKey.ephemeral()
-
-    var name: String { "\(user)/\(key.thumbprint.prefix(16))" }
-
-    func credentials(_ token: Data? = nil) throws -> DeviceCredentials {
-        DeviceCredentials(
-            identity: ParticipantIdentity(username: try Username(user), device: try DeviceID(thumbprint: key.thumbprint)),
-            token: token ?? DirectTokens.mint(user: user, key: key),
-            deviceKey: key
-        )
-    }
-}
 
 // MARK: - The relay's checks, in Swift
 
@@ -222,20 +163,11 @@ struct DirectEndpointTests {
     let alice = DirectDevice(user: "alice")
     let bob = DirectDevice(user: "bob")
 
-    static let eligible = DirectEligibility(endToEndEncrypted: true, participants: 2, everyoneOptedIn: true)
-
     func endpoint(_ device: DirectDevice, patience: Duration = .seconds(4)) async throws -> DirectEndpoint {
-        var configuration = DirectConfiguration(tenant: "acme", room: "room-42", me: device.name)
-        configuration.advertisedHost = "127.0.0.1"
-        configuration.patience = patience
-        return try await DirectEndpoint.bind(
-            configuration,
-            eligibility: Self.eligible,
-            exposure: .peersWillLearnMyIPAddresses()
-        )
+        try await DirectPair.endpoint(device, patience: patience)
     }
 
-    typealias Outcome = Result<DirectSession, DirectEndpointError>
+    typealias Outcome = DirectPair.Outcome
 
     /// Both sides establishing at once, as they would after trading offers.
     func establish(
@@ -244,27 +176,14 @@ struct DirectEndpointTests {
         offerToAlice: (CandidateOffer) -> CandidateOffer = { $0 },
         patience: Duration = .seconds(4)
     ) async throws -> (alice: Outcome, bob: Outcome) {
-        let a = try await endpoint(alice, patience: patience)
-        let b = try await endpoint(bob, patience: patience)
-        let toBob = a.offer(to: bob.name)
-        let toAlice = offerToAlice(b.offer(to: alice.name))
-        let aliceCredentials = try alice.credentials(aliceToken)
-        let bobCredentials = try bob.credentials(bobToken)
-        let keys = DirectTokens.keys
-
-        func outcome(_ body: () async throws -> DirectSession) async -> Outcome {
-            do { return .success(try await body()) } catch { return .failure(error as! DirectEndpointError) }
-        }
-        async let fromAlice = outcome {
-            try await a.establish(offer: toAlice, credentials: aliceCredentials, verifier: DirectPeerCheck(keys: keys))
-        }
-        async let fromBob = outcome {
-            try await b.establish(offer: toBob, credentials: bobCredentials, verifier: DirectPeerCheck(keys: keys))
-        }
-        let outcome = await (fromAlice, fromBob)
-        a.close()
-        b.close()
-        return outcome
+        try await DirectPair.establish(
+            alice: alice,
+            bob: bob,
+            aliceToken: aliceToken,
+            bobToken: bobToken,
+            offerToAlice: offerToAlice,
+            patience: patience
+        )
     }
 
     func track(_ publisher: DirectDevice) throws -> FullTrackName {
@@ -429,11 +348,3 @@ struct DirectEndpointTests {
         await atBob.session.close(code: 0, reason: "done")
     }
 }
-
-extension Result {
-    var failure: Failure? {
-        if case let .failure(error) = self { return error }
-        return nil
-    }
-}
-

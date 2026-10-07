@@ -54,9 +54,17 @@ let package = Package(
         ),
         .testTarget(name: "MoqomCoreTests", dependencies: ["MoqomCore"], swiftSettings: strict),
         .testTarget(name: "MoqomWireTests", dependencies: ["MoqomWire"], swiftSettings: strict),
+        // Helpers both direct-path suites share: tokens minted the way the
+        // control plane mints them, and two endpoints establishing at once.
+        .target(
+            name: "MoqomDirectTesting",
+            dependencies: ["MoqomCore", "MoqomKit"],
+            path: "Tests/MoqomDirectTesting",
+            swiftSettings: strict
+        ),
         .testTarget(
             name: "MoqomKitTests",
-            dependencies: ["MoqomKit", "MoqomLoopback", "MoqomWire"],
+            dependencies: ["MoqomKit", "MoqomLoopback", "MoqomWire", "MoqomDirectTesting"],
             swiftSettings: strict
         ),
     ]

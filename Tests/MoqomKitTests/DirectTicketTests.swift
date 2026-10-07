@@ -9,6 +9,7 @@ import Foundation
 import Testing
 
 @testable import MoqomCore
+import MoqomDirectTesting
 @testable import MoqomKit
 @testable import MoqomLoopback
 
