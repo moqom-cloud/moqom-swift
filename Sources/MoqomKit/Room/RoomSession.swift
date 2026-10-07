@@ -1639,10 +1639,16 @@ public actor RoomSession {
             throw MoqomError.invalidName(error)
         }
 
-        // Never encrypted. It is the description a receiver needs in order to
-        // decrypt anything else, and it says nothing that the announcement it
-        // travels beside does not already reveal.
-        let writer = try await connection.publish(name, priority: CatalogPublisher.priority)
+        // Sealed like the media it describes. What the relay needs — names,
+        // kinds, geometry, locale — rides beside it as the catalog's disclosure,
+        // authenticated by the same tag.
+        try requireEncryptionIfPolicyDemands()
+        let relay = try await connection.publish(name, priority: CatalogPublisher.priority)
+        let writer: any TrackWriter = if let encryption {
+            ProtectedTrackWriter(wrapping: relay, sender: encryption.sender)
+        } else {
+            relay
+        }
         let publisher = CatalogPublisher(writer: writer)
         catalogPublisher = publisher
         await refreshCatalog()
@@ -3487,6 +3493,7 @@ public actor RoomSession {
     }
 
     private func applyCatalog(_ object: TrackObject, from who: ParticipantIdentity) async {
+        guard let object = await open(object, from: who) else { return }
         let reader = catalogs[who] ?? CatalogReader()
         catalogs[who] = reader
         guard let catalog = await reader.apply(object) else { return }

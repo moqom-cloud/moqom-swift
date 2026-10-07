@@ -755,19 +755,26 @@ public struct ObjectProperties: Hashable, Sendable {
     /// exists to prevent.
     public var isSilence: Bool?
 
+    /// On a sealed `.catalog` object, the part of the catalog that is not
+    /// secret from the relay. See ``Catalog/disclosure()``.
+    public var disclosure: Data?
+
     public init(
         captureTime: FrameTimestamp? = nil,
         configuration: Data? = nil,
         temporalLayer: Int? = nil,
-        isSilence: Bool? = nil
+        isSilence: Bool? = nil,
+        disclosure: Data? = nil
     ) {
         self.captureTime = captureTime
         self.configuration = configuration
         self.temporalLayer = temporalLayer
         self.isSilence = isSilence
+        self.disclosure = disclosure
     }
 
     public var isEmpty: Bool {
         captureTime == nil && configuration == nil && temporalLayer == nil && isSilence == nil
+            && disclosure == nil
     }
 }

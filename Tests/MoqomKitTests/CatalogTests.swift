@@ -215,6 +215,94 @@ struct CatalogPublicationTests {
     }
 }
 
+@Suite("Sealed catalog")
+struct SealedCatalogTests {
+    private let catalog = Catalog(
+        keyID: 9,
+        muted: [.audio],
+        locale: "fr-FR",
+        tracks: [
+            CatalogTrack(
+                name: "video/720p",
+                kind: .video,
+                codec: "video/hevc",
+                decoderConfiguration: "00010203",
+                width: 1280,
+                height: 720,
+                frameRate: 30,
+                bitrate: 2_000_000,
+                rung: 1
+            ),
+            CatalogTrack(name: "audio", kind: .audio, codec: "audio/opus", bitrate: 24000),
+        ]
+    )
+
+    @Test("the disclosure names tracks, kinds, geometry and locale, and nothing else")
+    func disclosureIsMinimal() throws {
+        let disclosed = try #require(
+            JSONSerialization.jsonObject(with: catalog.disclosure()) as? [String: Any]
+        )
+        #expect(Set(disclosed.keys) == ["version", "keyID", "locale", "tracks"])
+        #expect(disclosed["locale"] as? String == "fr-FR")
+        let tracks = try #require(disclosed["tracks"] as? [[String: Any]])
+        #expect(Set(tracks[0].keys) == ["name", "kind", "width", "height"])
+        #expect(Set(tracks[1].keys) == ["name", "kind"])
+
+        let text = String(decoding: catalog.disclosure(), as: UTF8.self)
+        for secret in ["hevc", "opus", "00010203", "2000000", "muted"] {
+            #expect(!text.contains(secret))
+        }
+    }
+
+    @Test("a sealed catalog reaches the relay as ciphertext with only its disclosure readable")
+    func sealedOnTheWire() async throws {
+        let relay = LoopbackRelay()
+        let namespace = try MoqomNamespaces.participant(
+            tenant: "acme", room: "room-42", identity: identity("alice")
+        )
+        let track = try FullTrackName(namespace: namespace, name: TrackName(Catalog.trackName))
+        let transport = try await LoopbackTransport(relay: relay).connect(
+            to: RelayEndpoint(host: "loopback"), credentials: credentials("alice")
+        )
+        let key = SFrameKey(keyID: 9, baseKey: Data(repeating: 0x5A, count: 32))
+        let publisher = CatalogPublisher(
+            writer: ProtectedTrackWriter(
+                wrapping: try await transport.publish(track, priority: CatalogPublisher.priority),
+                sender: SFrameSender(key: key)
+            )
+        )
+        #expect(try await publisher.publish(catalog))
+
+        let sealed = try #require(await relay.objects(onTrackNamed: Catalog.trackName).first)
+        #expect(sealed.payload != (try catalog.encoded()))
+        #expect(!String(decoding: sealed.payload, as: UTF8.self).contains("hevc"))
+        #expect(sealed.properties.disclosure == catalog.disclosure())
+
+        let receiver = SFrameReceiver()
+        receiver.add(key)
+        let unprotector = MediaUnprotector(receiver: receiver)
+        let opened = try #require(await unprotector.unprotect(sealed))
+        let reader = CatalogReader()
+        #expect(await reader.apply(opened) == catalog)
+
+        // The relay can read the disclosure and cannot rewrite it: the SFrame
+        // tag covers it.
+        let forged = TrackObject(
+            group: sealed.group, object: sealed.object, priority: sealed.priority,
+            payload: sealed.payload, isKeyFrame: true,
+            properties: ObjectProperties(disclosure: Data(#"{"tracks":[],"version":1}"#.utf8))
+        )
+        #expect(await unprotector.unprotect(forged) == nil)
+
+        // Nor can it substitute a plaintext catalog of its own.
+        let plaintext = TrackObject(
+            group: 1, object: 0, payload: try catalog.encoded(), isKeyFrame: true,
+            properties: ObjectProperties(disclosure: catalog.disclosure())
+        )
+        #expect(await unprotector.unprotect(plaintext) == nil)
+    }
+}
+
 @Suite("Catalog discovery")
 struct CatalogDiscoveryTests {
     @Test("a viewer's ladder comes from the publisher rather than a default")

@@ -336,6 +336,47 @@ public struct Catalog: Hashable, Sendable, Codable {
         return try encoder.encode(self)
     }
 
+    /// What a sealed catalog leaves readable by the relay, as JSON in the shape
+    /// of a catalog: the version, the SFrame key ID, the locale, and for each
+    /// track its name, kind and video geometry.
+    ///
+    /// The relay tiers usage on geometry and the control plane reads the locale;
+    /// a recorder files tracks by name and kind and needs to know the media is
+    /// ciphertext. Everything else — codecs, bitrates, decoder configurations,
+    /// mutes, interruptions, invitations, references, and anything added later —
+    /// is inside the ciphertext and readable only by the room's members.
+    public func disclosure() -> Data {
+        struct Disclosed: Encodable {
+            let version: Int
+            let keyID: UInt64?
+            let locale: String?
+            let tracks: [Track]
+            struct Track: Encodable {
+                let name: String
+                let kind: CatalogTrack.Kind
+                let width: Int?
+                let height: Int?
+            }
+        }
+        let disclosed = Disclosed(
+            version: version,
+            keyID: keyID,
+            locale: locale,
+            tracks: tracks.map { track in
+                let visual = track.kind == .video || track.kind == .screen
+                return Disclosed.Track(
+                    name: track.name,
+                    kind: track.kind,
+                    width: visual ? track.width : nil,
+                    height: visual ? track.height : nil
+                )
+            }
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return (try? encoder.encode(disclosed)) ?? Data()
+    }
+
     public static func decode(_ data: Data) throws -> Catalog {
         let catalog = try JSONDecoder().decode(Catalog.self, from: data)
         guard catalog.version <= Catalog.currentVersion else {

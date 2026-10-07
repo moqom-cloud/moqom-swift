@@ -90,7 +90,8 @@ public actor CatalogPublisher {
                 object: 0,
                 priority: Self.priority,
                 payload: payload,
-                isKeyFrame: true
+                isKeyFrame: true,
+                properties: ObjectProperties(disclosure: catalog.disclosure())
             )
         )
         group += 1

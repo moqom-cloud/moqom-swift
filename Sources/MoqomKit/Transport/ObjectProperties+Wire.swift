@@ -54,6 +54,15 @@ public enum MoqomObjectProperty {
     /// silence from loss without decoding and a relay can tell it without
     /// decrypting.
     public static let silence: UInt64 = 0x7C
+
+    /// What a sealed `.catalog` object discloses: ``Catalog/disclosure()``.
+    ///
+    /// Odd, so it carries bytes. The catalog itself is end-to-end encrypted; this
+    /// is the part a relay meters on and a recorder files by — track names,
+    /// kinds and video geometry, the locale, and the SFrame key ID — and nothing
+    /// else. SFrame authenticates it with the ciphertext, so a relay can read it
+    /// and cannot change it.
+    public static let catalogDisclosure: UInt64 = 0x7D
 }
 
 extension ObjectProperties {
@@ -91,6 +100,11 @@ extension ObjectProperties {
         {
             items.append(parameter)
         }
+        if let disclosure, !disclosure.isEmpty,
+           let parameter = try? Parameter.bytes(MoqomObjectProperty.catalogDisclosure, disclosure)
+        {
+            items.append(parameter)
+        }
         return Parameters(items)
     }
 
@@ -111,7 +125,8 @@ extension ObjectProperties {
             // Absent means "not stated", which for audio means not silence. It
             // stays `nil` rather than becoming `false` so a video object does
             // not start claiming to be audible.
-            isSilence: silence.map { $0 != 0 }
+            isSilence: silence.map { $0 != 0 },
+            disclosure: parameters.bytes(MoqomObjectProperty.catalogDisclosure)
         )
     }
 }
