@@ -112,10 +112,19 @@ public enum DirectPair {
         aliceToken: Data? = nil,
         bobToken: Data? = nil,
         offerToAlice: (CandidateOffer) -> CandidateOffer = { $0 },
-        patience: Duration = .seconds(4)
+        patience: Duration = .seconds(4),
+        aliceDials: Bool? = nil
     ) async throws -> (alice: Outcome, bob: Outcome) {
-        let a = try await endpoint(alice, patience: patience, backend: aliceBackend)
         let b = try await endpoint(bob, patience: patience, backend: bobBackend)
+        // The lower fingerprint dials, and fingerprints are random, so a test
+        // that cares which side dials binds again until the dice agree.
+        var bound = try await endpoint(alice, patience: patience, backend: aliceBackend)
+        while let aliceDials,
+              bound.certificateFingerprint.lexicographicallyPrecedes(b.certificateFingerprint) != aliceDials {
+            bound.close()
+            bound = try await endpoint(alice, patience: patience, backend: aliceBackend)
+        }
+        let a = bound
         let toBob = a.offer(to: bob.name)
         let toAlice = offerToAlice(b.offer(to: alice.name))
         let aliceCredentials = try alice.credentials(aliceToken)
