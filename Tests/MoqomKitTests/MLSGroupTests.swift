@@ -10,19 +10,20 @@ import Testing
 struct MLSGroupTests {
     private let room = Data("acme/room-42".utf8)
 
-    private func bundle(_ who: String) throws -> MLSKeyPackageBundle {
-        try MLSKeyPackageBundle.generate(identity: who)
+    private func bundle(_ who: String, _ suite: MLSCipherSuite) throws -> MLSKeyPackageBundle {
+        try MLSKeyPackageBundle.generate(identity: who, cipherSuite: suite)
     }
 
     /// A, then B by Welcome, then C by Welcome; every member at the same epoch.
-    private func threeMembers() throws -> (MLSGroup, MLSGroup, MLSGroup) {
-        var alice = try MLSGroup.create(groupID: room, bundle: bundle("alice/a"))
-        let bob = try bundle("bob/b")
+    private func threeMembers(_ suite: MLSCipherSuite) throws -> (MLSGroup, MLSGroup, MLSGroup) {
+        var alice = try MLSGroup.create(groupID: room, bundle: bundle("alice/a", suite))
+        #expect(alice.cipherSuite == suite)
+        let bob = try bundle("bob/b", suite)
         let addBob = try alice.commit(adding: [bob.keyPackage])
         alice = addBob.next
         var bobGroup = try MLSGroup.join(try #require(addBob.welcome), bundle: bob)
 
-        let carol = try bundle("carol/c")
+        let carol = try bundle("carol/c", suite)
         let addCarol = try alice.commit(adding: [carol.keyPackage])
         alice = addCarol.next
         guard case let .advanced(next) = try bobGroup.process(addCarol.message) else {
@@ -31,12 +32,16 @@ struct MLSGroupTests {
         }
         bobGroup = next
         let carolGroup = try MLSGroup.join(try #require(addCarol.welcome), bundle: carol)
+        #expect(bobGroup.cipherSuite == suite && carolGroup.cipherSuite == suite)
         return (alice, bobGroup, carolGroup)
     }
 
-    @Test("Add by Welcome: every member derives the same epoch and the same SFrame keys")
-    func addAgrees() throws {
-        let (alice, bob, carol) = try threeMembers()
+    @Test(
+        "Add by Welcome: every member derives the same epoch and the same SFrame keys",
+        arguments: MLSCipherSuite.supported
+    )
+    func addAgrees(suite: MLSCipherSuite) throws {
+        let (alice, bob, carol) = try threeMembers(suite)
         #expect(alice.epoch == 2 && bob.epoch == 2 && carol.epoch == 2)
         #expect(alice.epochAuthenticator == bob.epochAuthenticator)
         #expect(alice.epochAuthenticator == carol.epochAuthenticator)
@@ -51,9 +56,12 @@ struct MLSGroupTests {
         }
     }
 
-    @Test("Remove: the removed member cannot follow, and the new epoch's keys are not theirs")
-    func removeIsForwardSecret() throws {
-        let (alice, bob, carol) = try threeMembers()
+    @Test(
+        "Remove: the removed member cannot follow, and the new epoch's keys are not theirs",
+        arguments: MLSCipherSuite.supported
+    )
+    func removeIsForwardSecret(suite: MLSCipherSuite) throws {
+        let (alice, bob, carol) = try threeMembers(suite)
         let bobLeaf = try #require(alice.leaf(of: "bob/b"))
         let removal = try alice.commit(removing: [bobLeaf])
         #expect(removal.welcome == nil)
@@ -79,12 +87,12 @@ struct MLSGroupTests {
         #expect(bob.epochAuthenticator != removal.next.epochAuthenticator)
     }
 
-    @Test("a joiner's keys are not any earlier epoch's")
-    func joinerCannotReadHistory() throws {
-        var alice = try MLSGroup.create(groupID: room, bundle: bundle("alice/a"))
+    @Test("a joiner's keys are not any earlier epoch's", arguments: MLSCipherSuite.supported)
+    func joinerCannotReadHistory(suite: MLSCipherSuite) throws {
+        var alice = try MLSGroup.create(groupID: room, bundle: bundle("alice/a", suite))
         let before = alice.sframeKey(for: 0, suite: .aes256GcmSha512)
         let sealed = try SFrameSender(key: before).protect(Data("history".utf8))
-        let bob = try bundle("bob/b")
+        let bob = try bundle("bob/b", suite)
         let add = try alice.commit(adding: [bob.keyPackage])
         alice = add.next
         let joined = try MLSGroup.join(try #require(add.welcome), bundle: bob)
@@ -93,9 +101,12 @@ struct MLSGroupTests {
         #expect(throws: SFrameError.self) { _ = try receiver.unprotect(sealed) }
     }
 
-    @Test("an empty commit is an Update: new epoch, new keys, same members")
-    func updateRotates() throws {
-        let (alice, bob, _) = try threeMembers()
+    @Test(
+        "an empty commit is an Update: new epoch, new keys, same members",
+        arguments: MLSCipherSuite.supported
+    )
+    func updateRotates(suite: MLSCipherSuite) throws {
+        let (alice, bob, _) = try threeMembers(suite)
         let update = try bob.commit()
         guard case let .advanced(aliceNext) = try alice.process(update.message) else {
             Issue.record("alice was not advanced")
@@ -108,9 +119,9 @@ struct MLSGroupTests {
             != alice.sframeKey(for: 0, suite: .aes128GcmSha256).keyID)
     }
 
-    @Test("a commit for an epoch already left is refused as stale")
-    func staleCommitRefused() throws {
-        let (alice, bob, carol) = try threeMembers()
+    @Test("a commit for an epoch already left is refused as stale", arguments: MLSCipherSuite.supported)
+    func staleCommitRefused(suite: MLSCipherSuite) throws {
+        let (alice, bob, carol) = try threeMembers(suite)
         let first = try alice.commit()
         let second = try bob.commit()
         guard case let .advanced(carolNext) = try carol.process(first.message) else {
@@ -122,9 +133,12 @@ struct MLSGroupTests {
         }
     }
 
-    @Test("a commit with a forged signature or confirmation tag is refused")
-    func tamperedCommitRefused() throws {
-        let (alice, bob, _) = try threeMembers()
+    @Test(
+        "a commit with a forged signature or confirmation tag is refused",
+        arguments: MLSCipherSuite.supported
+    )
+    func tamperedCommitRefused(suite: MLSCipherSuite) throws {
+        let (alice, bob, _) = try threeMembers(suite)
         let commit = try alice.commit()
         var bytes = commit.message.encoded
         bytes[bytes.index(before: bytes.endIndex)] ^= 1
@@ -139,11 +153,12 @@ struct MLSGroupTests {
         #expect(throws: MLSError.badSignature) { _ = try bob.process(forgedSignature) }
     }
 
-    @Test("a key package with a broken signature cannot be added")
-    func badKeyPackageRefused() throws {
-        let alice = try MLSGroup.create(groupID: room, bundle: bundle("alice/a"))
-        let bob = try bundle("bob/b").keyPackage
+    @Test("a key package with a broken signature cannot be added", arguments: MLSCipherSuite.supported)
+    func badKeyPackageRefused(suite: MLSCipherSuite) throws {
+        let alice = try MLSGroup.create(groupID: room, bundle: bundle("alice/a", suite))
+        let bob = try bundle("bob/b", suite).keyPackage
         let forged = MLSKeyPackage(
+            cipherSuite: bob.cipherSuite,
             identity: Data("mallory/m".utf8), signatureKey: bob.signatureKey, initKey: bob.initKey,
             encryptionKey: bob.encryptionKey, signature: bob.signature
         )
@@ -152,11 +167,11 @@ struct MLSGroupTests {
         #expect(try MLSKeyPackage.decode(bob.encoded) == bob)
     }
 
-    @Test("a Welcome opens only for the key package it was made for")
-    func welcomeAddressed() throws {
-        let alice = try MLSGroup.create(groupID: room, bundle: bundle("alice/a"))
-        let bob = try bundle("bob/b")
-        let other = try bundle("bob/b")
+    @Test("a Welcome opens only for the key package it was made for", arguments: MLSCipherSuite.supported)
+    func welcomeAddressed(suite: MLSCipherSuite) throws {
+        let alice = try MLSGroup.create(groupID: room, bundle: bundle("alice/a", suite))
+        let bob = try bundle("bob/b", suite)
+        let other = try bundle("bob/b", suite)
         let add = try alice.commit(adding: [bob.keyPackage])
         let welcome = try MLSWelcome.decode(try #require(add.welcome).encoded)
         #expect(welcome.isAddressed(to: bob.keyPackage))
@@ -164,11 +179,11 @@ struct MLSGroupTests {
         #expect(throws: MLSError.notAddressed) { _ = try MLSGroup.join(welcome, bundle: other) }
     }
 
-    @Test("a returning device is removed and re-added in one commit")
-    func replaceStaleLeaf() throws {
-        let (alice, _, carol) = try threeMembers()
+    @Test("a returning device is removed and re-added in one commit", arguments: MLSCipherSuite.supported)
+    func replaceStaleLeaf(suite: MLSCipherSuite) throws {
+        let (alice, _, carol) = try threeMembers(suite)
         let stale = try #require(alice.leaf(of: "bob/b"))
-        let bobAgain = try bundle("bob/b")
+        let bobAgain = try bundle("bob/b", suite)
         let commit = try alice.commit(adding: [bobAgain.keyPackage], removing: [stale])
         let rejoined = try MLSGroup.join(try #require(commit.welcome), bundle: bobAgain)
         guard case let .advanced(carolNext) = try carol.process(commit.message) else {
@@ -193,9 +208,12 @@ struct MLSGroupTests {
         #expect(MLSSFrameKeys.epochTag(ofKeyID: 0x331) == 1)
     }
 
-    @Test("the SFrame base key is the exporter's, with the sender told apart only by KID")
-    func baseKeyIsExporter() throws {
-        let (alice, _, _) = try threeMembers()
+    @Test(
+        "the SFrame base key is the exporter's, with the sender told apart only by KID",
+        arguments: MLSCipherSuite.supported
+    )
+    func baseKeyIsExporter(suite: MLSCipherSuite) throws {
+        let (alice, _, _) = try threeMembers(suite)
         let base = alice.secrets.export(label: "SFrame 1.0 Base Key", length: 32)
         let sealed = try SFrameSender(key: alice.sframeKey(for: 1, suite: .aes256GcmSha512))
             .protect(Data("x".utf8))
@@ -206,9 +224,12 @@ struct MLSGroupTests {
 
     // MARK: - Epoch change mid-stream
 
-    @Test("a frame under the next epoch waits for its key instead of being dropped")
-    func heldAcrossEpochChange() async throws {
-        let (alice, bob, _) = try threeMembers()
+    @Test(
+        "a frame under the next epoch waits for its key instead of being dropped",
+        arguments: MLSCipherSuite.supported
+    )
+    func heldAcrossEpochChange(suite: MLSCipherSuite) async throws {
+        let (alice, bob, _) = try threeMembers(suite)
         let update = try alice.commit()
         let receiver = SFrameReceiver()
         for key in bob.sframeKeys(suite: .aes256GcmSha512) { receiver.add(key) }

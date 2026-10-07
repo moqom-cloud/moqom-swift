@@ -15,13 +15,25 @@ import CryptoKit
 import Foundation
 
 /// `GroupContext`, RFC 9420 §8.1.
+///
+/// The cipher suite is part of it, so every signature over a commit or a
+/// GroupInfo, and every secret the key schedule derives, is bound to the suite
+/// the group was founded with.
 public struct MLSGroupContext: Hashable, Sendable {
+    public let cipherSuite: MLSCipherSuite
     public let groupID: Data
     public let epoch: UInt64
     public let treeHash: Data
     public let confirmedTranscriptHash: Data
 
-    public init(groupID: Data, epoch: UInt64, treeHash: Data, confirmedTranscriptHash: Data) {
+    public init(
+        cipherSuite: MLSCipherSuite,
+        groupID: Data,
+        epoch: UInt64,
+        treeHash: Data,
+        confirmedTranscriptHash: Data
+    ) {
+        self.cipherSuite = cipherSuite
         self.groupID = groupID
         self.epoch = epoch
         self.treeHash = treeHash
@@ -32,7 +44,7 @@ public struct MLSGroupContext: Hashable, Sendable {
     public var encoded: Data {
         var writer = MLSWriter()
         writer.uint16(MLSCipherSuite.version)
-        writer.uint16(MLSCipherSuite.identifier)
+        writer.uint16(cipherSuite.identifier)
         writer.vector(groupID)
         writer.uint64(epoch)
         writer.vector(treeHash)
@@ -42,15 +54,14 @@ public struct MLSGroupContext: Hashable, Sendable {
     }
 
     static func read(from reader: inout MLSReader) throws(MLSError) -> MLSGroupContext {
-        guard try reader.uint16() == MLSCipherSuite.version,
-              try reader.uint16() == MLSCipherSuite.identifier
-        else { throw MLSError.unsupported }
+        let suite = try reader.cipherSuite()
         let groupID = try reader.vector()
         let epoch = try reader.uint64()
         let treeHash = try reader.vector()
         let confirmed = try reader.vector()
         guard try reader.vector().isEmpty else { throw MLSError.unsupported }
         return MLSGroupContext(
+            cipherSuite: suite,
             groupID: groupID,
             epoch: epoch,
             treeHash: treeHash,

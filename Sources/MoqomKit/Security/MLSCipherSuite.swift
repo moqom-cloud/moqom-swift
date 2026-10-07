@@ -1,26 +1,108 @@
 // The RFC 9420 primitives MOQOM's group key management is built from.
 //
-// One cipher suite, MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 (0x0001), the
-// one every MLS implementation must support. Each function here is the RFC's
-// definition and nothing more, and each is checked against the MLS working
-// group's published test vectors (`crypto-basics.json`), which is the only
-// basis on which this file claims to match the RFC. What is built on top of
-// these primitives is MOQOM's own and is described in `MLSGroup.swift`.
+// Two cipher suites, which differ only in their KEM:
+//
+// - `MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519`, the default for every
+//   group founded by this SDK. draft-ietf-mls-pq-ciphersuites-06 §3.1 defines
+//   it as its first suite (HPKE KEM 0x647a, which draft-ietf-hpke-pq-05 names
+//   MLKEM768-X25519 and which is the X-Wing KEM of
+//   draft-connolly-cfrg-xwing-kem; HKDF-SHA256; AES-128-GCM; Ed25519). The
+//   draft's value is still "TBD1", so the identifier below is one from RFC 9420
+//   §17.1's private-use range and has to change to the IANA value once one is
+//   assigned. A peer that implements the draft would not recognise it.
+// - `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` (0x0001), the one every MLS
+//   implementation must support, kept so that groups founded with it still
+//   work.
+//
+// Everything a group derives — the key schedule, the exporter, and so SFrame
+// keys — depends on the hash, KDF and AEAD, which are the same in both, and on
+// the secrets the KEM carries, which is the only place the suites differ. The
+// hybrid KEM is what makes those secrets post-quantum: a commit secret or a
+// joiner secret sealed to X-Wing stays secret unless both ML-KEM-768 and
+// X25519 are broken. Signatures are Ed25519 in both, as the draft's suite
+// specifies; they authenticate members and are not post-quantum.
+//
+// Each function here is the RFC's definition and nothing more. Suite 0x0001 is
+// checked against the MLS working group's published test vectors
+// (`crypto-basics.json`); the hybrid KEM inside HPKE is checked against the
+// HPKE working group's vectors for KEM 0x647a (draft-ietf-hpke-pq), which is
+// the only basis on which this file claims to match either draft. What is
+// built on top of these primitives is MOQOM's own and is described in
+// `MLSGroup.swift`.
 //
 // Everything is CryptoKit. HPKE (RFC 9180) is CryptoKit's, composed from the
-// KEM, KDF and AEAD this suite names; there is no hand-rolled cryptography
+// KEM, KDF and AEAD each suite names; there is no hand-rolled cryptography
 // below this line, only encodings.
 
 import CryptoKit
 import Foundation
 
-/// The single MLS cipher suite implemented.
-public enum MLSCipherSuite {
-    /// `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`.
-    public static let identifier: UInt16 = 0x0001
+/// An MLS cipher suite this SDK implements.
+///
+/// A value carried by every key package and every group, never a setting: a
+/// group's suite is the one it was founded with, every member uses it, and a
+/// key package in any other suite is refused rather than added.
+public struct MLSCipherSuite: Hashable, Sendable, CustomStringConvertible {
+    /// The suite's two-byte identifier, as it appears on the wire.
+    public let identifier: UInt16
+
+    private let kem: KEM
+
+    private enum KEM: Hashable, Sendable {
+        case x25519
+        case xWing
+    }
+
+    private init(identifier: UInt16, kem: KEM) {
+        self.identifier = identifier
+        self.kem = kem
+    }
+
+    /// `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`, RFC 9420's mandatory suite.
+    public static let mls128DHKEMX25519 = MLSCipherSuite(identifier: 0x0001, kem: .x25519)
+
+    /// `MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519`, draft-ietf-mls-pq-ciphersuites' "TBD1".
+    ///
+    /// 0xF0A1 is a private-use value (RFC 9420 §17.1), standing in until IANA
+    /// assigns one. Only MOQOM's own SDK and control plane know it.
+    public static let mls128MLKEM768X25519 = MLSCipherSuite(identifier: 0xF0A1, kem: .xWing)
+
+    /// The suite a newly founded group uses.
+    public static let `default` = mls128MLKEM768X25519
+
+    /// Every suite implemented, the default first.
+    public static let supported: [MLSCipherSuite] = [.mls128MLKEM768X25519, .mls128DHKEMX25519]
+
+    /// The suite with this identifier, or `nil` if it is not one implemented here.
+    public init?(identifier: UInt16) {
+        guard let suite = Self.supported.first(where: { $0.identifier == identifier }) else { return nil }
+        self = suite
+    }
+
+    /// The registered name.
+    public var name: String {
+        switch kem {
+        case .x25519: "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519"
+        case .xWing: "MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519"
+        }
+    }
+
+    public var description: String {
+        "\(name) (0x\(String(identifier, radix: 16, uppercase: true)))"
+    }
+
+    /// Whether the KEM, and so every secret a commit or Welcome carries, is
+    /// meant to resist a quantum computer. Signatures are classical either way.
+    public var hasPostQuantumKEM: Bool { kem == .xWing }
 
     /// The protocol version, `mls10`.
     public static let version: UInt16 = 0x0001
+
+    // MARK: - Shared by both suites
+
+    // HKDF-SHA256, HMAC-SHA256, AES-128-GCM and Ed25519 are the same in every
+    // suite implemented, so they are not per-suite. A suite that differed in
+    // any of them would have to move them onto the value.
 
     /// Hash output length, `KDF.Nh`.
     public static let hashLength = 32
@@ -29,11 +111,8 @@ public enum MLSCipherSuite {
     static let aeadKeyLength = 16
     static let aeadNonceLength = 12
 
-    static let hpke = HPKE.Ciphersuite(
-        kem: .Curve25519_HKDF_SHA256,
-        kdf: .HKDF_SHA256,
-        aead: .AES_GCM_128
-    )
+    /// Ed25519 public key length.
+    static let signatureKeyLength = 32
 
     static func hash(_ data: Data) -> Data {
         Data(SHA256.hash(data: data))
@@ -85,7 +164,7 @@ public enum MLSCipherSuite {
         return hash(input.bytes)
     }
 
-    /// `MAC`, which for this suite is HMAC-SHA256.
+    /// `MAC`, which for both suites is HMAC-SHA256.
     static func mac(key: Data, data: Data) -> Data {
         Data(HMAC<SHA256>.authenticationCode(for: data, using: SymmetricKey(data: key)))
     }
@@ -125,7 +204,51 @@ public enum MLSCipherSuite {
         return key.isValidSignature(signature, for: signContent(label: label, content: content))
     }
 
-    // MARK: - Public-key encryption
+    // MARK: - Per suite: the KEM
+
+    /// The HPKE suite `EncryptWithLabel` uses.
+    var hpke: HPKE.Ciphersuite {
+        switch kem {
+        case .x25519: HPKE.Ciphersuite(kem: .Curve25519_HKDF_SHA256, kdf: .HKDF_SHA256, aead: .AES_GCM_128)
+        case .xWing: HPKE.Ciphersuite(kem: .XWingMLKEM768X25519, kdf: .HKDF_SHA256, aead: .AES_GCM_128)
+        }
+    }
+
+    /// `Npk`: an init key's or leaf encryption key's length. 32 for X25519,
+    /// 1216 for X-Wing (ML-KEM-768's 1184 then X25519's 32).
+    public var publicKeyLength: Int {
+        switch kem {
+        case .x25519: 32
+        case .xWing: 1216
+        }
+    }
+
+    /// `Nenc`: the KEM output in every HPKE ciphertext. 32 for X25519, 1120
+    /// for X-Wing (ML-KEM-768's 1088 then X25519's 32).
+    public var encapsulationLength: Int {
+        switch kem {
+        case .x25519: 32
+        case .xWing: 1120
+        }
+    }
+
+    /// A fresh KEM key pair: the private half as this type stores it (the
+    /// X25519 scalar, or X-Wing's 32-byte seed) and the public half as it
+    /// travels.
+    func generateKeyPair() throws(MLSError) -> (privateKey: Data, publicKey: Data) {
+        switch kem {
+        case .x25519:
+            let key = Curve25519.KeyAgreement.PrivateKey()
+            return (key.rawRepresentation, key.publicKey.rawRepresentation)
+        case .xWing:
+            do {
+                let key = try XWingMLKEM768X25519.PrivateKey.generate()
+                return (key.seedRepresentation, key.publicKey.rawRepresentation)
+            } catch {
+                throw MLSError.cryptoFailure
+            }
+        }
+    }
 
     private static func encryptContext(label: String, context: Data) -> Data {
         var info = MLSWriter()
@@ -135,19 +258,24 @@ public enum MLSCipherSuite {
     }
 
     /// `EncryptWithLabel`, RFC 9420 §5.1.3: HPKE base mode, empty AAD.
-    static func encryptWithLabel(
+    func encryptWithLabel(
         _ publicKey: Data,
         label: String,
         context: Data,
         plaintext: Data
     ) throws(MLSError) -> HPKECiphertext {
+        guard publicKey.count == publicKeyLength else { throw MLSError.malformed }
+        let info = Self.encryptContext(label: label, context: context)
         do {
-            let recipient = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: publicKey)
-            var sender = try HPKE.Sender(
-                recipientKey: recipient,
-                ciphersuite: hpke,
-                info: encryptContext(label: label, context: context)
-            )
+            var sender: HPKE.Sender
+            switch kem {
+            case .x25519:
+                let recipient = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: publicKey)
+                sender = try HPKE.Sender(recipientKey: recipient, ciphersuite: hpke, info: info)
+            case .xWing:
+                let recipient = try XWingMLKEM768X25519.PublicKey(rawRepresentation: publicKey)
+                sender = try HPKE.Sender(recipientKey: recipient, ciphersuite: hpke, info: info)
+            }
             let ciphertext = try sender.seal(plaintext, authenticating: Data())
             return HPKECiphertext(kemOutput: sender.encapsulatedKey, ciphertext: ciphertext)
         } catch {
@@ -155,20 +283,30 @@ public enum MLSCipherSuite {
         }
     }
 
-    /// `DecryptWithLabel`, RFC 9420 §5.1.3.
-    static func decryptWithLabel(
-        _ privateKey: Curve25519.KeyAgreement.PrivateKey,
+    /// `DecryptWithLabel`, RFC 9420 §5.1.3, with a private key as
+    /// ``generateKeyPair()`` returns it.
+    func decryptWithLabel(
+        _ privateKey: Data,
         label: String,
         context: Data,
         ciphertext: HPKECiphertext
     ) throws(MLSError) -> Data {
+        guard ciphertext.kemOutput.count == encapsulationLength else { throw MLSError.decryptionFailed }
+        let info = Self.encryptContext(label: label, context: context)
         do {
-            var recipient = try HPKE.Recipient(
-                privateKey: privateKey,
-                ciphersuite: hpke,
-                info: encryptContext(label: label, context: context),
-                encapsulatedKey: ciphertext.kemOutput
-            )
+            var recipient: HPKE.Recipient
+            switch kem {
+            case .x25519:
+                recipient = try HPKE.Recipient(
+                    privateKey: try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: privateKey),
+                    ciphersuite: hpke, info: info, encapsulatedKey: ciphertext.kemOutput
+                )
+            case .xWing:
+                recipient = try HPKE.Recipient(
+                    privateKey: try XWingMLKEM768X25519.PrivateKey(seedRepresentation: privateKey, publicKey: nil),
+                    ciphersuite: hpke, info: info, encapsulatedKey: ciphertext.kemOutput
+                )
+            }
             return try recipient.open(ciphertext.ciphertext, authenticating: Data())
         } catch {
             throw MLSError.decryptionFailed
@@ -249,8 +387,12 @@ public enum MLSError: Error, Hashable, Sendable {
     case removed
     /// Nothing in the message was addressed to this member.
     case notAddressed
-    /// The cipher suite or version is not the one implemented.
+    /// The cipher suite or version is not one implemented.
     case unsupported
+    /// A key package or Welcome in a different cipher suite from the group's.
+    /// A group never mixes suites: a device in another suite publishes new key
+    /// packages in the group's before it can be added.
+    case cipherSuiteMismatch(group: UInt16, other: UInt16)
 }
 
 // MARK: - Encoding
@@ -355,5 +497,13 @@ struct MLSReader {
 
     mutating func finish() throws(MLSError) {
         guard isAtEnd else { throw MLSError.malformed }
+    }
+
+    /// The suite a structure names, refusing one not implemented.
+    mutating func cipherSuite() throws(MLSError) -> MLSCipherSuite {
+        guard try uint16() == MLSCipherSuite.version,
+              let suite = MLSCipherSuite(identifier: try uint16())
+        else { throw MLSError.unsupported }
+        return suite
     }
 }

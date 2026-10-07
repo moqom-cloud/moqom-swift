@@ -74,8 +74,9 @@ struct MLSConformanceTests {
         let v = vector("encrypt_with_label")
         let key = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: hex(v["priv"]!))
         #expect(key.publicKey.rawRepresentation == hex(v["pub"]!))
-        let opened = try MLSCipherSuite.decryptWithLabel(
-            key,
+        let suite = MLSCipherSuite.mls128DHKEMX25519
+        let opened = try suite.decryptWithLabel(
+            key.rawRepresentation,
             label: v["label"]!,
             context: hex(v["context"]!),
             ciphertext: HPKECiphertext(
@@ -84,11 +85,11 @@ struct MLSConformanceTests {
         )
         #expect(opened == hex(v["plaintext"]!))
 
-        let sealed = try MLSCipherSuite.encryptWithLabel(
+        let sealed = try suite.encryptWithLabel(
             hex(v["pub"]!), label: v["label"]!, context: hex(v["context"]!), plaintext: Data("x".utf8)
         )
-        let back = try MLSCipherSuite.decryptWithLabel(
-            key, label: v["label"]!, context: hex(v["context"]!), ciphertext: sealed
+        let back = try suite.decryptWithLabel(
+            key.rawRepresentation, label: v["label"]!, context: hex(v["context"]!), ciphertext: sealed
         )
         #expect(back == Data("x".utf8))
     }
@@ -98,6 +99,7 @@ struct MLSConformanceTests {
         var initSecret = hex(MLSVectors.initialInitSecret)
         for (index, v) in MLSVectors.epochs.enumerated() {
             let context = MLSGroupContext(
+                cipherSuite: .mls128DHKEMX25519,
                 groupID: hex(MLSVectors.groupID),
                 epoch: UInt64(index),
                 treeHash: hex(v["tree_hash"]!),
@@ -141,9 +143,13 @@ struct MLSConformanceTests {
         }
     }
 
-    @Test("GroupContext round-trips through its encoding")
-    func groupContextRoundTrip() throws {
+    @Test(
+        "GroupContext round-trips through its encoding, in either suite",
+        arguments: MLSCipherSuite.supported
+    )
+    func groupContextRoundTrip(suite: MLSCipherSuite) throws {
         let context = MLSGroupContext(
+            cipherSuite: suite,
             groupID: Data("room".utf8), epoch: 7, treeHash: Data(repeating: 1, count: 32),
             confirmedTranscriptHash: Data(repeating: 2, count: 32)
         )
