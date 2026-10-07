@@ -166,10 +166,27 @@ struct RelayInteropTests {
         let publisher = try await relay.connect(alpn: alpn, credentials: credentials("alice"))
         let subscriber = try await relay.connect(alpn: alpn, credentials: credentials("bob"))
 
+        // The subscriber hears of the announcement from the relay before asking
+        // for the track. They are two connections, so nothing orders the
+        // relay's handling of one against the other, and a relay accepting a
+        // namespace sends nothing back to wait on: under load the SUBSCRIBE
+        // can be read first and refused as DOES_NOT_EXIST.
+        let room = try MoqomNamespaces.room(tenant: "acme", room: "room-42")
+        let events = try await subscriber.announcements(matching: room)
+        let seen = Collector<AnnouncementEvent>()
+        let watcher = Task { for await event in events { await seen.append(event) } }
+
         let mine = try namespace("alice")
         let announcement = try await publisher.announce(mine)
         let video = try FullTrackName(namespace: mine, name: try TrackName("video/720p"))
         let writer = try await publisher.publish(video, priority: 128)
+        #expect(
+            await eventually(timeout: .seconds(10)) {
+                await seen.items.contains(.announced(mine))
+            },
+            "the relay did not report the announcement"
+        )
+        watcher.cancel()
 
         let subscription = try await subscriber.subscribe(
             SubscribeRequest(track: video, priority: 128)
