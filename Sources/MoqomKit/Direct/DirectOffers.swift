@@ -25,23 +25,32 @@ public actor DirectOffers {
     private let room: RoomID
     private let connection: any TransportSession
     private let secret: DirectRoomSecret
+    private let announces: Bool
 
     private var writer: (any TrackWriter)?
     private var announcement: (any AnnouncementHandle)?
     private var group: UInt64 = 0
 
+    /// - Parameter announces: whether to announce the participant's namespace
+    ///   before publishing. `false` for a caller already announcing it, as a
+    ///   room does for a participant on stage: an announcement of its own here
+    ///   would keep the participant listed after their own publication ends,
+    ///   and withdrawing it, on a relay that does not count announcements per
+    ///   namespace, would take them off the roster while they are still live.
     public init(
         tenant: TenantID,
         room: RoomID,
         identity: ParticipantIdentity,
         connection: any TransportSession,
-        secret: DirectRoomSecret
+        secret: DirectRoomSecret,
+        announces: Bool = true
     ) {
         self.tenant = tenant
         self.room = room
         self.identity = identity
         self.connection = connection
         self.secret = secret
+        self.announces = announces
     }
 
     /// The name offers to this device are addressed by.
@@ -127,9 +136,9 @@ public actor DirectOffers {
         } catch {
             throw MoqomError.invalidName(error)
         }
-        // Announcements are per namespace and refcounted, so this is harmless
-        // beside a broadcast that already announced the same one.
-        announcement = try await connection.announce(namespace)
+        if announces {
+            announcement = try await connection.announce(namespace)
+        }
         let opened = try await connection.publish(track, priority: Self.priority)
         writer = opened
         return opened
