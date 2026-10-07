@@ -14,7 +14,7 @@ import MoqomLoopback
 /// ordered pair of people, a fresh ticket every `period` on the holder's slot,
 /// track `.direct/{peer}`.
 public actor DirectTicketDesk {
-    public static let signer = try! Curve25519.Signing.PrivateKey(rawRepresentation: Data(repeating: 13, count: 32))
+    public static let signer = try! MLDSA65.PrivateKey(seedRepresentation: Data(repeating: 13, count: 32), publicKey: nil)
     public static let kid = "room-ticket"
 
     private let relay: LoopbackRelay
@@ -85,7 +85,7 @@ public actor DirectTicketDesk {
 
     static func mint(holder: DirectDevice, peer: DirectDevice, issued: Date, lifetime: TimeInterval) -> Data {
         DirectTokens.jws(
-            ["alg": "EdDSA", "typ": DirectTicketCheck.type, "kid": kid],
+            ["alg": "ML-DSA-65", "typ": DirectTicketCheck.type, "kid": kid],
             [
                 "ten": "acme",
                 "room": "room-42",
@@ -99,8 +99,8 @@ public actor DirectTicketDesk {
     }
 
     static func object(_ ticket: Data, expires: Date) -> Data {
-        let x = DirectTokens.base64URL(signer.publicKey.rawRepresentation)
-        let keys: [[String: Any]] = [["kty": "OKP", "crv": "Ed25519", "kid": kid, "x": x]]
+        let key = DirectTokens.base64URL(signer.publicKey.rawRepresentation)
+        let keys: [[String: Any]] = [["kty": "AKP", "alg": "ML-DSA-65", "kid": kid, "pub": key]]
         let object: [String: Any] = [
             "version": 1,
             "ticket": String(decoding: ticket, as: UTF8.self),

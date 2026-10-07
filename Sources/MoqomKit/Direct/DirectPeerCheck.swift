@@ -22,16 +22,48 @@
 import CryptoKit
 import Foundation
 
-/// A public key tokens are signed with: Ed25519, as the control plane mints.
+/// A public key tokens and tickets are signed with: ML-DSA-65, as the control
+/// plane mints and relays sign, or Ed25519 for what was signed before the move.
 public struct DirectVerificationKey: Hashable, Sendable {
+    /// What a key verifies with. A property of the key, not of what it checks:
+    /// a token or ticket must name its key's algorithm, so neither can be made
+    /// to verify with the other's.
+    public enum Algorithm: Hashable, Sendable {
+        case mlDSA65
+        case ed25519
+
+        /// The JOSE `alg` a JWS signed with this key carries.
+        public var jose: String {
+            switch self {
+            case .mlDSA65: "ML-DSA-65"
+            case .ed25519: "EdDSA"
+            }
+        }
+    }
+
     /// The `kid` naming it.
     public let id: String
-    /// The raw 32-byte public key.
+    /// The raw public key: 1,952 bytes for ML-DSA-65, 32 for Ed25519.
     public let key: Data
+    /// What it verifies with.
+    public let algorithm: Algorithm
 
-    public init(id: String, key: Data) {
+    public init(id: String, key: Data, algorithm: Algorithm) {
         self.id = id
         self.key = key
+        self.algorithm = algorithm
+    }
+
+    /// Whether `signature` is this key's over `message`, by its own algorithm.
+    func verifies(_ signature: Data, for message: Data) -> Bool {
+        switch algorithm {
+        case .mlDSA65:
+            guard let key = try? MLDSA65.PublicKey(rawRepresentation: key) else { return false }
+            return key.isValidSignature(signature, for: message)
+        case .ed25519:
+            guard let key = try? Curve25519.Signing.PublicKey(rawRepresentation: key) else { return false }
+            return key.isValidSignature(signature, for: message)
+        }
     }
 
     /// Read the JWK set the control plane serves and a relay is configured
@@ -40,7 +72,14 @@ public struct DirectVerificationKey: Hashable, Sendable {
     /// - Throws: ``DirectPeerRefusal/unverifiable`` naming what was wrong,
     ///   since a key set that does not parse verifies nobody.
     public static func parseSet(_ document: Data) throws(DirectPeerRefusal) -> [DirectVerificationKey] {
-        struct JWK: Decodable { let kty: String; let crv: String; let kid: String; let x: String }
+        struct JWK: Decodable {
+            let kty: String
+            let crv: String?
+            let alg: String?
+            let kid: String
+            let x: String?
+            let `pub`: String?
+        }
         struct Wrapped: Decodable { let keys: [JWK] }
         let decoder = JSONDecoder()
         let jwks: [JWK]
@@ -53,10 +92,15 @@ public struct DirectVerificationKey: Hashable, Sendable {
         }
         var keys: [DirectVerificationKey] = []
         for jwk in jwks {
-            guard jwk.kty == "OKP", jwk.crv == "Ed25519",
-                  let bytes = Data(base64URLEncoded: jwk.x), bytes.count == 32
-            else { throw .unverifiable }
-            keys.append(DirectVerificationKey(id: jwk.kid, key: bytes))
+            if jwk.kty == "AKP", jwk.alg == "ML-DSA-65",
+               let bytes = jwk.pub.flatMap({ Data(base64URLEncoded: $0) }), bytes.count == 1952 {
+                keys.append(DirectVerificationKey(id: jwk.kid, key: bytes, algorithm: .mlDSA65))
+            } else if jwk.kty == "OKP", jwk.crv == "Ed25519",
+                      let bytes = jwk.x.flatMap({ Data(base64URLEncoded: $0) }), bytes.count == 32 {
+                keys.append(DirectVerificationKey(id: jwk.kid, key: bytes, algorithm: .ed25519))
+            } else {
+                throw .unverifiable
+            }
         }
         return keys
     }
@@ -161,7 +205,7 @@ public final class DirectPeerCheck: DirectPeerVerifying, @unchecked Sendable {
     static let clockSkew: TimeInterval = 30
     /// The relay's `MAX_TOKEN_BYTES` and `MAX_PROOF_BYTES`, checked before any
     /// parsing so the work stays proportional to an honest input.
-    static let maximumTokenBytes = 4096
+    static let maximumTokenBytes = 8192
     static let maximumProofBytes = 2048
     /// The relay's `MAX_REMEMBERED`.
     static let maximumRemembered = 100_000
@@ -171,7 +215,7 @@ public final class DirectPeerCheck: DirectPeerVerifying, @unchecked Sendable {
     /// token with any other bit is refused rather than read as granting less.
     static let knownCapabilities: UInt32 = 0x0000_001F | 0x0000_7F00 | 0x003F_0000 | 0x0700_0000
 
-    private let keys: [String: Data]
+    private let keys: [String: DirectVerificationKey]
     private let issuer: String
     private let lock = NSLock()
     private var spent: [String: Date] = [:]
@@ -181,8 +225,8 @@ public final class DirectPeerCheck: DirectPeerVerifying, @unchecked Sendable {
     /// - Parameter issuer: the `iss` every token must carry. Empty accepts any,
     ///   which is for tests, as on the relay.
     public init(keys: [DirectVerificationKey], issuer: String = "") {
-        var byID: [String: Data] = [:]
-        for key in keys { byID[key.id] = key.key }
+        var byID: [String: DirectVerificationKey] = [:]
+        for key in keys { byID[key.id] = key }
         self.keys = byID
         self.issuer = issuer
     }
@@ -297,14 +341,13 @@ public final class DirectPeerCheck: DirectPeerVerifying, @unchecked Sendable {
         guard let header = try? JSONDecoder().decode(TokenHeader.self, from: headerBytes) else {
             throw .malformedToken("header is not JSON")
         }
-        guard header.alg == "EdDSA", header.typ == "MOQT" else { throw .unsupportedToken }
-        guard let raw = keys[header.kid] else { throw .unknownKey }
+        guard header.typ == "MOQT" else { throw .unsupportedToken }
+        guard let key = keys[header.kid] else { throw .unknownKey }
+        guard header.alg == key.algorithm.jose else { throw .unsupportedToken }
 
         // The signature before any claim is read, for the relay's reason: a
         // verifier that acts on unverified claims is a parser an attacker reaches.
-        guard let key = try? Curve25519.Signing.PublicKey(rawRepresentation: raw),
-              key.isValidSignature(signature, for: signed)
-        else { throw .badSignature }
+        guard key.verifies(signature, for: signed) else { throw .badSignature }
 
         guard let claimsBytes = Data(base64URLEncoded: claimsSegment) else {
             throw .malformedToken("claims are not base64url")

@@ -11,7 +11,7 @@
 // relay. An app that drops its relay session therefore loses its direct path
 // as well; only two modified apps that both skip the check could keep one.
 //
-// A ticket is checked as a token is, an Ed25519 compact JWS by `kid`, against a
+// A ticket is checked as a token is, an ML-DSA-65 compact JWS by `kid`, against a
 // separate set of keys: the ticket keys, which each side takes from the ticket
 // objects its own relay sends. A key the peer handed over would prove nothing.
 
@@ -95,7 +95,7 @@ public enum DirectTicketCheck {
     public static let type = "moqom-direct-ticket"
     /// Clock skew allowed between the issuing relay and this device.
     public static let clockSkew: TimeInterval = 30
-    static let maximumBytes = 2048
+    static let maximumBytes = 8192
 
     /// Check `ticket`, presented by `holder` on a direct path to `me`
     /// (`user/device`), and return when it expires.
@@ -125,12 +125,11 @@ public enum DirectTicketCheck {
               let signature = Data(base64URLEncoded: Data(segments[2])),
               let header = try? JSONDecoder().decode(Header.self, from: headerBytes)
         else { throw .malformed }
-        guard header.alg == "EdDSA", header.typ == type else { throw .unsupported }
-        guard let raw = keys.first(where: { $0.id == header.kid })?.key else { throw .unknownKey }
+        guard header.typ == type else { throw .unsupported }
+        guard let key = keys.first(where: { $0.id == header.kid }) else { throw .unknownKey }
+        guard header.alg == key.algorithm.jose else { throw .unsupported }
         let signed = ticket.prefix(segments[0].count + 1 + segments[1].count)
-        guard let key = try? Curve25519.Signing.PublicKey(rawRepresentation: raw),
-              key.isValidSignature(signature, for: signed)
-        else { throw .badSignature }
+        guard key.verifies(signature, for: Data(signed)) else { throw .badSignature }
 
         guard let claimsBytes = Data(base64URLEncoded: Data(segments[1])),
               let claims = try? JSONDecoder().decode(Claims.self, from: claimsBytes)

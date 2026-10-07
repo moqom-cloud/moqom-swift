@@ -1,5 +1,5 @@
 // What the direct-path suites share: tokens minted with the Rust suite's test
-// key (an Ed25519 seed of sevens, kid `test-key`) and the same claims, so a
+// key (an ML-DSA-65 seed of sevens, kid `test-key`) and the same claims, so a
 // vector that passes in one SDK's tests is one the other's would mint; devices
 // holding them; and two endpoints establishing at once, each on the backend a
 // test names.
@@ -12,8 +12,8 @@ import MoqomKit
 // MARK: - Minting
 
 public enum DirectTokens {
-    public static let signer = try! Curve25519.Signing.PrivateKey(rawRepresentation: Data(repeating: 7, count: 32))
-    public static let keys = [DirectVerificationKey(id: "test-key", key: signer.publicKey.rawRepresentation)]
+    public static let signer = try! MLDSA65.PrivateKey(seedRepresentation: Data(repeating: 7, count: 32), publicKey: nil)
+    public static let keys = [DirectVerificationKey(id: "test-key", key: signer.publicKey.rawRepresentation, algorithm: .mlDSA65)]
 
     public static func jws(_ header: [String: Any], _ claims: [String: Any], sign: (Data) -> Data) -> Data {
         func segment(_ object: [String: Any]) -> String {
@@ -35,7 +35,7 @@ public enum DirectTokens {
         expires: Date = Date().addingTimeInterval(3600),
         issued: Date? = nil,
         kid: String = "test-key",
-        signer: Curve25519.Signing.PrivateKey = DirectTokens.signer,
+        signer: MLDSA65.PrivateKey = DirectTokens.signer,
         extraScope: [String: Any] = [:]
     ) -> Data {
         var scope: [String: Any] = ["room": room, "pub": publish, "cap": capabilities, "own": true, "bs": false]
@@ -48,7 +48,7 @@ public enum DirectTokens {
             "moqt": scope,
         ]
         if let issued { claims["iat"] = Int(issued.timeIntervalSince1970) }
-        return jws(["alg": "EdDSA", "typ": "MOQT", "kid": kid], claims) { try! signer.signature(for: $0) }
+        return jws(["alg": "ML-DSA-65", "typ": "MOQT", "kid": kid], claims) { try! signer.signature(for: $0) }
     }
 
     static func base64URL(_ data: Data) -> String {
