@@ -371,8 +371,68 @@ top of `Sources/MoqomKit/Transport/Transport.swift`.
     missing, forged or expired, so one honest app is enough to keep the pair
     billed.
 
-  `DirectEndpointTests` runs two endpoints over loopback on macOS. It hasn't
-  run across real networks.
+  #### In a room
+
+  Off unless the app asks for it, with the IP-exposure acknowledgement:
+
+  ```swift
+  let room = try await session.join(
+      room: "standup",
+      direct: DirectRoomOptions(
+          exposure: .peersWillLearnMyIPAddresses(),
+          tokenKeys: try DirectVerificationKey.parseSet(jwks),
+          issuer: "https://auth.example.com",
+          stun: (host: "stun.example.com", port: 3478)
+      )
+  )
+  for await event in room.events {
+      if case let .directPathChanged(who, path) = event { print(who, path) } // relay(why) / connecting / direct
+  }
+  ```
+
+  `RoomSession.setDirect(_:)` does the same on a room already joined, and `nil`
+  turns it off. Opting in is published as `direct: true` on this device's
+  catalog, which is how the others count it. The room then applies
+  `DirectEligibility` as it stands: end-to-end encryption required and in use,
+  no watchdog, this device publishing on stage, at most four participants, and
+  every one of them opted in. Participants are everyone on stage plus every
+  member of the room's MLS group, so a viewer holding the room's keys keeps the
+  room on the relay. While the rules hold, for each other participant the room:
+
+  - binds an endpoint on the session's `directBackend`, sends its sealed offer
+    on this participant's `.direct` track every second until the peer answers,
+    reads the peer's, and establishes with the newest offer it hasn't tried;
+  - once up, subscribes on its own relay to its ticket track
+    `.direct/{peer}`, presents its tickets and holds the peer to theirs
+    (`DirectTicketGuard`). It closes that subscription when the path ends;
+  - publishes every media track on the direct session as well as the relay.
+    The copy is made under the encryption, so both paths carry the same
+    ciphertext with the same object numbers. A stalled direct path drops its
+    own queued objects and never holds up the relay;
+  - reads each of the peer's tracks through a `DualSubscription`, the relay
+    subscription staying the one of record.
+
+  Any end of the path (the guard, the session closing, the peer offering a
+  new endpoint, the room no longer qualifying) leaves media
+  on the relay and calls `networkChanged()` on the merges. Another attempt
+  follows after a backoff that starts at `retry` (2 s) and doubles up to a
+  minute. A departure or `leave` tears that participant's path down, tickets
+  included. A new MLS epoch reseals the offers and offers again to anyone not
+  yet direct. Paths already up are kept. `RoomSession.directPaths` gives each
+  participant's state and how many objects came over each path.
+
+  The offer key is the managed group's epoch authenticator, run through
+  `DirectRoomSecret`'s HKDF. The design calls for an MLS exporter secret, and
+  `ManagedRoomKeys` doesn't expose one yet. A room keyed by the app instead
+  (`useEncryption`) passes `offerSecret`, or it reports `awaitingKeys`.
+
+  `DirectEndpointTests` runs two endpoints over loopback on macOS, and
+  `DirectRoomTests` runs whole rooms on the loopback relay with a stand-in
+  ticket issuer. It covers two people going direct, a viewer staying on the
+  relay, a participant who hasn't opted in keeping everyone there, fallback
+  when the session is killed, lapsed tickets and leaving.
+  `RustDirectRoomTests` repeats the first case on the Rust backend. None of
+  this has run across real networks.
 
   #### Direct backends
 
@@ -537,10 +597,13 @@ somebody demonstrates. Both are built and wired; neither has been seen.
 
 ### Not written
 
-- Direct mode is not wired into `Room`. An app can drive the pieces above
-  itself, but `Room` does not yet offer or take a direct path on its own.
-  `MoqomSession.directBackend` and `bindDirectEndpoint` are as far as the
-  session goes.
+- Direct paths in a room are partial:
+  - The offer key comes from the epoch authenticator, not an MLS exporter. The
+    Rust client isn't wired into a room, so nothing on that side derives the key
+    this way yet.
+  - Backstage publishing counts as audience.
+  - On the loopback relay `FORWARD=0` does nothing, so the 500 ms quiet resume
+    is covered only by the `DualSubscription` tests in `DirectTests`.
 - Media kinds are not enforced per track. `moqt.pub` distinguishes audio from
   video from screen, and the relay checks only that it is non-empty, so a token
   minted for audio can publish video under a namespace it does own.
