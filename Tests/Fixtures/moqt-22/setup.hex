@@ -1,0 +1,3 @@
+# SETUP 0x2F00: AUTHORIZATION_TOKEN option (USE_VALUE, type 0, "ticket") and MOQT_IMPLEMENTATION "moqom".
+af 00 00 11 03 08 03 00 74 69 63 6b 65 74 04 05
+6d 6f 71 6f 6d
