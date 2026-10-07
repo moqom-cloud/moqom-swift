@@ -219,6 +219,20 @@ public struct Catalog: Hashable, Sendable, Codable {
     /// reads whatever is still pending.
     public let invitations: [StageInvitationRecord]
 
+    /// Whether this publisher has opted in to direct (peer-to-peer) paths.
+    ///
+    /// A room goes direct only when every participant has, so each one says so
+    /// where the others already look, as with ``muted``. It says nothing about
+    /// where the publisher can be reached: addresses travel sealed, on the
+    /// `.direct` track (``DirectOffers``), and only once everyone has said yes.
+    /// The relay can read this, as it can read the rest of the catalog; it
+    /// learns no more than the ticket subscriptions a direct path opens would
+    /// tell it anyway.
+    ///
+    /// Absent, and so `false`, from catalogs published before this field
+    /// existed and from every publisher that has not opted in.
+    public let direct: Bool
+
     public static let currentVersion = 1
 
     public init(
@@ -229,6 +243,7 @@ public struct Catalog: Hashable, Sendable, Codable {
         locale: String? = nil,
         references: [TrackNamespace] = [],
         invitations: [StageInvitationRecord] = [],
+        direct: Bool = false,
         tracks: [CatalogTrack]
     ) {
         self.version = version
@@ -238,6 +253,7 @@ public struct Catalog: Hashable, Sendable, Codable {
         self.locale = locale
         self.references = references
         self.invitations = invitations
+        self.direct = direct
         self.tracks = tracks
     }
 
@@ -247,9 +263,11 @@ public struct Catalog: Hashable, Sendable, Codable {
     // participant off the stage over a missing key. The same now goes for
     // `interrupted`, which an older publisher never sends and whose absence
     // means a camera nobody has taken away, and for `locale`, which an older
-    // publisher never sends and whose absence means they have not said.
+    // publisher never sends and whose absence means they have not said. And for
+    // `direct`, written only when true, so a catalog that has not opted in is
+    // byte for byte what it was before the field existed.
     private enum CodingKeys: String, CodingKey {
-        case version, keyID, muted, interrupted, locale, references, invitations, tracks
+        case version, keyID, muted, interrupted, locale, references, invitations, direct, tracks
     }
 
     public init(from decoder: any Decoder) throws {
@@ -263,6 +281,7 @@ public struct Catalog: Hashable, Sendable, Codable {
         invitations = try container.decodeIfPresent(
             [StageInvitationRecord].self, forKey: .invitations
         ) ?? []
+        direct = try container.decodeIfPresent(Bool.self, forKey: .direct) ?? false
         tracks = try container.decode([CatalogTrack].self, forKey: .tracks)
     }
 
@@ -275,6 +294,7 @@ public struct Catalog: Hashable, Sendable, Codable {
         try container.encodeIfPresent(locale, forKey: .locale)
         if !references.isEmpty { try container.encode(references, forKey: .references) }
         if !invitations.isEmpty { try container.encode(invitations, forKey: .invitations) }
+        if direct { try container.encode(direct, forKey: .direct) }
         try container.encode(tracks, forKey: .tracks)
     }
 
