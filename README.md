@@ -384,7 +384,7 @@ top of `Sources/MoqomKit/Transport/Transport.swift`.
       transport: transport,
       credentials: credentials,      // authorityKeys: what peers are verified against
       tenant: tenant,
-      directPolicy: .automatic(stun: (host: "stun.example.com", port: 3478)) // or .relayOnly
+      directPolicy: .automatic       // or .automatic(stun: (host:port:)), or .relayOnly
   )
   let room = try await session.join(room: "standup")
   for await event in room.events {
@@ -610,10 +610,12 @@ somebody demonstrates. Both are built and wired; neither has been seen.
 - Direct paths in a room are on by default (`DirectPolicy.automatic`) and
   still partial:
   - Automatic needs `DeviceCredentials.authorityKeys` to verify a peer with;
-    a session without them stays on the relay. It offers only this device's
-    own addresses unless the app passes `.automatic(stun:)`, and MOQOM runs
-    no STUN service, so out of the box a direct path opens on the same
-    network and falls back to the relay behind a NAT.
+    a session without them stays on the relay. MOQOM's relays answer STUN,
+    and the token service's `direct.stun` names one, so automatic offers this
+    device's public address as well as its own. `.automatic(stun:)` names a
+    different server instead. A NAT that maps each destination to a new port
+    (symmetric NAT, common on carrier-grade NAT) still defeats hole-punching,
+    and MOQOM runs no TURN: those calls stay on the relay.
   - The room's policy (`direct_paths`, `max_direct_participants`) reaches the
     device through the token service's `direct` field. A backend that mints
     through the admin API has to pass `MintClientTokenResponse.direct` on
