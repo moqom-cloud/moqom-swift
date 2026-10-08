@@ -254,6 +254,31 @@ struct DirectRoomTests {
         for person in [automatic, relayOnly, unkeyed] { await person.session.close() }
     }
 
+    @Test("automatic asks the STUN server the token names unless the app named one, and relay-only asks none")
+    func stunServer() async throws {
+        let relay = LoopbackRelay()
+        let person = try await DirectRooms.join("alice", relay: relay, authorityKeys: DirectTokens.keys)
+        #expect(await person.session.directOptions(for: .automatic)?.stun == nil)
+
+        let token = DirectTokens.mint(user: "alice", key: person.device.key)
+        let relays = DirectSTUNServer(host: "relay.moqom.test")
+        try await person.session.updateCredential(IssuedToken(
+            token: token, expiresAt: Date().addingTimeInterval(600), username: "alice", room: "room-42",
+            direct: DirectRoomPolicy(allowed: true, stun: relays)
+        ))
+        let automatic = await person.session.directOptions(for: .automatic)
+        #expect(automatic?.stun?.host == "relay.moqom.test")
+        #expect(automatic?.stun?.port == 3478)
+        #expect(await person.room.isDirectEnabled)
+
+        let named = await person.session.directOptions(for: .automatic(stun: (host: "stun.example.net", port: 19302)))
+        #expect(named?.stun?.host == "stun.example.net")
+        #expect(named?.stun?.port == 19302)
+        #expect(await person.session.directOptions(for: .relayOnly) == nil)
+
+        await person.session.close()
+    }
+
     @Test("a direct path that dies falls back to the relay at once, and comes back")
     func fallsBackWhenKilled() async throws {
         let call = try await call()

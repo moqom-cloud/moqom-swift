@@ -31,18 +31,22 @@ public struct DirectPolicy: Sendable {
     /// of a qualifying room learn this device's public and local IP addresses;
     /// say so in the app. Peers are verified against the session's
     /// ``DeviceCredentials/authorityKeys``, and a session holding none stays on
-    /// the relay, having nothing to verify a peer with. Without a STUN server
-    /// only this device's own addresses are offered, which reach a peer on the
-    /// same network and nothing behind a NAT.
+    /// the relay, having nothing to verify a peer with.
+    ///
+    /// The public address comes from the STUN server the token service names
+    /// with the token (``DirectRoomPolicy/stun``), which is a MOQOM relay's.
+    /// A service that names none leaves only this device's own addresses to
+    /// offer, which reach a peer on the same network and nothing behind a NAT.
     public static let automatic = DirectPolicy(mode: .automatic(stun: nil))
 
-    /// ``automatic``, learning the public address from a STUN server.
+    /// ``automatic``, learning the public address from this STUN server rather
+    /// than the one the token service names.
     public static func automatic(stun: (host: String, port: UInt16)) -> DirectPolicy {
         DirectPolicy(mode: .automatic(stun: stun))
     }
 
-    /// Every participant's media through the relay, and this device's
-    /// addresses never offered to anyone.
+    /// Every participant's media through the relay, this device's addresses
+    /// never offered to anyone, and no STUN server asked.
     public static let relayOnly = DirectPolicy(mode: .relayOnly)
 
     /// Direct paths with options the application chose. The room's limit from
@@ -67,17 +71,28 @@ public struct DirectRoomPolicy: Hashable, Sendable {
     /// than ``DirectEligibility/maximumParticipants``.
     public var maximumParticipants: Int
 
-    public init(allowed: Bool, maximumParticipants: Int = DirectEligibility.maximumParticipants) {
+    /// Where ``DirectPolicy/automatic`` learns this device's public address:
+    /// the relays' STUN responder, as the token service names it. `nil` when
+    /// it names none.
+    public var stun: DirectSTUNServer?
+
+    public init(
+        allowed: Bool,
+        maximumParticipants: Int = DirectEligibility.maximumParticipants,
+        stun: DirectSTUNServer? = nil
+    ) {
         self.allowed = allowed
         self.maximumParticipants = min(max(maximumParticipants, 0), DirectEligibility.maximumParticipants)
+        self.stun = stun
     }
 
     /// What a control plane that says nothing means: allowed, up to the
-    /// SDK's own limit.
+    /// SDK's own limit, with no STUN server.
     public static let `default` = DirectRoomPolicy(allowed: true)
 
     /// The policy in a token service's response, `{"allowed": …,
-    /// "maxParticipants": …}`; ``default`` for anything else.
+    /// "maxParticipants": …, "stun": {"host": …, "port": …}}`; ``default``
+    /// for anything else.
     init(json: Any?) {
         guard let object = json as? [String: Any] else {
             self = .default
@@ -85,6 +100,31 @@ public struct DirectRoomPolicy: Hashable, Sendable {
         }
         let allowed = object["allowed"] as? Bool ?? true
         let limit = (object["maxParticipants"] as? Int).flatMap { $0 > 0 ? $0 : nil }
-        self.init(allowed: allowed, maximumParticipants: limit ?? DirectEligibility.maximumParticipants)
+        self.init(
+            allowed: allowed,
+            maximumParticipants: limit ?? DirectEligibility.maximumParticipants,
+            stun: DirectSTUNServer(json: object["stun"])
+        )
+    }
+}
+
+/// A STUN server: a host name or address literal, and a UDP port.
+public struct DirectSTUNServer: Hashable, Sendable {
+    public var host: String
+    public var port: UInt16
+
+    public init(host: String, port: UInt16 = 3478) {
+        self.host = host
+        self.port = port
+    }
+
+    /// `{"host": …, "port": …}`, or `nil` for anything a device could not
+    /// dial.
+    init?(json: Any?) {
+        guard let object = json as? [String: Any],
+              let host = object["host"] as? String, !host.isEmpty,
+              let port = object["port"] as? Int, let port = UInt16(exactly: port), port != 0
+        else { return nil }
+        self.init(host: host, port: port)
     }
 }

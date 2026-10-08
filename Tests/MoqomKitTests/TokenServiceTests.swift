@@ -91,6 +91,22 @@ struct TokenServiceTests {
         let relayOnly = try await refusing.token(username: "u", room: "r", device: key, session: again)
         #expect(!relayOnly.direct.allowed)
         #expect(DirectRoomPolicy(allowed: true, maximumParticipants: 40).maximumParticipants == 4)
+        #expect(issued.direct.stun == nil)
+    }
+
+    @Test("the relays' STUN server comes back with the token")
+    func stunServer() async throws {
+        let (service, session) = self.service(.ok("""
+        {"token":"a.b.c","expiresAt":"2026-08-05T18:15:00Z","room":"r","username":"u",
+         "direct":{"allowed":true,"maxParticipants":4,"stun":{"host":"relay.moqom.cloud","port":3478}}}
+        """))
+        let issued = try await service.token(username: "u", room: "r", device: key, session: session)
+        #expect(issued.direct.stun == DirectSTUNServer(host: "relay.moqom.cloud", port: 3478))
+
+        // Nothing a device could dial is no server at all.
+        for stun in [#"{"host":"","port":3478}"#, #"{"host":"r","port":0}"#, #"{"host":"r","port":70000}"#, #"{"host":"r"}"#] {
+            #expect(DirectRoomPolicy(json: try JSONSerialization.jsonObject(with: Data(#"{"stun":\#(stun)}"#.utf8))).stun == nil)
+        }
     }
 
     @Test("what the device asks for is what it sends")

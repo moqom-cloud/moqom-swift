@@ -48,10 +48,15 @@ public actor MoqomSession {
     private var connection: (any TransportSession)?
     private var rooms: [RoomID: RoomSession] = [:]
     private var roomPolicies: [RoomID: DirectPolicy] = [:]
-    /// The room limit each room's direct paths were last set up with, `nil`
-    /// for none, so a renewal that restates the same policy leaves live paths
-    /// alone.
-    private var appliedDirect: [RoomID: Int?] = [:]
+    /// The room limit and STUN server each room's direct paths were last set
+    /// up with, `nil` for none, so a renewal that restates the same policy
+    /// leaves live paths alone.
+    private var appliedDirect: [RoomID: AppliedDirect?] = [:]
+
+    private struct AppliedDirect: Equatable {
+        var limit: Int
+        var stun: DirectSTUNServer?
+    }
 
     /// The endpoint to redial.
     ///
@@ -542,7 +547,7 @@ public actor MoqomSession {
             var options = DirectRoomOptions(
                 exposure: .peersWillLearnMyIPAddresses(),
                 tokenKeys: credentials.authorityKeys,
-                stun: stun
+                stun: stun ?? limits.stun.map { (host: $0.host, port: $0.port) }
             )
             options.maximumParticipants = limits.maximumParticipants
             return options
@@ -552,7 +557,9 @@ public actor MoqomSession {
     private func applyDirect(to room: RoomID) async throws(MoqomError) {
         guard let session = rooms[room], let policy = roomPolicies[room] else { return }
         let options = directOptions(for: policy)
-        let applied = options?.maximumParticipants
+        let applied = options.map {
+            AppliedDirect(limit: $0.maximumParticipants, stun: $0.stun.map { DirectSTUNServer(host: $0.host, port: $0.port) })
+        }
         if let previous = appliedDirect[room], previous == applied { return }
         do {
             try await session.setDirect(options)
