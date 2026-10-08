@@ -296,7 +296,7 @@ public final class DirectPeerCheck: DirectPeerVerifying, @unchecked Sendable {
         } catch {
             throw switch error {
             case let .malformed(why): .malformedProof(why)
-            case .unsupported, .notSigned: .unsupportedProof
+            case .unsupported, .notSigned, .configuration: .unsupportedProof
             case .badSignature: .proofBadSignature
             case .wrongKey: .proofWrongKey
             case .wrongToken: .proofWrongToken
