@@ -625,9 +625,10 @@ somebody demonstrates. Both are built and wired; neither has been seen.
   - Backstage pairs only with backstage, and a device starts watching the
     backstage prefix only once it publishes there. A stage device and a
     backstage one stay on the relay with each other.
-  - The Rust client has the same policy type and room limit
-    (`moqom_client::direct::DirectPolicy`) but isn't wired into a room, so
-    nothing on that side derives the offer key from the MLS exporter yet.
+  - The Rust client runs the same room behaviour in
+    `moqom_client::direct::DirectRoom`, pausing the relay copy the same way,
+    but has no MLS or catalog, so its caller supplies the offer key and who
+    opted in.
   - On the loopback relay `FORWARD=0` does nothing, so the 500 ms quiet resume
     is covered only by the `DualSubscription` tests in `DirectTests`.
 - Media kinds are not enforced per track. `moqt.pub` distinguishes audio from
