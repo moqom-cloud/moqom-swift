@@ -241,7 +241,9 @@ actor ManagedRoomKeys {
     }
 
     var status: GroupKeyStatus? {
-        guard let group else { return nil }
+        guard let group,
+              let directOfferSecret = try? group.exporter(label: "MOQOM direct offer", length: 32)
+        else { return nil }
         let members = group.roster.map(\.member.identityString)
         return GroupKeyStatus(
             epoch: group.epoch,
@@ -251,7 +253,7 @@ actor ManagedRoomKeys {
             undisclosedAgents: undisclosedAgents(in: members),
             audience: audience,
             epochAuthenticator: group.epochAuthenticator,
-            directOfferSecret: group.exporter(label: "MOQOM direct offer", length: 32)
+            directOfferSecret: directOfferSecret
         )
     }
 
