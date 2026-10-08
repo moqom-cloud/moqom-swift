@@ -63,6 +63,9 @@ public actor RoomSession {
     /// The MLS group keying this room, when the SDK rather than the application
     /// holds the keys. See ``DeviceCredentials/keyDelivery``.
     private var managedKeys: ManagedRoomKeys?
+    /// This device's keys as a viewer outside the group, instead of
+    /// ``managedKeys``, when its token grants no publishing. See ``AudienceKeys``.
+    private var viewerKeys: AudienceKeys?
     private let keyDelivery: (any MLSDeliveryService)?
     private let currentToken: (@Sendable () async -> Data)?
 
@@ -333,6 +336,10 @@ public actor RoomSession {
             self.managedKeys = nil
             Task { await managedKeys.stop() }
         }
+        if let viewerKeys {
+            self.viewerKeys = nil
+            Task { await viewerKeys.stop() }
+        }
         self.encryption = encryption
         unprotector = MediaUnprotector(receiver: encryption.receiver)
         refusedUnencrypted.removeAll()
@@ -349,6 +356,12 @@ public actor RoomSession {
     /// window is dropped rather than sent, because nobody could open it.
     public var groupKeys: GroupKeyStatus? {
         get async { await managedKeys?.status }
+    }
+
+    /// The broadcast keys this device holds as a viewer outside the group:
+    /// `nil` unless its token grants no publishing and a key has arrived.
+    public var audienceKeys: AudienceKeyStatus? {
+        get async { await viewerKeys?.status }
     }
 
     // MARK: - Direct paths
@@ -488,6 +501,7 @@ public actor RoomSession {
             view.optedIn = directOptedIn.intersection(view.peers)
             if let managedKeys, let status = await managedKeys.status {
                 view.members = Set(status.members)
+                view.audience = status.audience
                 // Every device in the group derives the same value for the same
                 // epoch, and nobody outside it can.
                 view.secret = direct?.offerSecret ?? status.directOfferSecret
@@ -594,14 +608,32 @@ public actor RoomSession {
     }
 
     /// Hand the room's keys to MLS, if the room requires encryption, nobody
-    /// supplied a key, and there is a delivery service to agree them through.
+    /// supplied a key, and there is a delivery service to agree them through:
+    /// as a member of the group if this device may publish or is an agent, and
+    /// as a viewer sealed the group's keys if not.
     ///
-    /// Rooms only. A personal channel is a broadcast to an audience of any
-    /// size, which is the case group key agreement is the wrong tool for.
+    /// Rooms only, for now: a personal channel's audience is keyed by whoever
+    /// it is the channel of, and that is not built.
     private func startManagedKeysIfNeeded() async {
-        guard encryption == nil, managedKeys == nil, !encryptionPolicy.allowsPlaintext, channel == nil,
-              let keyDelivery, let currentToken
+        guard encryption == nil, managedKeys == nil, viewerKeys == nil, !encryptionPolicy.allowsPlaintext,
+              channel == nil, let keyDelivery, let currentToken
         else { return }
+        if await isViewer() {
+            let keys: AudienceKeys
+            do {
+                keys = try AudienceKeys(identity: identity, delivery: keyDelivery, token: currentToken, logger: logger)
+            } catch {
+                logger.error(.room, "could not make an audience key", [LogField("error", .text("\(error)"))])
+                return
+            }
+            viewerKeys = keys
+            encryption = keys.encryption
+            unprotector = keys.unprotector
+            refusedUnencrypted.removeAll()
+            await keys.start()
+            logger.info(.room, "end-to-end encryption keys are sealed to this viewer by the group")
+            return
+        }
         let keys = ManagedRoomKeys(
             identity: identity, delivery: keyDelivery, token: currentToken, logger: logger
         )
@@ -614,11 +646,44 @@ public actor RoomSession {
         logger.info(.room, "end-to-end encryption keys are managed by MLS")
     }
 
+    /// A token that says this device may not publish, for anybody but an agent.
+    /// One that does not say is a member, as every device was before viewers
+    /// were keyed apart.
+    private func isViewer() async -> Bool {
+        guard let currentToken else { return false }
+        if identity.username.value.hasPrefix(ManagedRoomKeys.agentPrefix) { return false }
+        return DeviceCredentials.mayPublish(token: await currentToken()) == false
+    }
+
+    /// Move between the group and the audience when a renewed token grants or
+    /// withdraws publishing.
+    private func followKeyRole() async {
+        let viewer = await isViewer()
+        let switching = (viewer && managedKeys != nil) || (!viewer && viewerKeys != nil)
+        guard switching else { return }
+        logger.info(.room, viewer ? "moving to the audience: the token no longer grants publishing"
+            : "joining the group: the token now grants publishing")
+        await managedKeys?.stop()
+        managedKeys = nil
+        await viewerKeys?.stop()
+        viewerKeys = nil
+        encryption = nil
+        unprotector = nil
+        if viewer {
+            let publishing = broadcast != nil || audio != nil
+            await stopBroadcast()
+            await stopAudio()
+            if publishing { eventContinuation.yield(.encryptionRequired(identity)) }
+        }
+        await startManagedKeysIfNeeded()
+    }
+
     /// Take the policy renewed credentials state, which outside this package's
     /// tests is always ``EncryptionPolicy/required``. Moving to required stops
     /// a publication going out in the clear, and this device is told why
     /// through ``RoomEvent/encryptionRequired(_:)``.
     func applyEncryptionPolicy(_ policy: EncryptionPolicy) async {
+        await followKeyRole()
         guard policy != encryptionPolicy else { return }
         encryptionPolicy = policy
         logger.info(.room, "encryption policy changed", [LogField("e2ee", .text(policy.rawValue))])
@@ -1360,6 +1425,8 @@ public actor RoomSession {
         audio = nil
         await managedKeys?.stop()
         managedKeys = nil
+        await viewerKeys?.stop()
+        viewerKeys = nil
         await audioAnnouncement?.withdraw()
         audioAnnouncement = nil
         catalogRefresh?.cancel()

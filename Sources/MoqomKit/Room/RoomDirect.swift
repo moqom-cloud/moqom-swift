@@ -396,9 +396,13 @@ final class DirectMergedSubscription: SubscriptionHandle {
         /// Those of them whose catalog says they opted in.
         var optedIn: Set<ParticipantIdentity> = []
         /// The room's MLS group, as `user/device`. Every device holding the
-        /// offer key counts as a participant, viewers included, because each
-        /// of them could open an offer.
+        /// offer key counts as a participant, because each of them could open
+        /// an offer.
         var members: Set<String>?
+        /// Viewers outside the group, sealed its media keys. They cannot open
+        /// an offer, but a room with an audience is not a small call, so each
+        /// counts as a participant who has not opted in.
+        var audience = 0
         /// The offer key's material, `nil` until there is one.
         var secret: Data?
     }
@@ -561,8 +565,10 @@ final class DirectMergedSubscription: SubscriptionHandle {
             let everyone = others.union(view.members ?? []).union([me])
             let opted = Set(view.optedIn.map(DirectParticipant.name(of:)))
             do throws(DirectIneligibility) {
-                try eligibility(participants: everyone.count, optedIn: everyone.subtracting([me]).isSubset(of: opted))
-                    .check()
+                try eligibility(
+                    participants: everyone.count + view.audience,
+                    optedIn: everyone.subtracting([me]).isSubset(of: opted) && view.audience == 0
+                ).check()
             } catch {
                 return .ineligible(error)
             }

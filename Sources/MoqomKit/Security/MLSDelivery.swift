@@ -39,6 +39,11 @@ public struct MLSDeliverySnapshot: Sendable, Hashable {
     /// The sequence number to ask from next time.
     public var cursor: UInt64
 
+    /// Viewers present that are not in the group, and how many of them do not
+    /// yet hold the current epoch's key. Reported to members only.
+    public var audience: Int
+    public var audienceWaiting: Int
+
     public struct Group: Sendable, Hashable {
         public var id: Data
         public var epoch: UInt64
@@ -81,13 +86,17 @@ public struct MLSDeliverySnapshot: Sendable, Hashable {
         messages: [Message],
         members: [String],
         pending: [String],
-        cursor: UInt64
+        cursor: UInt64,
+        audience: Int = 0,
+        audienceWaiting: Int = 0
     ) {
         self.group = group
         self.messages = messages
         self.members = members
         self.pending = pending
         self.cursor = cursor
+        self.audience = audience
+        self.audienceWaiting = audienceWaiting
     }
 }
 
@@ -153,6 +162,81 @@ public protocol MLSDeliveryService: Sendable {
     /// Leave, so the next commit removes this device without waiting for it to
     /// go quiet.
     func leave(token: Data) async throws
+
+    // MARK: Audience
+
+    /// Post this device's audience key and wait up to `wait` for an epoch key
+    /// sealed to it other than `have`. Also its heartbeat as a viewer.
+    func joinAudience(publicKey: Data, have: MLSEpochRef?, wait: Duration, token: Data) async throws -> MLSAudienceEnvelope?
+
+    /// Stop being a viewer.
+    func leaveAudience(token: Data) async throws
+
+    /// The current epoch, and the viewers that do not hold it. Members only.
+    func audienceWork(token: Data) async throws -> MLSAudienceWork
+
+    /// Store sealed epoch keys by device. `false` when the group has moved past
+    /// `epoch`.
+    func sealAudience(_ envelopes: [String: Data], for epoch: MLSEpochRef, token: Data) async throws -> Bool
+}
+
+extension MLSDeliveryService {
+    public func joinAudience(publicKey: Data, have: MLSEpochRef?, wait: Duration, token: Data) async throws -> MLSAudienceEnvelope? {
+        throw MLSDeliveryError.refused(status: 501, reason: "this delivery service has no audience")
+    }
+
+    public func leaveAudience(token: Data) async throws {}
+
+    public func audienceWork(token: Data) async throws -> MLSAudienceWork {
+        throw MLSDeliveryError.refused(status: 501, reason: "this delivery service has no audience")
+    }
+
+    public func sealAudience(_ envelopes: [String: Data], for epoch: MLSEpochRef, token: Data) async throws -> Bool {
+        throw MLSDeliveryError.refused(status: 501, reason: "this delivery service has no audience")
+    }
+}
+
+/// One epoch of one group.
+public struct MLSEpochRef: Sendable, Hashable {
+    public var groupID: Data
+    public var epoch: UInt64
+
+    public init(groupID: Data, epoch: UInt64) {
+        self.groupID = groupID
+        self.epoch = epoch
+    }
+}
+
+/// An epoch's SFrame base key sealed to one viewer.
+public struct MLSAudienceEnvelope: Sendable, Hashable {
+    public var epoch: MLSEpochRef
+    public var data: Data
+
+    public init(epoch: MLSEpochRef, data: Data) {
+        self.epoch = epoch
+        self.data = data
+    }
+}
+
+/// What a member seals next.
+public struct MLSAudienceWork: Sendable, Hashable {
+    public struct Seat: Sendable, Hashable {
+        public var device: String
+        public var publicKey: Data
+
+        public init(device: String, publicKey: Data) {
+            self.device = device
+            self.publicKey = publicKey
+        }
+    }
+
+    public var epoch: MLSEpochRef
+    public var seats: [Seat]
+
+    public init(epoch: MLSEpochRef, seats: [Seat]) {
+        self.epoch = epoch
+        self.seats = seats
+    }
 }
 
 /// Why the delivery service could not be used.
@@ -218,7 +302,9 @@ public final class HTTPMLSDelivery: MLSDeliveryService {
             },
             members: body.members ?? [],
             pending: body.pending ?? [],
-            cursor: body.cursor
+            cursor: body.cursor,
+            audience: body.audience ?? 0,
+            audienceWaiting: body.audienceWaiting ?? 0
         )
     }
 
@@ -258,9 +344,77 @@ public final class HTTPMLSDelivery: MLSDeliveryService {
         _ = try await call("DELETE", "/mls/v1/presence", body: Optional<Empty>.none, token: token)
     }
 
+    public func joinAudience(publicKey: Data, have: MLSEpochRef?, wait: Duration, token: Data) async throws -> MLSAudienceEnvelope? {
+        let seconds = max(0, Int(wait.components.seconds))
+        let data = try await call(
+            "POST", "/mls/v1/audience",
+            body: AudienceBody(publicKey: publicKey, haveGroupId: have?.groupID, haveEpoch: have?.epoch, wait: seconds),
+            token: token, timeout: TimeInterval(seconds) + 10
+        )
+        // 204: nothing newer than `have` was sealed in time.
+        guard !data.isEmpty else { return nil }
+        let body = try decode(EnvelopeResponse.self, data)
+        return MLSAudienceEnvelope(epoch: MLSEpochRef(groupID: body.groupId, epoch: body.epoch), data: body.data)
+    }
+
+    public func leaveAudience(token: Data) async throws {
+        _ = try await call("DELETE", "/mls/v1/audience", body: Optional<Empty>.none, token: token)
+    }
+
+    public func audienceWork(token: Data) async throws -> MLSAudienceWork {
+        let data = try await call("GET", "/mls/v1/audience/work", body: Optional<Empty>.none, token: token)
+        let body = try decode(WorkResponse.self, data)
+        return MLSAudienceWork(
+            epoch: MLSEpochRef(groupID: body.groupId, epoch: body.epoch),
+            seats: body.seats.map { MLSAudienceWork.Seat(device: $0.device, publicKey: $0.publicKey) }
+        )
+    }
+
+    public func sealAudience(_ envelopes: [String: Data], for epoch: MLSEpochRef, token: Data) async throws -> Bool {
+        do {
+            _ = try await call(
+                "POST", "/mls/v1/audience/envelopes",
+                body: SealBody(groupId: epoch.groupID, epoch: epoch.epoch, envelopes: envelopes), token: token
+            )
+            return true
+        } catch MLSDeliveryError.refused(status: 409, _) {
+            return false
+        }
+    }
+
     // MARK: - Wire
 
     private struct Empty: Encodable {}
+
+    private struct AudienceBody: Encodable {
+        var publicKey: Data
+        var haveGroupId: Data?
+        var haveEpoch: UInt64?
+        var wait: Int
+    }
+
+    private struct EnvelopeResponse: Decodable {
+        var groupId: Data
+        var epoch: UInt64
+        var data: Data
+    }
+
+    private struct WorkResponse: Decodable {
+        struct Seat: Decodable {
+            var device: String
+            var publicKey: Data
+        }
+
+        var groupId: Data
+        var epoch: UInt64
+        var seats: [Seat]
+    }
+
+    private struct SealBody: Encodable {
+        var groupId: Data
+        var epoch: UInt64
+        var envelopes: [String: Data]
+    }
 
     private struct KeyPackagesBody: Encodable {
         var keyPackages: [Data]
@@ -302,6 +456,8 @@ public final class HTTPMLSDelivery: MLSDeliveryService {
         var members: [String]?
         var pending: [String]?
         var cursor: UInt64
+        var audience: Int?
+        var audienceWaiting: Int?
     }
 
     private func decode<T: Decodable>(_: T.Type, _ data: Data) throws -> T {

@@ -268,16 +268,17 @@ struct DirectRoomTests {
         await call.hangUp()
     }
 
-    @Test("a viewer joining the room's MLS group takes the room back to the relay")
-    func viewerInTheGroupCounts() async throws {
+    @Test("a viewer sealed the room's keys takes the room back to the relay")
+    func viewerInTheAudienceCounts() async throws {
         let call = try await call()
         let a = call.alice.identity, b = call.bob.identity
         #expect(await eventually(timeout: .seconds(30)) {
             await bothDirect(call)
         })
 
-        // A viewer holding the group's keys could open the offers, so it is a
-        // participant who has not opted in.
+        // A viewer is not in the group and cannot open the offers, but a room
+        // with an audience is not a small call: it counts as a participant who
+        // has not opted in.
         let service = call.service
         let viewer = try await DirectRooms.join(
             "carol", relay: call.relay, publish: 0, keyDelivery: { @Sendable in await service.client($0) }

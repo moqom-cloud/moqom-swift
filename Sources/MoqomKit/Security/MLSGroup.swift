@@ -540,6 +540,12 @@ public struct MLSGroup: Sendable {
     }
 
     /// Every current member's SFrame key for this epoch, from one export.
+    /// The epoch's SFrame base key, from which every member's key derives.
+    /// What a broadcast's viewers are sealed; see ``AudienceKeys``.
+    func sframeBaseKey(suite: SFrameCipherSuite) -> Data {
+        MLSSFrameKeys.baseKey(secrets, suite: suite)
+    }
+
     public func sframeKeys(suite: SFrameCipherSuite) -> [SFrameKey] {
         let base = MLSSFrameKeys.baseKey(secrets, suite: suite)
         return roster.map { MLSSFrameKeys.key(baseKey: base, leaf: $0.leaf, epoch: epoch, suite: suite) }

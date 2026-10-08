@@ -69,13 +69,16 @@ actor FakeKeyDelivery {
             for key in rows.keys { rows[key]?.member = false }
         }
         let visible = messages.filter { $0.seq > after && ($0.to == nil || $0.to!.contains(who)) }
+        let (audience, audienceWaiting) = audienceCounts(for: who)
         return MLSDeliverySnapshot(
             group: group,
             messages: visible.map { .init(sequence: $0.seq, kind: $0.kind, data: $0.data) },
             members: rows.filter { $0.value.member && $0.value.online }.map(\.key).sorted(),
             pending: rows.filter { !$0.value.member && $0.value.online && packages[$0.key] != nil }
                 .map(\.key).sorted(),
-            cursor: sequence
+            cursor: sequence,
+            audience: audience,
+            audienceWaiting: audienceWaiting
         )
     }
 
@@ -108,6 +111,63 @@ actor FakeKeyDelivery {
     func rejoin(_ who: String) { rows[who]?.member = false }
     func leave(_ who: String) { rows[who] = nil }
 
+    struct Viewer {
+        var key: Data
+        var online = true
+        var envelope: MLSAudienceEnvelope?
+    }
+
+    private(set) var viewers: [String: Viewer] = [:]
+    private var deaf: Set<String> = []
+
+    /// A viewer that stops checking in but keeps whatever keys it holds: the
+    /// one rotation is there to shut out.
+    func deafen(_ who: String) {
+        deaf.insert(who)
+        viewers[who]?.online = false
+    }
+
+    private var current: MLSEpochRef? { group.map { MLSEpochRef(groupID: $0.id, epoch: $0.epoch) } }
+
+    private var waiting: [String] {
+        viewers.filter { $0.value.online && $0.value.envelope?.epoch != current }.map(\.key).sorted()
+    }
+
+    /// A viewer that stops checking in, as one that closed the app does.
+    func depart(_ who: String) { viewers[who]?.online = false }
+
+    func joinAudience(_ who: String, key: Data, have: MLSEpochRef?) -> MLSAudienceEnvelope? {
+        guard !deaf.contains(who) else { return nil }
+        if viewers[who]?.key != key { viewers[who] = Viewer(key: key) }
+        viewers[who]?.online = true
+        guard let envelope = viewers[who]?.envelope, envelope.epoch != have else { return nil }
+        return envelope
+    }
+
+    func audienceWork(_ who: String) throws -> MLSAudienceWork {
+        guard rows[who]?.member == true, let current else {
+            throw MLSDeliveryError.refused(status: 403, reason: "not a member")
+        }
+        return MLSAudienceWork(
+            epoch: current,
+            seats: waiting.map { .init(device: $0, publicKey: viewers[$0]!.key) }
+        )
+    }
+
+    func seal(_ envelopes: [String: Data], for epoch: MLSEpochRef, by who: String) -> Bool {
+        guard rows[who]?.member == true, epoch == current else { return false }
+        for (device, data) in envelopes where viewers[device] != nil {
+            everything.append(data)
+            viewers[device]?.envelope = MLSAudienceEnvelope(epoch: epoch, data: data)
+        }
+        return true
+    }
+
+    func audienceCounts(for who: String) -> (Int, Int) {
+        guard rows[who]?.member == true else { return (0, 0) }
+        return (viewers.values.filter(\.online).count, waiting.count)
+    }
+
     struct Client: MLSDeliveryService {
         let service: FakeKeyDelivery
         let identity: String
@@ -134,6 +194,23 @@ actor FakeKeyDelivery {
 
         func rejoin(token _: Data) async throws { await service.rejoin(identity) }
         func leave(token _: Data) async throws { await service.leave(identity) }
+
+        func joinAudience(publicKey: Data, have: MLSEpochRef?, wait _: Duration, token _: Data) async throws -> MLSAudienceEnvelope? {
+            if let envelope = await service.joinAudience(identity, key: publicKey, have: have) { return envelope }
+            // Held, as the service holds it, rather than spun on.
+            try? await Task.sleep(for: .milliseconds(5))
+            return nil
+        }
+
+        func leaveAudience(token _: Data) async throws { await service.depart(identity) }
+
+        func audienceWork(token _: Data) async throws -> MLSAudienceWork {
+            try await service.audienceWork(identity)
+        }
+
+        func sealAudience(_ envelopes: [String: Data], for epoch: MLSEpochRef, token _: Data) async throws -> Bool {
+            await service.seal(envelopes, for: epoch, by: identity)
+        }
     }
 }
 
@@ -152,6 +229,21 @@ struct ManagedRoomKeysTests {
             cipherSuite: cipherSuite,
             sleep: { try? await Task.sleep(for: min($0, .milliseconds(5))) }
         )
+    }
+
+    private func viewer(_ name: String, _ service: FakeKeyDelivery) async throws -> AudienceKeys {
+        let who = identity(name, device: "tv")
+        return try AudienceKeys(
+            identity: who,
+            delivery: await service.client(who),
+            token: { Data() },
+            sleep: { try? await Task.sleep(for: min($0, .milliseconds(5))) }
+        )
+    }
+
+    private func holds(_ viewer: AudienceKeys, epochOf member: ManagedRoomKeys) async -> Bool {
+        guard let epoch = await member.status?.epoch else { return false }
+        return await viewer.status?.epoch == epoch
     }
 
     private func sameEpoch(_ all: [ManagedRoomKeys], members: Int) async -> Bool {
@@ -253,6 +345,115 @@ struct ManagedRoomKeysTests {
         for keys in [alice, bob, recorder] { await keys.stop() }
     }
 
+    @Test("viewers outside the group are sealed each epoch's key and read every publisher")
+    func viewersAreSealedTheEpoch() async throws {
+        let service = FakeKeyDelivery()
+        let alice = await keys("alice", "iphone-a", service)
+        let bob = await keys("bob", "iphone-b", service)
+        await alice.start()
+        #expect(await eventually { await alice.status != nil })
+        await bob.start()
+        #expect(await eventually { await sameEpoch([alice, bob], members: 2) })
+
+        let carol = try await viewer("carol", service)
+        let dave = try await viewer("dave", service)
+        await carol.start()
+        await dave.start()
+        #expect(await eventually { await holds(carol, epochOf: alice) })
+        #expect(await eventually { await holds(dave, epochOf: alice) })
+
+        // Not members: the group is still two, and the audience is counted apart.
+        let status = try #require(await alice.status)
+        #expect(status.members.count == 2)
+        #expect(await eventually { await alice.status?.audience == 2 })
+
+        // Each publisher's frames open from the one base key, by key ID.
+        for sender in [alice, bob] {
+            let sealed = try sender.encryption.sender.protect(Data("on air".utf8))
+            #expect(try carol.encryption.receiver.unprotect(sealed) == Data("on air".utf8))
+            #expect(try dave.encryption.receiver.unprotect(sealed) == Data("on air".utf8))
+        }
+        // A viewer has nothing to send under.
+        #expect(throws: SFrameError.noKey) { _ = try carol.encryption.sender.protect(Data("hi".utf8)) }
+
+        // A new member moves the epoch, and viewers follow it.
+        let erin = await keys("erin", "iphone-e", service)
+        await erin.start()
+        #expect(await eventually { await sameEpoch([alice, bob, erin], members: 3) })
+        #expect(await eventually { await holds(carol, epochOf: alice) })
+        let sealed = try erin.encryption.sender.protect(Data("new epoch".utf8))
+        #expect(try carol.encryption.receiver.unprotect(sealed) == Data("new epoch".utf8))
+
+        for keys in [alice, bob, erin] { await keys.stop() }
+        await carol.stop()
+        await dave.stop()
+    }
+
+    @Test("a viewer that goes is not sealed the next rotation, and cannot read past it")
+    func rotationShutsOutDepartedViewers() async throws {
+        let service = FakeKeyDelivery()
+        let alice = ManagedRoomKeys(
+            identity: identity("alice", device: "iphone-a"),
+            delivery: await service.client(identity("alice", device: "iphone-a")),
+            token: { Data() },
+            audienceRotation: .milliseconds(300),
+            sleep: { try? await Task.sleep(for: min($0, .milliseconds(5))) }
+        )
+        await alice.start()
+        #expect(await eventually { await alice.status != nil })
+        let carol = try await viewer("carol", service)
+        let dave = try await viewer("dave", service)
+        await carol.start()
+        await dave.start()
+        #expect(await eventually { await holds(carol, epochOf: alice) })
+        #expect(await eventually { await holds(dave, epochOf: alice) })
+        let before = try #require(await alice.status).epoch
+        let early = try alice.encryption.sender.protect(Data("before".utf8))
+        #expect(try dave.encryption.receiver.unprotect(early) == Data("before".utf8))
+
+        await service.deafen("dave/tv")
+        // With nobody joining or leaving the group, the epoch moves on a timer
+        // because there is an audience.
+        #expect(await eventually(timeout: .seconds(10)) { (await alice.status?.epoch ?? 0) > before })
+        #expect(await eventually { await holds(carol, epochOf: alice) })
+        let late = try alice.encryption.sender.protect(Data("after".utf8))
+        #expect(try carol.encryption.receiver.unprotect(late) == Data("after".utf8))
+        #expect(throws: SFrameError.self) { _ = try dave.encryption.receiver.unprotect(late) }
+
+        await alice.stop()
+        await carol.stop()
+        await dave.stop()
+    }
+
+    @Test("an audience envelope opens only for its viewer and its epoch")
+    func audienceEnvelopes() throws {
+        let viewer = try AudienceSeal.suite.generateKeyPair()
+        let other = try AudienceSeal.suite.generateKeyPair()
+        let base = Data(repeating: 0x42, count: 32)
+        let epoch = MLSEpochRef(groupID: Data("group".utf8), epoch: 9)
+        let sealed = try AudienceSeal.seal(base, to: viewer.publicKey, epoch: epoch)
+        #expect(try AudienceSeal.open(.init(epoch: epoch, data: sealed), privateKey: viewer.privateKey) == base)
+        #expect(throws: MLSError.self) {
+            _ = try AudienceSeal.open(.init(epoch: epoch, data: sealed), privateKey: other.privateKey)
+        }
+        // Replayed as another epoch's key, it does not open.
+        let later = MLSEpochRef(groupID: epoch.groupID, epoch: 10)
+        #expect(throws: MLSError.self) {
+            _ = try AudienceSeal.open(.init(epoch: later, data: sealed), privateKey: viewer.privateKey)
+        }
+        // A classical key is refused, not sealed to.
+        let classical = try MLSCipherSuite.mls128DHKEMX25519.generateKeyPair()
+        #expect(throws: MLSError.self) { _ = try AudienceSeal.seal(base, to: classical.publicKey, epoch: epoch) }
+    }
+
+    @Test("the publish grant in a token decides member or viewer, and silence means member")
+    func publishGrant() {
+        #expect(DeviceCredentials.mayPublish(token: testToken(subject: "a", e2ee: nil, publish: true)) == true)
+        #expect(DeviceCredentials.mayPublish(token: testToken(subject: "a", e2ee: nil, publish: false)) == false)
+        #expect(DeviceCredentials.mayPublish(token: testToken(subject: "a", e2ee: nil)) == nil)
+        #expect(DeviceCredentials.mayPublish(token: Data("not a token".utf8)) == nil)
+    }
+
     @Test("a group in a suite this build does not implement is not joined")
     func unknownSuiteNotJoined() async throws {
         let service = FakeKeyDelivery()
@@ -323,13 +524,15 @@ struct ManagedKeysRoomTests {
         id: "video/360p", size: PixelSize(width: 640, height: 360), frameRate: 30, bitrate: 600_000
     )
 
-    private func join(_ name: String, relay: LoopbackRelay, service: FakeKeyDelivery) async throws -> RoomSession {
+    private func join(
+        _ name: String, relay: LoopbackRelay, service: FakeKeyDelivery, publish: Bool? = nil
+    ) async throws -> RoomSession {
         let who = identity(name)
         let session = MoqomSession(
             transport: LoopbackTransport(relay: relay),
             credentials: DeviceCredentials(
                 identity: who,
-                token: testToken(subject: name, e2ee: .required),
+                token: testToken(subject: name, e2ee: .required, publish: publish),
                 deviceKey: nil,
                 keyDelivery: await service.client(who)
             ),
@@ -379,6 +582,52 @@ struct ManagedKeysRoomTests {
         #expect(await live.stats.objectsPublished >= 3)
         let sealed = try #require(await relay.objects(onTrackNamed: "video/360p").first)
         #expect(Set(sealed.payload.dropFirst(8)).count > 32)
+        #expect(await viewer.decryptionStatistics?.objectsRejected == 0)
+    }
+
+    @Test("a viewer token is keyed as audience, outside the group, and reads the broadcast")
+    func viewerRoom() async throws {
+        let relay = LoopbackRelay()
+        let service = FakeKeyDelivery()
+        let host = try await join("alice", relay: relay, service: service, publish: true)
+        let viewer = try await join("bob", relay: relay, service: service, publish: false)
+        #expect(await eventually(timeout: .seconds(20)) {
+            guard let group = await host.groupKeys, let held = await viewer.audienceKeys else { return false }
+            return group.epoch == held.epoch && group.audience == 1
+        })
+        #expect(await host.groupKeys?.members == ["alice/iphone-0001"])
+        #expect(await viewer.groupKeys == nil)
+
+        let source = FrameRelay(format: CaptureFormat(size: rung.size, frameRate: 30), depth: 16)
+        _ = try await host.startBroadcast(
+            from: source,
+            configuration: BroadcastConfiguration(
+                ladder: LayerLadder(rungs: [rung]),
+                encoderFactory: { SyntheticEncoder(configuration: $0) }
+            )
+        )
+        let who = identity("alice")
+        #expect(await eventually { await viewer.roster[who] != nil })
+        await viewer.updateLayout([who: RenderBox(width: 640, height: 360, scale: 1)], linkBitrate: 5_000_000)
+        let frames = try #require(await viewer.frames(from: who))
+        let feeding = Task {
+            var index = 0
+            while !Task.isCancelled {
+                source.submit(VideoFrame(
+                    timestamp: FrameTimestamp(nanoseconds: UInt64(index) * 33_000_000),
+                    size: rung.size, surface: .synthetic(byteCount: 1024), forcesKeyFrame: index % 30 == 0
+                ))
+                index += 1
+                try? await Task.sleep(for: .milliseconds(33))
+            }
+        }
+        defer { feeding.cancel() }
+        var received = 0
+        for await _ in frames {
+            received += 1
+            if received == 3 { break }
+        }
+        #expect(received == 3)
         #expect(await viewer.decryptionStatistics?.objectsRejected == 0)
     }
 

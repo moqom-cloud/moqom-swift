@@ -46,6 +46,14 @@
 // to a group with an agent nobody was told about. The key is reinstated as soon
 // as the watchdog is disclosed or the agent leaves.
 //
+// # Audience
+//
+// Viewers of a broadcast are not members; see ``AudienceKeys``. The member that
+// would commit also seals the current epoch's base key to every viewer the
+// delivery service lists as lacking it, and while there is an audience it
+// commits an empty rotation every five minutes so a viewer who has gone
+// stops being able to read.
+//
 // # Cipher suites
 //
 // A device founds in its own suite, the hybrid one unless it was built to do
@@ -77,6 +85,11 @@ public struct GroupKeyStatus: Sendable, Hashable {
     /// Agents whose watchdog the room's control log has not disclosed. While
     /// this is not empty, this device sends no media.
     public let undisclosedAgents: [String]
+
+    /// Viewers outside the group that the delivery service says are present,
+    /// each holding this epoch's keys or about to. Unlike ``members`` this is
+    /// the service's word, not the group's; see ``AudienceKeys``.
+    public let audience: Int
 
     /// Equal on every member's device for the same epoch. Two people who read
     /// the same value to each other know that nobody is in the group that one
@@ -110,6 +123,12 @@ actor ManagedRoomKeys {
     /// One-time key packages uploaded alongside the last-resort one.
     static let oneTimePackages = 2
 
+    /// How long an epoch lasts while the room has viewers outside the group.
+    static let defaultAudienceRotation: Duration = .seconds(300)
+
+    /// Envelopes per request to the delivery service.
+    static let envelopesPerSeal = 512
+
     nonisolated let identity: String
     nonisolated let encryption: RoomEncryption
     nonisolated let unprotector: MediaUnprotector
@@ -119,6 +138,7 @@ actor ManagedRoomKeys {
     private let foundingSuite: MLSCipherSuite
     private let logger: MoqomLogger
     private let sleep: @Sendable (Duration) async -> Void
+    private let audienceRotation: Duration
 
     private var bundles: [Data: MLSKeyPackageBundle] = [:]
     private var lastResort: Data?
@@ -132,6 +152,10 @@ actor ManagedRoomKeys {
     private var previousKeys: Set<UInt64> = []
     private var retiring: Task<Void, Never>?
     private var workSince: ContinuousClock.Instant?
+    /// When this device adopted the current epoch.
+    private var epochSince: ContinuousClock.Instant = .now
+    /// Viewers outside the group, as the last sync counted them.
+    private var audience = 0
     private var loop: Task<Void, Never>?
     /// Watchdogs the room's control log has disclosed, by ID.
     private var disclosed: Set<String> = []
@@ -145,9 +169,11 @@ actor ManagedRoomKeys {
         suite: SFrameCipherSuite = .aes256GcmSha512,
         cipherSuite: MLSCipherSuite = .default,
         logger: MoqomLogger = .silent,
+        audienceRotation: Duration = defaultAudienceRotation,
         sleep: @escaping @Sendable (Duration) async -> Void = { try? await Task.sleep(for: $0) }
     ) {
         self.identity = Self.name(of: identity)
+        self.audienceRotation = audienceRotation
         self.delivery = delivery
         self.token = token
         self.suite = suite
@@ -223,6 +249,7 @@ actor ManagedRoomKeys {
             members: members,
             agents: members.filter { Self.watchdog(of: $0) != nil },
             undisclosedAgents: undisclosedAgents(in: members),
+            audience: audience,
             epochAuthenticator: group.epochAuthenticator,
             directOfferSecret: group.export(label: "MOQOM direct offer", length: 32)
         )
@@ -329,7 +356,11 @@ actor ManagedRoomKeys {
             if snapshot.members.contains(identity) { try await requestRejoin() }
             return
         }
+        audience = snapshot.audience
         try await commitIfDue(group, snapshot)
+        if snapshot.audienceWaiting > 0, let group = self.group, rank(in: group, snapshot) == 0 {
+            try await sealAudience(group)
+        }
     }
 
     // MARK: - Joining
@@ -434,17 +465,14 @@ actor ManagedRoomKeys {
             let who = $0.member.identityString
             return who != identity && (!online.contains(who) || pending.contains(who))
         }
-        guard !leaving.isEmpty || !pending.isEmpty else {
+        let now = ContinuousClock.now
+        let rotating = snapshot.audience > 0 && now - epochSince >= audienceRotation
+        guard !leaving.isEmpty || !pending.isEmpty || rotating else {
             workSince = nil
             return
         }
 
-        let committers = roster
-            .filter { online.contains($0.member.identityString) && !pending.contains($0.member.identityString) }
-            .map(\.leaf)
-            .sorted()
-        guard let rank = committers.firstIndex(of: group.ownLeaf) else { return }
-        let now = ContinuousClock.now
+        guard let rank = rank(in: group, snapshot) else { return }
         let since = workSince ?? now
         workSince = since
         guard rank == 0 || now - since >= Self.fallbackStep * rank else { return }
@@ -467,7 +495,7 @@ actor ManagedRoomKeys {
             !pending.contains(leaf.member.identityString)
                 || packages.contains { $0.identityString == leaf.member.identityString }
         }
-        guard !packages.isEmpty || !removing.isEmpty else { return }
+        guard !packages.isEmpty || !removing.isEmpty || rotating else { return }
 
         let built = try group.commit(adding: packages, removing: removing.map(\.leaf))
         let receipt = try await delivery.submitCommit(
@@ -488,7 +516,7 @@ actor ManagedRoomKeys {
             guard self.group?.epoch == group.epoch else { return }
             workSince = nil
             adopt(built.next)
-            logger.info(.room, "committed a membership change", [
+            logger.info(.room, packages.isEmpty && removing.isEmpty ? "rotated the epoch for the audience" : "committed a membership change", [
                 LogField("epoch", .number(Int(built.next.epoch))),
                 LogField("added", .number(packages.count)),
                 LogField("removed", .number(removing.count)),
@@ -500,10 +528,49 @@ actor ManagedRoomKeys {
         }
     }
 
+    /// This member's place in the order of who commits, `nil` if it is not
+    /// one of the members that may.
+    private func rank(in group: MLSGroup, _ snapshot: MLSDeliverySnapshot) -> Int? {
+        let online = Set(snapshot.members)
+        let pending = Set(snapshot.pending).subtracting([identity])
+        return group.roster
+            .filter { online.contains($0.member.identityString) && !pending.contains($0.member.identityString) }
+            .map(\.leaf)
+            .sorted()
+            .firstIndex(of: group.ownLeaf)
+    }
+
+    // MARK: - Audience
+
+    private func sealAudience(_ group: MLSGroup) async throws {
+        let work = try await delivery.audienceWork(token: token())
+        let epoch = MLSEpochRef(groupID: group.groupID, epoch: group.epoch)
+        // The group moved while asking; the next sync seals the new epoch.
+        guard work.epoch == epoch, self.group?.epoch == group.epoch else { return }
+        let base = group.sframeBaseKey(suite: suite)
+        var sealed = 0
+        for start in stride(from: 0, to: work.seats.count, by: Self.envelopesPerSeal) {
+            var envelopes: [String: Data] = [:]
+            for seat in work.seats[start ..< min(start + Self.envelopesPerSeal, work.seats.count)] {
+                // A key that is not ML-KEM-768 is that viewer's problem, not the batch's.
+                envelopes[seat.device] = try? AudienceSeal.seal(base, to: seat.publicKey, epoch: epoch)
+            }
+            guard try await delivery.sealAudience(envelopes, for: epoch, token: token()) else { return }
+            sealed += envelopes.count
+        }
+        if sealed > 0 {
+            logger.info(.room, "sealed the epoch's keys to the audience", [
+                LogField("epoch", .number(Int(group.epoch))),
+                LogField("viewers", .number(sealed)),
+            ])
+        }
+    }
+
     // MARK: - Keys
 
     private func adopt(_ next: MLSGroup) {
         group = next
+        epochSince = .now
         let keys = next.sframeKeys(suite: suite)
         let receiver = encryption.receiver
         let fresh = Set(keys.map(\.keyID))
