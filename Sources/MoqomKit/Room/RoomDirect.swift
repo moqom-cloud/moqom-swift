@@ -60,9 +60,10 @@ public struct DirectRoomOptions: Sendable {
     /// relay, reporting ``DirectFallback/awaitingKeys``.
     public var offerSecret: Data?
 
-    /// A STUN server to learn the public address from. Without one only this
-    /// device's own address is offered, which reaches a peer on the same
-    /// network and nothing behind a NAT.
+    /// A STUN server to learn the public address from. ``MoqomSession`` fills
+    /// in the one the token names (``DirectRoomPolicy/stun``) when this is
+    /// `nil`. With neither, only this device's own address is offered, which
+    /// reaches a peer on the same network and nothing behind a NAT.
     public var stun: (host: String, port: UInt16)?
 
     /// The host address to offer instead of the routed one; for tests on one

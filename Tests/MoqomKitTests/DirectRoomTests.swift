@@ -276,6 +276,12 @@ struct DirectRoomTests {
         #expect(named?.stun?.port == 19302)
         #expect(await person.session.directOptions(for: .relayOnly) == nil)
 
+        // Options set by hand ask the token's server too, unless they name one.
+        var custom = DirectRoomOptions(exposure: .peersWillLearnMyIPAddresses(), tokenKeys: DirectTokens.keys)
+        #expect(await person.session.directOptions(for: .custom(custom))?.stun?.host == "relay.moqom.test")
+        custom.stun = (host: "stun.example.net", port: 19302)
+        #expect(await person.session.directOptions(for: .custom(custom))?.stun?.host == "stun.example.net")
+
         await person.session.close()
     }
 

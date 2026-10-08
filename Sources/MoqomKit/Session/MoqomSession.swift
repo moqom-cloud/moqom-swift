@@ -541,6 +541,9 @@ public actor MoqomSession {
             return nil
         case var .custom(options):
             options.maximumParticipants = min(options.maximumParticipants, limits.maximumParticipants)
+            if options.stun == nil {
+                options.stun = limits.stun.map { (host: $0.host, port: $0.port) }
+            }
             return options
         case let .automatic(stun):
             guard !credentials.authorityKeys.isEmpty else { return nil }

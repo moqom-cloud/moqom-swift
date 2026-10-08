@@ -50,7 +50,8 @@ public struct DirectPolicy: Sendable {
     public static let relayOnly = DirectPolicy(mode: .relayOnly)
 
     /// Direct paths with options the application chose. The room's limit from
-    /// the control plane still applies.
+    /// the control plane still applies, and options naming no STUN server ask
+    /// the one the token names.
     public static func custom(_ options: DirectRoomOptions) -> DirectPolicy {
         DirectPolicy(mode: .custom(options))
     }
