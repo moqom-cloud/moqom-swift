@@ -373,31 +373,41 @@ top of `Sources/MoqomKit/Transport/Transport.swift`.
 
   #### In a room
 
-  Off unless the app asks for it, with the IP-exposure acknowledgement:
+  On by default. `MoqomSession(directPolicy:)` is `.automatic` unless the app
+  says otherwise, and a 1:1 call or a small private room moves to direct paths
+  wherever it qualifies. Choosing automatic accepts, on the user's behalf, that
+  the other participants of such a room learn this device's IP addresses, so
+  say so in the app; `.relayOnly` never offers them:
 
   ```swift
-  let room = try await session.join(
-      room: "standup",
-      direct: DirectRoomOptions(
-          exposure: .peersWillLearnMyIPAddresses(),
-          tokenKeys: try DirectVerificationKey.parseSet(jwks),
-          issuer: "https://auth.example.com",
-          stun: (host: "stun.example.com", port: 3478)
-      )
+  let session = MoqomSession(
+      transport: transport,
+      credentials: credentials,      // authorityKeys: what peers are verified against
+      tenant: tenant,
+      directPolicy: .automatic(stun: (host: "stun.example.com", port: 3478)) // or .relayOnly
   )
+  let room = try await session.join(room: "standup")
   for await event in room.events {
       if case let .directPathChanged(who, path) = event { print(who, path) } // relay(why) / connecting / direct
   }
   ```
 
+  `join(room:directPolicy:)` overrides the session's policy for one room, and
+  `.custom(DirectRoomOptions(...))` sets every option by hand.
   `RoomSession.setDirect(_:)` does the same on a room already joined, and `nil`
-  turns it off. Opting in is published as `direct: true` on this device's
+  turns it off. The room's own policy from the control plane, which comes
+  with each token (`IssuedToken.direct`), can lower the participant limit or
+  keep the room on the relay, and a renewed token that changes it reaches a
+  room in progress. Opting in is published as `direct: true` on this device's
   catalog, which is how the others count it. The room then applies
   `DirectEligibility` as it stands: end-to-end encryption required and in use,
-  no watchdog, this device publishing on stage, at most four participants, and
-  every one of them opted in. Participants are everyone on stage plus every
-  member of the room's MLS group, so a viewer holding the room's keys keeps the
-  room on the relay. While the rules hold, for each other participant the room:
+  no watchdog, this device publishing, at most four participants (fewer if the
+  room's policy says so), and
+  every one of them opted in. Participants are everyone publishing where this
+  device publishes (on stage, or backstage with the other cohosts there) plus
+  every member of the room's MLS group, so a viewer holding the room's keys
+  keeps the room on the relay. While the rules hold, for each other
+  participant the room:
 
   - binds an endpoint on the session's `directBackend`, sends its sealed offer
     on this participant's `.direct` track every second until the peer answers,
@@ -597,10 +607,25 @@ somebody demonstrates. Both are built and wired; neither has been seen.
 
 ### Not written
 
-- Direct paths in a room are partial:
-  - The Rust client isn't wired into a room, so nothing on that side derives
-    the offer key from the MLS exporter yet.
-  - Backstage publishing counts as audience.
+- Direct paths in a room are on by default (`DirectPolicy.automatic`) and
+  still partial:
+  - Automatic needs `DeviceCredentials.authorityKeys` to verify a peer with;
+    a session without them stays on the relay. It offers only this device's
+    own addresses unless the app passes `.automatic(stun:)`, and MOQOM runs
+    no STUN service, so out of the box a direct path opens on the same
+    network and falls back to the relay behind a NAT.
+  - The room's policy (`direct_paths`, `max_direct_participants`) reaches the
+    device through the token service's `direct` field. A backend that mints
+    through the admin API has to pass `MintClientTokenResponse.direct` on
+    itself; one that does not leaves the SDK's own default, allowed for up to
+    four. The relay refuses direct tickets in a relay-only room, so a
+    modified client cannot keep a path there either.
+  - Backstage pairs only with backstage, and a device starts watching the
+    backstage prefix only once it publishes there. A stage device and a
+    backstage one stay on the relay with each other.
+  - The Rust client has the same policy type and room limit
+    (`moqom_client::direct::DirectPolicy`) but isn't wired into a room, so
+    nothing on that side derives the offer key from the MLS exporter yet.
   - On the loopback relay `FORWARD=0` does nothing, so the 500 ms quiet resume
     is covered only by the `DualSubscription` tests in `DirectTests`.
 - Media kinds are not enforced per track. `moqt.pub` distinguishes audio from
