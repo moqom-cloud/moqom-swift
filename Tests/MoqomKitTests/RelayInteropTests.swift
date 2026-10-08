@@ -304,12 +304,15 @@ final class RelayProcess {
     }
 
     /// Start a relay and wait until it is listening.
-    static func start() throws -> RelayProcess {
+    ///
+    /// - Parameter settings: more of the relay's environment, such as the keys
+    ///   that make it verify tokens and issue direct tickets.
+    static func start(_ settings: [String: String] = [:]) throws -> RelayProcess {
         guard let binary = relayBinary else { throw InteropUnavailable() }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: binary)
-        var environment = ProcessInfo.processInfo.environment
+        var environment = ProcessInfo.processInfo.environment.merging(settings) { $1 }
         // Port zero because tests run in parallel and each starts its own relay,
         // and the wildcard address because `localhost` resolves to `::1` before
         // `127.0.0.1` on macOS — a relay bound only to the IPv4 loopback never
@@ -381,6 +384,19 @@ final class RelayProcess {
             trust: trust
         )
         return try await MoqtSession.connect(over: carrier, credentials: credentials)
+    }
+
+    /// Where a ``MoqomSession`` reaches this relay.
+    var endpoint: RelayEndpoint { RelayEndpoint(host: host, port: port) }
+
+    /// A transport for a ``MoqomSession``, over the system QUIC stack.
+    var transport: MoqtTransport {
+        let trust = trust
+        return MoqtTransport { endpoint, _ in
+            try await NetworkQUICCarrier.connect(
+                host: endpoint.host, port: endpoint.port, alpn: endpoint.alpn, trust: trust
+            )
+        }
     }
 
     /// Read the relay's two startup lines, or give up.

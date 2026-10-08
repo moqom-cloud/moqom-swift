@@ -311,10 +311,44 @@ struct MoqtSessionTests {
         )
 
         let handle = try await client.announce(namespace)
-        #expect(await handle.refusal == nil)
 
+        // The acknowledgement is not the outcome, since a later change of
+        // grants could still revoke the announcement on that stream: the
+        // answer stays pending, and is not a refusal.
+        let answer = Collector<MoqomError?>()
+        let waiting = Task { await answer.append(await handle.refusal) }
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(await answer.items.isEmpty)
+
+        waiting.cancel()
         await client.close(code: 0, reason: "done")
         await server.close(code: 0, reason: "done")
+    }
+
+    /// What a draft-22 relay does to a cohost who goes live: acknowledge the
+    /// backstage announcement, then end it when the new token no longer
+    /// covers it. Stopping at the acknowledgement would leave the publisher
+    /// encoding into a slot the relay had dropped.
+    @Test("a revocation after the acknowledgement is still heard")
+    func revokedAfterAcknowledgement() async throws {
+        let (clientCarrier, serverCarrier) = MemoryCarrier.pair()
+        let relay = refusingRelay(
+            on: serverCarrier,
+            reason: "grants changed: this session is not backstage",
+            acknowledgingFirst: true
+        )
+        defer { relay.cancel() }
+
+        let client = try await MoqtSession.connect(over: clientCarrier, credentials: credentials("alice"))
+        let namespace = try MoqomNamespaces.participant(tenant: "acme", room: "room-42", identity: identity("alice"))
+        let handle = try await client.announce(namespace)
+
+        guard case let .rejected(reason) = await handle.refusal else {
+            Issue.record("the revocation was not reported")
+            return
+        }
+        #expect(reason == .revoked(namespace))
+        await client.close(code: 0, reason: "done")
     }
 
     /// A relay that completes SETUP and then refuses whatever is announced.
@@ -326,7 +360,8 @@ struct MoqtSessionTests {
     private func refusingRelay(
         on carrier: MemoryCarrier,
         code: UInt64 = RequestErrorCode.unauthorized,
-        reason: String = "not your namespace"
+        reason: String = "not your namespace",
+        acknowledgingFirst: Bool = false
     ) -> Task<Void, Never> {
         Task {
             for await stream in carrier.incomingBidirectionalStreams {
@@ -339,6 +374,10 @@ struct MoqtSessionTests {
                             case .setup:
                                 try? await Self.write(Setup(), to: stream)
                             case .publishNamespace:
+                                if acknowledgingFirst {
+                                    try? await Self.write(RequestOk(), to: stream)
+                                    try? await Task.sleep(for: .milliseconds(50))
+                                }
                                 try? await Self.write(
                                     RequestError(code: code, reason: reason),
                                     to: stream
