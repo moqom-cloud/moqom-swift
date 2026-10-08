@@ -1,11 +1,11 @@
 // Checking a direct peer's MOQOM credentials exactly as a relay would.
 //
 // A direct path skips the relay for media and must not skip its checks, so this
-// is a port of the relay's admission (`moqom_relay::direct::PeerCheck`): the
-// token verification in `identity.rs` and the possession check in
-// `possession.rs`, with the same order, the same limits and the same refusals.
-// The two are meant to be read side by side; a rule that differs here is a peer
-// one SDK admits and the other refuses.
+// is the relay's admission (`moqom_relay::direct::PeerCheck`): the token
+// verified by `MoqomToken` and the proof checked by `MoqomProof`, the libraries
+// the relay verifies with, then the relay's own rules in `identity.rs` on top,
+// with the same order, the same limits and the same refusals. A rule that
+// differs here is a peer one SDK admits and the other refuses.
 //
 // What differs from a relay's admission is the relay's own `direct.rs` list:
 //
@@ -19,8 +19,9 @@
 // And on top of a token that verified, the direct-path rules: same tenant and
 // room, publishing granted, and naming the participant whose offer was accepted.
 
-import CryptoKit
 import Foundation
+import MoqomProof
+import MoqomToken
 
 /// A public key tokens and tickets are signed with: ML-DSA-65, as the control
 /// plane mints and relays sign, or Ed25519 for what was signed before the move.
@@ -54,16 +55,26 @@ public struct DirectVerificationKey: Hashable, Sendable {
         self.algorithm = algorithm
     }
 
+    init(_ key: MoqomToken.PublicKey) {
+        self.init(
+            id: key.id,
+            key: key.rawRepresentation,
+            algorithm: key.algorithm == .mlDSA65 ? .mlDSA65 : .ed25519
+        )
+    }
+
+    /// The same key, as `MoqomToken` verifies with it.
+    var tokenKey: MoqomToken.PublicKey {
+        MoqomToken.PublicKey(
+            id: id,
+            algorithm: algorithm == .mlDSA65 ? .mlDSA65 : .ed25519,
+            rawRepresentation: key
+        )
+    }
+
     /// Whether `signature` is this key's over `message`, by its own algorithm.
     func verifies(_ signature: Data, for message: Data) -> Bool {
-        switch algorithm {
-        case .mlDSA65:
-            guard let key = try? MLDSA65.PublicKey(rawRepresentation: key) else { return false }
-            return key.isValidSignature(signature, for: message)
-        case .ed25519:
-            guard let key = try? Curve25519.Signing.PublicKey(rawRepresentation: key) else { return false }
-            return key.isValidSignature(signature, for: message)
-        }
+        tokenKey.isValidSignature(signature, for: message)
     }
 
     /// Read the JWK set the control plane serves and a relay is configured
@@ -72,37 +83,11 @@ public struct DirectVerificationKey: Hashable, Sendable {
     /// - Throws: ``DirectPeerRefusal/unverifiable`` naming what was wrong,
     ///   since a key set that does not parse verifies nobody.
     public static func parseSet(_ document: Data) throws(DirectPeerRefusal) -> [DirectVerificationKey] {
-        struct JWK: Decodable {
-            let kty: String
-            let crv: String?
-            let alg: String?
-            let kid: String
-            let x: String?
-            let `pub`: String?
-        }
-        struct Wrapped: Decodable { let keys: [JWK] }
-        let decoder = JSONDecoder()
-        let jwks: [JWK]
-        if let wrapped = try? decoder.decode(Wrapped.self, from: document) {
-            jwks = wrapped.keys
-        } else if let bare = try? decoder.decode([JWK].self, from: document) {
-            jwks = bare
-        } else {
+        do {
+            return try MoqomToken.PublicKey.parseSet(document).map(DirectVerificationKey.init)
+        } catch {
             throw .unverifiable
         }
-        var keys: [DirectVerificationKey] = []
-        for jwk in jwks {
-            if jwk.kty == "AKP", jwk.alg == "ML-DSA-65",
-               let bytes = jwk.pub.flatMap({ Data(base64URLEncoded: $0) }), bytes.count == 1952 {
-                keys.append(DirectVerificationKey(id: jwk.kid, key: bytes, algorithm: .mlDSA65))
-            } else if jwk.kty == "OKP", jwk.crv == "Ed25519",
-                      let bytes = jwk.x.flatMap({ Data(base64URLEncoded: $0) }), bytes.count == 32 {
-                keys.append(DirectVerificationKey(id: jwk.kid, key: bytes, algorithm: .ed25519))
-            } else {
-                throw .unverifiable
-            }
-        }
-        return keys
     }
 }
 
@@ -139,6 +124,7 @@ public enum DirectPeerRefusal: Error, Hashable, Sendable, CustomStringConvertibl
     case badSignature
     case expired
     case notYetValid
+    case lifetime
     case wrongIssuer
     case incomplete
     case proofMissing
@@ -148,6 +134,8 @@ public enum DirectPeerRefusal: Error, Hashable, Sendable, CustomStringConvertibl
     case proofWrongKey
     case proofWrongToken
     case proofWrongRelay
+    case proofExpired
+    case proofNotYetValid
     case proofReplayed
     case proofOverloaded
     /// The token verified and is for another tenant or room.
@@ -167,6 +155,7 @@ public enum DirectPeerRefusal: Error, Hashable, Sendable, CustomStringConvertibl
         case .badSignature: "token signature does not verify"
         case .expired: "token has expired"
         case .notYetValid: "token is not valid yet"
+        case .lifetime: "token lifetime is out of range"
         case .wrongIssuer: "token was issued by another deployment"
         case .incomplete: "token does not name a complete identity"
         case .proofMissing: "no proof of possession was presented"
@@ -176,6 +165,8 @@ public enum DirectPeerRefusal: Error, Hashable, Sendable, CustomStringConvertibl
         case .proofWrongKey: "proof is signed by a key the token was not issued to"
         case .proofWrongToken: "proof was made for a different token"
         case .proofWrongRelay: "proof was made for another relay"
+        case .proofExpired: "proof was made too long ago"
+        case .proofNotYetValid: "proof is dated in the future"
         case .proofReplayed: "proof has already been presented"
         case .proofOverloaded: "this relay is tracking too many proofs to accept another"
         case .anotherRoom: "the peer's token is for another room"
@@ -200,35 +191,21 @@ public protocol DirectPeerVerifying: Sendable {
 /// One per endpoint, as on the relay: the spent-proof set is per binding, and a
 /// binding is one endpoint's certificate.
 public final class DirectPeerCheck: DirectPeerVerifying, @unchecked Sendable {
-    /// Matches the relay's `CLOCK_SKEW`: a token from slightly in the future is
-    /// a clock, an expired one is a boundary and is not extended.
-    static let clockSkew: TimeInterval = 30
-    /// The relay's `MAX_TOKEN_BYTES` and `MAX_PROOF_BYTES`, checked before any
-    /// parsing so the work stays proportional to an honest input.
-    static let maximumTokenBytes = 8192
-    static let maximumProofBytes = 2048
-    /// The relay's `MAX_REMEMBERED`.
-    static let maximumRemembered = 100_000
     /// Matches `DEVICE_ID_LENGTH` in the relay and `DeviceID(thumbprint:)`.
     static let deviceIDLength = 16
     /// Every capability bit the relay knows (`scope::capability::KNOWN`). A
     /// token with any other bit is refused rather than read as granting less.
     static let knownCapabilities: UInt32 = 0x0000_001F | 0x0000_7F00 | 0x003F_0000 | 0x0700_0000
 
-    private let keys: [String: DirectVerificationKey]
-    private let issuer: String
-    private let lock = NSLock()
-    private var spent: [String: Date] = [:]
+    private let tokens: MoqomToken.Verifier
+    private let proofs = Checker(store: MemoryNonceStore())
 
     /// - Parameter keys: the deployment's verification keys, the same set its
     ///   relays hold; see ``DirectVerificationKey/parseSet(_:)``.
     /// - Parameter issuer: the `iss` every token must carry. Empty accepts any,
     ///   which is for tests, as on the relay.
     public init(keys: [DirectVerificationKey], issuer: String = "") {
-        var byID: [String: DirectVerificationKey] = [:]
-        for key in keys { byID[key.id] = key }
-        self.keys = byID
-        self.issuer = issuer
+        tokens = MoqomToken.Verifier(issuer: issuer, keys: keys.map(\.tokenKey))
     }
 
     public func verify(
@@ -237,7 +214,7 @@ public final class DirectPeerCheck: DirectPeerVerifying, @unchecked Sendable {
         localCertificate: String,
         now: Date
     ) throws(DirectPeerRefusal) -> VerifiedDirectPeer {
-        if keys.isEmpty { throw .unverifiable }
+        if tokens.isEmpty { throw .unverifiable }
         if token.isEmpty { throw .anonymous }
         let admitted = try verifyToken(token, now: now)
         try checkPossession(
@@ -259,149 +236,42 @@ public final class DirectPeerCheck: DirectPeerVerifying, @unchecked Sendable {
         let expires: Date
     }
 
-    private struct TokenHeader: Decodable { let alg: String; let typ: String; let kid: String }
-
-    private struct Claims: Decodable {
-        var iss = ""
-        var sub = ""
-        var aud = ""
-        var iat: Int64 = 0
-        var exp: Int64 = 0
-        var jkt = ""
-        var moqt = Scope()
-
-        private enum Keys: String, CodingKey { case iss, sub, aud, iat, exp, cnf, moqt }
-        private enum Confirmation: String, CodingKey { case jkt }
-
-        init(from decoder: any Decoder) throws {
-            let container = try decoder.container(keyedBy: Keys.self)
-            iss = try container.decodeIfPresent(String.self, forKey: .iss) ?? ""
-            sub = try container.decodeIfPresent(String.self, forKey: .sub) ?? ""
-            aud = try container.decodeIfPresent(String.self, forKey: .aud) ?? ""
-            iat = try container.decodeIfPresent(Int64.self, forKey: .iat) ?? 0
-            exp = try container.decodeIfPresent(Int64.self, forKey: .exp) ?? 0
-            if container.contains(.cnf) {
-                let cnf = try container.nestedContainer(keyedBy: Confirmation.self, forKey: .cnf)
-                jkt = try cnf.decodeIfPresent(String.self, forKey: .jkt) ?? ""
-            }
-            moqt = try container.decodeIfPresent(Scope.self, forKey: .moqt) ?? Scope()
-        }
-    }
-
-    /// The `moqt` claim, strict as the relay's is: a field this build does not
-    /// know might narrow the grant, so a scope it cannot fully read is refused.
-    private struct Scope: Decodable {
-        var room = ""
-        var publish: UInt8 = 0
-        var capabilities: UInt32 = 0
-
-        init() {}
-
-        private struct Key: CodingKey {
-            let stringValue: String
-            init?(stringValue: String) { self.stringValue = stringValue }
-            var intValue: Int? { nil }
-            init?(intValue _: Int) { nil }
-        }
-
-        private static let known: Set<String> = ["room", "pub", "cap", "own", "bs", "age"]
-
-        init(from decoder: any Decoder) throws {
-            let container = try decoder.container(keyedBy: Key.self)
-            for key in container.allKeys where !Self.known.contains(key.stringValue) {
-                throw DecodingError.dataCorruptedError(
-                    forKey: key, in: container, debugDescription: "unknown scope field"
-                )
-            }
-            func key(_ name: String) -> Key { Key(stringValue: name)! }
-            room = try container.decodeIfPresent(String.self, forKey: key("room")) ?? ""
-            publish = try container.decodeIfPresent(UInt8.self, forKey: key("pub")) ?? 0
-            capabilities = try container.decodeIfPresent(UInt32.self, forKey: key("cap")) ?? 0
-            // Parsed so a wrong type is refused as the relay refuses it, and not
-            // otherwise read: none decides anything on a direct path.
-            _ = try container.decodeIfPresent(Bool.self, forKey: key("own"))
-            _ = try container.decodeIfPresent(Bool.self, forKey: key("bs"))
-            _ = try container.decodeIfPresent(Bool.self, forKey: key("age"))
-        }
-    }
-
     private func verifyToken(_ token: Data, now: Date) throws(DirectPeerRefusal) -> Admitted {
-        guard token.count <= Self.maximumTokenBytes else {
-            throw .malformedToken("token length is out of range")
+        let claims: MoqomToken.Claims
+        do {
+            claims = try tokens.verify(token, now: now)
+        } catch {
+            throw switch error {
+            case let .malformed(why): .malformedToken(why)
+            case .unsupported: .unsupportedToken
+            case .unknownKey: .unknownKey
+            case .badSignature: .badSignature
+            case .expired: .expired
+            case .notYetValid: .notYetValid
+            case .lifetime: .lifetime
+            case .wrongIssuer: .wrongIssuer
+            // No tenant is pinned here; ``directAdmissible`` compares it.
+            case .wrongTenant: .anotherRoom
+            case .incomplete: .incomplete
+            case .thumbprint: .malformedToken("thumbprint")
+            }
         }
-        guard let (headerSegment, claimsSegment, signed, signature) = Self.split(token) else {
-            throw .malformedToken("expected three segments")
-        }
-        guard let signature = Data(base64URLEncoded: signature) else {
-            throw .malformedToken("signature is not base64url")
-        }
-        guard let headerBytes = Data(base64URLEncoded: headerSegment) else {
-            throw .malformedToken("header is not base64url")
-        }
-        guard let header = try? JSONDecoder().decode(TokenHeader.self, from: headerBytes) else {
-            throw .malformedToken("header is not JSON")
-        }
-        guard header.typ == "MOQT" else { throw .unsupportedToken }
-        guard let key = keys[header.kid] else { throw .unknownKey }
-        guard header.alg == key.algorithm.jose else { throw .unsupportedToken }
-
-        // The signature before any claim is read, for the relay's reason: a
-        // verifier that acts on unverified claims is a parser an attacker reaches.
-        guard key.verifies(signature, for: signed) else { throw .badSignature }
-
-        guard let claimsBytes = Data(base64URLEncoded: claimsSegment) else {
-            throw .malformedToken("claims are not base64url")
-        }
-        guard let claims = try? JSONDecoder().decode(Claims.self, from: claimsBytes) else {
-            throw .malformedToken("claims are not JSON")
-        }
-
-        if !issuer.isEmpty, claims.iss != issuer { throw .wrongIssuer }
-        if claims.exp == 0 { throw .malformedToken("no expiry") }
-        let expires = Date(timeIntervalSince1970: TimeInterval(claims.exp))
-        if now.addingTimeInterval(-Self.clockSkew) > expires { throw .expired }
-        if claims.iat != 0,
-           now.addingTimeInterval(Self.clockSkew) < Date(timeIntervalSince1970: TimeInterval(claims.iat)) {
-            throw .notYetValid
-        }
-        let device = String(claims.jkt.prefix(Self.deviceIDLength))
-        if claims.aud.isEmpty || claims.sub.isEmpty || device.isEmpty { throw .incomplete }
-        if claims.moqt.capabilities & ~Self.knownCapabilities != 0 { throw .unsupportedToken }
+        if claims.grant.capabilities & ~Self.knownCapabilities != 0 { throw .unsupportedToken }
 
         return Admitted(
             peer: VerifiedDirectPeer(
-                tenant: claims.aud,
-                user: claims.sub,
-                device: device,
-                room: claims.moqt.room.isEmpty ? nil : claims.moqt.room,
-                mayPublish: claims.moqt.publish != 0
+                tenant: claims.tenant,
+                user: claims.subject,
+                device: String(claims.thumbprint.prefix(Self.deviceIDLength)),
+                room: claims.grant.room.isEmpty ? nil : claims.grant.room,
+                mayPublish: claims.grant.publish != 0
             ),
-            thumbprint: claims.jkt,
-            expires: expires
+            thumbprint: claims.thumbprint,
+            expires: claims.expiresDate
         )
     }
 
     // MARK: - The proof (`possession.rs`, `Possession::check` in `Required` mode)
-
-    private struct ProofHeader: Decodable {
-        let alg: String
-        let typ: String
-        let jwk: JWK
-        struct JWK: Decodable { let kty: String; let crv: String; let x: String; let y: String }
-    }
-
-    private struct ProofClaims: Decodable {
-        var ath = ""
-        var jti = ""
-        var rel = ""
-        private enum Keys: String, CodingKey { case ath, jti, rel }
-        init(from decoder: any Decoder) throws {
-            let container = try decoder.container(keyedBy: Keys.self)
-            ath = try container.decodeIfPresent(String.self, forKey: .ath) ?? ""
-            jti = try container.decodeIfPresent(String.self, forKey: .jti) ?? ""
-            rel = try container.decodeIfPresent(String.self, forKey: .rel) ?? ""
-        }
-    }
 
     private func checkPossession(
         token: Data,
@@ -412,77 +282,31 @@ public final class DirectPeerCheck: DirectPeerVerifying, @unchecked Sendable {
         now: Date
     ) throws(DirectPeerRefusal) {
         guard let proof else { throw .proofMissing }
-        guard !proof.isEmpty, proof.count <= Self.maximumProofBytes else {
-            throw .malformedProof("proof length is out of range")
+        // A binding that does not decode can match no proof.
+        guard let certificate = Data(base64URLEncoded: binding) else { throw .proofWrongRelay }
+        do {
+            try proofs.check(
+                proof,
+                token: token,
+                certificateHash: certificate,
+                thumbprint: thumbprint,
+                now: now,
+                until: expires
+            )
+        } catch {
+            throw switch error {
+            case let .malformed(why): .malformedProof(why)
+            case .unsupported, .notSigned: .unsupportedProof
+            case .badSignature: .proofBadSignature
+            case .wrongKey: .proofWrongKey
+            case .wrongToken: .proofWrongToken
+            case .wrongCertificate: .proofWrongRelay
+            case .expired: .proofExpired
+            case .notYetValid: .proofNotYetValid
+            case .replayed: .proofReplayed
+            case .overloaded: .proofOverloaded
+            }
         }
-        guard let (headerSegment, claimsSegment, signed, signatureSegment) = Self.split(proof) else {
-            throw .malformedProof("expected three segments")
-        }
-        guard let signature = Data(base64URLEncoded: signatureSegment) else {
-            throw .malformedProof("signature is not base64url")
-        }
-        guard let headerBytes = Data(base64URLEncoded: headerSegment) else {
-            throw .malformedProof("header is not base64url")
-        }
-        guard let header = try? JSONDecoder().decode(ProofHeader.self, from: headerBytes) else {
-            throw .malformedProof("header is not JSON, or carries no key")
-        }
-        guard header.alg == "ES256", header.typ == "MOQT-POP" else { throw .unsupportedProof }
-        guard header.jwk.kty == "EC", header.jwk.crv == "P-256" else { throw .unsupportedProof }
-        guard let x = Data(base64URLEncoded: header.jwk.x), let y = Data(base64URLEncoded: header.jwk.y) else {
-            throw .malformedProof("key coordinate is not base64url")
-        }
-        guard x.count == 32, y.count == 32 else { throw .malformedProof("key coordinate is not 32 bytes") }
-
-        guard let key = try? P256.Signing.PublicKey(rawRepresentation: x + y),
-              let ecdsa = try? P256.Signing.ECDSASignature(rawRepresentation: signature),
-              key.isValidSignature(ecdsa, for: signed)
-        else { throw .proofBadSignature }
-
-        // Re-encoded from the decoded coordinates, never copied, so a padded
-        // spelling of one key cannot produce a second thumbprint.
-        let canonical = DeviceKey.thumbprint(x: x.base64URLEncodedString, y: y.base64URLEncodedString)
-        guard constantTimeEqual(Data(thumbprint.utf8), Data(canonical.utf8)) else { throw .proofWrongKey }
-
-        guard let claimsBytes = Data(base64URLEncoded: claimsSegment),
-              let claims = try? JSONDecoder().decode(ProofClaims.self, from: claimsBytes)
-        else { throw .malformedProof("claims are not JSON") }
-        let tokenHash = Data(SHA256.hash(data: token)).base64URLEncodedString
-        guard constantTimeEqual(Data(claims.ath.utf8), Data(tokenHash.utf8)) else { throw .proofWrongToken }
-        guard constantTimeEqual(Data(claims.rel.utf8), Data(binding.utf8)) else { throw .proofWrongRelay }
-        guard !claims.jti.isEmpty else { throw .malformedProof("no identifier to spend") }
-
-        try spend(claims.jti, until: expires, now: now)
-    }
-
-    /// Spent only after every check passed, so a corrupted proof cannot burn a
-    /// legitimate one's identifier; full means refused, never evicted.
-    private func spend(_ id: String, until expires: Date, now: Date) throws(DirectPeerRefusal) {
-        lock.lock()
-        defer { lock.unlock() }
-        if spent.count >= Self.maximumRemembered {
-            spent = spent.filter { $0.value > now }
-        }
-        if spent.count >= Self.maximumRemembered { throw .proofOverloaded }
-        if spent[id] != nil { throw .proofReplayed }
-        spent[id] = expires
-    }
-
-    /// A compact JWS's segments, with the signed bytes taken verbatim from the
-    /// input: the signature is over bytes, and a round trip would not keep them.
-    private static func split(_ jws: Data) -> (Data, Data, Data, Data)? {
-        let bytes = [UInt8](jws)
-        guard let first = bytes.firstIndex(of: UInt8(ascii: ".")) else { return nil }
-        let rest = bytes[(first + 1)...]
-        guard let second = rest.firstIndex(of: UInt8(ascii: ".")) else { return nil }
-        let signature = bytes[(second + 1)...]
-        guard !signature.contains(UInt8(ascii: ".")) else { return nil }
-        return (
-            Data(bytes[..<first]),
-            Data(bytes[(first + 1) ..< second]),
-            Data(bytes[..<second]),
-            Data(signature)
-        )
     }
 }
 

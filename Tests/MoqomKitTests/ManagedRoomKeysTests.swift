@@ -427,23 +427,22 @@ struct ManagedRoomKeysTests {
 
     @Test("an audience envelope opens only for its viewer and its epoch")
     func audienceEnvelopes() throws {
-        let viewer = try AudienceSeal.suite.generateKeyPair()
-        let other = try AudienceSeal.suite.generateKeyPair()
+        let viewer = try MLSAudience.generateKeyPair()
+        let other = try MLSAudience.generateKeyPair()
         let base = Data(repeating: 0x42, count: 32)
-        let epoch = MLSEpochRef(groupID: Data("group".utf8), epoch: 9)
-        let sealed = try AudienceSeal.seal(base, to: viewer.publicKey, epoch: epoch)
-        #expect(try AudienceSeal.open(.init(epoch: epoch, data: sealed), privateKey: viewer.privateKey) == base)
+        let group = Data("group".utf8)
+        let sealed = try MLSAudience.seal(base, to: viewer.publicKey, groupID: group, epoch: 9)
+        #expect(try MLSAudience.open(sealed, privateKey: viewer.privateKey, groupID: group, epoch: 9) == base)
         #expect(throws: MLSError.self) {
-            _ = try AudienceSeal.open(.init(epoch: epoch, data: sealed), privateKey: other.privateKey)
+            _ = try MLSAudience.open(sealed, privateKey: other.privateKey, groupID: group, epoch: 9)
         }
         // Replayed as another epoch's key, it does not open.
-        let later = MLSEpochRef(groupID: epoch.groupID, epoch: 10)
         #expect(throws: MLSError.self) {
-            _ = try AudienceSeal.open(.init(epoch: later, data: sealed), privateKey: viewer.privateKey)
+            _ = try MLSAudience.open(sealed, privateKey: viewer.privateKey, groupID: group, epoch: 10)
         }
         // A classical key is refused, not sealed to.
-        let classical = try MLSCipherSuite.mls128DHKEMX25519.generateKeyPair()
-        #expect(throws: MLSError.self) { _ = try AudienceSeal.seal(base, to: classical.publicKey, epoch: epoch) }
+        let classical = Data(repeating: 9, count: 32)
+        #expect(throws: MLSError.self) { _ = try MLSAudience.seal(base, to: classical, groupID: group, epoch: 9) }
     }
 
     @Test("the publish grant in a token decides member or viewer, and silence means member")

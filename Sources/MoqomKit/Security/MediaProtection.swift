@@ -1,47 +1,63 @@
 // Putting SFrame on the media path.
 //
-// The interesting decision is what goes in the authenticated metadata, and the
-// answer is: everything the relay is allowed to read. Group, object, priority,
-// capture time, and temporal layer all stay in the clear so the relay can
-// schedule and shed, and all of them are bound into the AEAD tag so it cannot
-// change any of them.
+// The cryptography, and the choice of what an object authenticates as, is
+// MoqomSFrame's. What lives here is the MoQ-session side: the decorator that
+// seals every object a track writer is given, and the receive path that opens
+// them, holds an object briefly for a key still in flight, and counts what it
+// drops.
 //
-// That binding is doing real work. Without it a relay could take an object from
-// group 5 and re-label it as group 2, and the receiver would decrypt it happily
-// and render a frame out of order. It could take a low-priority enhancement
-// layer object and present it as a base layer one. Neither attack requires
-// breaking any cryptography — they only require that the position not be
-// authenticated. So it is.
-//
-// The decorator shape matters too. Encryption wraps a ``TrackWriter`` rather
-// than living inside the publish path, which means the publish path cannot
+// The decorator shape matters. Encryption wraps a ``TrackWriter`` rather than
+// living inside the publish path, which means the publish path cannot
 // accidentally bypass it: there is no code path from a frame to the wire that
 // goes around the wrapper, because the wrapper *is* the writer as far as
 // everything upstream is concerned.
 
 import Foundation
 import MoqomCore
+@_exported import MoqomSFrame
 import MoqomWire
 
-/// The canonical bytes an object's position and metadata authenticate as.
-///
-/// Canonical because both ends must produce identical bytes from the same
-/// object or nothing decrypts. Fixed field order, varints throughout, and the
-/// same parameter encoding the wire uses — deriving it from the wire encoding
-/// rather than inventing a second format is what keeps the two from drifting.
-public enum SFrameMetadata {
+extension SFrameMetadata {
+    /// A track object's position and properties, as SFrame binds them.
+    public init(_ object: TrackObject) {
+        self.init(
+            group: object.group,
+            object: object.object,
+            priority: object.priority,
+            properties: object.properties
+        )
+    }
+
+    public init(group: UInt64, object: UInt64, priority: UInt8, properties: ObjectProperties) {
+        self.init(
+            group: group,
+            object: object,
+            priority: priority,
+            properties: properties.parameters.items.map {
+                switch $0.value {
+                case let .integer(value): .integer($0.type, value)
+                case let .bytes(value): .bytes($0.type, value)
+                }
+            }
+        )
+    }
+
+    /// The canonical bytes an object's position and metadata authenticate as.
+    ///
+    /// Every field here came off, or is going onto, the wire, so it is always
+    /// in range; failing to encode is a bug rather than bad input.
     public static func encode(
         group: UInt64,
         object: UInt64,
         priority: UInt8,
         properties: ObjectProperties
     ) -> Data {
-        var writer = WireWriter(capacity: 32)
-        writer.varInt(group)
-        writer.varInt(object)
-        writer.byte(priority)
-        properties.parameters.writeCounted(to: &writer)
-        return writer.bytes
+        do {
+            return try SFrameMetadata(group: group, object: object, priority: priority, properties: properties)
+                .encoded()
+        } catch {
+            preconditionFailure("object metadata out of wire range")
+        }
     }
 
     public static func encode(for object: TrackObject) -> Data {
@@ -71,7 +87,7 @@ public final class ProtectedTrackWriter: TrackWriter {
     }
 
     public func write(_ object: TrackObject) async throws(MoqomError) {
-        let metadata = SFrameMetadata.encode(for: object)
+        let metadata = SFrameMetadata(object)
         let sealed: Data
         do {
             sealed = try sender.protect(object.payload, metadata: metadata)
@@ -164,7 +180,7 @@ public actor MediaUnprotector {
     }
 
     public func unprotect(_ object: TrackObject) async -> TrackObject? {
-        let metadata = SFrameMetadata.encode(for: object)
+        let metadata = SFrameMetadata(object)
         let deadline = ContinuousClock.now.advanced(by: keyHold)
         while true {
             do {

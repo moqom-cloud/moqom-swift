@@ -99,10 +99,7 @@ struct TokenServiceTests {
         // get a token bound to a claim rather than to a key — and this assertion
         // is the one that notices if that regresses.
         let sentKey = try #require(decoded["key"] as? [String: String])
-        #expect(sentKey["kty"] == "EC")
-        #expect(sentKey["crv"] == "P-256")
-        #expect(sentKey["x"] == key.x)
-        #expect(sentKey["y"] == key.y)
+        #expect(sentKey == ["kty": "AKP", "alg": "ML-DSA-65", "pub": try #require(key.jwk.pub)])
 
         // Truncated the way a namespace field is, since that is what the device
         // announces under and what the endpoint checks the key against.

@@ -144,12 +144,7 @@ public struct TokenService: Sendable, Hashable {
             // what the key actually hashes to — so a client whose namespace and
             // whose key disagree is told here rather than at a relay.
             "device": DeviceID.field(of: device.thumbprint),
-            "key": [
-                "kty": "EC",
-                "crv": "P-256",
-                "x": device.x,
-                "y": device.y,
-            ],
+            "key": device.jwk.members,
         ])
         // Short, because this sits in front of a connection somebody is waiting
         // for. A token service that hangs for the platform's default of sixty

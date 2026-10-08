@@ -27,37 +27,6 @@
 import Foundation
 import MoqomCore
 
-/// An epoch's SFrame base key sealed to one viewer.
-enum AudienceSeal {
-    /// Viewers' keys are ML-KEM-768 whatever suite the group is in, so the
-    /// audience is post-quantum even in a group founded in an older suite.
-    static let suite = MLSCipherSuite.mls192MLKEM768MLDSA65
-    static let label = "MOQOM audience key"
-
-    private static func context(_ epoch: MLSEpochRef) -> Data {
-        var writer = MLSWriter()
-        writer.vector(epoch.groupID)
-        writer.uint64(epoch.epoch)
-        return writer.bytes
-    }
-
-    static func seal(_ baseKey: Data, to publicKey: Data, epoch: MLSEpochRef) throws(MLSError) -> Data {
-        let sealed = try suite.encryptWithLabel(publicKey, label: label, context: context(epoch), plaintext: baseKey)
-        var writer = MLSWriter()
-        sealed.write(to: &writer)
-        return writer.bytes
-    }
-
-    static func open(_ envelope: MLSAudienceEnvelope, privateKey: Data) throws(MLSError) -> Data {
-        var reader = MLSReader(envelope.data)
-        let sealed = try HPKECiphertext.read(from: &reader)
-        try reader.finish()
-        return try suite.decryptWithLabel(
-            privateKey, label: label, context: context(envelope.epoch), ciphertext: sealed
-        )
-    }
-}
-
 /// Where a viewer's keys stand.
 public struct AudienceKeyStatus: Sendable, Hashable {
     /// The group and epoch whose base key this device holds.
@@ -115,7 +84,7 @@ actor AudienceKeys {
         self.suite = suite
         self.logger = logger
         self.sleep = sleep
-        keyPair = try AudienceSeal.suite.generateKeyPair()
+        keyPair = try MLSAudience.generateKeyPair()
         let receiver = SFrameReceiver()
         // A viewer sends nothing, so its sender never has a key.
         encryption = RoomEncryption(sender: SFrameSender(), receiver: receiver)
@@ -166,7 +135,10 @@ actor AudienceKeys {
     func install(_ envelope: MLSAudienceEnvelope) {
         let base: Data
         do {
-            base = try AudienceSeal.open(envelope, privateKey: keyPair.privateKey)
+            base = try MLSAudience.open(
+                envelope.data, privateKey: keyPair.privateKey,
+                groupID: envelope.epoch.groupID, epoch: envelope.epoch.epoch
+            )
         } catch {
             logger.warning(.room, "could not open an audience key", [LogField("error", .text("\(error)"))])
             return

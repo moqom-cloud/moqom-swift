@@ -8,6 +8,7 @@ import CryptoKit
 import Foundation
 import MoqomCore
 import MoqomKit
+import MoqomToken
 
 // MARK: - Minting
 
@@ -24,7 +25,12 @@ public enum DirectTokens {
         return Data((signed + "." + base64URL(sign(Data(signed.utf8)))).utf8)
     }
 
-    /// A token as the control plane mints one, with any claim overridable.
+    /// A token as the control plane mints one, through `MoqomToken`, with any
+    /// claim overridable.
+    ///
+    /// Claims the library refuses to sign (an incomplete identity, an expiry
+    /// before issue, a grant field it does not know) are signed as they are, so
+    /// that what a test sees refused is the verifier refusing them.
     public static func mint(
         user: String,
         key: DeviceKey,
@@ -32,23 +38,34 @@ public enum DirectTokens {
         room: String = "room-42",
         publish: Int = 0x0F,
         capabilities: Int = 0,
-        expires: Date = Date().addingTimeInterval(3600),
-        issued: Date? = nil,
+        expires: Date = Date().addingTimeInterval(600),
+        issued: Date? = Date(),
         kid: String = "test-key",
         signer: MLDSA65.PrivateKey = DirectTokens.signer,
         extraScope: [String: Any] = [:]
     ) -> Data {
+        let claims = MoqomToken.Claims(
+            subject: user,
+            tenant: tenant,
+            issuedAt: issued.map { Int64($0.timeIntervalSince1970) } ?? 0,
+            expires: Int64(expires.timeIntervalSince1970),
+            thumbprint: key.thumbprint,
+            grant: MoqomToken.Grant(room: room, publish: UInt8(publish), capabilities: UInt32(capabilities), owner: true)
+        )
+        if extraScope.isEmpty, let token = try? MoqomToken.Signer(privateKey: signer, keyID: kid).sign(claims) {
+            return Data(token.utf8)
+        }
         var scope: [String: Any] = ["room": room, "pub": publish, "cap": capabilities, "own": true, "bs": false]
         scope.merge(extraScope) { $1 }
-        var claims: [String: Any] = [
+        var raw: [String: Any] = [
             "sub": user,
             "aud": tenant,
-            "exp": Int(expires.timeIntervalSince1970),
+            "exp": claims.expires,
             "cnf": ["jkt": key.thumbprint],
             "moqt": scope,
         ]
-        if let issued { claims["iat"] = Int(issued.timeIntervalSince1970) }
-        return jws(["alg": "ML-DSA-65", "typ": "MOQT", "kid": kid], claims) { try! signer.signature(for: $0) }
+        if claims.issuedAt != 0 { raw["iat"] = claims.issuedAt }
+        return jws(["alg": "ML-DSA-65", "typ": "MOQT", "kid": kid], raw) { try! signer.signature(for: $0) }
     }
 
     static func base64URL(_ data: Data) -> String {

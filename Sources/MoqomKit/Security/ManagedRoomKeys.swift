@@ -251,7 +251,7 @@ actor ManagedRoomKeys {
             undisclosedAgents: undisclosedAgents(in: members),
             audience: audience,
             epochAuthenticator: group.epochAuthenticator,
-            directOfferSecret: group.export(label: "MOQOM direct offer", length: 32)
+            directOfferSecret: group.exporter(label: "MOQOM direct offer", length: 32)
         )
     }
 
@@ -553,7 +553,9 @@ actor ManagedRoomKeys {
             var envelopes: [String: Data] = [:]
             for seat in work.seats[start ..< min(start + Self.envelopesPerSeal, work.seats.count)] {
                 // A key that is not ML-KEM-768 is that viewer's problem, not the batch's.
-                envelopes[seat.device] = try? AudienceSeal.seal(base, to: seat.publicKey, epoch: epoch)
+                envelopes[seat.device] = try? MLSAudience.seal(
+                    base, to: seat.publicKey, groupID: epoch.groupID, epoch: epoch.epoch
+                )
             }
             guard try await delivery.sealAudience(envelopes, for: epoch, token: token()) else { return }
             sealed += envelopes.count

@@ -40,12 +40,23 @@ let package = Package(
         // codec without the SDK on top of it.
         .library(name: "MoqomWire", targets: ["MoqomWire"]),
     ],
+    // A sibling checkout until moqom-security has a published tag; then this
+    // becomes `.package(url: "https://github.com/moqom-cloud/moqom-security", from: ...)`.
+    dependencies: [
+        .package(path: "../moqom-security"),
+    ],
     targets: [
         .target(name: "MoqomCore", swiftSettings: strict),
         .target(name: "MoqomWire", dependencies: ["MoqomCore"], swiftSettings: strict),
         .target(
             name: "MoqomKit",
-            dependencies: ["MoqomCore", "MoqomWire"],
+            dependencies: [
+                "MoqomCore", "MoqomWire",
+                .product(name: "MoqomToken", package: "moqom-security"),
+                .product(name: "MoqomProof", package: "moqom-security"),
+                .product(name: "MoqomSFrame", package: "moqom-security"),
+                .product(name: "MoqomMLS", package: "moqom-security"),
+            ],
             swiftSettings: strict
         ),
         .target(
@@ -60,7 +71,10 @@ let package = Package(
         // rooms on a loopback relay that issues direct tickets.
         .target(
             name: "MoqomDirectTesting",
-            dependencies: ["MoqomCore", "MoqomKit", "MoqomLoopback"],
+            dependencies: [
+                "MoqomCore", "MoqomKit", "MoqomLoopback",
+                .product(name: "MoqomToken", package: "moqom-security"),
+            ],
             path: "Tests/MoqomDirectTesting",
             swiftSettings: strict
         ),

@@ -19,7 +19,8 @@ import MoqomWire
 
 @Suite("Checking a direct peer as a relay would")
 struct DirectPeerCheckTests {
-    let binding = "local-certificate-identity"
+    /// A certificate digest is base64url, and a proof binds its bytes.
+    let binding = "bG9jYWwtY2VydGlmaWNhdGU"
     let alice = DirectDevice(user: "alice")
 
     func proof(_ token: Data, for binding: String? = nil, key: DeviceKey? = nil) throws -> Data {
@@ -76,7 +77,7 @@ struct DirectPeerCheckTests {
         let check = DirectPeerCheck(keys: DirectTokens.keys)
 
         #expect(verify(token, proof: nil, check: check) == .failure(.proofMissing))
-        #expect(verify(token, proof: try proof(token, for: "another"), check: check) == .failure(.proofWrongRelay))
+        #expect(verify(token, proof: try proof(token, for: "YW5vdGhlcg"), check: check) == .failure(.proofWrongRelay))
         #expect(verify(token, proof: try proof(other), check: check) == .failure(.proofWrongToken))
         #expect(
             verify(token, proof: try proof(token, key: DeviceKey.ephemeral()), check: check)

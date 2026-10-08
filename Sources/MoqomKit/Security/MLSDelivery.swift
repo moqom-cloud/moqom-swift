@@ -17,6 +17,7 @@
 
 import Foundation
 import MoqomCore
+@_exported import MoqomMLS
 
 /// What the delivery service knows about one room's group.
 public struct MLSDeliverySnapshot: Sendable, Hashable {
