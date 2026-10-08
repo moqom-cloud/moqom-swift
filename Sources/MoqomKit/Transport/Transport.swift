@@ -38,13 +38,120 @@ public struct RelayEndpoint: Hashable, Sendable {
     ///
     /// Version negotiation is ALPN — moq-wg PR #499 removed it from SETUP
     /// entirely — so this list is the version list. Drafts use `moqt-NN`; the
-    /// final RFC will use bare `moqt`.
+    /// final RFC will use bare `moqt`. The default offers draft-22 first and
+    /// falls back to MOQOM's draft-19 profile for relays not yet upgraded;
+    /// the session speaks whichever the relay picks.
     public let alpn: [String]
 
-    public init(host: String, port: UInt16 = 443, alpn: [String] = ["moqt-19"]) {
+    /// Whose relay this is, which decides what a session may ask of it.
+    public let profile: RelayProfile
+
+    /// The draft-16 PATH setup parameter: the path, with any query, a raw-QUIC
+    /// client would have put in a URL. `nil` for relays that take their
+    /// credential from the token instead.
+    ///
+    /// May hold a bearer credential, which is why ``description`` does not
+    /// print it.
+    public let path: String?
+
+    public init(
+        host: String,
+        port: UInt16 = 443,
+        alpn: [String] = ["moqt-22", "moqt-19"],
+        profile: RelayProfile = .moqom,
+        path: String? = nil
+    ) {
         self.host = host
         self.port = port
         self.alpn = alpn
+        self.profile = profile
+        self.path = path
+    }
+
+    /// A Cloudflare MoQ relay, which speaks draft-16 and authorises by a token
+    /// in the setup PATH.
+    ///
+    /// - Parameter token: the JWT Cloudflare issued, sent as PATH `/<token>`.
+    /// - Parameter host: the relay; the default is Cloudflare's public
+    ///   draft-16 endpoint.
+    public static func cloudflare(
+        token: String,
+        host: String = "draft-16.cloudflare.mediaoverquic.com",
+        draft: CloudflareDraft = .draft16
+    ) -> RelayEndpoint {
+        RelayEndpoint(host: host, port: 443, alpn: [draft.alpn], profile: .cloudflare, path: "/" + token)
+    }
+}
+
+extension RelayEndpoint: CustomStringConvertible {
+    public var description: String {
+        "\(host):\(port) \(alpn.joined(separator: ",")) \(profile)" + (path == nil ? "" : " path=<redacted>")
+    }
+}
+
+/// The drafts Cloudflare's relay is reachable on that this SDK speaks.
+///
+/// Its own enumeration, rather than ``MoqtDraft``, so that asking for a draft
+/// Cloudflare runs and this SDK does not is a compile error rather than a
+/// failed handshake. Adding draft-18 is a case here and a dialect for it.
+public enum CloudflareDraft: Sendable, CaseIterable {
+    case draft16
+
+    var alpn: String {
+        switch self {
+        case .draft16: "moqt-16"
+        }
+    }
+}
+
+/// Whose relay an endpoint is, and so which features a session can use.
+public enum RelayProfile: Hashable, Sendable, CustomStringConvertible {
+    /// A MOQOM relay: every feature this SDK has.
+    case moqom
+    /// Cloudflare's MoQ relay, as of its draft-16 deployment.
+    case cloudflare
+
+    /// What this relay does not implement, and so what a session refuses to
+    /// ask of it.
+    public var unsupported: Set<RelayFeature> {
+        switch self {
+        case .moqom:
+            []
+        case .cloudflare:
+            // From Cloudflare's published draft-16 support matrix: no FETCH,
+            // no REQUEST_UPDATE, no GOAWAY. MOQOM's admission (its token and
+            // proof) and in-session renewal are MOQOM's own.
+            [.fetch, .requestUpdate, .credentialRenewal, .goaway]
+        }
+    }
+
+    public var description: String {
+        switch self {
+        case .moqom: "MOQOM relay"
+        case .cloudflare: "Cloudflare relay"
+        }
+    }
+}
+
+/// A capability a relay may lack.
+public enum RelayFeature: Hashable, Sendable, CaseIterable, CustomStringConvertible {
+    /// FETCH, and with it catch-up on join and seeking back through a track.
+    case fetch
+    /// REQUEST_UPDATE, which is how a live subscription is paused and resumed
+    /// (FORWARD) and how its priority is changed.
+    case requestUpdate
+    /// Replacing the session's credential without reconnecting.
+    case credentialRenewal
+    /// GOAWAY, the relay asking a client to move.
+    case goaway
+
+    public var description: String {
+        switch self {
+        case .fetch: "FETCH (catch-up and history)"
+        case .requestUpdate: "REQUEST_UPDATE (pausing a subscription or changing its priority)"
+        case .credentialRenewal: "renewing a credential in-session"
+        case .goaway: "GOAWAY"
+        }
     }
 }
 
@@ -104,18 +211,45 @@ public struct DeviceCredentials: Sendable {
     /// lifetime as a property of the handshake alone.
     public let renew: (@Sendable () async throws -> IssuedToken)?
 
+    /// Where a room's end-to-end encryption keys are agreed, when the SDK is
+    /// to manage them.
+    ///
+    /// Set, and the room keys itself with MLS: no key passes through the application and none
+    /// reaches MOQOM's servers, which only order and forward ciphertext. A key
+    /// given to ``RoomSession/useEncryption(_:)`` overrides it. `nil` and the room
+    /// publishes nothing until the application supplies a key. ``TokenService/keyDelivery`` is MOQOM's.
+    public let keyDelivery: (any MLSDeliveryService)?
+
+    /// The keys the room's control log is signed with: the control plane's
+    /// ML-DSA-65 keys, as its JWK set publishes them (see
+    /// ``DirectVerificationKey/parseSet(_:)``).
+    ///
+    /// A room applies only control entries signed by one of these. Empty, and
+    /// the control log is ignored — nobody is promoted, muted or ended by it —
+    /// because an entry nobody can verify is one the relay could have written.
+    public var authorityKeys: [DirectVerificationKey] = []
+
+    /// What the control plane allows of direct paths in the token's room, as
+    /// it stated with the token (``IssuedToken/direct``).
+    public var directRoom: DirectRoomPolicy = .default
+
+    /// See ``EncryptionPolicy/plaintextForTesting``.
+    var plaintextForTesting = false
+
     public init(
         identity: ParticipantIdentity,
         token: Data,
         deviceKey: DeviceKey?,
         expiresAt: Date? = nil,
-        renew: (@Sendable () async throws -> IssuedToken)? = nil
+        renew: (@Sendable () async throws -> IssuedToken)? = nil,
+        keyDelivery: (any MLSDeliveryService)? = nil
     ) {
         self.identity = identity
         self.token = token
         self.deviceKey = deviceKey
         self.expiresAt = expiresAt
         self.renew = renew
+        self.keyDelivery = keyDelivery
     }
 
     /// The same credentials carrying a token that has just been issued.
@@ -124,13 +258,18 @@ public struct DeviceCredentials: Sendable {
     /// renewal repeatable: the replacement has to be able to replace itself, and
     /// to prove itself with the key the new token was issued to.
     public func replacing(with issued: IssuedToken) -> DeviceCredentials {
-        DeviceCredentials(
+        var replaced = DeviceCredentials(
             identity: identity,
             token: issued.token,
             deviceKey: deviceKey,
             expiresAt: issued.expiresAt,
-            renew: renew
+            renew: renew,
+            keyDelivery: keyDelivery
         )
+        replaced.authorityKeys = authorityKeys
+        replaced.plaintextForTesting = plaintextForTesting
+        replaced.directRoom = issued.direct
+        return replaced
     }
 }
 
@@ -390,7 +529,22 @@ public protocol SubscriptionHandle: Sendable, AnyObject {
     /// scroll position without rate-limiting it themselves.
     func updatePriority(_ priority: UInt8) async
 
+    /// Ask the publisher to stop, or resume, sending this subscription's
+    /// objects without ending it: draft-19's FORWARD parameter in a
+    /// REQUEST_UPDATE.
+    ///
+    /// A request rather than a switch. A relay that does not act on it keeps
+    /// sending, and one that does resumes at the start of the next group, not
+    /// mid-group, because it forwards whole subgroups.
+    func updateForwarding(_ forward: Bool) async
+
     func cancel() async
+}
+
+public extension SubscriptionHandle {
+    /// Nothing to pause: a transport with no relay in it delivers only what
+    /// it is given.
+    func updateForwarding(_: Bool) async {}
 }
 
 /// What history to ask for.
@@ -432,6 +586,14 @@ public struct FetchRequest: Hashable, Sendable {
         /// already seen, which is what resuming from a known position wants. Only
         /// the end is resolved against the edge.
         case joiningFrom(subscription: any SubscriptionHandle, group: UInt64)
+
+        /// The track the range is in.
+        public var track: FullTrackName {
+            switch self {
+            case let .standalone(track, _, _): track
+            case let .joining(subscription, _), let .joiningFrom(subscription, _): subscription.track
+            }
+        }
 
         public static func == (lhs: Range, rhs: Range) -> Bool {
             switch (lhs, rhs) {
@@ -616,19 +778,32 @@ public struct ObjectProperties: Hashable, Sendable {
     /// exists to prevent.
     public var isSilence: Bool?
 
+    /// On a sealed `.catalog` object, the part of the catalog that is not
+    /// secret from the relay. See ``Catalog/disclosure()``.
+    public var disclosure: Data?
+
+    /// On a `.control` entry, the room authority's signature over it. See
+    /// ``RoomLogSigner``.
+    public var authoritySignature: Data?
+
     public init(
         captureTime: FrameTimestamp? = nil,
         configuration: Data? = nil,
         temporalLayer: Int? = nil,
-        isSilence: Bool? = nil
+        isSilence: Bool? = nil,
+        disclosure: Data? = nil,
+        authoritySignature: Data? = nil
     ) {
         self.captureTime = captureTime
         self.configuration = configuration
         self.temporalLayer = temporalLayer
         self.isSilence = isSilence
+        self.disclosure = disclosure
+        self.authoritySignature = authoritySignature
     }
 
     public var isEmpty: Bool {
         captureTime == nil && configuration == nil && temporalLayer == nil && isSilence == nil
+            && disclosure == nil && authoritySignature == nil
     }
 }

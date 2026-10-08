@@ -268,6 +268,10 @@ final class AppModel {
             Journal.shared.say("INVITE unreadable \(url.absoluteString.prefix(60))")
             return
         }
+        guard !invitation.enrolsUnpinned else {
+            Journal.shared.say("INVITE refused: enrols with an unpinned token service")
+            return
+        }
         Journal.shared.say("INVITE \(invitation.destination)")
         offered = invitation
     }
@@ -1430,6 +1434,12 @@ final class AppModel {
             case let .room(name):
                 room = try await session.join(room: RoomID(name))
             }
+            // Before anything is published or subscribed. Without it a room whose
+            // backend has not turned end-to-end encryption off — which is every room
+            // by default — refuses Go live and drops everybody's media. See RoomKey.
+            await room.useEncryption(
+                RoomKey.encryption(room: room.room, passphrase: launch.roomKey ?? RoomKey.samplePassphrase)
+            )
             let model = RoomModel(
                 session: session,
                 room: room,

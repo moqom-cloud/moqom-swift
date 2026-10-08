@@ -3,9 +3,61 @@
 The Apple-platform client SDK for [MOQOM](https://github.com/moqom-cloud/moqom),
 the Media Over QUIC Orchestration Mesh. iOS, visionOS, macOS, and tvOS.
 
+Documentation is at [moqom.dev](https://moqom.dev), starting with the
+[iOS & macOS guide](https://moqom.dev/guides/ios-macos/).
+
+## Install
+
+In Xcode, **File → Add Package Dependencies…** and enter
+`https://github.com/moqom-cloud/moqom-swift`, or in `Package.swift`:
+
 ```swift
 .package(url: "https://github.com/moqom-cloud/moqom-swift", from: "0.1.0")
+
+// in your target
+.product(name: "MoqomKit", package: "moqom-swift")
 ```
+
+## Quickstart
+
+Your backend mints a token bound to this device's key (see
+[moqom-go](https://github.com/moqom-cloud/moqom-go) or
+[moqom-rust](https://github.com/moqom-cloud/moqom-rust)); the app connects, joins,
+and goes live.
+
+```swift
+import MoqomKit
+import MoqomCore
+
+let deviceKey = try DeviceKey.installed()   // Secure Enclave where available
+let issued = try await myBackend.moqomToken(room: "demo", thumbprint: deviceKey.thumbprint)
+
+let session = MoqomSession(
+    transport: MoqtTransport.network(),
+    credentials: DeviceCredentials(
+        identity: ParticipantIdentity(
+            username: try Username(issued.username),
+            device: try DeviceID(thumbprint: deviceKey.thumbprint)
+        ),
+        token: issued.token,
+        deviceKey: deviceKey,
+        expiresAt: issued.expiresAt,
+        renew: { try await myBackend.moqomToken(room: "demo", thumbprint: deviceKey.thumbprint) }
+    ),
+    tenant: TenantID("t_3f9a0c1d2e4b5a69")
+)
+try await session.connect(to: RelayEndpoint(host: "relay.example.moqom.cloud"))
+let room = try await session.join(room: RoomID("demo"))
+
+let camera = try CameraSource(format: CaptureFormat(size: PixelSize(width: 1280, height: 720), frameRate: 30))
+camera.start()
+try await room.startBroadcast(from: camera).start()
+```
+
+The full walkthrough, including the backend half, is the
+[quickstart](https://moqom.dev/getting-started/quickstart/).
+
+## Where this came from
 
 This was the first piece to leave the monorepo, and for a reason peculiar to
 SwiftPM: it resolves a git dependency by looking for `Package.swift` at the
@@ -30,9 +82,10 @@ SDK.
 | Target | What it is |
 | --- | --- |
 | `MoqomCore` | Namespaces, identity, layer ladders, frame and audio types, logging |
-| `MoqomWire` | The `draft-ietf-moq-transport-19` codec: varints, parameters, control messages, datagrams, subgroup streams |
+| `MoqomWire` | The MoQ Transport codecs for drafts 16, 19 and 22: varints, parameters, control messages, datagrams, subgroup streams |
 | `MoqomKit` | Session, MOQT transport, rooms, publishing, subscribing, layer selection, SFrame, platform capture |
 | `MoqomLoopback` | An in-memory relay and an in-memory QUIC carrier, so the tests exercise the whole stack |
+| `MoqomDirectRust` | Optional. Direct paths over the Rust `moqom-direct-ffi` instead of `Network.framework`; present only when its xcframework is (see [Direct backends](#direct-backends)) |
 
 ## Status
 
@@ -63,7 +116,7 @@ top of `Sources/MoqomKit/Transport/Transport.swift`.
 
 ### Verified: builds and is tested
 
-838 tests across 123 suites. All but the three interop tests run on every
+957 tests across 145 suites. All but the three interop tests run on every
 `swift test`; those need a relay binary and skip without one.
 
 - **Namespaces and identity.** Tuple construction, field limits in UTF-8 bytes,
@@ -178,7 +231,9 @@ top of `Sources/MoqomKit/Transport/Transport.swift`.
   under 1% of a video object and about a third of an Opus packet. And that
   arriving out of order is not mistaken for a replay, since subgroups ride
   separate QUIC streams and a strict counter rule would read reordering as loss.
-- **Proof of possession.** That a session presents a proof beside its token at
+- **Proof of possession.** Relays require it by default
+  (`MOQOM_RELAY_POSSESSION=required`), so a token presented without a proof from
+  the key it is bound to is refused. Tested: that a session presents a proof beside its token at
   SETUP and a fresh one on every renewal, and that the proof verifies: the
   signature is checked under the key the proof carries, the RFC 7638 thumbprint
   of that key is recomputed canonically, and the claims are matched — which is
@@ -258,6 +313,215 @@ top of `Sources/MoqomKit/Transport/Transport.swift`.
   stream. And that the three changes a delay would make actively wrong — a mute
   the user just pressed, a recorder attaching, the stream ending — skip the
   queue.
+- **End-to-end encryption by default.** `EncryptionPolicy` reads the room's
+  `e2ee` claim from the token and nothing else, so there is no client-side
+  switch to forget. A room is encrypted unless its owner's backend relaxed it,
+  and that change is in the room's audit log. An SDK holding no key refuses to
+  publish into a room that requires one.
+- **MLS-managed room keys.** `ManagedRoomKeys` runs group membership for small
+  encrypted rooms so an application never handles a key. Each epoch has its
+  own SFrame keys. Senders switch the moment a removal is ordered, so a removed
+  member's last key stops being used, and an ordinary epoch change drops no
+  frames.
+  `MLSGroup` is a deliberately small subset of MLS (RFC 9420). The primitives
+  and key schedule are RFC 9420 and are checked against its test vectors
+  (`MLSConformanceTests`); the group protocol keeps the RFC's epochs, commits,
+  Welcomes and transcript hashes but uses a flat member list instead of a
+  ratchet tree. The comment at the top of `MLSGroup.swift` lists what differs.
+  `MLSDelivery` is the ordering service: it only ever sees public key packages
+  and sealed commits, never anything that derives a key. The committer is the
+  lowest live leaf, with a fallback, so there is no election.
+  Groups are founded in a hybrid post-quantum suite,
+  `MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519` from
+  draft-ietf-mls-pq-ciphersuites (the X-Wing KEM: ML-KEM-768 with X25519).
+  The draft has no code point yet, so MoqomKit uses `0xF0A1` from RFC 9420's
+  private-use range, and no other MLS implementation will recognise it. Every
+  commit secret and joiner secret is sealed to X-Wing, so the epoch secrets
+  and the SFrame keys derived from them stay confidential unless both
+  ML-KEM-768 and X25519 are broken. Signatures are not post-quantum: MLS
+  signatures are Ed25519, device proofs are ES256, and tokens are EdDSA. They
+  authenticate members during a call, and breaking one later would not
+  decrypt recorded traffic. Suite `0x0001` still works for existing groups. A
+  group keeps one suite for its whole life, and a key package in another suite
+  is refused. X-Wing makes a key package about 2.5 KB and adds about 1.2 KB per
+  member to each commit and Welcome. `MLSHybridSuiteTests` checks CryptoKit's
+  X-Wing against the HPKE working group's KEM `0x647a` test vector.
+- **Direct (peer-to-peer) calls**, in `Sources/MoqomKit/Direct/`. Wire-compatible
+  with the Rust client's `moqom_client::direct`, so either SDK can be either
+  end:
+  - `DirectEligibility`: small, end-to-end encrypted rooms where everyone has
+    agreed and nobody is an audience. Viewers never get a direct path, because
+    it would tell them the publisher's network address.
+  - `CandidateOffer` and `DirectOffers`: addresses and a certificate hash,
+    sealed with AES-256-GCM under a key from the room's MLS group and sent on
+    the participant's own track. The relay carries them and cannot read or
+    forge them.
+  - `DirectEndpoint`: one UDP port, STUN, hole-punching (the lower certificate
+    hash dials), then pinned mutual TLS against the hash in the offer, and a
+    MOQT SETUP carrying the MOQOM token plus a proof bound to the peer's
+    certificate.
+  - `DirectPeerCheck`: a port of the relay's token and possession checks, with
+    the proof required. A refused peer is closed with `0x03`.
+  - `DualSubscription`: the relay subscription stays open as the fallback. Once
+    the direct path keeps up, the relay copy is paused with `FORWARD=0`, and it
+    resumes on loss or after 500 ms of direct silence.
+  - `DirectTicket`: the relay signs a ticket about once a minute while a
+    participant is direct, and meters direct minutes from it. Each side presents
+    its tickets to the other and drops the direct path when the peer's are
+    missing, forged or expired, so one honest app is enough to keep the pair
+    billed.
+
+  #### In a room
+
+  On by default. `MoqomSession(directPolicy:)` is `.automatic` unless the app
+  says otherwise, and a 1:1 call or a small private room moves to direct paths
+  wherever it qualifies. Choosing automatic accepts, on the user's behalf, that
+  the other participants of such a room learn this device's IP addresses, so
+  say so in the app; `.relayOnly` never offers them:
+
+  ```swift
+  let session = MoqomSession(
+      transport: transport,
+      credentials: credentials,      // authorityKeys: what peers are verified against
+      tenant: tenant,
+      directPolicy: .automatic       // or .automatic(stun: (host:port:)), or .relayOnly
+  )
+  let room = try await session.join(room: "standup")
+  for await event in room.events {
+      if case let .directPathChanged(who, path) = event { print(who, path) } // relay(why) / connecting / direct
+  }
+  ```
+
+  `join(room:directPolicy:)` overrides the session's policy for one room, and
+  `.custom(DirectRoomOptions(...))` sets every option by hand.
+  `RoomSession.setDirect(_:)` does the same on a room already joined, and `nil`
+  turns it off. The room's own policy from the control plane, which comes
+  with each token (`IssuedToken.direct`), can lower the participant limit or
+  keep the room on the relay, and a renewed token that changes it reaches a
+  room in progress. Opting in is published as `direct: true` on this device's
+  catalog, which is how the others count it. The room then applies
+  `DirectEligibility` as it stands: end-to-end encryption required and in use,
+  no watchdog, this device publishing, at most four participants (fewer if the
+  room's policy says so), and
+  every one of them opted in. Participants are everyone publishing where this
+  device publishes (on stage, or backstage with the other cohosts there) plus
+  every member of the room's MLS group, so a viewer holding the room's keys
+  keeps the room on the relay. While the rules hold, for each other
+  participant the room:
+
+  - binds an endpoint on the session's `directBackend`, sends its sealed offer
+    on this participant's `.direct` track every second until the peer answers,
+    reads the peer's, and establishes with the newest offer it hasn't tried;
+  - once up, subscribes on its own relay to its ticket track
+    `.direct/{peer}`, presents its tickets and holds the peer to theirs
+    (`DirectTicketGuard`). It closes that subscription when the path ends;
+  - publishes every media track on the direct session as well as the relay.
+    The copy is made under the encryption, so both paths carry the same
+    ciphertext with the same object numbers. A stalled direct path drops its
+    own queued objects and never holds up the relay;
+  - reads each of the peer's tracks through a `DualSubscription`, the relay
+    subscription staying the one of record.
+
+  Any end of the path (the guard, the session closing, the peer offering a
+  new endpoint, the room no longer qualifying) leaves media
+  on the relay and calls `networkChanged()` on the merges. Another attempt
+  follows after a backoff that starts at `retry` (2 s) and doubles up to a
+  minute. A departure or `leave` tears that participant's path down, tickets
+  included. A new MLS epoch reseals the offers and offers again to anyone not
+  yet direct. Paths already up are kept. `RoomSession.directPaths` gives each
+  participant's state and how many objects came over each path.
+
+  The offer key is an MLS exporter secret from the managed group
+  (`MLS-Exporter("MOQOM direct offer", "", 32)`), run through
+  `DirectRoomSecret`'s HKDF. A room keyed by the app instead (`useEncryption`)
+  passes `offerSecret`, or it reports `awaitingKeys`.
+
+  `DirectEndpointTests` runs two endpoints over loopback on macOS, and
+  `DirectRoomTests` runs whole rooms on the loopback relay with a stand-in
+  ticket issuer. It covers two people going direct, a viewer staying on the
+  relay, a participant who hasn't opted in keeping everyone there, fallback
+  when the session is killed, lapsed tickets and leaving.
+  `RustDirectRoomTests` repeats the first case on the Rust backend. None of
+  this has run across real networks.
+
+  #### Direct backends
+
+  `DirectEndpoint` is the MOQT half of a direct path. The socket under it —
+  the port, the certificate, probing, dialling and accepting — sits behind
+  `DirectSocketProvider` and `DirectSocket`, and is chosen when the SDK is
+  made:
+
+  ```swift
+  import MoqomDirectRust
+
+  let session = MoqomSession(
+      transport: transport, credentials: credentials, tenant: tenant,
+      directBackend: .rust
+  )
+  let endpoint = try await session.bindDirectEndpoint(configuration, eligibility: eligibility, exposure: exposure)
+  ```
+
+  - `.networkFramework`, the default, is the code that was there before,
+    moved rather than rewritten: the accepting side probes in a burst only,
+    and the listener is cancelled before dialling. `DirectEndpointTests` runs
+    on it unchanged.
+  - `.rust`, from `MoqomDirectRust`, is quinn behind `moqom-direct-ffi` in
+    `moqom-engine`. One socket listens and dials at once, so it probes on
+    both sides for the whole of establishment, and it carries QUIC datagrams.
+    `RustDirectBackend.isCompatible` checks the library's ABI version; a
+    mismatch fails `bind` instead of calling into it.
+  - `.custom(_:)` takes any other `DirectSocketProvider`.
+
+  The module exists only when the xcframework does, so a checkout without it
+  builds exactly as before. `Scripts/direct-ffi.sh` runs the engine's
+  `build-apple.sh` and copies `MoqomDirectFFI.xcframework` into `Artifacts/`
+  (ignored by git), which the manifest looks for; `--copy` skips the build
+  and `--remove` takes it out again. The manifest is sandboxed and cannot see
+  the sibling repository, so the alternatives are environment variables:
+  `MOQOM_DIRECT_RUST=1` uses `../moqom-engine/target/MoqomDirectFFI.xcframework`,
+  and `MOQOM_DIRECT_FFI_XCFRAMEWORK` names any relative path. SwiftPM caches
+  the manifest's answer, so after the framework appears or goes, run
+  `swift package purge-cache` (the script does). iOS and macOS only: the
+  engine builds no visionOS or tvOS slices, and the Rust target links the
+  framework on those two platforms alone.
+
+  `MoqomDirectRustTests` establishes a direct session for every pairing —
+  Rust to Rust, `Network.framework` dialling Rust, and Rust dialling
+  `Network.framework` — and in each sends media both ways and refuses a
+  viewer, an impostor and the wrong certificate. Below MOQT it checks
+  bidirectional and 300 KB unidirectional streams, finish, reset, datagrams,
+  and that a deliberate close is not reported as loss. All of it passes on
+  macOS, from both the `Artifacts/` copy and `MOQOM_DIRECT_RUST=1`. Three
+  things it found:
+
+  - `NWConnectionGroup` opens a bidirectional stream of its own and never
+    writes to it, and quinn hands that stream to the acceptor first, ahead
+    of the control stream. `RustQUICCarrier` therefore offers an inbound
+    bidirectional stream only once it has carried a byte or ended. The Rust
+    client's `moqom_client::direct` accepting from this SDK's
+    `Network.framework` backend should have the same problem, and that has not
+    been tested.
+  - A reset from a `NetworkQUICCarrier` stream, on the side that accepted,
+    never reaches a Rust reader while the stream is open. It is recorded as a
+    known issue, not a pass.
+  - On the iOS Simulator, the refusal scenarios crash inside
+    `NetworkQUICCarrier.close`, which sets the application error on a
+    connection the peer has already closed, and `Network.framework` traps.
+    It happens with `Network.framework` on both ends as well, so the Rust
+    backend did not cause it, but nothing had run those paths on iOS
+    before. The scenarios without a `Network.framework` acceptor pass
+    there. `MoqomDirectRust` builds for iOS devices and the simulator, and
+    has not run on a phone.
+- **Space edits, events and playout.** `SpaceEdit` adds spawn, move, despawn
+  and event without the app writing a simulation; the simulation can still
+  refuse them. `SpaceEvents` delivers moments (a goal, a turn) exactly once and
+  in order, alongside the forgiving state ticks. `SpacePlayout` interpolates
+  ticks for smooth drawing, and can hold the board in step with the video
+  beside it.
+- **Grant changes mid-session** (`GrantChangeTests`). A viewer promoted to
+  guest, or sent back to the audience, stays on the same connection. The new
+  token is presented there, the next renewal mints the new role, and a
+  publication the relay withdraws is stopped instead of encoding into nothing.
 
 ### Verified on two phones, not by the test suite
 
@@ -343,17 +607,30 @@ somebody demonstrates. Both are built and wired; neither has been seen.
 
 ### Not written
 
-- Enforcement of proofs by *default*, which is now the whole of what is left here.
-  This entry has been narrowed twice: it once said proof of possession was not
-  written, then that no deployment enforced it. The dev deployment does —
-  `MOQOM_RELAY_POSSESSION=required` on both relay regions, verified by a token
-  this deployment had just minted being refused for presenting no proof. But the
-  binary still defaults to `observed`, which verifies a proof when one is offered
-  and admits a session that offers none, so any deployment that has not set the
-  variable is still taking bearer tokens from whatever presents one. Changing the
-  default is the remaining step, and it is deliberately not taken while a fleet
-  can still be mid-upgrade: the cost of getting it wrong is an outage, and the
-  cost of leaving it is a setting an operator must know about.
+- Direct paths in a room are on by default (`DirectPolicy.automatic`) and
+  still partial:
+  - Automatic needs `DeviceCredentials.authorityKeys` to verify a peer with;
+    a session without them stays on the relay. MOQOM's relays answer STUN,
+    and the token service's `direct.stun` names one, so automatic offers this
+    device's public address as well as its own. `.automatic(stun:)` names a
+    different server instead. A NAT that maps each destination to a new port
+    (symmetric NAT, common on carrier-grade NAT) still defeats hole-punching,
+    and MOQOM runs no TURN: those calls stay on the relay.
+  - The room's policy (`direct_paths`, `max_direct_participants`) reaches the
+    device through the token service's `direct` field. A backend that mints
+    through the admin API has to pass `MintClientTokenResponse.direct` on
+    itself; one that does not leaves the SDK's own default, allowed for up to
+    four. The relay refuses direct tickets in a relay-only room, so a
+    modified client cannot keep a path there either.
+  - Backstage pairs only with backstage, and a device starts watching the
+    backstage prefix only once it publishes there. A stage device and a
+    backstage one stay on the relay with each other.
+  - The Rust client runs the same room behaviour in
+    `moqom_client::direct::DirectRoom`, pausing the relay copy the same way,
+    but has no MLS or catalog, so its caller supplies the offer key and who
+    opted in.
+  - On the loopback relay `FORWARD=0` does nothing, so the 500 ms quiet resume
+    is covered only by the `DualSubscription` tests in `DirectTests`.
 - Media kinds are not enforced per track. `moqt.pub` distinguishes audio from
   video from screen, and the relay checks only that it is non-empty, so a token
   minted for audio can publish video under a namespace it does own.
@@ -426,6 +703,68 @@ another city. What remains unobserved is narrower than it was, and specific:
   allowed there, and the ActivityKit budget is not applied. The selection and
   the throttling are tested; that the window keeps drawing and the card keeps
   updating on a real device for a real hour is not.
+
+## MoQ Transport drafts
+
+The draft is chosen by ALPN during the QUIC handshake. Three are spoken:
+
+| ALPN | Session | Used for |
+| --- | --- | --- |
+| `moqt-22` | `MoqtSession` | MOQOM relays, preferred |
+| `moqt-19` | `MoqtSession` | MOQOM relays not yet on draft-22, and direct calls |
+| `moqt-16` | `Draft16Session` | Cloudflare's relay |
+
+`RelayEndpoint(host:)` offers `moqt-22` then `moqt-19`. `DirectEndpoint` speaks
+`moqt-19` only. Draft-16 is never offered to a MOQOM relay.
+
+Draft-22 makes any Message Parameter the receiver does not define a protocol
+violation, so MOQOM's extras are negotiated there. Each end's SETUP carries the
+private option MOQOM_PARAMETERS (0x4D50) = 1. Once both have declared it, a
+session sends NAMESPACE_DONE's withdrawal reason and a renewal's
+AUTHORIZATION_PROOF (0x4D51), and accepts RELAY_HOPS (0x4D50) and
+AUTHORIZATION_PROOF from the peer. With any other draft-22 peer, neither end
+sends them, and receiving one ends the session. Draft-19 needs no
+negotiation, and the Cloudflare profile never declares it.
+
+### Cloudflare
+
+```swift
+let session = try await MoqtTransport.network().connect(
+    to: .cloudflare(token: jwt),          // draft-16.cloudflare.mediaoverquic.com:443
+    credentials: credentials              // identity only; the token is not sent
+)
+let initSegment = try await session.subscribe(
+    SubscribeRequest(track: FullTrackName(namespace: TrackNamespace(["bbb"]), name: TrackName("0.mp4")),
+                     start: .latestGroup)
+)
+```
+
+The token is sent as the draft-16 PATH setup parameter (`/<token>`), next to
+AUTHORITY and MAX_REQUEST_ID. MOQOM's own setup options, token and proof are
+not sent. `RelayEndpoint.description` does not print the path.
+
+Cloudflare's relay does not support the following, and the SDK behaves as
+listed:
+
+| Feature | On Cloudflare |
+| --- | --- |
+| FETCH, so catch-up on join and seeking back | `fetch` throws `MoqomError.unsupportedByRelay(feature: .fetch, …)`; a room skips catch-up and waits for the next group |
+| REQUEST_UPDATE, so priority changes and pause/resume | `updatePriority` and `updateForwarding` do nothing |
+| Credential renewal | `renewCredential` throws `.unsupportedByRelay(feature: .credentialRenewal, …)`; the session ends when the token does |
+| GOAWAY | Not sent. One received is reported as an interruption |
+
+End-to-end encryption works the same on every draft: payloads are sealed above
+the transport and the object properties it authenticates go through unchanged.
+Publishing to Cloudflare is covered by unit tests against a scripted relay,
+not against Cloudflare.
+
+`CloudflareLiveTests` subscribes to `bbb` on the public relay. It is skipped
+unless asked for:
+
+```sh
+MOQOM_CF_DEMO_TOKEN=fetch swift test --filter CloudflareLiveTests   # reads the demo token from Cloudflare's docs
+MOQOM_CF_DEMO_TOKEN=<jwt> swift test --filter CloudflareLiveTests
+```
 
 ## Interop
 
@@ -545,6 +884,17 @@ encode rather than a namespace with no media behind it.
   and a build that cross-compiles for four Apple platforms — to reach a QUIC
   stack that `Network.framework` already provides. The mitigation is that the
   tests pin bytes the Rust side produced rather than bytes we produced.
+- **A Rust runtime after all, for direct paths only, and optional.** The
+  argument above holds for the relay, where one connection is dialled and
+  `Network.framework` is enough. A direct path is different. It needs one port
+  that listens and dials at once and keeps probing until somebody gets
+  through, and `Network.framework` can do this only by cancelling its listener
+  before dialling and limiting the accepting side to a burst of probes. The
+  Rust backend has neither limit, and it is the same QUIC stack as the Rust
+  client at the other end. It sits behind `DirectSocket`, so the MOQT, the
+  token checks and the tickets stay in one Swift implementation. It is opt-in
+  per session, and absent from any build that has not fetched its
+  framework, so an app that never asks for it carries no Rust at all.
 - **Time is injected into the session state machine.** `MonotonicTime` is a
   parameter on every transition and there is no clock inside the SDK. It makes
   the reconnect windows testable in microseconds, and it means an app with a
@@ -625,3 +975,24 @@ encode rather than a namespace with no media behind it.
   The uncomfortable part is that the SDK cannot tell an on-device transcriber
   from an upload, and saying so in the doc comment is the whole of the
   mitigation; `Watchdog` is the mechanism if an integrator wants to disclose it.
+
+## Contribute
+
+Bug reports, fixes and examples are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md):
+the first pull request asks you to sign the CLA, and `swift test` runs with no
+account or network.
+
+## Security
+
+Do not open a public issue for a vulnerability. Email
+[security@moqom.cloud](mailto:security@moqom.cloud); see [SECURITY.md](SECURITY.md).
+
+## Donate
+
+The SDKs and samples are free. If they save you time, you can support the
+open-source work at [elliottwave.dev/donate](https://elliottwave.dev/donate/).
+
+## Licence
+
+Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE), which also carries the
+notices for third-party components. © 2026 Elliott Wave LLC.

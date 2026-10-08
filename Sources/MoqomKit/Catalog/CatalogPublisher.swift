@@ -90,7 +90,8 @@ public actor CatalogPublisher {
                 object: 0,
                 priority: Self.priority,
                 payload: payload,
-                isKeyFrame: true
+                isKeyFrame: true,
+                properties: ObjectProperties(disclosure: catalog.disclosure())
             )
         )
         group += 1
@@ -171,7 +172,8 @@ public extension Catalog {
         interrupted: MediaKind = [],
         locale: String? = nil,
         references: [TrackNamespace] = [],
-        invitations: [StageInvitationRecord] = []
+        invitations: [StageInvitationRecord] = [],
+        direct: Bool = false
     ) -> Catalog {
         // The live ladder when there is one, because a publication's geometry can
         // move after it starts: the rungs keep their names and their short sides,
@@ -214,6 +216,7 @@ public extension Catalog {
             locale: locale,
             references: references,
             invitations: invitations,
+            direct: direct,
             tracks: tracks
         )
     }

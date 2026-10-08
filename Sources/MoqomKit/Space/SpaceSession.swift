@@ -65,6 +65,23 @@ public protocol SpaceSimulation: Sendable {
         to state: inout SpaceSnapshot,
         at now: Timecode
     )
+
+    /// Whether a built-in ``SpaceEdit`` may happen. Everything is permitted
+    /// unless this says otherwise, which is what makes ``OpenSpace`` a space
+    /// with no rules.
+    func permits(_ edit: SpaceEdit, from who: ParticipantIdentity, in state: SpaceSnapshot) -> Bool
+
+    /// Moments this tick produced, worked out from what it changed.
+    ///
+    /// Called once per tick after every intent and the step, with the state
+    /// before and after. A goal is a score that went up; a pop is a bubble that
+    /// is gone. Each one returned is numbered and delivered exactly once to
+    /// everybody, as ``SpaceEdit/event(_:)`` is.
+    func events(
+        between previous: SpaceSnapshot,
+        and next: SpaceSnapshot,
+        at now: Timecode
+    ) -> [SpaceGameEvent]
 }
 
 public extension SpaceSimulation {
@@ -76,7 +93,25 @@ public extension SpaceSimulation {
         to _: inout SpaceSnapshot,
         at _: Timecode
     ) {}
+
+    func permits(_: SpaceEdit, from _: ParticipantIdentity, in _: SpaceSnapshot) -> Bool {
+        true
+    }
+
+    func events(
+        between _: SpaceSnapshot,
+        and _: SpaceSnapshot,
+        at _: Timecode
+    ) -> [SpaceGameEvent] {
+        []
+    }
 }
+
+/// Reads the authority's capture clock: the clock its video frames are
+/// stamped with, at the instant of the tick.
+///
+/// `nil` while there is no video to align to. See ``SpacePlayout``.
+public typealias SpaceMediaClock = @Sendable () async -> FrameTimestamp?
 
 /// Reads the clock the space's timestamps are on.
 ///
@@ -130,18 +165,36 @@ public actor SpaceSession {
         /// second would be a refusal once a second in somebody's logs.
         public var mayLead: Bool
 
+        /// How many of an epoch's most recent game events every snapshot
+        /// repeats.
+        ///
+        /// The window a client that lost a whole group, or its connection, can
+        /// recover events from. One older than this is reported as
+        /// ``Event/eventsMissed(epoch:sequences:)`` instead.
+        public var eventRetention: Int
+
+        /// How many of the group's events so far each delta repeats.
+        ///
+        /// A delta lost mid-group is made good by the next one only for the
+        /// events within this many of the newest.
+        public var eventRedundancy: Int
+
         public init(
             tickRate: Double = 20,
             groupLength: Int = 40,
             quiet: Duration = .seconds(4),
             intentLifetime: Duration = .seconds(2),
-            mayLead: Bool = true
+            mayLead: Bool = true,
+            eventRetention: Int = 64,
+            eventRedundancy: Int = 8
         ) {
             self.tickRate = max(1, tickRate)
             self.groupLength = max(1, groupLength)
             self.quiet = quiet
             self.intentLifetime = intentLifetime
             self.mayLead = mayLead
+            self.eventRetention = max(1, eventRetention)
+            self.eventRedundancy = max(1, eventRedundancy)
         }
     }
 
@@ -166,6 +219,14 @@ public actor SpaceSession {
 
         /// The space is being simulated by somebody else now.
         case authorityChanged(ParticipantIdentity?)
+
+        /// Something happened, once, in the authority's order.
+        case event(SpaceEventRecord)
+
+        /// Events that can no longer be recovered: older than the authority's
+        /// ``Configuration/eventRetention`` by the time this device caught up.
+        /// The state already reflects them; only the moment is lost.
+        case eventsMissed(epoch: UInt32, sequences: ClosedRange<UInt64>)
     }
 
     public nonisolated let identity: ParticipantIdentity
@@ -186,6 +247,7 @@ public actor SpaceSession {
     private let connection: any TransportSession
     private let simulation: any SpaceSimulation
     private let clock: SpaceTimeReading
+    private let mediaClock: SpaceMediaClock?
     private let logger: MoqomLogger
     private var configuration: Configuration
 
@@ -200,6 +262,12 @@ public actor SpaceSession {
 
     private var encoder = SpaceEncoder()
     private var decoder = SpaceDecoder()
+
+    /// This device's numbering of events, while it leads.
+    private var log: SpaceEventLog
+
+    /// Every authority's events, once each and in order, whoever is leading.
+    private var sequencer: SpaceEventSequencer
 
     private var ticker: Task<Void, Never>?
     private var claimer: Task<Void, Never>?
@@ -228,7 +296,17 @@ public actor SpaceSession {
 
     private let eventStream: AsyncStream<Event>
     private let eventContinuation: AsyncStream<Event>.Continuation
+    private let stateStream: AsyncStream<SpaceSample>
+    private let stateContinuation: AsyncStream<SpaceSample>.Continuation
 
+    /// - Parameters:
+    ///   - mediaClock: The capture clock of the video this device publishes,
+    ///     read on every tick while it leads, so that a viewer can draw the
+    ///     board at the instant of the picture beside it. Leave `nil` for a
+    ///     device that is not on camera.
+    ///   - cursor: Where a previous session on this device had got to in the
+    ///     space's events, so a reconnect delivers what it missed rather than
+    ///     skipping it as history. See ``eventCursor``.
     public init(
         tenant: TenantID,
         room: RoomID,
@@ -237,7 +315,9 @@ public actor SpaceSession {
         simulation: any SpaceSimulation,
         configuration: Configuration = Configuration(),
         clock: @escaping SpaceTimeReading = { .fallback() },
-        logger: MoqomLogger = .silent
+        logger: MoqomLogger = .silent,
+        mediaClock: SpaceMediaClock? = nil,
+        resuming cursor: SpaceEventCursor? = nil
     ) throws(MoqomError) {
         do {
             roomNamespace = try MoqomNamespaces.room(tenant: tenant, room: room)
@@ -258,15 +338,36 @@ public actor SpaceSession {
         self.simulation = simulation
         self.configuration = configuration
         self.clock = clock
+        self.mediaClock = mediaClock
         self.logger = logger
+        log = SpaceEventLog(
+            retention: configuration.eventRetention,
+            redundancy: configuration.eventRedundancy
+        )
+        sequencer = SpaceEventSequencer(resuming: cursor)
         (eventStream, eventContinuation) = AsyncStream.makeStream(
             of: Event.self,
             bufferingPolicy: .unbounded
+        )
+        // Newest only: a renderer that stalls wants the latest states when it
+        // comes back, not a backlog it would interpolate through.
+        (stateStream, stateContinuation) = AsyncStream.makeStream(
+            of: SpaceSample.self,
+            bufferingPolicy: .bufferingNewest(64)
         )
     }
 
     /// Everything happening in the space. One consumer, as with `RoomSession`.
     public nonisolated var events: AsyncStream<Event> { eventStream }
+
+    /// Every state the space passes through, with the instants it describes,
+    /// for a ``SpacePlayout`` to draw from. One consumer.
+    public nonisolated var states: AsyncStream<SpaceSample> { stateStream }
+
+    /// Where this device has got to in the space's events.
+    ///
+    /// Pass it to the next session's initialiser after a reconnect.
+    public var eventCursor: SpaceEventCursor? { sequencer.cursor }
 
     /// Who is simulating, as far as this device knows.
     public var authority: ParticipantIdentity? { state.authority }
@@ -313,6 +414,7 @@ public actor SpaceSession {
         await ownAnnouncement?.withdraw()
         ownAnnouncement = nil
         eventContinuation.finish()
+        stateContinuation.finish()
     }
 
     // MARK: - Watching
@@ -366,7 +468,15 @@ public actor SpaceSession {
     }
 
     private func apply(_ update: SpaceUpdate) {
-        guard shouldApply(update) else { return }
+        guard shouldApply(update) else {
+            // Behind on state is not behind on events. A delta that lost the
+            // race to the one after it may still carry an event that one did
+            // not repeat, and the sequencer drops what it has already seen.
+            if role == .following, update.tick.epoch == tick.epoch, !update.isSnapshot {
+                sequence(update)
+            }
+            return
+        }
         tick = update.tick
 
         var next = state
@@ -383,6 +493,36 @@ public actor SpaceSession {
             eventContinuation.yield(.authorityChanged(state.authority))
         }
         eventContinuation.yield(.changed(state, delta, at: update.at))
+        stateContinuation.yield(
+            SpaceSample(tick: update.tick, state: state, at: update.at, media: update.media)
+        )
+        sequence(update)
+
+        if update.successor == identity, role == .following, isRunning, configuration.mayLead {
+            Task { try? await self.lead() }
+        }
+    }
+
+    /// Hand whatever events an update carried to the application, once each.
+    private func sequence(_ update: SpaceUpdate) {
+        let outputs = sequencer.receive(
+            epoch: update.tick.epoch,
+            events: update.events,
+            through: update.eventSequence,
+            isSnapshot: update.isSnapshot
+        )
+        deliver(outputs)
+    }
+
+    private func deliver(_ outputs: [SpaceEventSequencer.Output]) {
+        for output in outputs {
+            switch output {
+            case let .event(record):
+                eventContinuation.yield(.event(record))
+            case let .missed(epoch, sequences):
+                eventContinuation.yield(.eventsMissed(epoch: epoch, sequences: sequences))
+            }
+        }
     }
 
     /// Whether an arriving update is news, and whether this device should stand
@@ -416,6 +556,9 @@ public actor SpaceSession {
                 logger.info(.control, "space authority conceded", [
                     LogField("to", .participant(author)),
                 ])
+                // The winner numbered its events from 1 in this same epoch,
+                // and none of them are ones this device has delivered.
+                sequencer.restart(epoch: update.tick.epoch)
                 Task { await self.follow() }
                 return true
             }
@@ -457,6 +600,8 @@ public actor SpaceSession {
         writer = opened
         role = .leading
         tick = tick.succeeding
+        log.restart(epoch: tick.epoch)
+        sequencer.restart(epoch: tick.epoch)
         encoder.reset()
         group = 0
         object = 0
@@ -474,10 +619,25 @@ public actor SpaceSession {
 
         // Before the first tick, so a subscriber that arrives in the gap gets a
         // world rather than an empty group.
-        try await writeSnapshot(at: now)
+        try await writeSnapshot(at: now, media: await mediaClock?())
 
         for slot in rostered.values { listenForIntents(of: slot) }
         startTicking()
+    }
+
+    /// Give the space to `successor` and stop simulating.
+    ///
+    /// A last snapshot names them, and they take over at once rather than
+    /// after ``Configuration/quiet`` of silence — the difference between a host
+    /// leaving gracefully and a host lost in a tunnel. If the named device
+    /// never takes it, whoever claims first after the silence does.
+    public func handOver(to successor: ParticipantIdentity) async throws(MoqomError) {
+        guard role == .leading else { return }
+        try await writeSnapshot(at: await clock(), media: await mediaClock?(), successor: successor)
+        await follow()
+        // Long enough for the successor's first snapshot to arrive before this
+        // device would consider the space abandoned.
+        markHeard()
     }
 
     /// Stop simulating, without deciding who should instead.
@@ -515,17 +675,41 @@ public actor SpaceSession {
         let elapsed = lastTick.map { instant - $0 } ?? .seconds(1 / configuration.tickRate)
         lastTick = instant
 
+        let media = await mediaClock?()
+        let previous = state
         var next = state
+        var raised: [(SpaceGameEvent, ParticipantIdentity?)] = []
         let asked = pending
         pending.removeAll(keepingCapacity: true)
         for (intent, who) in asked {
-            simulation.apply(intent, from: who, to: &next, at: now)
+            if let edit = SpaceEdit(intent) {
+                guard simulation.permits(edit, from: who, in: next) else { continue }
+                edit.apply(to: &next, from: who, emitting: &raised)
+            } else if !SpaceEdit.isReserved(intent.verb) {
+                simulation.apply(intent, from: who, to: &next, at: now)
+            }
         }
         simulation.step(&next, at: now, since: elapsed)
         next.authority = identity
+        for event in simulation.events(between: previous, and: next, at: now) {
+            raised.append((event, nil))
+        }
 
         let delta = state.delta(to: next)
         state = next
+
+        var records: [SpaceEventRecord] = []
+        for (event, who) in raised {
+            records.append(log.append(event, from: who, at: now, media: media))
+        }
+        if !records.isEmpty {
+            deliver(sequencer.receive(
+                epoch: tick.epoch,
+                events: records,
+                through: log.sequence,
+                isSnapshot: false
+            ))
+        }
 
         do {
             // Counted in ticks rather than in published objects, which is what
@@ -538,13 +722,25 @@ public actor SpaceSession {
             // and a phone joining it waited that long to see anything at all.
             ticksThisGroup += 1
             if ticksThisGroup > configuration.groupLength {
-                try await writeSnapshot(at: now)
-            } else if !delta.isEmpty {
-                tick = tick.next
-                try await write(
-                    SpaceUpdate(tick: tick, at: now, body: .delta(delta)),
-                    on: writer
-                )
+                try await writeSnapshot(at: now, media: media)
+            } else {
+                // A quiet tick still goes out while an event is fresh, so the
+                // last event before a still spell does not rest on one delta.
+                let (events, mustSend) = log.forDelta(hasNew: !records.isEmpty)
+                if !delta.isEmpty || mustSend {
+                    tick = tick.next
+                    try await write(
+                        SpaceUpdate(
+                            tick: tick,
+                            at: now,
+                            body: .delta(delta),
+                            media: media,
+                            events: events,
+                            eventSequence: log.sequence
+                        ),
+                        on: writer
+                    )
+                }
             }
         } catch {
             logger.warning(.control, "space tick not published", [
@@ -554,21 +750,36 @@ public actor SpaceSession {
 
         if !delta.isEmpty {
             eventContinuation.yield(.changed(state, delta, at: now))
+            stateContinuation.yield(SpaceSample(tick: tick, state: state, at: now, media: media))
         }
     }
 
-    private func writeSnapshot(at now: Timecode) async throws(MoqomError) {
+    private func writeSnapshot(
+        at now: Timecode,
+        media: FrameTimestamp?,
+        successor: ParticipantIdentity? = nil
+    ) async throws(MoqomError) {
         guard let writer else { return }
         group += 1
         object = 0
         ticksThisGroup = 0
         tick = tick.next
+        log.groupStarted()
         try await writer.startGroup(group)
         try await write(
-            SpaceUpdate(tick: tick, at: now, body: .snapshot(state)),
+            SpaceUpdate(
+                tick: tick,
+                at: now,
+                body: .snapshot(state),
+                media: media,
+                events: log.retained,
+                eventSequence: log.sequence,
+                successor: successor
+            ),
             on: writer,
             isKeyFrame: true
         )
+        stateContinuation.yield(SpaceSample(tick: tick, state: state, at: now, media: media))
     }
 
     private func write(
@@ -643,15 +854,23 @@ public actor SpaceSession {
         at point: SpaceVector? = nil,
         facts: [String: SpaceValue] = [:]
     ) async {
+        await send(SpaceIntent(verb: verb, subject: subject, at: point, facts: facts))
+    }
+
+    /// Spawn, move, or despawn something, or send an event, without a
+    /// simulation of your own having to implement it.
+    ///
+    /// Travels and is applied like ``act(verb:subject:at:facts:)``, after the
+    /// authority's ``SpaceSimulation/permits(_:from:in:)`` agrees.
+    public func edit(_ edit: SpaceEdit) async {
+        await send(edit.intent())
+    }
+
+    private func send(_ unsent: SpaceIntent) async {
         sent += 1
-        let intent = SpaceIntent(
-            verb: verb,
-            subject: subject,
-            at: point,
-            facts: facts,
-            sequence: sent,
-            when: await clock()
-        )
+        var intent = unsent
+        intent.sequence = sent
+        intent.when = await clock()
 
         guard role == .following else {
             pending.append((intent, identity))
@@ -674,7 +893,7 @@ public actor SpaceSession {
             )
         } catch {
             logger.warning(.control, "space intent not sent", [
-                LogField("verb", .text(verb)),
+                LogField("verb", .text(intent.verb)),
                 LogField("reason", .text("\(error)")),
             ])
         }
@@ -711,6 +930,9 @@ public actor SpaceSession {
             listenForIntents(of: slot)
         case .withdrawn:
             rostered.removeValue(forKey: slot.identity)
+            // A participant who comes back is a new session numbering its
+            // intents from 1 again, and the old fence would drop every one.
+            applied.removeValue(forKey: slot.identity)
             intents.removeValue(forKey: slot.identity)?.cancel()
             spaces.removeValue(forKey: slot.identity)?.cancel()
         }

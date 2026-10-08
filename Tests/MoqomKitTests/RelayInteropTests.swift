@@ -23,7 +23,10 @@
 // Skipping rather than failing when it is absent is the right trade for a client
 // SDK whose CI has no Rust toolchain — but it does mean a green run here is not
 // evidence of interop unless that variable was set.
+//
+// macOS only: it launches the relay with `Process`, which iOS doesn't have.
 
+#if os(macOS)
 import Foundation
 import Synchronization
 import Testing
@@ -47,13 +50,13 @@ struct RelayInteropTests {
     /// The assertion that matters is the implementation string: it is a value
     /// only the Rust relay could have produced, so reading it back proves an
     /// exchange happened rather than that a local default was returned.
-    @Test("SETUP completes against the Rust relay")
-    func setup() async throws {
+    @Test("SETUP completes against the Rust relay", arguments: interopDrafts)
+    func setup(alpn: String) async throws {
         let relay = try RelayProcess.start()
-        let session = try await relay.connect(credentials: credentials("alice"))
+        let session = try await relay.connect(alpn: alpn, credentials: credentials("alice"))
 
         let negotiated = await session.negotiated
-        #expect(negotiated.alpn == "moqt-19")
+        #expect(negotiated.alpn == alpn)
 
         let peer = await session.peerSetupOptions
         let implementation = peer.string(SetupOption.implementation)
@@ -72,11 +75,11 @@ struct RelayInteropTests {
     /// rejoins them. That arithmetic is implemented twice, in two languages, and
     /// a disagreement produces a namespace that decodes cleanly and names the
     /// wrong participant — exactly the failure a loopback test cannot see.
-    @Test("an announcement crosses the relay to a watcher")
-    func announcementCrossesTheRelay() async throws {
+    @Test("an announcement crosses the relay to a watcher", arguments: interopDrafts)
+    func announcementCrossesTheRelay(alpn: String) async throws {
         let relay = try RelayProcess.start()
-        let publisher = try await relay.connect(credentials: credentials("alice"))
-        let watcher = try await relay.connect(credentials: credentials("bob"))
+        let publisher = try await relay.connect(alpn: alpn, credentials: credentials("alice"))
+        let watcher = try await relay.connect(alpn: alpn, credentials: credentials("bob"))
 
         let room = try MoqomNamespaces.room(tenant: "acme", room: "room-42")
         let events = try await watcher.announcements(matching: room)
@@ -101,12 +104,11 @@ struct RelayInteropTests {
         // describe; a loopback test asserts Swift against Swift and would pass
         // whatever the relay actually sent.
         await announcement.withdraw()
-        #expect(
-            await eventually(timeout: .seconds(10)) {
-                await seen.items.contains(.withdrawn(mine, .stopped))
-            },
-            "the relay did not report the withdrawal"
-        )
+        let withdrawn = await eventually(timeout: .seconds(10)) {
+            await seen.items.contains(.withdrawn(mine, .stopped))
+        }
+        let saw = await seen.items
+        #expect(withdrawn, "the relay did not report the withdrawal: \(saw)")
 
         reader.cancel()
         await publisher.close(code: 0, reason: "done")
@@ -119,11 +121,11 @@ struct RelayInteropTests {
     /// it is the pair that gives it meaning: the test above establishes that the
     /// relay can say `stopped`, and this one that it does not simply always say
     /// so. Nothing else about the two endings differs on the wire.
-    @Test("a publisher whose session dies is reported as vanished, not stopped")
-    func vanishingCrossesTheRelay() async throws {
+    @Test("a publisher whose session dies is reported as vanished, not stopped", arguments: interopDrafts)
+    func vanishingCrossesTheRelay(alpn: String) async throws {
         let relay = try RelayProcess.start()
-        let publisher = try await relay.connect(credentials: credentials("alice"))
-        let watcher = try await relay.connect(credentials: credentials("bob"))
+        let publisher = try await relay.connect(alpn: alpn, credentials: credentials("alice"))
+        let watcher = try await relay.connect(alpn: alpn, credentials: credentials("bob"))
 
         let room = try MoqomNamespaces.room(tenant: "acme", room: "room-42")
         let events = try await watcher.announcements(matching: room)
@@ -143,12 +145,11 @@ struct RelayInteropTests {
         // withdrawing it first is the whole scenario: the relay has to infer the
         // withdrawal from the transport, which is what a dead battery looks like.
         await publisher.close(code: 0, reason: "vanished")
-        #expect(
-            await eventually(timeout: .seconds(10)) {
-                await seen.items.contains(.withdrawn(mine, .vanished))
-            },
-            "the relay did not report the withdrawal as a vanish"
-        )
+        let withdrawn = await eventually(timeout: .seconds(10)) {
+            await seen.items.contains(.withdrawn(mine, .vanished))
+        }
+        let saw = await seen.items
+        #expect(withdrawn, "the relay did not report the withdrawal as a vanish: \(saw)")
 
         _ = announcement
         reader.cancel()
@@ -162,16 +163,33 @@ struct RelayInteropTests {
     /// two implementations disagree about where that field sits, the subscriber
     /// either drops the stream or attributes it to the wrong track, and neither
     /// shows up without a real relay in the middle.
-    @Test("objects survive a round trip through the relay")
-    func objectsSurviveTheRelay() async throws {
+    @Test("objects survive a round trip through the relay", arguments: interopDrafts)
+    func objectsSurviveTheRelay(alpn: String) async throws {
         let relay = try RelayProcess.start()
-        let publisher = try await relay.connect(credentials: credentials("alice"))
-        let subscriber = try await relay.connect(credentials: credentials("bob"))
+        let publisher = try await relay.connect(alpn: alpn, credentials: credentials("alice"))
+        let subscriber = try await relay.connect(alpn: alpn, credentials: credentials("bob"))
+
+        // The subscriber hears of the announcement from the relay before asking
+        // for the track. They are two connections, so nothing orders the
+        // relay's handling of one against the other, and a relay accepting a
+        // namespace sends nothing back to wait on: under load the SUBSCRIBE
+        // can be read first and refused as DOES_NOT_EXIST.
+        let room = try MoqomNamespaces.room(tenant: "acme", room: "room-42")
+        let events = try await subscriber.announcements(matching: room)
+        let seen = Collector<AnnouncementEvent>()
+        let watcher = Task { for await event in events { await seen.append(event) } }
 
         let mine = try namespace("alice")
         let announcement = try await publisher.announce(mine)
         let video = try FullTrackName(namespace: mine, name: try TrackName("video/720p"))
         let writer = try await publisher.publish(video, priority: 128)
+        #expect(
+            await eventually(timeout: .seconds(10)) {
+                await seen.items.contains(.announced(mine))
+            },
+            "the relay did not report the announcement"
+        )
+        watcher.cancel()
 
         let subscription = try await subscriber.subscribe(
             SubscribeRequest(track: video, priority: 128)
@@ -248,6 +266,10 @@ struct RelayInteropTests {
     }
 }
 
+/// Every draft the relay serves, each offered on its own so the relay can't
+/// quietly pick the other.
+let interopDrafts = ["moqt-22", "moqt-19"]
+
 /// A `moqom-relay` process on a loopback port, and the pin needed to reach it.
 ///
 /// The relay prints two lines on stdout before its first accept — the
@@ -282,12 +304,15 @@ final class RelayProcess {
     }
 
     /// Start a relay and wait until it is listening.
-    static func start() throws -> RelayProcess {
+    ///
+    /// - Parameter settings: more of the relay's environment, such as the keys
+    ///   that make it verify tokens and issue direct tickets.
+    static func start(_ settings: [String: String] = [:]) throws -> RelayProcess {
         guard let binary = relayBinary else { throw InteropUnavailable() }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: binary)
-        var environment = ProcessInfo.processInfo.environment
+        var environment = ProcessInfo.processInfo.environment.merging(settings) { $1 }
         // Port zero because tests run in parallel and each starts its own relay,
         // and the wildcard address because `localhost` resolves to `::1` before
         // `127.0.0.1` on macOS — a relay bound only to the IPv4 loopback never
@@ -351,14 +376,27 @@ final class RelayProcess {
     }
 
     /// Open a MOQT session to this relay over the system QUIC stack.
-    func connect(credentials: DeviceCredentials) async throws -> MoqtSession {
+    func connect(alpn: String, credentials: DeviceCredentials) async throws -> MoqtSession {
         let carrier = try await NetworkQUICCarrier.connect(
             host: host,
             port: port,
-            alpn: ["moqt-19"],
+            alpn: [alpn],
             trust: trust
         )
         return try await MoqtSession.connect(over: carrier, credentials: credentials)
+    }
+
+    /// Where a ``MoqomSession`` reaches this relay.
+    var endpoint: RelayEndpoint { RelayEndpoint(host: host, port: port) }
+
+    /// A transport for a ``MoqomSession``, over the system QUIC stack.
+    var transport: MoqtTransport {
+        let trust = trust
+        return MoqtTransport { endpoint, _ in
+            try await NetworkQUICCarrier.connect(
+                host: endpoint.host, port: endpoint.port, alpn: endpoint.alpn, trust: trust
+            )
+        }
     }
 
     /// Read the relay's two startup lines, or give up.
@@ -479,3 +517,4 @@ private extension String {
         hasPrefix(prefix) ? String(dropFirst(prefix.count)) : nil
     }
 }
+#endif

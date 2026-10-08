@@ -480,9 +480,12 @@ public struct PublishDone: ControlMessage {
             + WireSize.lengthPrefixed(reason)
     }
 
+    /// "Not counted" is the encoding's largest value: `2^62 - 1` under QUIC
+    /// varints and `2^64 - 1` under draft-22's, which is why the sentinel comes
+    /// from the writer rather than a constant.
     public func write(to writer: inout WireWriter) {
         writer.varInt(status)
-        writer.varInt(streamCount ?? varIntMaximum)
+        writer.varInt(streamCount ?? writer.encoding.maximum)
         writer.lengthPrefixed(reason)
     }
 
@@ -491,7 +494,7 @@ public struct PublishDone: ControlMessage {
         let count = try reader.varInt()
         return PublishDone(
             status: status,
-            streamCount: count == varIntMaximum ? nil : count,
+            streamCount: count == reader.encoding.maximum ? nil : count,
             reason: try reader.lengthPrefixedString()
         )
     }
@@ -596,20 +599,40 @@ public struct RequestError: ControlMessage {
     public struct Redirect: Hashable, Sendable {
         /// Empty means stay on the current session.
         public var connectURI: String
-        public var track: FullTrackName
+        /// The Redirect target's namespace, which may have no fields.
+        public var namespace: TrackNamespace
+        /// The Redirect target's track name, which may be empty: it MUST be
+        /// for a namespace-scoped request (draft-22 §9.4.1), and ``TrackName``
+        /// can't hold an empty name, so this is the raw value.
+        public var name: String
 
         public init(connectURI: String, track: FullTrackName) {
+            self.init(connectURI: connectURI, namespace: track.namespace, name: track.name.value)
+        }
+
+        public init(connectURI: String, namespace: TrackNamespace, name: String) {
             self.connectURI = connectURI
-            self.track = track
+            self.namespace = namespace
+            self.name = name
+        }
+
+        /// The target as a track, `nil` when the name is empty.
+        ///
+        /// Since draft-22 (moq-wg #1824) the target is always literal: an empty
+        /// namespace and name are not "the original request's track".
+        public var track: FullTrackName? {
+            guard let name = try? TrackName(name) else { return nil }
+            return try? FullTrackName(namespace: namespace, name: name)
         }
 
         var encodedLength: Int {
-            WireSize.lengthPrefixed(connectURI) + track.encodedLength
+            WireSize.lengthPrefixed(connectURI) + namespace.encodedLength + WireSize.lengthPrefixed(name)
         }
 
         func write(to writer: inout WireWriter) {
             writer.lengthPrefixed(connectURI)
-            track.write(to: &writer)
+            namespace.write(to: &writer)
+            writer.lengthPrefixed(name)
         }
     }
 
@@ -654,9 +677,15 @@ public struct RequestError: ControlMessage {
         var redirect: Redirect?
         if code == RequestErrorCode.redirect {
             let uri = try reader.lengthPrefixed()
+            let namespace = try TrackNamespace.read(from: &reader)
+            let name = try reader.lengthPrefixedString()
+            guard namespace.byteCount + name.utf8.count <= maximumNameLength else {
+                throw WireError.invalid("redirect target exceeds \(maximumNameLength) bytes")
+            }
             redirect = Redirect(
                 connectURI: String(data: uri, encoding: .utf8) ?? "",
-                track: try FullTrackName.read(from: &reader)
+                namespace: namespace,
+                name: name
             )
         }
         return RequestError(
@@ -739,7 +768,7 @@ public struct Goaway: ControlMessage {
     }
 }
 
-private extension String {
+extension String {
     /// Truncate to a UTF-8 byte budget without splitting a scalar.
     func truncatedUTF8(to limit: Int) -> String {
         guard utf8.count > limit else { return self }

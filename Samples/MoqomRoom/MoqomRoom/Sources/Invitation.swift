@@ -68,6 +68,14 @@ struct Invitation {
     /// Whether this link enrols the device rather than handing it one credential.
     var enrols: Bool { relay.tokenService?.credential.isEmpty == false }
 
+    /// Whether it enrols with a token service it does not pin.
+    ///
+    /// Refused outright rather than offered. Enrolling sends the long-lived
+    /// credential on every join, and under ordinary certificate validation
+    /// anybody who can get a certificate for that name -- a hijacked registry
+    /// is enough -- is handed it.
+    var enrolsUnpinned: Bool { enrols && relay.tokenService?.certificateHashes.isEmpty == true }
+
     /// Whether taking this is pointless because the credential has already died.
     ///
     /// Worth saying before rather than after. A QR code photographed twenty

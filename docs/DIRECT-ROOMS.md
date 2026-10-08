@@ -1,0 +1,12 @@
+# Direct paths by default in calls and small rooms
+
+- `DirectPolicy` (`.automatic`, `.relayOnly`, `.custom(DirectRoomOptions)`) is set on `MoqomSession` and may be overridden per `join`. `.automatic` is the default.
+- `.automatic` turns on the existing `RoomDirectPaths` machinery for every room, with `DirectRoomOptions` built from the session: the IP-exposure acknowledgement is implied by the policy (documented), peer tokens are checked against `DeviceCredentials.authorityKeys`, and offers are sealed under the room's MLS exporter. No authority keys means there is nothing to verify a peer against, so the room stays on the relay.
+- `.relayOnly` never publishes a direct opt-in, so peers count this device as not opted in and every path in the room stays on the relay. This device's addresses are never offered.
+- Eligibility is unchanged (`DirectEligibility`): end-to-end encrypted, no watchdog, no audience, 2 to N participants, everyone opted in. N is the smaller of `DirectEligibility.maximumParticipants` (4) and the room's own limit.
+- The room's limit comes from the control plane: `RoomPolicy.direct` (`DirectPaths` allowed / relay only, `max_direct_participants`). It is returned with every token (`MintClientTokenResponse.direct`, `/join` `direct`) and carried to the relay in `RoomSnapshot`. A room that disallows direct paths makes MoqomKit skip the opt-in, which is enough: one participant not opting in keeps the whole room on the relay.
+- Any one device refusing is sufficient, so the policy is enforced by every honest client; a modified client can only go direct with peers that opted in, and those peers check its token and proof as a relay would.
+- Backstage: a device publishing backstage offers on its backstage namespace and pairs only with other backstage publishers; a stage device pairs only with stage publishers. Neither side is ever counted as audience for publishing in the other slot.
+- Fallback is the existing one: relay subscriptions stay open (paused with `FORWARD=0`), `DualSubscription` resumes on loss or 500 ms of direct silence, and a failed attempt retries with backoff.
+- Rust (`moqom-client`): the room type is not wired to direct paths; parity covers the policy type and room limit so both SDKs refuse the same rooms.
+- Not in scope: a MOQOM-hosted STUN service. Without `stun`, only local addresses are offered, so automatic direct paths open on the same network and fall back to the relay elsewhere.

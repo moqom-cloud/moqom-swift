@@ -21,6 +21,12 @@ public enum PublishSizing: Sendable {
     /// step is a reshape, and a reshape is a keyframe.
     public static let steps = [180, 360, 540, 720, 1080]
 
+    /// ``steps`` extended to 4K, for a publisher whose ladder has a 2160p rung.
+    ///
+    /// Opt-in rather than the default: without 1440 between them, a box just past 1080 would
+    /// jump to 2160 — four times the pixels — and a full-screen iPad tile is such a box.
+    public static let uhdSteps = steps + [1440, 2160]
+
     /// How much smaller than its box a picture may be published, against the box's short side.
     ///
     /// An eighth. The far end upscales by 1.14× to fill the box, which on a phone is not a thing

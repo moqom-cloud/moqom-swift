@@ -50,12 +50,40 @@ func framesEncodedOnceSettled(_ broadcast: Broadcast) async -> Int {
     return last
 }
 
-func credentials(_ name: String, device: String = "iphone-0001") -> DeviceCredentials {
-    DeviceCredentials(
+/// Credentials for a loopback session.
+///
+/// The token is shaped like a compact JWS, as a minted one is. In the clear
+/// by default (``EncryptionPolicy/plaintextForTesting``, which no token or
+/// application can ask for), because most suites here are about something
+/// other than encryption and inspect media bytes on the loopback relay; the
+/// suites that are about encryption pass `.required` or `nil` and say so.
+func credentials(
+    _ name: String,
+    device: String = "iphone-0001",
+    e2ee: EncryptionPolicy? = .plaintextForTesting
+) -> DeviceCredentials {
+    var credentials = DeviceCredentials(
         identity: identity(name, device: device),
-        token: Data("token-\(name)".utf8),
+        token: testToken(subject: name, e2ee: e2ee == nil ? nil : .required),
         deviceKey: nil
     )
+    credentials.plaintextForTesting = e2ee == .plaintextForTesting
+    credentials.authorityKeys = [testAuthority.verificationKey]
+    return credentials
+}
+
+/// The room authority every test room trusts, from a fixed seed.
+let testAuthority = try! RoomLogSigner(seed: Data(repeating: 0xA7, count: 32))
+
+/// An unsigned token carrying the claims the SDK reads. The loopback relay
+/// verifies nothing, so the signature segment is a placeholder.
+func testToken(subject: String, e2ee: EncryptionPolicy?, publish: Bool? = nil) -> Data {
+    var claims = #"{"sub":"\#(subject)""#
+    if let e2ee { claims += #","e2ee":"\#(e2ee.rawValue)""# }
+    if let publish { claims += #","moqt":{"room":"room-42","pub":\#(publish ? 1 : 0)}"# }
+    claims += "}"
+    let header = Data(#"{"alg":"EdDSA","typ":"MOQT"}"#.utf8).base64URLEncodedString
+    return Data((header + "." + Data(claims.utf8).base64URLEncodedString + ".sig").utf8)
 }
 
 @Suite("Loopback transport")

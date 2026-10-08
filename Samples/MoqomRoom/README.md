@@ -359,6 +359,15 @@ Both are idempotent, and the second prints the same block the readout shows,
 per phone, at the end of the run. The app itself already points at that relay;
 `--relay-host` is only needed when a script wants a different one.
 
+### Encryption
+
+Rooms require end-to-end encryption by default, and the SDK will not publish
+without a key. The app derives one from a passphrase and the room name
+(`RoomKey.swift`) and calls `useEncryption` right after joining. The default
+passphrase is in the source and therefore public: it makes the relay carry
+ciphertext, and it keeps nobody who has read this repository out. Give every
+phone in a call the same `--room-key <passphrase>` for a key that is not.
+
 ### The credential
 
 A deployed relay holds the control plane's verification keys, which means it

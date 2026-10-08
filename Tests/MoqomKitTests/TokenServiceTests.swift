@@ -73,6 +73,40 @@ struct TokenServiceTests {
             username: "u", room: "r", device: key, session: session
         )
         #expect(issued.expiresAt.timeIntervalSince1970 == 1_785_953_700)
+        #expect(issued.direct == .default)
+    }
+
+    @Test("the room's direct policy comes back with the token")
+    func directPolicy() async throws {
+        let (service, session) = self.service(.ok("""
+        {"token":"a.b.c","expiresAt":"2026-08-05T18:15:00Z","room":"r","username":"u",
+         "direct":{"allowed":true,"maxParticipants":2}}
+        """))
+        let issued = try await service.token(username: "u", room: "r", device: key, session: session)
+        #expect(issued.direct == DirectRoomPolicy(allowed: true, maximumParticipants: 2))
+
+        let (refusing, again) = self.service(.ok("""
+        {"token":"a.b.c","expiresAt":"2026-08-05T18:15:00Z","direct":{"allowed":false}}
+        """))
+        let relayOnly = try await refusing.token(username: "u", room: "r", device: key, session: again)
+        #expect(!relayOnly.direct.allowed)
+        #expect(DirectRoomPolicy(allowed: true, maximumParticipants: 40).maximumParticipants == 4)
+        #expect(issued.direct.stun == nil)
+    }
+
+    @Test("the relays' STUN server comes back with the token")
+    func stunServer() async throws {
+        let (service, session) = self.service(.ok("""
+        {"token":"a.b.c","expiresAt":"2026-08-05T18:15:00Z","room":"r","username":"u",
+         "direct":{"allowed":true,"maxParticipants":4,"stun":{"host":"relay.moqom.cloud","port":3478}}}
+        """))
+        let issued = try await service.token(username: "u", room: "r", device: key, session: session)
+        #expect(issued.direct.stun == DirectSTUNServer(host: "relay.moqom.cloud", port: 3478))
+
+        // Nothing a device could dial is no server at all.
+        for stun in [#"{"host":"","port":3478}"#, #"{"host":"r","port":0}"#, #"{"host":"r","port":70000}"#, #"{"host":"r"}"#] {
+            #expect(DirectRoomPolicy(json: try JSONSerialization.jsonObject(with: Data(#"{"stun":\#(stun)}"#.utf8))).stun == nil)
+        }
     }
 
     @Test("what the device asks for is what it sends")
@@ -99,10 +133,7 @@ struct TokenServiceTests {
         // get a token bound to a claim rather than to a key — and this assertion
         // is the one that notices if that regresses.
         let sentKey = try #require(decoded["key"] as? [String: String])
-        #expect(sentKey["kty"] == "EC")
-        #expect(sentKey["crv"] == "P-256")
-        #expect(sentKey["x"] == key.x)
-        #expect(sentKey["y"] == key.y)
+        #expect(sentKey == ["kty": "AKP", "alg": "ML-DSA-65", "pub": try #require(key.jwk.pub)])
 
         // Truncated the way a namespace field is, since that is what the device
         // announces under and what the endpoint checks the key against.

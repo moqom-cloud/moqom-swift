@@ -598,6 +598,10 @@ struct LaunchOptions {
     /// costs should not be paying that on top of the call.
     var quietLogs = false
 
+    /// The passphrase this run derives its room's media key from, in place of the
+    /// sample's public default. Phones in one room need the same one. See RoomKey.
+    var roomKey: String?
+
     static func current(
         arguments: [String] = ProcessInfo.processInfo.arguments
     ) -> LaunchOptions {
@@ -635,6 +639,7 @@ struct LaunchOptions {
             case "--pop-every": options.popEverySeconds = value.flatMap(Double.init)
             case "--reshape-every": options.reshapeEverySeconds = value.flatMap(Double.init)
             case "--quiet-logs": options.quietLogs = true
+            case "--room-key": options.roomKey = value
             default: break
             }
             index += 1

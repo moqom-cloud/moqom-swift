@@ -28,18 +28,28 @@
 // can tell whether it actually is. A silent fallback would be the same code with
 // none of the guarantee and no way to notice.
 //
-// # ES256, which is not the fastest thing available
+// # ML-DSA-65, and ES256 for the keys that already exist
 //
-// P-256 with SHA-256, because the enclave does P-256 and nothing else.
-// `CryptoKit` offers Ed25519, it verifies about twice as quickly, and it holds
-// its private key in ordinary memory — where it can be dumped alongside the
-// token by precisely the attacker this exists to stop. A faster check of a
-// weaker claim is not a saving. The relay pins the same choice for the same
-// reason.
+// ML-DSA-65, because the enclave holds it from the 26 releases and a device key
+// outlives every token bound to it: a key made today is one a quantum attacker
+// would be forging proofs for years from now. P-256 is what the enclave held
+// before, so a device that already made one keeps it — its thumbprint is its
+// identity — and the relay accepts ES256 until those keys are gone. A new key is
+// never P-256.
+//
+// `CryptoKit` offers Ed25519, it verifies quickly, and it holds its private key
+// in ordinary memory — where it can be dumped alongside the token by precisely
+// the attacker this exists to stop. A faster check of a weaker claim is not a
+// saving. The relay pins the same choice for the same reason.
+//
+// The proof format and its check are `MoqomProof`'s, shared with the relay and
+// the control plane, so this file decides where the key lives and nothing about
+// what a proof looks like.
 
 import CryptoKit
 import Foundation
 import MoqomCore
+import MoqomProof
 import Security
 
 /// Why a device key could not be produced or used.
@@ -53,11 +63,12 @@ public enum DeviceKeyError: Error, Sendable {
     /// Something was stored under this label, but it is not a key.
     case corrupt
 
-    /// The key exists and refused to sign.
+    /// The key exists and refused to sign, or the certificate it was asked to
+    /// bind a proof to is not a base64url digest.
     case notSigned
 }
 
-/// The non-exportable P-256 key this installation is identified by.
+/// The non-exportable key this installation is identified by.
 ///
 /// One per install. It outlives every token, because a token is bound to it: the
 /// control plane puts this key's thumbprint in `cnf.jkt` and the relay refuses a
@@ -85,23 +96,9 @@ public struct DeviceKey: Sendable {
         }
     }
 
-    /// The two key types have no common protocol worth naming — one signs in
-    /// hardware and one in software, and that is the entire difference — so this
-    /// is an enum rather than an existential.
-    private enum Held: Sendable {
-        case enclave(SecureEnclave.P256.Signing.PrivateKey)
-        case software(P256.Signing.PrivateKey)
-    }
-
-    private let held: Held
+    private let prover: Prover
 
     public let storage: Storage
-
-    /// The `x` coordinate, base64url, as a JWK carries it.
-    public let x: String
-
-    /// The `y` coordinate, base64url.
-    public let y: String
 
     /// The RFC 7638 thumbprint of the public half, base64url, untruncated.
     ///
@@ -111,19 +108,26 @@ public struct DeviceKey: Sendable {
     /// against cannot drift apart.
     public let thumbprint: String
 
-    private init(held: Held, storage: Storage, publicKey: P256.Signing.PublicKey) {
-        self.held = held
+    private init(_ key: Prover.Key, storage: Storage) {
+        prover = Prover(key)
         self.storage = storage
-
-        // `rawRepresentation` is the two coordinates and nothing else, in the
-        // order and the fixed width the curve defines, which is what a JWK
-        // wants. The x9.63 form would need its leading 0x04 stripped and gives
-        // no benefit here.
-        let raw = publicKey.rawRepresentation
-        x = raw.prefix(32).base64URLEncodedString
-        y = raw.suffix(32).base64URLEncodedString
-        thumbprint = Self.thumbprint(x: x, y: y)
+        thumbprint = prover.thumbprint
     }
+
+    /// What this key signs with: ML-DSA-65, or ES256 for a key made before it.
+    public var algorithm: ProofAlgorithm { prover.algorithm }
+
+    /// The public key as a JWK: `AKP` for ML-DSA-65, `EC` for P-256.
+    ///
+    /// What the control plane is given at join so it can derive `cnf.jkt`
+    /// itself. It derives rather than accepts: a thumbprint supplied by the
+    /// client is a claim about which key it holds, and the whole point is not to
+    /// take that on trust.
+    public var jwk: ProofJWK { prover.jwk }
+
+    /// ``jwk`` in RFC 7638 canonical form: the exact bytes the thumbprint is
+    /// the hash of.
+    public var publicKeyJWK: String { (try? prover.jwk.canonical()) ?? "" }
 
     // MARK: - Installing
 
@@ -134,7 +138,8 @@ public struct DeviceKey: Sendable {
     ///
     /// Idempotent, and it has to be: the thumbprint is the device's identity, so
     /// a call that generated a fresh key whenever it was convenient would give
-    /// the device a new name and orphan every token issued to the old one.
+    /// the device a new name and orphan every token issued to the old one. That
+    /// is also why a stored P-256 key is returned rather than replaced.
     ///
     /// - Throws: ``DeviceKeyError`` when no key can be created or read back. Not
     ///   recoverable by retrying — a device that cannot hold a key cannot prove
@@ -149,54 +154,55 @@ public struct DeviceKey: Sendable {
     /// For tests and for a caller that wants possession within one session
     /// without leaving anything behind. Always software: the enclave's value is
     /// in surviving, and a key that is discarded has nothing to survive.
-    public static func ephemeral() -> DeviceKey {
-        let key = P256.Signing.PrivateKey()
-        return DeviceKey(held: .software(key), storage: .software, publicKey: key.publicKey)
+    public static func ephemeral(_ algorithm: ProofAlgorithm = .mlDSA65) -> DeviceKey {
+        switch algorithm {
+        case .mlDSA65:
+            // Software ML-DSA key generation fails only if the system CSPRNG
+            // does, and nothing can run without that.
+            DeviceKey(.mlDSA65(try! MLDSA65.PrivateKey()), storage: .software)
+        case .es256:
+            DeviceKey(.es256(P256.Signing.PrivateKey()), storage: .software)
+        }
     }
 
-    /// A key from material the caller already holds.
+    /// A key from material the caller already holds: a 32-byte ML-DSA-65 seed,
+    /// or a P-256 scalar for ES256.
     ///
-    /// Deliberately not public. Anything that can supply a P-256 scalar has
+    /// Deliberately not public. Anything that can supply key material has
     /// already given up the property the enclave exists to provide, so the only
     /// legitimate caller is the interop fixture — which has to name the same
     /// device on every regeneration, or its diff would be noise instead of a
     /// signal that an encoding changed.
     ///
-    /// - Throws: ``DeviceKeyError/corrupt`` if the material is not a valid
-    ///   P-256 private key.
-    static func material(_ raw: Data) throws(DeviceKeyError) -> DeviceKey {
-        guard let key = try? P256.Signing.PrivateKey(rawRepresentation: raw) else {
-            throw DeviceKeyError.corrupt
+    /// - Throws: ``DeviceKeyError/corrupt`` if the material is not a valid key.
+    static func material(_ raw: Data, algorithm: ProofAlgorithm = .mlDSA65) throws(DeviceKeyError) -> DeviceKey {
+        switch algorithm {
+        case .mlDSA65:
+            guard let key = try? MLDSA65.PrivateKey(seedRepresentation: raw, publicKey: nil) else {
+                throw .corrupt
+            }
+            return DeviceKey(.mlDSA65(key), storage: .software)
+        case .es256:
+            guard let key = try? P256.Signing.PrivateKey(rawRepresentation: raw) else {
+                throw .corrupt
+            }
+            return DeviceKey(.es256(key), storage: .software)
         }
-        return DeviceKey(held: .software(key), storage: .software, publicKey: key.publicKey)
     }
 
     private static func create(label: String) throws(DeviceKeyError) -> DeviceKey {
-        // Tried first and unconditionally, rather than behind
-        // `SecureEnclave.isAvailable`. The property answers for the hardware and
-        // not for this process's entitlements, so a build that cannot use the
-        // enclave for some other reason would still be told it can; letting the
-        // generation attempt be the test means the fallback is chosen by what
-        // actually failed.
+        // `SecureEnclave.isAvailable` answers for the hardware and not for this
+        // process's entitlements, so the generation attempt is the real test and
+        // the fallback is chosen by what actually failed.
         if SecureEnclave.isAvailable,
-           let enclave = try? SecureEnclave.P256.Signing.PrivateKey(
-               accessControl: accessControl()
-           ) {
-            try store(enclave.dataRepresentation, label: label, storage: .secureEnclave)
-            return DeviceKey(
-                held: .enclave(enclave),
-                storage: .secureEnclave,
-                publicKey: enclave.publicKey
-            )
+           let enclave = try? SecureEnclave.MLDSA65.PrivateKey(accessControl: accessControl()) {
+            try store(enclave.dataRepresentation, label: label, tag: .secureEnclaveMLDSA65)
+            return DeviceKey(.secureEnclaveMLDSA65(enclave), storage: .secureEnclave)
         }
 
-        let software = P256.Signing.PrivateKey()
-        try store(software.rawRepresentation, label: label, storage: .software)
-        return DeviceKey(
-            held: .software(software),
-            storage: .software,
-            publicKey: software.publicKey
-        )
+        guard let software = try? MLDSA65.PrivateKey() else { throw .notCreated }
+        try store(software.seedRepresentation, label: label, tag: .softwareMLDSA65)
+        return DeviceKey(.mlDSA65(software), storage: .software)
     }
 
     /// The access policy for both kinds of stored key.
@@ -228,17 +234,15 @@ public struct DeviceKey: Sendable {
     /// The stored form: one byte saying which kind, then the material.
     ///
     /// Tagged rather than inferred from length, because an enclave blob and a
-    /// raw P-256 scalar are both just bytes and guessing wrong means handing the
+    /// raw key are both just bytes and guessing wrong means handing the
     /// enclave's ciphertext to the software initialiser and calling the result
-    /// corrupt. The tag also means a device whose enclave key was written by an
-    /// older build is read back as an enclave key.
+    /// corrupt. The tag also means a key written by an older build is read back
+    /// as what it is: 1 and 2 are P-256 keys from before ML-DSA-65.
     private enum Tag: UInt8 {
-        case secureEnclave = 1
-        case software = 2
-
-        init(_ storage: Storage) {
-            self = storage == .secureEnclave ? .secureEnclave : .software
-        }
+        case secureEnclaveES256 = 1
+        case softwareES256 = 2
+        case secureEnclaveMLDSA65 = 3
+        case softwareMLDSA65 = 4
     }
 
     private static func query(label: String) -> [String: Any] {
@@ -252,10 +256,10 @@ public struct DeviceKey: Sendable {
     private static func store(
         _ material: Data,
         label: String,
-        storage: Storage
+        tag: Tag
     ) throws(DeviceKeyError) {
         var item = query(label: label)
-        item[kSecValueData as String] = Data([Tag(storage).rawValue]) + material
+        item[kSecValueData as String] = Data([tag.rawValue]) + material
         item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
 
         SecItemDelete(query(label: label) as CFDictionary)
@@ -275,33 +279,26 @@ public struct DeviceKey: Sendable {
             throw DeviceKeyError.keychain(status)
         }
 
-        let material = stored.dropFirst()
+        let material = Data(stored.dropFirst())
+        let key: DeviceKey?
         switch Tag(rawValue: first) {
-        case .secureEnclave:
-            guard let enclave = try? SecureEnclave.P256.Signing.PrivateKey(
-                dataRepresentation: Data(material)
-            ) else {
-                throw DeviceKeyError.corrupt
-            }
-            return DeviceKey(
-                held: .enclave(enclave),
-                storage: .secureEnclave,
-                publicKey: enclave.publicKey
-            )
-        case .software:
-            guard let software = try? P256.Signing.PrivateKey(
-                rawRepresentation: Data(material)
-            ) else {
-                throw DeviceKeyError.corrupt
-            }
-            return DeviceKey(
-                held: .software(software),
-                storage: .software,
-                publicKey: software.publicKey
-            )
+        case .secureEnclaveMLDSA65:
+            key = (try? SecureEnclave.MLDSA65.PrivateKey(dataRepresentation: material))
+                .map { DeviceKey(.secureEnclaveMLDSA65($0), storage: .secureEnclave) }
+        case .softwareMLDSA65:
+            key = (try? MLDSA65.PrivateKey(seedRepresentation: material, publicKey: nil))
+                .map { DeviceKey(.mlDSA65($0), storage: .software) }
+        case .secureEnclaveES256:
+            key = (try? SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: material))
+                .map { DeviceKey(.secureEnclaveES256($0), storage: .secureEnclave) }
+        case .softwareES256:
+            key = (try? P256.Signing.PrivateKey(rawRepresentation: material))
+                .map { DeviceKey(.es256($0), storage: .software) }
         case nil:
-            throw DeviceKeyError.corrupt
+            key = nil
         }
+        guard let key else { throw DeviceKeyError.corrupt }
+        return key
     }
 
     /// Forget the stored key.
@@ -313,49 +310,15 @@ public struct DeviceKey: Sendable {
         SecItemDelete(query(label: label) as CFDictionary)
     }
 
-    // MARK: - The public half
-
-    /// The public key as a JWK, in RFC 7638 canonical form.
-    ///
-    /// What the control plane is given at join so it can derive `cnf.jkt`
-    /// itself. It derives rather than accepts: a thumbprint supplied by the
-    /// client is a claim about which key it holds, and the whole point is not to
-    /// take that on trust.
-    ///
-    /// Assembled by hand rather than encoded, because canonical means exactly
-    /// four members, ordered lexicographically, with no whitespace — and a
-    /// `JSONEncoder` promises none of that. The values interpolated are
-    /// base64url, whose alphabet contains nothing JSON escapes.
-    public var publicKeyJWK: String {
-        #"{"crv":"P-256","kty":"EC","x":"\#(x)","y":"\#(y)"}"#
-    }
-
-    /// The RFC 7638 thumbprint of an EC public key.
-    ///
-    /// Over the canonical form above, which is the specification's whole
-    /// content: same key, same bytes, same hash, in any implementation. The
-    /// relay computes this independently in Rust and the Go control plane in Go;
-    /// `Tests/MoqomKitTests/DeviceKeyTests.swift` pins the RFC's worked example
-    /// so that the three cannot drift.
-    static func thumbprint(x: String, y: String) -> String {
-        let canonical = #"{"crv":"P-256","kty":"EC","x":"\#(x)","y":"\#(y)"}"#
-        return Data(SHA256.hash(data: Data(canonical.utf8))).base64URLEncodedString
-    }
-
     // MARK: - Proving
-
-    /// The proof type, so a JWS minted for anything else — including a token
-    /// from this same deployment — cannot be presented as one.
-    private static let proofType = "MOQT-POP"
 
     /// A proof that this key holds `token`, for the relay identified by `relay`.
     ///
-    /// A compact JWS over two claims and no timestamps. The freshness argument
-    /// is the relay's to make and is written out in `possession.rs`: the proof
-    /// commits to one token by hash, the token expires in minutes, and the
-    /// proof's own identifier is accepted exactly once. So there is no clock
-    /// here to disagree with anybody about, and no round trip spent fetching a
-    /// nonce before a client that speaks first can speak.
+    /// A `MoqomProof` proof: a compact JWS committing to the token by hash, to
+    /// the relay's certificate, to a fresh single-use identifier and to the time
+    /// it was made. The freshness argument is the relay's to make and is written
+    /// out in `possession.rs`; there is no round trip spent fetching a nonce
+    /// before a client that speaks first can speak.
     ///
     /// - Parameter relay: base64url SHA-256 of the relay's leaf certificate.
     ///   Empty where the carrier could not see one, which a relay that knows its
@@ -363,44 +326,16 @@ public struct DeviceKey: Sendable {
     ///   binding would be replayable by any relay it was presented to, and the
     ///   attack the binding answers is a compromised relay in a fleet of them.
     ///
-    /// - Throws: ``DeviceKeyError/notSigned`` if the key refuses. Signing is a
-    ///   call into the enclave and can fail for reasons outside this process.
-    public func proof(over token: Data, for relay: String) throws(DeviceKeyError) -> Data {
-        let header = #"{"alg":"ES256","typ":"\#(Self.proofType)","jwk":\#(publicKeyJWK)}"#
-        let claims = #"{"ath":"\#(Self.digest(of: token))","jti":"\#(Self.identifier())","rel":"\#(relay)"}"#
-        let signed = "\(Data(header.utf8).base64URLEncodedString)."
-            + Data(claims.utf8).base64URLEncodedString
-
-        guard let signature = try? signature(over: Data(signed.utf8)) else {
-            throw DeviceKeyError.notSigned
+    /// - Throws: ``DeviceKeyError/notSigned`` if the key refuses, which an
+    ///   enclave can for reasons outside this process, or if `relay` is not
+    ///   base64url.
+    public func proof(over token: Data, for relay: String, at now: Date = Date()) throws(DeviceKeyError) -> Data {
+        guard let certificate = Data(base64URLEncoded: relay) else { throw .notSigned }
+        do {
+            return try prover.prove(token: token, certificateHash: certificate, nonce: Prover.nonce(), issuedAt: now)
+        } catch {
+            throw .notSigned
         }
-        return Data("\(signed).\(signature.base64URLEncodedString)".utf8)
-    }
-
-    /// ES256 over `message`: SHA-256, then P-256, as the fixed `r || s` pair.
-    ///
-    /// `rawRepresentation` rather than `derRepresentation`, which is the
-    /// difference between what the relay's verifier accepts and a signature it
-    /// reads as malformed. `ECDSA_P256_SHA256_FIXED` there means fixed-width;
-    /// DER would be the `_ASN1` variant.
-    private func signature(over message: Data) throws -> Data {
-        switch held {
-        case let .enclave(key): try key.signature(for: message).rawRepresentation
-        case let .software(key): try key.signature(for: message).rawRepresentation
-        }
-    }
-
-    private static func digest(of token: Data) -> String {
-        Data(SHA256.hash(data: token)).base64URLEncodedString
-    }
-
-    /// A proof's single-use identifier.
-    ///
-    /// 128 bits from the system's CSPRNG, which is what makes the relay's replay
-    /// set correct: two honest clients must never pick the same one, or the
-    /// second is refused as a replay of the first.
-    private static func identifier() -> String {
-        SymmetricKey(size: .bits128).withUnsafeBytes { Data($0) }.base64URLEncodedString
     }
 }
 

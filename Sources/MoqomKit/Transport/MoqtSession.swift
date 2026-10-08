@@ -49,6 +49,12 @@ public struct MoqtTransport: Transport {
             throw MoqomError.transport(.unreachable)
         }
 
+        // Draft-16 is a different session rather than a dialect of this one:
+        // its requests share the control stream instead of owning streams.
+        if MoqtDraft(alpn: carrier.alpn) == .draft16 {
+            return try await Draft16Session.connect(over: carrier, endpoint: endpoint)
+        }
+
         let session = MoqtSession(carrier: carrier, role: .client)
         try await session.performSetup(credentials: credentials)
         await session.startReading()
@@ -77,6 +83,14 @@ public enum SessionRole: Sendable {
 public actor MoqtSession: TransportSession {
     private let carrier: any QUICCarrier
     private let role: SessionRole
+
+    /// The draft's bytes, from the negotiated ALPN: draft-19 or draft-22.
+    /// Finished by the peer's SETUP, which says whether MOQOM's private
+    /// parameters may travel; nothing copies it before then.
+    private(set) var dialect: SessionDialect
+
+    /// The draft this session speaks.
+    public nonisolated let draft: MoqtDraft
 
     private var parameters: NegotiatedParameters
     private var nextRequestID: UInt64
@@ -122,6 +136,8 @@ public actor MoqtSession: TransportSession {
     init(carrier: any QUICCarrier, role: SessionRole) {
         self.carrier = carrier
         self.role = role
+        dialect = SessionDialect(alpn: carrier.alpn)
+        draft = dialect.draft
         nextRequestID = role.firstRequestID
         parameters = NegotiatedParameters(
             alpn: carrier.alpn,
@@ -175,15 +191,11 @@ public actor MoqtSession: TransportSession {
     /// the session. Nothing else may be sent until the peer's SETUP arrives,
     /// which is why this is not folded into the read loop.
     func performSetup(credentials: DeviceCredentials) async throws(MoqomError) {
-        let control = try await carrier.openBidirectionalStream()
-        controlStream = control
-
         // Kept for the life of the session, because a renewal has to prove
         // itself too: a proof commits to one token by hash, so the fresh token
         // needs a fresh proof and there is nowhere else to find the key.
         deviceKey = credentials.deviceKey
 
-        var options = Parameters()
         // The token goes in a session option because it authorises the
         // connection, and the proof goes beside it because it proves the token
         // is this device's. Both are per-session for the same reason: a session
@@ -195,47 +207,59 @@ public actor MoqtSession: TransportSession {
         // is a malformed one: a relay that verifies reads an option that cannot
         // parse and ends the session, where a client that claimed nothing would
         // have been let in and limited by address.
-        if !credentials.token.isEmpty,
-           let token = try? Parameter.bytes(SetupOption.authorizationToken, credentials.token) {
-            options.insert(token)
-            if let proof = prove(credentials.token),
-               let parameter = try? Parameter.bytes(SetupOption.authorizationProof, proof) {
-                options.insert(parameter)
+        let token = credentials.token.isEmpty ? nil : credentials.token
+        let setup = OutgoingMessage.setup(token: token, proof: token.flatMap(prove))
+
+        if draft.controlStreamsAreUnidirectional {
+            // Draft-22 §3.3: each end opens its own control stream, so the
+            // peer's SETUP arrives among the unidirectional streams and is
+            // picked out there by its stream type.
+            let control = try await carrier.openUnidirectionalStream()
+            controlSend = control
+            try await send(setup, on: control)
+            startReading()
+            do {
+                try await waitForSetup()
+            } catch let error as MoqomError {
+                throw error
+            } catch {
+                throw MoqomError.transport(.unreachable)
             }
-        }
-        if let implementation = try? Parameter.string(
-            SetupOption.implementation,
-            "moqom-swift/\(moqomKitVersion)"
-        ) {
-            options.insert(implementation)
+            return
         }
 
-        try await send(Setup(options: options), on: control)
+        let control = try await carrier.openBidirectionalStream()
+        controlSend = control
+        controlReceive = control
+        try await send(setup, on: control)
 
-        var framer = StreamFramer()
+        var framer = dialect.framer()
         while true {
             guard let chunk = try await control.read() else {
                 throw MoqomError.transport(.closedByPeer(code: 0, reason: "closed during setup"))
             }
             framer.append(chunk)
-            guard let frame = try framer.next() else { continue }
-            guard frame.type == .setup else {
-                throw MoqomError.protocolViolation("expected SETUP, got \(frame.type)")
-            }
-            var reader = WireReader(frame.body)
-            let peer: Setup
+            guard let frame = try framer.nextRaw() else { continue }
+            let message: PeerMessage
             do {
-                peer = try Setup.read(from: &reader)
+                message = try dialect.decode(frame)
             } catch {
                 throw MoqomError.protocolViolation("malformed SETUP")
             }
-            peerOptions = peer.options
+            guard case let .setup(options) = message else {
+                throw MoqomError.protocolViolation("expected SETUP, got 0x\(String(frame.code, radix: 16))")
+            }
+            peerOptions = options
             setupFramer = framer
             return
         }
     }
 
-    private var controlStream: (any QUICStream)?
+    /// Where this end's control messages go: the bidirectional control stream
+    /// in draft-19, this end's own unidirectional one in draft-22.
+    private var controlSend: (any QUICSendStream)?
+    /// Where the peer's arrive, which in draft-22 is a different stream.
+    private var controlReceive: (any QUICReceiveStream)?
     private var setupFramer = StreamFramer()
     private var peerOptions = Parameters()
 
@@ -271,7 +295,12 @@ public actor MoqtSession: TransportSession {
     // MARK: - Reading
 
     func startReading() {
-        readers.append(Task { [weak self] in await self?.readControlStream() })
+        // Twice for a draft-22 dialler, which has to be reading before its
+        // setup can finish and is then started again by its caller.
+        guard readers.isEmpty else { return }
+        if !draft.controlStreamsAreUnidirectional {
+            readers.append(Task { [weak self] in await self?.readControlStream() })
+        }
         readers.append(Task { [weak self] in await self?.readIncomingStreams() })
         readers.append(Task { [weak self] in await self?.readDatagrams() })
         readers.append(Task { [weak self] in await self?.watchCarrier() })
@@ -286,14 +315,15 @@ public actor MoqtSession: TransportSession {
     }
 
     private func readControlStream() async {
-        guard let control = controlStream else { return }
+        guard let control = controlReceive else { return }
         var framer = setupFramer
         while !isClosed {
             do {
                 guard let chunk = try await control.read() else { break }
                 framer.append(chunk)
-                while let frame = try framer.next() {
-                    handleControl(frame)
+                while let frame = try framer.nextRaw() {
+                    guard let message = await interpret(frame) else { continue }
+                    handleControl(message)
                 }
             } catch {
                 break
@@ -308,20 +338,115 @@ public actor MoqtSession: TransportSession {
         reportInterruption(.closed)
     }
 
-    private func handleControl(_ frame: (type: MessageType, body: Data)) {
+    /// Read the peer's draft-22 control stream, whose first message is its
+    /// SETUP.
+    private func readPeerControl(_ stream: any QUICReceiveStream, first chunk: Data) async {
+        // Draft-22 §3.3: one control stream per endpoint, for the life of the
+        // session.
+        guard controlReceive == nil else {
+            await violation("second control stream")
+            return
+        }
+        controlReceive = stream
+        var framer = dialect.framer()
+        framer.append(chunk)
+        var hasSetup = false
+
+        reading: while !isClosed {
+            do {
+                while let frame = try framer.nextRaw() {
+                    guard let message = await interpret(frame) else { break reading }
+                    if hasSetup {
+                        handleControl(message)
+                        continue
+                    }
+                    guard case let .setup(options) = message else {
+                        finishSetup(.failure(MoqomError.protocolViolation("expected SETUP")))
+                        await violation("control stream did not begin with SETUP")
+                        return
+                    }
+                    hasSetup = true
+                    guard await setupArrived(options) else { return }
+                }
+                guard let next = try await stream.read() else { break }
+                framer.append(next)
+            } catch {
+                await violation("\(error)")
+                break
+            }
+        }
+        if !hasSetup { finishSetup(.failure(MoqomError.transport(.closed))) }
+        reportInterruption(.closed)
+    }
+
+    /// The peer's draft-22 SETUP, which an accepting end answers on a control
+    /// stream of its own. `false` if the session ended here.
+    private func setupArrived(_ options: Parameters) async -> Bool {
+        peerOptions = options
+        // This end always declares it in draft-22, so the peer's word decides.
+        dialect.moqomParameters = options.integer(SetupOption.moqomParameters) == 1
+        guard role == .server else {
+            finishSetup(.success(()))
+            return true
+        }
+
+        var token: Data?
+        if let answer = setupAnswer {
+            if let refusal = await answer.admit(options) {
+                await carrier.close(code: 0x03, reason: refusal)
+                finishSetup(.failure(MoqomError.rejected(.unauthorized)))
+                return false
+            }
+            deviceKey = answer.credentials.deviceKey
+            token = answer.credentials.token
+        }
+        do {
+            let control = try await carrier.openUnidirectionalStream()
+            controlSend = control
+            try await send(.setup(token: token, proof: token.flatMap(prove)), on: control)
+        } catch {
+            finishSetup(.failure(error))
+            return false
+        }
+        finishSetup(.success(()))
+        return true
+    }
+
+    private func handleControl(_ message: PeerMessage) {
         // GOAWAY is the only message that appears on the control stream after
         // setup, and it cancels nothing: subscriptions stay live and the client
         // is expected to wind them down itself. Treating it as a teardown would
         // discard state the peer still expects to exist.
-        guard frame.type == .goaway else { return }
-        var reader = WireReader(frame.body)
-        guard let goaway = try? Goaway.read(from: &reader) else { return }
+        guard case let .goaway(uri, timeout) = message else { return }
         goawayContinuation?.yield(
             GoawayNotice(
-                newSessionURI: goaway.newSessionURI.isEmpty ? nil : goaway.newSessionURI,
-                timeout: .milliseconds(Int(goaway.timeoutMilliseconds))
+                newSessionURI: uri.isEmpty ? nil : uri,
+                timeout: .milliseconds(Int(timeout))
             )
         )
+    }
+
+    /// Decode a control message, or deal with one that will not decode.
+    ///
+    /// `nil` means drop it — and, in draft-22, that the session is over:
+    /// §9 makes a malformed message, an unknown type and an unknown Message
+    /// Parameter all a PROTOCOL_VIOLATION. Draft-19 callers have always
+    /// skipped what they could not read, and still do.
+    func interpret(_ frame: RawFrame) async -> PeerMessage? {
+        do {
+            return try dialect.decode(frame)
+        } catch {
+            await violation("control message 0x\(String(frame.code, radix: 16)): \(error)")
+            return nil
+        }
+    }
+
+    /// End a draft-22 session over a PROTOCOL_VIOLATION (0x3). A no-op in
+    /// draft-19, whose readers drop what they cannot parse.
+    func violation(_ detail: String) async {
+        guard dialect.isStrict, !isClosed else { return }
+        reportInterruption(.closedByPeer(code: 0x3, reason: "protocol violation: \(detail)"))
+        await close(code: 0x3, reason: detail)
     }
 
     private var goawayContinuation: AsyncStream<GoawayNotice>.Continuation?
@@ -340,18 +465,21 @@ public actor MoqtSession: TransportSession {
                 for await stream in carrier.incomingUnidirectionalStreams {
                     Task { await self.readDataStream(stream) }
                 }
+                // Draft-22's SETUP comes this way, and it is not coming now.
+                await self.finishSetup(.failure(MoqomError.transport(.closed)))
             }
             group.addTask { [weak self] in
                 guard let self else { return }
                 let role = self.role
+                let bidirectionalControl = !self.draft.controlStreamsAreUnidirectional
                 var isFirst = true
                 for await stream in carrier.incomingBidirectionalStreams {
-                    // The first bidirectional stream of a session is the
-                    // control stream by definition, and on the accepting side
-                    // it arrives here rather than being opened. Dispatching it
-                    // as an ordinary request would leave SETUP unanswered and
-                    // the dialling peer waiting forever.
-                    if isFirst, role == .server {
+                    // The first bidirectional stream of a draft-19 session is
+                    // the control stream by definition, and on the accepting
+                    // side it arrives here rather than being opened.
+                    // Dispatching it as an ordinary request would leave SETUP
+                    // unanswered and the dialling peer waiting forever.
+                    if isFirst, role == .server, bidirectionalControl {
                         isFirst = false
                         Task { await self.acceptSetup(on: stream) }
                         continue
@@ -359,13 +487,20 @@ public actor MoqtSession: TransportSession {
                     isFirst = false
                     Task { await self.readPeerRequest(stream) }
                 }
+                // The connection ended before the peer opened a control
+                // stream, so its SETUP is never coming and `accept` must not
+                // wait for it.
+                if isFirst, role == .server, bidirectionalControl {
+                    await self.finishSetup(.failure(MoqomError.transport(.closed)))
+                }
             }
         }
     }
 
     /// Answer a peer's SETUP on the control stream it opened.
     private func acceptSetup(on stream: any QUICStream) async {
-        controlStream = stream
+        controlSend = stream
+        controlReceive = stream
         var framer = StreamFramer()
 
         while true {
@@ -383,6 +518,23 @@ public actor MoqtSession: TransportSession {
             peerOptions = (try? Setup.read(from: &reader))?.options ?? Parameters()
 
             var options = Parameters()
+            if let answer = setupAnswer {
+                // Refused before anything is sent back, so a peer that fails
+                // the check learns nothing about this end but the reason.
+                if let refusal = await answer.admit(peerOptions) {
+                    await carrier.close(code: 0x03, reason: refusal)
+                    finishSetup(.failure(MoqomError.rejected(.unauthorized)))
+                    return
+                }
+                deviceKey = answer.credentials.deviceKey
+                if let token = try? Parameter.bytes(SetupOption.authorizationToken, answer.credentials.token) {
+                    options.insert(token)
+                }
+                if let proof = prove(answer.credentials.token),
+                   let parameter = try? Parameter.bytes(SetupOption.authorizationProof, proof) {
+                    options.insert(parameter)
+                }
+            }
             if let implementation = try? Parameter.string(
                 SetupOption.implementation,
                 "moqom-swift/\(moqomKitVersion)"
@@ -402,6 +554,24 @@ public actor MoqtSession: TransportSession {
             return
         }
         finishSetup(.failure(MoqomError.transport(.closed)))
+    }
+
+    /// How an accepting session answers a peer that has to present itself.
+    ///
+    /// A relay's in-process stand-in answers anyone; a direct path is the one
+    /// place a client accepts a session from another client, and there each end
+    /// checks the other's credentials and sends its own.
+    struct SetupAnswer: Sendable {
+        /// What this end presents, its proof bound to the dialler's certificate.
+        let credentials: DeviceCredentials
+        /// The reason to refuse the peer's SETUP options, or `nil` to admit.
+        let admit: @Sendable (Parameters) async -> String?
+    }
+
+    private var setupAnswer: SetupAnswer?
+
+    private func setSetupAnswer(_ answer: SetupAnswer?) {
+        setupAnswer = answer
     }
 
     private var setupResult: Result<Void, any Error>?
@@ -425,7 +595,7 @@ public actor MoqtSession: TransportSession {
 
     private func readDatagrams() async {
         for await payload in carrier.datagrams {
-            var reader = WireReader(payload)
+            var reader = dialect.reader(payload)
             guard let datagram = try? ObjectDatagram.read(from: &reader) else { continue }
             guard case let .payload(bytes, _) = datagram.content else { continue }
             deliver(
@@ -452,16 +622,19 @@ public actor MoqtSession: TransportSession {
     private func readDataStream(_ stream: any QUICReceiveStream) async {
         var buffer = Data()
         while true {
-            if let kind = StreamType.peek(buffer) {
+            if let kind = StreamType.peek(buffer, draft: draft) {
                 switch kind {
                 case .fetch: await readFetchStream(stream, first: buffer)
                 case .subgroup: await readSubgroup(stream, first: buffer)
+                case .control: await readPeerControl(stream, first: buffer)
+                case .padding: await stream.stopReceiving(code: 0)
                 }
                 return
             }
-            // A varint is never longer than 8 bytes, so more than that without a
-            // recognised type is a stream we will never understand.
-            guard buffer.count < 8 else { return }
+            // A varint is never longer than 9 bytes (8 in QUIC's encoding), so
+            // more than that without a recognised type is a stream we will
+            // never understand.
+            guard buffer.count < 9 else { return }
             let chunk: Data?
             do { chunk = try await stream.read() } catch { return }
             guard let chunk else { return }
@@ -482,16 +655,30 @@ public actor MoqtSession: TransportSession {
 
         while true {
             while true {
-                var reader = WireReader(buffer)
+                var reader = dialect.reader(buffer)
                 if header == nil {
-                    guard let parsed = try? SubgroupHeader.read(from: &reader) else { break }
+                    let parsed: SubgroupHeader
+                    do {
+                        parsed = try SubgroupHeader.read(from: &reader, draft: draft)
+                    } catch {
+                        if case .short = error { break }
+                        await violation("subgroup header: \(error)")
+                        return
+                    }
                     header = parsed
                     subgroupReader = SubgroupReader(header: parsed)
                     buffer = reader.rest
                     continue
                 }
                 guard var active = subgroupReader, let header else { break }
-                guard let object = try? active.read(from: &reader) else { break }
+                let object: SubgroupObject
+                do {
+                    object = try active.read(from: &reader)
+                } catch {
+                    if case .short = error { break }
+                    await violation("subgroup object: \(error)")
+                    return
+                }
                 subgroupReader = active
                 buffer = reader.rest
 
@@ -551,39 +738,58 @@ public actor MoqtSession: TransportSession {
     /// SUBSCRIBE, we answer SUBSCRIBE_OK with an alias, and from then on our
     /// writer has somewhere to send.
     private func readPeerRequest(_ stream: any QUICStream) async {
-        var framer = StreamFramer()
+        var framer = dialect.framer()
         var subscribedTrack: FullTrackName?
+        var subscription: UInt64?
 
-        while true {
+        reading: while true {
             let chunk: Data?
             do { chunk = try await stream.read() } catch { break }
             guard let chunk else { break }
             framer.append(chunk)
 
-            while let frame = try? framer.next() {
-                switch frame.type {
-                case .subscribe:
-                    var reader = WireReader(frame.body)
-                    guard let request = try? Subscribe.read(from: &reader) else { break }
-                    subscribedTrack = request.track
-                    await answerSubscribe(request, on: stream)
-                case .fetch:
-                    var reader = WireReader(frame.body)
-                    guard let request = try? Fetch.read(from: &reader) else { break }
-                    await answerFetch(request, on: stream)
-                case .subscribeNamespace:
-                    var reader = WireReader(frame.body)
-                    guard let request = try? SubscribeNamespace.read(from: &reader) else { break }
-                    await acceptNamespaceWatch(request, on: stream)
-                case .publish:
-                    var reader = WireReader(frame.body)
-                    guard let offer = try? Publish.read(from: &reader) else { break }
-                    accept(offer)
+            while true {
+                let frame: RawFrame
+                do {
+                    guard let next = try framer.nextRaw() else { break }
+                    frame = next
+                } catch {
+                    await violation("\(error)")
+                    break reading
+                }
+                guard let message = await interpret(frame) else {
+                    if dialect.isStrict { break reading }
+                    continue
+                }
+                switch message {
+                case let .subscribe(requestID, track, fill):
+                    subscribedTrack = track
+                    subscription = requestID
+                    await answerSubscribe(requestID: requestID, track: track, on: stream)
+                    if let fill {
+                        await serveFill(fill, joining: requestID, as: requestID)
+                    }
+                case let .requestUpdate(requestID, fill):
+                    guard dialect.isStrict else { break }
+                    // Draft-22 §9.10: every update is answered. Accepted
+                    // whatever it changed, because what it can change here —
+                    // priority, forwarding — this end does not act on.
+                    try? await send(.requestOk, on: stream)
+                    if let fill, let subscription {
+                        await serveFill(fill, joining: subscription, as: requestID)
+                    }
+                case let .fetch(requestID, kind, order):
+                    await answerFetch(requestID: requestID, kind: kind, order: order, on: stream)
+                case let .subscribeNamespace(prefix):
+                    await acceptNamespaceWatch(prefix: prefix, on: stream)
+                case let .publish(track, alias):
+                    accept(track: track, alias: alias)
+                    if dialect.isStrict { try? await send(.requestOk, on: stream) }
                 case .publishNamespace:
                     // Nothing for a client to do with a peer's announcement
                     // beyond acknowledging it: the roster is built from the
                     // prefix subscription, not from these.
-                    try? await send(RequestOk(), on: stream)
+                    try? await send(.requestOk, on: stream)
                 default:
                     break
                 }
@@ -602,23 +808,23 @@ public actor MoqtSession: TransportSession {
     /// as it has written the offer, so a PUBLISH_OK would arrive at a stream
     /// that is already gone. Refusing an offer is resetting it, which a client
     /// that has stopped reading gets for free.
-    private func accept(_ offer: Publish) {
-        if let existing = offered[offer.track] {
+    private func accept(track: FullTrackName, alias: UInt64) {
+        if let existing = offered[track] {
             // Rebind the name onto the new alias, keeping the stream the
             // consumer is already reading. Deliberately not `unregister`: that
             // finishes the continuation, and this is the same track arriving
             // again rather than a track going away.
             inboundTracks.removeValue(forKey: existing.alias)
             pendingAliases.removeValue(forKey: existing.alias)
-            offered[offer.track] = Offer(alias: offer.trackAlias, continuation: existing.continuation)
-            register(existing.continuation, for: offer.trackAlias)
+            offered[track] = Offer(alias: alias, continuation: existing.continuation)
+            register(existing.continuation, for: alias)
             return
         }
 
         let (stream, continuation) = AsyncStream.makeStream(of: TrackObject.self)
-        offered[offer.track] = Offer(alias: offer.trackAlias, continuation: continuation)
-        register(continuation, for: offer.trackAlias)
-        offerContinuation.yield(TrackOffer(track: offer.track, objects: stream))
+        offered[track] = Offer(alias: alias, continuation: continuation)
+        register(continuation, for: alias)
+        offerContinuation.yield(TrackOffer(track: track, objects: stream))
     }
 
     private struct Offer {
@@ -626,21 +832,17 @@ public actor MoqtSession: TransportSession {
         let continuation: AsyncStream<TrackObject>.Continuation
     }
 
-    private func answerSubscribe(_ request: Subscribe, on stream: any QUICStream) async {
-        guard let track = outboundTracks[request.track] else {
-            try? await send(
-                RequestError(
-                    code: RequestErrorCode.doesNotExist,
-                    reason: "no such track"
-                ),
-                on: stream
-            )
+    private func answerSubscribe(requestID: UInt64, track name: FullTrackName, on stream: any QUICStream) async {
+        guard let track = outboundTracks[name] else {
+            try? await send(.requestError(code: RequestErrorCode.doesNotExist, reason: "no such track"), on: stream)
             await stream.finish()
             return
         }
 
         let alias = allocateTrackAlias()
-        try? await send(SubscribeOk(trackAlias: alias), on: stream)
+        // LARGEST_OBJECT is only written by draft-22, which has a place for
+        // it in SUBSCRIBE_OK; it is what a subscriber sizes a fill against.
+        try? await send(.subscribeOk(alias: alias, largest: await track.latestLocation), on: stream)
         await track.addSubscriber(alias: alias, stream: stream, carrier: carrier)
 
         // Kept so a joining fetch can be resolved. A joining fetch names a
@@ -648,7 +850,38 @@ public actor MoqtSession: TransportSession {
         // namespace — so without this the only answerable fetch is a standalone
         // one, and catch-up silently does nothing over a real session while
         // appearing to work over the loopback.
-        inboundSubscriptions[request.requestID] = request.track
+        inboundSubscriptions[requestID] = name
+    }
+
+    /// Serve a draft-22 fill: the joining fetch's range, on a fetch stream
+    /// whose header names the request that asked for it.
+    ///
+    /// There is no response message (§3.4): the stream is the answer, a FIN
+    /// says it is complete, and a reset straight after the header says it
+    /// failed.
+    private func serveFill(_ filter: LocationFilter, joining subscription: UInt64, as requestID: UInt64) async {
+        let kind: Fetch.Kind? = switch filter {
+        // StartGroup 1 is the current group, which is draft-19's zero back.
+        case let .relativeStart(groups) where groups > 0:
+            .relativeJoining(request: subscription, groups: groups - 1)
+        case let .absoluteStart(start):
+            .absoluteJoining(request: subscription, group: start.group)
+        default:
+            nil
+        }
+
+        let header = FetchHeader(requestID: requestID)
+        guard let kind, case let .success(resolved) = await resolve(kind) else {
+            guard let data = try? await carrier.openUnidirectionalStream() else { return }
+            var writer = dialect.writer()
+            header.write(to: &writer)
+            try? await data.write(writer.bytes)
+            await data.reset(code: 0)
+            return
+        }
+        let order = GroupOrder.ascending
+        let held = await resolved.published.objects(from: resolved.start, through: resolved.end, order: order)
+        await stream(held, as: header, order: order)
     }
 
     /// Tracks the peer has subscribed to, by the request ID that asked.
@@ -697,10 +930,7 @@ public actor MoqtSession: TransportSession {
     }
 
     public func renewCredential(_ token: Data) async throws(MoqomError) {
-        guard let parameter = try? Parameter.bytes(
-            RequestParameter.authorizationToken,
-            token
-        ) else {
+        guard (try? Parameter.bytes(RequestParameter.authorizationToken, token)) != nil else {
             throw MoqomError.invalidState(
                 expected: "a token within the parameter's size",
                 actual: "\(token.count) bytes"
@@ -711,11 +941,12 @@ public actor MoqtSession: TransportSession {
         // to the token it accompanied and has already been spent, so reusing it
         // would be refused as a replay — and a renewal that could carry no proof
         // would be a way to trade a proven credential for an unproven one.
-        var parameters = Parameters([parameter])
-        if let proof = prove(token),
-           let signed = try? Parameter.bytes(RequestParameter.authorizationProof, proof) {
-            parameters.insert(signed)
-        }
+        //
+        // Draft-22 carries it only to a peer that declared MOQOM_PARAMETERS:
+        // the proof is a private Message Parameter, and §9.20 closes the
+        // session over one the receiver does not define. To any other
+        // draft-22 peer the renewal is the token alone.
+        let change = RequestChange.token(token, proof: prove(token))
 
         // Any one of them will do — the relay reads the token off whichever
         // stream it arrives on and applies it to the session — so the first that
@@ -723,11 +954,11 @@ public actor MoqtSession: TransportSession {
         // request has ended without this having heard yet, so it is dropped and
         // the next is tried rather than the renewal being abandoned.
         for (request, stream) in renewable {
+            // Draft-22's REQUEST_UPDATE has an ID of its own (§9.10); the
+            // stream says which request it updates.
+            let id = dialect.isStrict ? allocateRequestID() : request
             do {
-                try await send(
-                    RequestUpdate(requestID: request, parameters: parameters),
-                    on: stream
-                )
+                try await send(.update(requestID: id, change), on: stream)
                 return
             } catch {
                 forget(request)
@@ -745,22 +976,22 @@ public actor MoqtSession: TransportSession {
     ) async throws(MoqomError) -> any AnnouncementHandle {
         let stream = try await carrier.openBidirectionalStream()
         let request = allocateRequestID()
-        let message = PublishNamespace(requestID: request, namespace: namespace)
-        try await send(message, on: stream)
+        try await send(.publishNamespace(requestID: request, namespace: namespace), on: stream)
         announced.insert(namespace)
         remember(stream, as: request)
 
         for watcher in namespaceWatchers where namespace.starts(with: watcher.prefix) {
             guard let suffix = Self.split(namespace, under: watcher.prefix) else { continue }
-            try? await send(NamespaceAnnounced(suffix: suffix), on: watcher.stream)
+            try? await send(.namespace(suffix: suffix), on: watcher.stream)
         }
 
+        let dialect = dialect
         return MoqtAnnouncement(
             namespace: namespace,
             stream: stream,
             session: self,
             request: request,
-            verdict: Task { await Self.verdict(on: stream, announcing: namespace) }
+            verdict: Task { await Self.verdict(on: stream, announcing: namespace, in: dialect) }
         )
     }
 
@@ -775,13 +1006,17 @@ public actor MoqtSession: TransportSession {
     /// produced a publisher that encoded happily into a name the relay had
     /// dropped.
     ///
-    /// A peer that is another `MoqtSession` acknowledges with `REQUEST_OK`
-    /// instead of staying quiet, so both shapes are understood rather than one.
+    /// A draft-22 relay, or a peer that is another `MoqtSession`, acknowledges
+    /// with `REQUEST_OK` instead of staying quiet. That is not the last word:
+    /// a relay whose grants change under a live announcement ends it with a
+    /// `REQUEST_ERROR` on the same stream, so the acknowledgement is passed
+    /// over and the stream read on.
     private static func verdict(
         on stream: any QUICStream,
-        announcing namespace: TrackNamespace
+        announcing namespace: TrackNamespace,
+        in dialect: SessionDialect
     ) async -> MoqomError? {
-        var framer = StreamFramer()
+        var framer = dialect.framer()
         while true {
             let chunk: Data?
             do { chunk = try await stream.read() } catch { return nil }
@@ -791,11 +1026,13 @@ public actor MoqtSession: TransportSession {
             guard let chunk else { return nil }
             framer.append(chunk)
 
-            while let frame = try? framer.next() {
-                guard frame.type == .requestError else { return nil }
-                var body = WireReader(frame.body)
-                let error = (try? RequestError.read(from: &body))
-                    ?? RequestError(code: RequestErrorCode.internalError)
+            while let frame = try? framer.nextRaw() {
+                if frame.code == MessageType.requestOk.rawValue { continue }
+                guard frame.code == MessageType.requestError.rawValue else { return nil }
+                let error: RequestError = switch try? dialect.decode(frame) {
+                case let .requestError(error)?: error
+                default: RequestError(code: RequestErrorCode.internalError)
+                }
                 return Self.refusal(for: error, announcing: namespace)
             }
         }
@@ -809,17 +1046,27 @@ public actor MoqtSession: TransportSession {
     /// makes it actionable, since the usual cause is a tenant or a room that
     /// disagrees with the one the token was minted for, and naming it is the
     /// difference between a fix and a bisect.
-    private static func refusal(
+    static func refusal(
         for error: RequestError,
         announcing namespace: TrackNamespace
     ) -> MoqomError {
         switch error.code {
+        case RequestErrorCode.unauthorized where error.reason.hasPrefix(Self.grantsChanged):
+            .rejected(.revoked(namespace))
         case RequestErrorCode.unauthorized:
             .rejected(.forbidden(namespace))
         default:
             rejection(for: error)
         }
     }
+
+    /// How a relay begins the reason for ending a request because the session's
+    /// grants changed, rather than because they never covered it.
+    ///
+    /// Read from the phrase because the code is the same either way — it is the
+    /// answer the request would get if it were made now — and the phrase is
+    /// the part the relay keeps stable for exactly this.
+    static let grantsChanged = "grants changed"
 
     func withdraw(_ namespace: TrackNamespace, announcedAs request: UInt64) async {
         forget(request)
@@ -831,33 +1078,30 @@ public actor MoqtSession: TransportSession {
             // called ``AnnouncementHandle/withdraw()``. A session that merely
             // ends never runs this: the streams close and the peer reports its
             // own `vanished` instead.
-            try? await send(NamespaceDone(suffix: suffix, reason: .stopped), on: watcher.stream)
+            try? await send(.namespaceDone(suffix: suffix, reason: .stopped), on: watcher.stream)
         }
     }
 
-    private func acceptNamespaceWatch(
-        _ request: SubscribeNamespace,
-        on stream: any QUICStream
-    ) async {
+    private func acceptNamespaceWatch(prefix: TrackNamespace, on stream: any QUICStream) async {
         // Overlapping prefixes on one session are refused rather than merged:
         // an announcement carries only its suffix, so two overlapping watches
         // would produce suffixes with no way to say which watch they answer.
         let overlaps = namespaceWatchers.contains {
-            $0.prefix.starts(with: request.prefix) || request.prefix.starts(with: $0.prefix)
+            $0.prefix.starts(with: prefix) || prefix.starts(with: $0.prefix)
         }
         guard !overlaps else {
-            try? await send(
-                RequestError(code: RequestErrorCode.prefixOverlap, reason: "prefix overlap"),
-                on: stream
-            )
+            try? await send(.requestError(code: RequestErrorCode.prefixOverlap, reason: "prefix overlap"), on: stream)
             await stream.finish()
             return
         }
 
-        namespaceWatchers.append((request.prefix, stream))
-        for namespace in announced where namespace.starts(with: request.prefix) {
-            guard let suffix = Self.split(namespace, under: request.prefix) else { continue }
-            try? await send(NamespaceAnnounced(suffix: suffix), on: stream)
+        // Draft-22 answers every request; draft-19's watch is accepted by
+        // silence.
+        if dialect.isStrict { try? await send(.requestOk, on: stream) }
+        namespaceWatchers.append((prefix, stream))
+        for namespace in announced where namespace.starts(with: prefix) {
+            guard let suffix = Self.split(namespace, under: prefix) else { continue }
+            try? await send(.namespace(suffix: suffix), on: stream)
         }
     }
 
@@ -874,10 +1118,7 @@ public actor MoqtSession: TransportSession {
     ) async throws(MoqomError) -> AsyncStream<AnnouncementEvent> {
         let stream = try await carrier.openBidirectionalStream()
         let request = allocateRequestID()
-        try await send(
-            SubscribeNamespace(requestID: request, prefix: prefix),
-            on: stream
-        )
+        try await send(.subscribeNamespace(requestID: request, prefix: prefix), on: stream)
         remember(stream, as: request)
 
         let (events, continuation) = AsyncStream.makeStream(
@@ -885,27 +1126,26 @@ public actor MoqtSession: TransportSession {
             bufferingPolicy: .unbounded
         )
 
-        let reader = Task {
-            var framer = StreamFramer()
-            while true {
+        let reader = Task { [weak self, dialect] in
+            var framer = dialect.framer()
+            reading: while true {
                 let chunk: Data?
                 do { chunk = try await stream.read() } catch { break }
                 guard let chunk else { break }
                 framer.append(chunk)
 
-                while let frame = try? framer.next() {
-                    var body = WireReader(frame.body)
-                    switch frame.type {
-                    case .namespace:
-                        guard let message = try? NamespaceAnnounced.read(from: &body),
-                              let full = Self.join(prefix: prefix, suffix: message.suffix)
-                        else { break }
+                while let frame = try? framer.nextRaw() {
+                    guard let message = await self?.interpret(frame) else {
+                        if dialect.isStrict { break reading }
+                        continue
+                    }
+                    switch message {
+                    case let .namespace(suffix):
+                        guard let full = Self.join(prefix: prefix, suffix: suffix) else { break }
                         continuation.yield(.announced(full))
-                    case .namespaceDone:
-                        guard let message = try? NamespaceDone.read(from: &body),
-                              let full = Self.join(prefix: prefix, suffix: message.suffix)
-                        else { break }
-                        continuation.yield(.withdrawn(full, message.reason))
+                    case let .namespaceDone(suffix, reason):
+                        guard let full = Self.join(prefix: prefix, suffix: suffix) else { break }
+                        continuation.yield(.withdrawn(full, reason))
                     default:
                         break
                     }
@@ -940,24 +1180,13 @@ public actor MoqtSession: TransportSession {
         let stream = try await carrier.openBidirectionalStream()
         let requestID = allocateRequestID()
 
-        var parameters = Parameters()
-        if let priority = try? Parameter.integer(
-            SubscribeParameter.subscriberPriority,
-            UInt64(request.priority)
-        ) {
-            parameters.insert(priority)
-        }
-        if let timeout = request.deliveryTimeout,
-           let parameter = try? Parameter.integer(
-               SubscribeParameter.deliveryTimeout,
-               UInt64(max(0, timeout.milliseconds))
-           )
-        {
-            parameters.insert(parameter)
-        }
-
         try await send(
-            Subscribe(requestID: requestID, track: request.track, parameters: parameters),
+            .subscribe(
+                requestID: requestID,
+                track: request.track,
+                priority: request.priority,
+                deliveryTimeout: request.deliveryTimeout.map { UInt64(max(0, $0.milliseconds)) }
+            ),
             on: stream
         )
 
@@ -977,6 +1206,7 @@ public actor MoqtSession: TransportSession {
             session: self
         )
         subscriptionRequests[ObjectIdentifier(subscription)] = requestID
+        subscriptionStreams[ObjectIdentifier(subscription)] = stream
         watchForEnd(of: alias, on: stream)
         return subscription
     }
@@ -990,21 +1220,27 @@ public actor MoqtSession: TransportSession {
     /// told from a bad network, and waiting out a bad network is the right
     /// thing to do — so a subscription that ends in silence ends as a stall.
     private func watchForEnd(of alias: UInt64, on stream: any QUICStream) {
-        Task { [weak self] in
-            var framer = StreamFramer()
+        Task { [weak self, dialect] in
+            var framer = dialect.framer()
             reading: while true {
                 let chunk: Data?
                 do { chunk = try await stream.read() } catch { break }
                 guard let chunk else { break }
                 framer.append(chunk)
 
-                while let frame = try? framer.next() {
+                while let frame = try? framer.nextRaw() {
                     // Anything else here is a message this build has no use
-                    // for. Ignored rather than treated as a violation: the
-                    // draft adds to what may travel on this stream, and a
-                    // subscriber that hung up over an unfamiliar message would
-                    // break against every relay newer than itself.
-                    if frame.type == .publishDone { break reading }
+                    // for. Ignored rather than treated as a violation in
+                    // draft-19: the draft adds to what may travel on this
+                    // stream, and a subscriber that hung up over an unfamiliar
+                    // message would break against every relay newer than
+                    // itself. Draft-22 is explicit that it is one.
+                    if dialect.isStrict {
+                        guard let message = await self?.interpret(frame) else { break reading }
+                        if case .publishDone = message { break reading }
+                    } else if frame.code == MessageType.publishDone.rawValue {
+                        break reading
+                    }
                 }
             }
             // On every way out, not only on PUBLISH_DONE. A reset or a lost
@@ -1023,8 +1259,13 @@ public actor MoqtSession: TransportSession {
     /// caller is actually watching.
     private var subscriptionRequests: [ObjectIdentifier: UInt64] = [:]
 
+    /// The request streams of those subscriptions, which is where a draft-22
+    /// fill is asked for.
+    private var subscriptionStreams: [ObjectIdentifier: any QUICStream] = [:]
+
     func forget(subscription: ObjectIdentifier) {
         subscriptionRequests.removeValue(forKey: subscription)
+        subscriptionStreams.removeValue(forKey: subscription)
     }
 
     /// Block until the response arrives on the request's own stream.
@@ -1033,7 +1274,7 @@ public actor MoqtSession: TransportSession {
     /// than a shortcut: responses travel on the same bidirectional stream as
     /// the request they answer, so the stream *is* the correlation.
     private func awaitSubscribeOk(on stream: any QUICStream) async throws(MoqomError) -> UInt64 {
-        var framer = StreamFramer()
+        var framer = dialect.framer()
         while true {
             let chunk: Data?
             do { chunk = try await stream.read() } catch {
@@ -1044,28 +1285,32 @@ public actor MoqtSession: TransportSession {
             }
             framer.append(chunk)
 
-            while let frame = try framer.next() {
-                var body = WireReader(frame.body)
-                switch frame.type {
-                case .subscribeOk:
-                    guard let ok = try? SubscribeOk.read(from: &body) else {
-                        throw MoqomError.protocolViolation("malformed SUBSCRIBE_OK")
+            while let frame = try framer.nextRaw() {
+                let message: PeerMessage
+                do {
+                    message = try dialect.decode(frame)
+                } catch {
+                    if frame.code == MessageType.requestError.rawValue {
+                        throw Self.rejection(for: RequestError(code: RequestErrorCode.internalError))
                     }
-                    return ok.trackAlias
-                case .requestError:
-                    let error = (try? RequestError.read(from: &body))
-                        ?? RequestError(code: RequestErrorCode.internalError)
+                    await violation("SUBSCRIBE response: \(error)")
+                    throw MoqomError.protocolViolation("malformed SUBSCRIBE_OK")
+                }
+                switch message {
+                case let .subscribeOk(alias):
+                    return alias
+                case let .requestError(error):
                     throw Self.rejection(for: error)
                 default:
                     throw MoqomError.protocolViolation(
-                        "expected SUBSCRIBE_OK, got \(frame.type)"
+                        "expected SUBSCRIBE_OK, got 0x\(String(frame.code, radix: 16))"
                     )
                 }
             }
         }
     }
 
-    private static func rejection(for error: RequestError) -> MoqomError {
+    static func rejection(for error: RequestError) -> MoqomError {
         switch error.code {
         case RequestErrorCode.unauthorized,
              RequestErrorCode.expiredAuthToken,
@@ -1083,14 +1328,11 @@ public actor MoqtSession: TransportSession {
     }
 
     func updatePriority(_ priority: UInt8, on stream: any QUICStream) async {
-        guard let parameter = try? Parameter.integer(
-            SubscribeParameter.subscriberPriority,
-            UInt64(priority)
-        ) else { return }
-        try? await send(
-            RequestUpdate(requestID: allocateRequestID(), parameters: Parameters([parameter])),
-            on: stream
-        )
+        try? await send(.update(requestID: allocateRequestID(), .priority(priority)), on: stream)
+    }
+
+    func updateForwarding(_ forward: Bool, on stream: any QUICStream) async {
+        try? await send(.update(requestID: allocateRequestID(), .forward(forward)), on: stream)
     }
 
     // MARK: - Fetching
@@ -1116,6 +1358,10 @@ public actor MoqtSession: TransportSession {
     }
 
     public func fetch(_ request: FetchRequest) async throws(MoqomError) -> any FetchHandle {
+        if dialect.isStrict, let fill = try fill(for: request.range) {
+            return try await requestFill(fill.filter, on: fill.stream, order: request.order)
+        }
+
         let kind: Fetch.Kind
         switch request.range {
         case let .standalone(track, from, to):
@@ -1144,20 +1390,6 @@ public actor MoqtSession: TransportSession {
         let stream = try await carrier.openBidirectionalStream()
         let requestID = allocateRequestID()
 
-        var parameters = Parameters()
-        if let priority = try? Parameter.integer(
-            SubscribeParameter.subscriberPriority,
-            UInt64(request.priority)
-        ) {
-            parameters.insert(priority)
-        }
-        if let order = try? Parameter.integer(
-            SubscribeParameter.groupOrder,
-            request.order.rawValue
-        ) {
-            parameters.insert(order)
-        }
-
         let (records, continuation) = AsyncStream.makeStream(
             of: FetchedRecord.self,
             bufferingPolicy: .unbounded
@@ -1168,7 +1400,7 @@ public actor MoqtSession: TransportSession {
 
         do {
             try await send(
-                Fetch(requestID: requestID, kind: kind, parameters: parameters),
+                .fetch(requestID: requestID, kind: kind, priority: request.priority, order: request.order),
                 on: stream
             )
         } catch {
@@ -1181,7 +1413,8 @@ public actor MoqtSession: TransportSession {
             requestID: requestID,
             records: records,
             stream: stream,
-            session: self
+            session: self,
+            dialect: dialect
         )
         // The response is awaited in the background rather than here: the data
         // stream is already allowed to be flowing, so blocking the caller until
@@ -1190,12 +1423,68 @@ public actor MoqtSession: TransportSession {
         return handle
     }
 
-    func fetchResponded(_ requestID: UInt64, with response: FetchOk) {
+    /// A joining range as draft-22 asks for it — a location filter for
+    /// FILL_PARAMETERS and the subscription stream to send it on — or `nil`
+    /// for a standalone range, which is still a FETCH.
+    private func fill(
+        for range: FetchRequest.Range
+    ) throws(MoqomError) -> (filter: LocationFilter, stream: any QUICStream)? {
+        let subscription: any SubscriptionHandle
+        let filter: LocationFilter
+        switch range {
+        case .standalone:
+            return nil
+        case let .joining(handle, groups):
+            subscription = handle
+            // Draft-19 counts back from the current group; draft-22's
+            // StartGroup 1 *is* the current group (§3.5).
+            filter = .relativeStart(groups: groups + 1)
+        case let .joiningFrom(handle, group):
+            subscription = handle
+            filter = .absoluteStart(Location.group(group))
+        }
+        guard let stream = subscriptionStreams[ObjectIdentifier(subscription)] else {
+            throw MoqomError.invalidState(
+                expected: "a live subscription on this session",
+                actual: "an unknown subscription"
+            )
+        }
+        return (filter, stream)
+    }
+
+    /// Ask for a draft-22 fill on a subscription's own stream.
+    ///
+    /// The fill fetch stream's header carries the REQUEST_UPDATE's ID, which
+    /// is how it is routed to this handle. Nothing comes back on the request
+    /// stream that matters here: a fill has no FETCH_OK, and failure is the
+    /// fill stream being reset.
+    private func requestFill(
+        _ filter: LocationFilter,
+        on stream: any QUICStream,
+        order: GroupOrder
+    ) async throws(MoqomError) -> any FetchHandle {
+        let requestID = allocateRequestID()
+        let (records, continuation) = AsyncStream.makeStream(
+            of: FetchedRecord.self,
+            bufferingPolicy: .unbounded
+        )
+        pendingFetches[requestID] = FetchSink(continuation: continuation, order: order)
+        do {
+            try await send(.update(requestID: requestID, .fill(filter)), on: stream)
+        } catch {
+            pendingFetches.removeValue(forKey: requestID)
+            continuation.finish()
+            throw error
+        }
+        return MoqtFill(requestID: requestID, records: records, session: self)
+    }
+
+    func fetchResponded(_ requestID: UInt64, with end: FetchEnd) {
         // Nothing to route: FETCH_OK carries a range, and the records travel on
         // their own stream. Kept as a hook because a relay that answers with a
         // narrower range than requested is the normal case, not an error.
         _ = requestID
-        _ = response
+        _ = end
     }
 
     func fetchFailed(_ requestID: UInt64) {
@@ -1211,7 +1500,7 @@ public actor MoqtSession: TransportSession {
 
         while true {
             while true {
-                var reader = WireReader(buffer)
+                var reader = dialect.reader(buffer)
                 if header == nil {
                     guard let parsed = try? FetchHeader.read(from: &reader) else { break }
                     header = parsed
@@ -1223,12 +1512,20 @@ public actor MoqtSession: TransportSession {
                         await stream.stopReceiving(code: RequestErrorCode.uninterested)
                         return
                     }
-                    fetchReader = FetchReader(header: parsed, order: sink.order)
+                    fetchReader = FetchReader(header: parsed, order: sink.order, draft: draft)
                     buffer = reader.rest
                     continue
                 }
                 guard var active = fetchReader, let sink else { break }
-                guard let record = try? active.read(from: &reader) else { break }
+                let record: FetchRecord
+                do {
+                    record = try active.read(from: &reader)
+                } catch {
+                    if case .short = error { break }
+                    await violation("fetch stream: \(error)")
+                    if let header { finish(fetch: header.requestID) }
+                    return
+                }
                 fetchReader = active
                 buffer = reader.rest
 
@@ -1248,7 +1545,7 @@ public actor MoqtSession: TransportSession {
                     )
                 case let .endOfNonExistentRange(location):
                     sink.continuation.yield(.missing(through: location))
-                case let .endOfUnknownRange(location):
+                case let .endOfUnknownRange(location), let .endOfTimedOutRange(location):
                     sink.continuation.yield(.unknown(through: location))
                 }
             }
@@ -1282,19 +1579,29 @@ public actor MoqtSession: TransportSession {
     /// A publishing client can serve this because `PublishedTrack` keeps the
     /// most recent groups: that is what makes catch-up work without a relay in
     /// the middle, and it is how the fetch path is tested at all.
-    private func answerFetch(_ request: Fetch, on stream: any QUICStream) async {
+    private func answerFetch(
+        requestID: UInt64,
+        kind: Fetch.Kind?,
+        order: GroupOrder,
+        on stream: any QUICStream
+    ) async {
+        guard let kind else {
+            // A draft-22 range relative to the live edge, which a fetch can
+            // name but only a fill can mean.
+            try? await send(.requestError(code: RequestErrorCode.invalidRange, reason: "relative fetch"), on: stream)
+            await stream.finish()
+            return
+        }
         let resolved: Resolved
-        switch await resolve(request.kind) {
+        switch await resolve(kind) {
         case let .success(value):
             resolved = value
         case let .failure(code, reason):
-            try? await send(RequestError(code: code, reason: reason), on: stream)
+            try? await send(.requestError(code: code, reason: reason), on: stream)
             await stream.finish()
             return
         }
 
-        let order = request.parameters.integer(SubscribeParameter.groupOrder)
-            .flatMap(GroupOrder.init(rawValue:)) ?? .ascending
         let held = await resolved.published.objects(
             from: resolved.start,
             through: resolved.end,
@@ -1306,19 +1613,19 @@ public actor MoqtSession: TransportSession {
         // the delivery, so reporting `held.last` would tell a descending
         // subscriber the range ended where it in fact began.
         guard let furthest = held.map(\.location).max() else {
-            try? await send(
-                RequestError(code: RequestErrorCode.invalidRange, reason: "nothing in range"),
-                on: stream
-            )
+            try? await send(.requestError(code: RequestErrorCode.invalidRange, reason: "nothing in range"), on: stream)
             await stream.finish()
             return
         }
 
-        try? await send(FetchOk(end: .through(furthest)), on: stream)
+        try? await send(.fetchOk(.through(furthest)), on: stream)
+        await self.stream(held, as: FetchHeader(requestID: requestID), order: order)
+    }
 
+    /// Write held objects to a new fetch stream, gaps marked, then FIN.
+    private func stream(_ held: [FetchObject], as header: FetchHeader, order: GroupOrder) async {
         guard let data = try? await carrier.openUnidirectionalStream() else { return }
-        let header = FetchHeader(requestID: request.requestID)
-        var writer = WireWriter(capacity: header.encodedLength)
+        var writer = dialect.writer(capacity: header.encodedLength)
         header.write(to: &writer)
         guard (try? await data.write(writer.bytes)) != nil else { return }
 
@@ -1328,15 +1635,15 @@ public actor MoqtSession: TransportSession {
         // flight.
         let markers = FetchGaps.markers(before: held.map(\.location), order: order)
 
-        var records = FetchWriter(header: header, order: order)
+        var records = FetchWriter(header: header, order: order, draft: draft)
         for (index, object) in held.enumerated() {
             if let marker = markers[index] {
-                var buffer = WireWriter(capacity: 16)
+                var buffer = dialect.writer(capacity: 16)
                 guard (try? records.write(.endOfNonExistentRange(marker), to: &buffer)) != nil
                 else { break }
                 guard (try? await data.write(buffer.bytes)) != nil else { break }
             }
-            var buffer = WireWriter(capacity: object.payload.count + 16)
+            var buffer = dialect.writer(capacity: object.payload.count + 16)
             guard (try? records.write(.object(object), to: &buffer)) != nil else { break }
             guard (try? await data.write(buffer.bytes)) != nil else { break }
         }
@@ -1425,7 +1732,7 @@ public actor MoqtSession: TransportSession {
         _ track: FullTrackName,
         priority: UInt8
     ) async throws(MoqomError) -> any TrackWriter {
-        let published = PublishedTrack(track: track, priority: priority)
+        let published = PublishedTrack(track: track, priority: priority, draft: draft)
         outboundTracks[track] = published
         return MoqtTrackWriter(track: track, published: published, session: self)
     }
@@ -1460,11 +1767,15 @@ public actor MoqtSession: TransportSession {
         // relay it just deliberately left.
         interruptionContinuation.finish()
 
-        if let controlStream {
-            try? await send(Goaway(timeoutMilliseconds: 0), on: controlStream)
-            await controlStream.finish()
+        if let controlSend {
+            try? await send(.goaway, on: controlSend)
+            await controlSend.finish()
         }
         await carrier.close(code: code, reason: reason)
+    }
+
+    private func send(_ message: OutgoingMessage, on stream: any QUICSendStream) async throws(MoqomError) {
+        try await stream.write(try dialect.bytes(message))
     }
 
     private func send(
@@ -1500,7 +1811,16 @@ public extension MoqtSession {
     /// is who dialled. It is also what lets two sessions be tested against each
     /// other with no relay in between.
     static func accept(over carrier: any QUICCarrier) async throws(MoqomError) -> MoqtSession {
+        try await accept(over: carrier, answering: nil)
+    }
+
+    /// Accept, checking the peer's SETUP with `answer` before replying.
+    internal static func accept(
+        over carrier: any QUICCarrier,
+        answering answer: SetupAnswer?
+    ) async throws(MoqomError) -> MoqtSession {
         let session = MoqtSession(carrier: carrier, role: .server)
+        await session.setSetupAnswer(answer)
         await session.startReading()
         do {
             try await session.waitForSetup()
@@ -1522,19 +1842,24 @@ public struct GoawayNotice: Hashable, Sendable {
     public let timeout: Duration
 }
 
-/// Subscribe parameter codes, per draft-19 §15.
+/// Subscribe parameter codes, per draft-19 Table 13 (Message Parameters).
 ///
 /// Not present in `moqom-proto`, which carries subscribe parameters opaquely
 /// because a relay forwards them without interpreting. A client is the one
-/// thing that has to name them.
+/// thing that has to name them, and a conformant relay closes the session on
+/// a code that is not in the registry.
 public enum SubscribeParameter {
-    /// Lower is more urgent.
-    public static let subscriberPriority: UInt64 = 0x0E
+    /// Lower is more urgent. Not `0x0E`, which is the
+    /// `DEFAULT_PUBLISHER_PRIORITY` Track Property (§12.4).
+    public static let subscriberPriority: UInt64 = 0x20
     /// Milliseconds after which an undelivered object is worthless.
     public static let deliveryTimeout: UInt64 = 0x02
     /// Ascending or descending, and on a fetch it changes the delta signs on the
     /// data stream rather than only the delivery order.
     public static let groupOrder: UInt64 = 0x22
+    /// Zero asks the publisher to stop sending objects without ending the
+    /// subscription, one to resume (§10.2.17). Omitted means unchanged.
+    public static let forward: UInt64 = 0x10
 }
 
 // MARK: - Handles
@@ -1603,6 +1928,10 @@ private final class MoqtSubscription: SubscriptionHandle {
         await session.updatePriority(priority, on: stream)
     }
 
+    func updateForwarding(_ forward: Bool) async {
+        await session.updateForwarding(forward, on: stream)
+    }
+
     func cancel() async {
         // A reset rather than a finish: the subscription is being abandoned,
         // not completed, and the relay should stop sending immediately rather
@@ -1620,18 +1949,21 @@ private final class MoqtFetch: FetchHandle, @unchecked Sendable {
     private let requestID: UInt64
     private let stream: any QUICStream
     private let session: MoqtSession
+    private let dialect: SessionDialect
     private let state = Mutex<FetchEnd?>(nil)
 
     init(
         requestID: UInt64,
         records: AsyncStream<FetchedRecord>,
         stream: any QUICStream,
-        session: MoqtSession
+        session: MoqtSession,
+        dialect: SessionDialect
     ) {
         self.requestID = requestID
         self.records = records
         self.stream = stream
         self.session = session
+        self.dialect = dialect
     }
 
     var served: FetchEnd? {
@@ -1640,20 +1972,19 @@ private final class MoqtFetch: FetchHandle, @unchecked Sendable {
 
     /// Read the one response the request stream will carry.
     func awaitResponse() async {
-        var framer = StreamFramer()
+        var framer = dialect.framer()
         while true {
             let chunk: Data?
             do { chunk = try await stream.read() } catch { break }
             guard let chunk else { break }
             framer.append(chunk)
 
-            while let frame = try? framer.next() {
-                var body = WireReader(frame.body)
-                switch frame.type {
-                case .fetchOk:
-                    guard let ok = try? FetchOk.read(from: &body) else { break }
-                    state.value = ok.end
-                    await session.fetchResponded(requestID, with: ok)
+            while let frame = try? framer.nextRaw() {
+                guard let message = await session.interpret(frame) else { continue }
+                switch message {
+                case let .fetchOk(end):
+                    state.value = end
+                    await session.fetchResponded(requestID, with: end)
                     return
                 case .requestError:
                     // A relay may stream cached objects before it knows whether
@@ -1674,6 +2005,33 @@ private final class MoqtFetch: FetchHandle, @unchecked Sendable {
         // Mandatory on the request stream, optional on the data stream — §5.2.
         // Resetting the request stream is what makes the publisher reset both.
         await stream.reset(code: RequestErrorCode.uninterested)
+        await session.cancelFetch(requestID)
+    }
+}
+
+/// A draft-22 fill: records on a fill fetch stream, and no request stream of
+/// its own — it was asked for on the subscription's.
+private final class MoqtFill: FetchHandle {
+    let records: AsyncStream<FetchedRecord>
+
+    private let requestID: UInt64
+    private let session: MoqtSession
+
+    init(requestID: UInt64, records: AsyncStream<FetchedRecord>, session: MoqtSession) {
+        self.requestID = requestID
+        self.records = records
+        self.session = session
+    }
+
+    /// Always `nil`: a fill has no FETCH_OK to report a range in. The stream's
+    /// FIN is the only statement that it is complete.
+    var served: FetchEnd? {
+        get async { nil }
+    }
+
+    func cancel() async {
+        // The fill stream is stopped when it next delivers to a sink that is
+        // no longer there; the subscription carries on (§3.4).
         await session.cancelFetch(requestID)
     }
 }
@@ -1729,14 +2087,28 @@ private final class MoqtTrackWriter: TrackWriter {
 actor PublishedTrack {
     private struct Subscriber {
         let alias: UInt64
-        let control: any QUICStream
+        /// The subscription's own request stream, finished with the track.
+        /// `nil` in draft-16, where the request lives on the shared control
+        /// stream and is ended by a PUBLISH_DONE the session sends instead.
+        let control: (any QUICStream)?
         var stream: (any QUICSendStream)?
         var writer: SubgroupWriter?
+        /// Subgroup streams opened for this subscriber, which draft-16's
+        /// PUBLISH_DONE has to state.
+        var streamsOpened: UInt64 = 0
+    }
+
+    /// A subscriber is its request stream where it has one, and its request ID
+    /// where it shares the control stream.
+    private enum SubscriberKey: Hashable {
+        case stream(ObjectIdentifier)
+        case request(UInt64)
     }
 
     private let track: FullTrackName
     private let priority: UInt8
-    private var subscribers: [ObjectIdentifier: Subscriber] = [:]
+    private let draft: MoqtDraft
+    private var subscribers: [SubscriberKey: Subscriber] = [:]
     private var carrier: (any QUICCarrier)?
     private var currentGroup: UInt64 = 0
 
@@ -1825,20 +2197,32 @@ actor PublishedTrack {
     /// thermal budget rather than a few wasted bytes.
     var hasSubscribers: Bool { !subscribers.isEmpty }
 
-    init(track: FullTrackName, priority: UInt8) {
+    init(track: FullTrackName, priority: UInt8, draft: MoqtDraft = .draft19) {
         self.track = track
         self.priority = priority
+        self.draft = draft
     }
 
     func addSubscriber(alias: UInt64, stream: any QUICStream, carrier: any QUICCarrier) {
         self.carrier = carrier
-        subscribers[ObjectIdentifier(stream)] = Subscriber(alias: alias, control: stream)
+        subscribers[.stream(ObjectIdentifier(stream))] = Subscriber(alias: alias, control: stream)
+    }
+
+    func addSubscriber(alias: UInt64, request: UInt64, carrier: any QUICCarrier) {
+        self.carrier = carrier
+        subscribers[.request(request)] = Subscriber(alias: alias, control: nil)
     }
 
     func removeSubscriber(stream: any QUICStream) async {
-        guard let subscriber = subscribers.removeValue(forKey: ObjectIdentifier(stream)) else {
-            return
-        }
+        await removeSubscriber(.stream(ObjectIdentifier(stream)))
+    }
+
+    func removeSubscriber(request: UInt64) async {
+        await removeSubscriber(.request(request))
+    }
+
+    private func removeSubscriber(_ key: SubscriberKey) async {
+        guard let subscriber = subscribers.removeValue(forKey: key) else { return }
         await subscriber.stream?.finish()
     }
 
@@ -1891,15 +2275,16 @@ actor PublishedTrack {
                     propertiesPresent: !object.properties.isEmpty
                 )
                 let stream = try await carrier.openUnidirectionalStream()
-                var writer = WireWriter(capacity: header.encodedLength)
+                var writer = draft.writer(capacity: header.encodedLength)
                 header.write(to: &writer)
                 try await stream.write(writer.bytes)
+                subscriber.streamsOpened += 1
                 subscriber.stream = stream
                 subscriber.writer = SubgroupWriter(header: header)
             }
 
             guard var writer = subscriber.writer, let stream = subscriber.stream else { continue }
-            var buffer = WireWriter(capacity: object.payload.count + 16)
+            var buffer = draft.writer(capacity: object.payload.count + 16)
             do {
                 try writer.write(
                     SubgroupObject(
@@ -1923,12 +2308,18 @@ actor PublishedTrack {
         }
     }
 
-    func finish() async {
-        for subscriber in subscribers.values {
+    /// End the track for everyone, returning the subscribers that share a
+    /// control stream so the session can tell them in a message.
+    @discardableResult
+    func finish() async -> [(request: UInt64, streams: UInt64)] {
+        var ended: [(request: UInt64, streams: UInt64)] = []
+        for (key, subscriber) in subscribers {
             await subscriber.stream?.finish()
-            await subscriber.control.finish()
+            await subscriber.control?.finish()
+            if case let .request(request) = key { ended.append((request, subscriber.streamsOpened)) }
         }
         subscribers.removeAll()
+        return ended
     }
 }
 

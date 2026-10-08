@@ -21,3 +21,7 @@ Package.resolved
 # Carries DEVELOPMENT_TEAM, which is personal. Signing.xcconfig holds the shared
 # half and includes this one when it exists.
 Local.xcconfig
+
+# The Rust direct backend, copied in by Scripts/direct-ffi.sh. A build artefact
+# of moqom-engine, and its presence is what turns MoqomDirectRust on.
+Artifacts/

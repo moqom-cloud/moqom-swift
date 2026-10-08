@@ -1311,6 +1311,23 @@ final class RoomModel {
                 expected: "a broadcast on a live session",
                 actual: "a publication that could not be reopened after reconnecting"
             )
+        case .publishingRevoked(let stopped):
+            // A moderator took this device off the stage. The SDK has already
+            // ended the publications; what is left is this model's own hold on
+            // the capture hardware and the "live" interface around it. The room
+            // keeps playing, so nothing else changes.
+            Journal.shared.say("REVOKED stopped=\(stopped.rawValue)")
+            if stopped.contains(.video) { await stopBroadcast() }
+            if stopped.contains(.audio) { await stopAudio(deliberately: false) }
+            await refresh()
+        case .encryptionRequired(let who):
+            // Only reachable if the key above was never set, or a tightened room
+            // stopped this device's own broadcast. Said on screen, because the
+            // alternative is a black tile with nothing to explain it.
+            Journal.shared.say("E2EE required, media refused from \(who.username.value)")
+            if who == identity {
+                lastError = MoqomError.encryptionRequired
+            }
         case .qualityChanged(let who, let quality):
             // Applied straight rather than through `refresh()`: the indicator is
             // the only thing that changed, and rebuilding the roster to draw one
@@ -1345,6 +1362,9 @@ final class RoomModel {
         case .participantJoined, .presenceChanged,
              .grantsChanged, .spotlightChanged:
             await refresh()
+        case .directPathChanged:
+            // This sample leaves direct paths off.
+            break
         case .terminated:
             await leave()
         }

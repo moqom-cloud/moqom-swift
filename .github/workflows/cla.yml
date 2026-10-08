@@ -1,0 +1,43 @@
+name: CLA
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, synchronize, closed]
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+  statuses: write
+
+jobs:
+  cla:
+    name: Check CLA signature
+    runs-on: ubuntu-latest
+    if: >
+      (github.event.comment.body == 'recheck' ||
+       github.event.comment.body == 'I have read the Copyright Assignment Agreement and I hereby sign it') ||
+      github.event_name == 'pull_request_target'
+    steps:
+      - uses: contributor-assistant/github-action@v2.6.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # A PAT with `repo` scope, stored as CLA_SIGNATURES_TOKEN. Required
+          # because signatures are committed to a separate branch, which the
+          # default GITHUB_TOKEN cannot push to from a fork-triggered run.
+          PERSONAL_ACCESS_TOKEN: ${{ secrets.CLA_SIGNATURES_TOKEN }}
+        with:
+          path-to-signatures: signatures/version1/cla.json
+          path-to-document: https://github.com/${{ github.repository }}/blob/main/.github/CLA.md
+          branch: cla-signatures
+          allowlist: elliott-io,dependabot[bot],renovate[bot]
+          custom-notsigned-prcomment: >
+            Thanks for the contribution. Before it can be merged, please sign
+            the [Copyright Assignment Agreement](https://github.com/${{ github.repository }}/blob/main/.github/CLA.md).
+            It assigns the copyright in your contribution to Elliott Wave LLC and
+            licenses it back to you for any use — Sections 2, 3 and 5 explain
+            exactly what you are agreeing to.
+          custom-pr-sign-comment: I have read the Copyright Assignment Agreement and I hereby sign it
+          custom-allsigned-prcomment: All contributors have signed the Copyright Assignment Agreement.

@@ -330,6 +330,8 @@ extension MoqomError {
             "The relay is speaking a protocol this app does not understand."
         case .encryptionFailed:
             "Could not encrypt the stream, so nothing was sent."
+        case .encryptionRequired:
+            "This room requires end-to-end encryption and no key is set, so nothing was sent."
         case let .platform(api, status):
             "\(api) failed with \(status)."
         }

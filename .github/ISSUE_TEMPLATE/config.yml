@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://moqom.dev/security/disclosure/
+    about: Do not open a public issue. Email security@moqom.cloud instead.
+  - name: Documentation
+    url: https://moqom.dev
+    about: Guides and API reference.

@@ -459,7 +459,18 @@ struct GalleryIntegrationTests {
         #expect(await viewerRoom.galleryLayout.first?.claim == .present)
         #expect(await viewerRoom.galleryOverflow.isEmpty)
 
-        for index in 0 ..< 24 { source.submit(voice(index)) }
+        // Talking at a speaker's pace rather than in one burst: live audio that
+        // reaches the relay before the viewer has subscribed is gone, and a burst
+        // can land entirely in that window.
+        let talking = Task {
+            var index = 0
+            while !Task.isCancelled {
+                source.submit(voice(index))
+                index += 1
+                try? await Task.sleep(for: .milliseconds(20))
+            }
+        }
+        defer { talking.cancel() }
 
         #expect(await eventually { await viewerRoom.isSpeaking(who) })
         let slot = try #require(await viewerRoom.galleryLayout.first)
@@ -502,8 +513,18 @@ struct GalleryIntegrationTests {
         let who = identity("carol")
         #expect(await eventually { await viewerRoom.galleryLayout.count == 1 })
 
-        for index in 0 ..< 24 { source.submit(voice(index)) }
+        // Until the viewer hears it, for the reason in the test above; then
+        // silence, which is the point of this one.
+        let talking = Task {
+            var index = 0
+            while !Task.isCancelled {
+                source.submit(voice(index))
+                index += 1
+                try? await Task.sleep(for: .milliseconds(20))
+            }
+        }
         #expect(await eventually { await viewerRoom.isSpeaking(who) })
+        talking.cancel()
 
         #expect(await eventually(timeout: .seconds(3)) { await !viewerRoom.isSpeaking(who) })
 

@@ -12,6 +12,27 @@ import Testing
 /// and the control plane behind it, not by a participant's phone. A client
 /// appears in these tests only as a reader — apart from one that checks a
 /// moderator's action reaching the log, which is the self-hosted case.
+/// A control entry as the room's authority writes it: signed for room-42.
+func signedEntry(
+    _ update: RoomUpdate,
+    group: UInt64,
+    object: UInt64,
+    isKeyFrame: Bool = false,
+    signer: RoomLogSigner = testAuthority,
+    room: RoomID = "room-42"
+) throws -> TrackObject {
+    let payload = try update.encoded()
+    return TrackObject(
+        group: group,
+        object: object,
+        payload: payload,
+        isKeyFrame: isKeyFrame,
+        properties: ObjectProperties(
+            authoritySignature: try signer.sign(payload, tenant: "acme", room: room)
+        )
+    )
+}
+
 @Suite("The room control track")
 struct ControlTrackTests {
     private let endpoint = RelayEndpoint(host: "loopback", alpn: ["moqt-19"])
@@ -47,6 +68,7 @@ struct ControlTrackTests {
             room: "room-42",
             tenant: "acme",
             on: session,
+            signer: testAuthority,
             state: state,
             cadence: cadence
         )
@@ -212,20 +234,11 @@ struct ControlTrackTests {
         state[alice] = ParticipantControl(identity: alice)
         try await writer.startGroup(1)
         try await writer.write(
-            TrackObject(
-                group: 1,
-                object: 0,
-                payload: try RoomUpdate(sequence: 1, state).encoded(),
-                isKeyFrame: true
-            )
+            signedEntry(RoomUpdate(sequence: 1, state), group: 1, object: 0, isKeyFrame: true)
         )
         try await writer.write(
-            TrackObject(
-                group: 1,
-                object: 1,
-                // Sequence 3, so 2 is missing.
-                payload: try RoomUpdate(sequence: 3, .spotlight(alice)).encoded()
-            )
+            // Sequence 3, so 2 is missing.
+            signedEntry(RoomUpdate(sequence: 3, .spotlight(alice)), group: 1, object: 1)
         )
 
         let watcher = try await viewer("bob", relay: relay)
@@ -239,12 +252,7 @@ struct ControlTrackTests {
         state.stage.spotlighted = alice
         try await writer.startGroup(2)
         try await writer.write(
-            TrackObject(
-                group: 2,
-                object: 0,
-                payload: try RoomUpdate(sequence: 4, state).encoded(),
-                isKeyFrame: true
-            )
+            signedEntry(RoomUpdate(sequence: 4, state), group: 2, object: 0, isKeyFrame: true)
         )
 
         #expect(await eventually { await room.currentState.stage.spotlighted == alice })
@@ -252,6 +260,76 @@ struct ControlTrackTests {
         #expect(await room.logPosition == 4)
 
         await watcher.close()
+    }
+
+    @Test("only entries the room's authority signed for this room are applied")
+    func onlySignedEntriesApply() async throws {
+        // Written by a party with the relay's position: it can put anything on
+        // the track, and has every key but the authority's.
+        let relay = LoopbackRelay()
+        let session = try await LoopbackTransport(relay: relay).connect(
+            to: endpoint,
+            credentials: credentials("control-plane", device: "relay-0001")
+        )
+        let track = try FullTrackName(
+            namespace: MoqomNamespaces.room(tenant: "acme", room: "room-42"),
+            name: TrackName(RoomUpdate.trackName)
+        )
+        let writer = try await session.publish(track, priority: RoomLogPublisher.priority)
+        let (_, _) = try await announce(alice, relay: relay)
+        let watcher = try await viewer("bob", relay: relay)
+        let room = try await watcher.join(room: "room-42")
+
+        var state = RoomSnapshot()
+        state[alice] = ParticipantControl(identity: alice)
+        state.stage.spotlighted = alice
+        let impostor = try RoomLogSigner(seed: Data(repeating: 0x01, count: 32))
+        let genuine = try signedEntry(RoomUpdate(sequence: 1, state), group: 1, object: 0)
+
+        try await writer.startGroup(1)
+        // Unsigned.
+        try await writer.write(
+            TrackObject(group: 1, object: 0, payload: genuine.payload, isKeyFrame: true)
+        )
+        // Signed, by a key the room does not trust.
+        try await writer.write(
+            signedEntry(RoomUpdate(sequence: 1, state), group: 1, object: 1, signer: impostor)
+        )
+        // Signed by the authority, for another room.
+        try await writer.write(
+            signedEntry(RoomUpdate(sequence: 1, state), group: 1, object: 2, room: "room-7")
+        )
+        // The authority's signature, over different words.
+        var altered = state
+        altered.stage.spotlighted = bob
+        try await writer.write(
+            TrackObject(
+                group: 1, object: 3, payload: try RoomUpdate(sequence: 1, altered).encoded(),
+                properties: genuine.properties
+            )
+        )
+
+        #expect(await eventually { await room.controlEntriesRefused == 4 })
+        #expect(await room.logPosition == 0)
+        #expect(await room.currentState.stage.spotlighted == nil)
+
+        try await writer.write(
+            TrackObject(
+                group: 1, object: 4, payload: genuine.payload, properties: genuine.properties
+            )
+        )
+        #expect(await eventually { await room.currentState.stage.spotlighted == alice })
+        #expect(await room.logPosition == 1)
+
+        await watcher.close()
+    }
+
+    @Test("a seed always names the same key")
+    func aSeedNamesTheSameKey() throws {
+        let again = try RoomLogSigner(seed: Data(repeating: 0xA7, count: 32))
+        #expect(again.id == testAuthority.id)
+        #expect(again.verificationKey == testAuthority.verificationKey)
+        #expect(testAuthority.verificationKey.key.count == 1952)
     }
 
     @Test("being removed tells the client why instead of stopping the stream")
@@ -328,7 +406,7 @@ struct ControlTrackTests {
         let relay = LoopbackRelay()
         let host = try await viewer("alice", relay: relay)
         let hostRoom = try await host.join(room: "room-42")
-        let log = try await hostRoom.assumeAuthority()
+        let log = try await hostRoom.assumeAuthority(signer: testAuthority)
         let (_, _) = try await announce(bob, relay: relay)
         #expect(await eventually { await hostRoom.roster[bob] != nil })
 
@@ -367,7 +445,7 @@ struct ControlTrackTests {
         let relay = LoopbackRelay()
         let host = try await viewer("alice", relay: relay)
         let hostRoom = try await host.join(room: "room-42")
-        let first = try await hostRoom.assumeAuthority()
+        let first = try await hostRoom.assumeAuthority(signer: testAuthority)
         try await first.append(.spotlight(identity("alice")))
         let reached = await first.sequence
         let group = await first.group

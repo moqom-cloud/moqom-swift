@@ -117,9 +117,29 @@ public protocol QUICStream: QUICSendStream, QUICReceiveStream {}
 /// arrive is always safe.
 struct StreamFramer: Sendable {
     private var buffer = Data()
+    private let draft: MoqtDraft
+
+    init(draft: MoqtDraft = .draft19) {
+        self.draft = draft
+    }
 
     mutating func append(_ data: Data) {
         buffer.append(data)
+    }
+
+    /// The next complete frame with its type uninterpreted, which is the form
+    /// every draft can produce.
+    mutating func nextRaw() throws(MoqomError) -> RawFrame? {
+        guard !buffer.isEmpty else { return nil }
+        var reader = draft.reader(buffer)
+        do {
+            let frame = try ControlFrame.readRaw(from: &reader)
+            buffer = reader.rest
+            return RawFrame(code: frame.code, body: frame.body)
+        } catch {
+            if case .short = error { return nil }
+            throw MoqomError.protocolViolation(error.description)
+        }
     }
 
     /// The next complete frame, or `nil` if more bytes are needed.

@@ -231,6 +231,12 @@ struct GeometryChangeTests {
 
         submit(stage.source, 8, from: 4, size: Self.sideways.size)
         #expect(await eventually { await stage.broadcast.stats.reshapes == 1 })
+        // Counted when the encoders hand over, which is before the keyframe that
+        // opens the new shape has been written; wait for the relay to hold it.
+        #expect(await eventually {
+            let held = await stage.relay.objects(onTrackNamed: "video/360p")
+            return Set(held.compactMap(\.properties.configuration)).count == 2
+        })
 
         let published = await stage.relay.objects(onTrackNamed: "video/360p")
         let configurations = published
@@ -407,6 +413,12 @@ struct GeometryChangeTests {
         #expect(await eventually { await stage.broadcast.stats.objectsPublished >= 4 })
         submit(stage.source, 10, from: 4, size: Self.sideways.size)
         #expect(await eventually { await stage.broadcast.stats.reshapes == 1 })
+        // Counted when the encoders hand over, which is before the keyframe that
+        // opens the new shape has been written; wait for the relay to hold it.
+        #expect(await eventually {
+            let held = await stage.relay.objects(onTrackNamed: "video/360p")
+            return Set(held.compactMap(\.properties.configuration)).count == 2
+        })
 
         // A viewer arriving now, with no catalog at all. This is the case the
         // relay's cache creates and cannot see: it serves groups by track name,

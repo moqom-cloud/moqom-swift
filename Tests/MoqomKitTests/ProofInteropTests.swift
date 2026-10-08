@@ -8,23 +8,25 @@
 // and it presents as a handshake refused at connect time with the reason in
 // somebody else's log.
 //
-// So this writes what the relay reads. A device key with fixed material, proofs
-// over fixed tokens, and thumbprint vectors that include the cases an
-// implementation gets wrong quietly — a coordinate with a leading zero byte, one
-// whose high bit is set — committed into the engine repository next to the
-// verifier. `moqom-relay`'s own tests check every proof here verifies and every
+// So this writes what the relay reads. Device keys with fixed material, in
+// ML-DSA-65 and ES256, proofs over fixed tokens made at a fixed time, and
+// thumbprint vectors that include the cases an implementation gets wrong
+// quietly — a coordinate with a leading zero byte, one whose high bit is set —
+// committed into the engine repository next to the verifier. `moqom-relay`'s own tests check every proof here verifies and every
 // thumbprint here is the one it computes; the Go control plane checks the
 // thumbprints too, because it is the side that derives `cnf.jkt` and a
 // disagreement there would mint tokens naming a device that does not exist.
 //
 // Regenerate with MOQOM_WRITE_FIXTURES=1. Note what does *not* survive that:
-// ECDSA signs with a fresh random nonce, so regenerating produces different
-// signature bytes for the same key over the same input. The fixture pins the
-// encoding, the claims and the key — not the bytes of the signature — and a diff
-// showing only the third segment changed is a regeneration rather than a change.
+// ML-DSA and ECDSA both sign with fresh randomness, and every proof has a fresh
+// identifier, so regenerating produces different claims and signature bytes for
+// the same key over the same input. The fixture pins the encoding, the token
+// binding and the keys — not the bytes of a proof — and a diff showing only
+// proofs changed is a regeneration rather than a change.
 
 import CryptoKit
 import Foundation
+import MoqomProof
 import Testing
 
 @testable import MoqomKit
@@ -36,19 +38,14 @@ struct ProofInteropTests {
     private struct Fixture: Codable {
         /// The relay digest every proof in `proofs` is bound to.
         let relay: String
+        /// When every proof in `proofs` was made, in Unix seconds: their `iat`.
+        let now: Int64
         let keys: [Key]
         let proofs: [Proof]
 
-        struct Jwk: Codable {
-            let kty: String
-            let crv: String
-            let x: String
-            let y: String
-        }
-
         struct Key: Codable {
             let name: String
-            let jwk: Jwk
+            let jwk: ProofJWK
             let thumbprint: String
         }
 
@@ -69,18 +66,25 @@ struct ProofInteropTests {
         }
     }
 
-    /// The device this fixture speaks for.
+    /// The devices this fixture speaks for: an ML-DSA-65 key, as every new
+    /// device has, and a P-256 key, as a device from before it keeps.
     ///
-    /// A fixed scalar, so regeneration names the same device. Small and
+    /// Fixed material, so regeneration names the same devices. Small and
     /// repetitive rather than plausible-looking: a value that looked like real
     /// key material would invite somebody to wonder whether it was.
-    private static func device() throws -> DeviceKey {
-        try DeviceKey.material(Data(repeating: 0x07, count: 32))
+    private static func devices() throws -> [(String, DeviceKey)] {
+        [
+            ("ml-dsa-65", try DeviceKey.material(Data(repeating: 0x07, count: 32))),
+            ("es256", try DeviceKey.material(Data(repeating: 0x07, count: 32), algorithm: .es256)),
+        ]
     }
 
     /// Stands in for a relay's certificate digest. Nothing here verifies it; it
     /// has to be carried intact and compared, which is the whole of the binding.
     private static let relay = "cGludGhpc3JlbGF5c2NlcnRpZmljYXRlaGFzaA"
+
+    /// When the proofs are made, so a reader checks them at a time they are fresh.
+    private static let now: Int64 = 1_700_000_000
 
     /// Where the verifier reads it from.
     ///
@@ -112,17 +116,20 @@ struct ProofInteropTests {
     ///
     /// The first is the anchor: RFC 7638's canonicalisation applied to the EC key
     /// from RFC 7517 §A.1, which is the only vector here whose expected value
-    /// comes from outside this codebase. The rest are pinned to each other, and
-    /// exist because they are the coordinates an implementation mishandles
-    /// without noticing — a leading zero byte that a big-integer encoder would
-    /// trim, and a high bit set, which is where a signed representation grows a
-    /// pad byte.
-    private func keys() -> [Fixture.Key] {
-        var vectors: [(String, String, String)] = [
+    /// comes from outside this codebase. The next two are coordinates an
+    /// implementation mishandles without noticing — a leading zero byte that a
+    /// big-integer encoder would trim, and a high bit set, which is where a
+    /// signed representation grows a pad byte. Then the devices' own keys, the
+    /// ML-DSA-65 one being the `AKP` form every new token names.
+    private func keys(_ devices: [(String, DeviceKey)]) throws -> [Fixture.Key] {
+        var vectors: [(String, ProofJWK)] = [
             (
                 "rfc 7517 §a.1, thumbprinted per rfc 7638",
-                "MKBCTNIcKUSDii11ySs3526iDZ8AiTo7Tu6KPAqv7D4",
-                "4Etl6SRW2YiLUrN5vfvVHuhp7x8PxltmWWlbbM4IFyM"
+                ProofJWK(
+                    kty: "EC", crv: "P-256",
+                    x: "MKBCTNIcKUSDii11ySs3526iDZ8AiTo7Tu6KPAqv7D4",
+                    y: "4Etl6SRW2YiLUrN5vfvVHuhp7x8PxltmWWlbbM4IFyM"
+                )
             )
         ]
 
@@ -136,25 +143,22 @@ struct ProofInteropTests {
         highBit[0] = 0xFF
         vectors.append((
             "a coordinate whose first byte is zero",
-            leadingZero.base64URLEncodedString,
-            highBit.base64URLEncodedString
+            ProofJWK(kty: "EC", crv: "P-256", x: leadingZero.base64URLEncodedString, y: highBit.base64URLEncodedString)
         ))
         vectors.append((
             "a coordinate whose high bit is set",
-            highBit.base64URLEncodedString,
-            leadingZero.base64URLEncodedString
+            ProofJWK(kty: "EC", crv: "P-256", x: highBit.base64URLEncodedString, y: leadingZero.base64URLEncodedString)
         ))
+        for (name, device) in devices {
+            vectors.append(("the \(name) device key", device.jwk))
+        }
 
-        return vectors.map { name, x, y in
-            Fixture.Key(
-                name: name,
-                jwk: Fixture.Jwk(kty: "EC", crv: "P-256", x: x, y: y),
-                thumbprint: DeviceKey.thumbprint(x: x, y: y)
-            )
+        return try vectors.map { name, jwk in
+            Fixture.Key(name: name, jwk: jwk, thumbprint: try jwk.thumbprint())
         }
     }
 
-    private func proofs(from key: DeviceKey) throws -> [Fixture.Proof] {
+    private func proofs(_ devices: [(String, DeviceKey)]) throws -> [Fixture.Proof] {
         // The second token is shaped like a real one, dots and all, because the
         // proof commits to the token's bytes and a hash of "a.token" would pass
         // on an implementation that hashed only up to the first separator.
@@ -167,37 +171,32 @@ struct ProofInteropTests {
                     + ".c2lnbmF0dXJlLWJ5dGVzLXdoaWNoLW5vdGhpbmctaGVyZS12ZXJpZmllcw"
             ),
         ]
+        let made = Date(timeIntervalSince1970: TimeInterval(Self.now))
 
-        var built: [Fixture.Proof] = []
-        for (name, token) in tokens {
-            built.append(
-                Fixture.Proof(
-                    name: name,
-                    token: token,
-                    thumbprint: key.thumbprint,
-                    proof: String(
-                        decoding: try key.proof(over: Data(token.utf8), for: Self.relay),
-                        as: UTF8.self
-                    )
+        func proof(_ name: String, _ token: String, by key: DeviceKey) throws -> Fixture.Proof {
+            Fixture.Proof(
+                name: name,
+                token: token,
+                thumbprint: key.thumbprint,
+                proof: String(
+                    decoding: try key.proof(over: Data(token.utf8), for: Self.relay, at: made),
+                    as: UTF8.self
                 )
             )
+        }
+
+        var built: [Fixture.Proof] = []
+        for (device, key) in devices {
+            for (name, token) in tokens {
+                built.append(try proof("\(device): \(name)", token, by: key))
+            }
         }
 
         // Two proofs over one token, which must both be accepted. The relay
         // spends identifiers rather than tokens, and an implementation that
         // remembered the token instead would pass every test above and refuse
         // the second session of every pair.
-        built.append(
-            Fixture.Proof(
-                name: "a second proof over the first token",
-                token: tokens[0].1,
-                thumbprint: key.thumbprint,
-                proof: String(
-                    decoding: try key.proof(over: Data(tokens[0].1.utf8), for: Self.relay),
-                    as: UTF8.self
-                )
-            )
-        )
+        built.append(try proof("a second proof over the first token", tokens[0].1, by: devices[0].1))
         return built
     }
 
@@ -205,12 +204,12 @@ struct ProofInteropTests {
 
     @Test("the committed fixture is what this build produces and reads")
     func fixtureAgrees() throws {
-        let key = try Self.device()
-        let built = Fixture(relay: Self.relay, keys: keys(), proofs: try proofs(from: key))
+        let devices = try Self.devices()
+        let built = Fixture(relay: Self.relay, now: Self.now, keys: try keys(devices), proofs: try proofs(devices))
 
         if ProcessInfo.processInfo.environment["MOQOM_WRITE_FIXTURES"] == "1" {
             let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
             var encoded = try encoder.encode(built)
             encoded.append(UInt8(ascii: "\n"))
             try FileManager.default.createDirectory(
@@ -237,112 +236,61 @@ struct ProofInteropTests {
         // The thumbprints, byte for byte. This is the half of the fixture that
         // is deterministic on both sides, so it is compared rather than merely
         // recomputed — a committed vector that this build no longer reproduces
-        // is a change to `DeviceKey.thumbprint`, and every token already minted
-        // against the old value is one the relay would refuse.
+        // is a change to the thumbprint, and every token already minted against
+        // the old value is one the relay would refuse.
         #expect(committed.keys.count == built.keys.count)
         for (mine, theirs) in zip(built.keys, committed.keys) {
             #expect(mine.name == theirs.name)
-            #expect(mine.jwk.x == theirs.jwk.x)
-            #expect(mine.jwk.y == theirs.jwk.y)
+            #expect(mine.jwk == theirs.jwk)
             #expect(
-                DeviceKey.thumbprint(x: theirs.jwk.x, y: theirs.jwk.y) == theirs.thumbprint,
+                try theirs.jwk.thumbprint() == theirs.thumbprint,
                 "\(theirs.name): the committed thumbprint is not what this build computes"
             )
         }
 
-        // The proofs cannot be compared byte for byte — see the file note on
-        // ECDSA's nonce — so what is checked is that each committed proof still
-        // verifies here, under the key it carries, over the token it names.
+        // The proofs cannot be compared byte for byte — see the file note — so
+        // what is checked is that each committed proof passes the relay's check
+        // here, under the key the fixture names, over the token beside it.
         #expect(!committed.proofs.isEmpty)
+        let made = Date(timeIntervalSince1970: TimeInterval(committed.now))
+        let certificate = try #require(Data(base64URL: committed.relay))
+        var algorithms: Set<String> = []
         for proof in committed.proofs {
-            let parts = try Signed(proof.proof)
-
-            #expect(parts.header.alg == "ES256", "\(proof.name)")
-            #expect(parts.header.typ == "MOQT-POP", "\(proof.name)")
-            #expect(
-                DeviceKey.thumbprint(x: parts.header.jwk.x, y: parts.header.jwk.y)
-                    == proof.thumbprint,
-                "\(proof.name): the proof is signed by a key the fixture does not name"
+            try Checker(store: MemoryNonceStore()).check(
+                Data(proof.proof.utf8),
+                token: Data(proof.token.utf8),
+                certificateHash: certificate,
+                thumbprint: proof.thumbprint,
+                now: made,
+                until: made.addingTimeInterval(600)
             )
-
-            let carried = try P256.Signing.PublicKey(rawRepresentation:
-                #require(Data(base64URL: parts.header.jwk.x))
-                    + #require(Data(base64URL: parts.header.jwk.y))
-            )
-            #expect(
-                carried.isValidSignature(
-                    try P256.Signing.ECDSASignature(rawRepresentation: parts.signature),
-                    for: parts.signed
-                ),
-                "\(proof.name): the committed signature no longer verifies here"
-            )
-
-            #expect(
-                parts.claims.ath
-                    == Data(SHA256.hash(data: Data(proof.token.utf8))).base64URLEncodedString,
-                "\(proof.name): the proof does not commit to the token beside it"
-            )
-            #expect(parts.claims.rel == committed.relay, "\(proof.name)")
-            #expect(!parts.claims.jti.isEmpty, "\(proof.name)")
+            algorithms.insert(try Header(proof.proof).alg)
         }
+        #expect(algorithms == ["ML-DSA-65", "ES256"], "the fixture must carry both algorithms")
 
         // Distinct, or the relay's replay cache would refuse the second of them
         // and a fleet would see every other connection fail.
-        let identifiers = try committed.proofs.map { try Signed($0.proof).claims.jti }
-        #expect(Set(identifiers).count == identifiers.count)
+        let store = MemoryNonceStore()
+        for proof in committed.proofs {
+            try Checker(store: store).check(
+                Data(proof.proof.utf8),
+                token: Data(proof.token.utf8),
+                certificateHash: certificate,
+                thumbprint: proof.thumbprint,
+                now: made,
+                until: made.addingTimeInterval(600)
+            )
+        }
     }
 
-    // MARK: - Reading a proof back
-
-    /// A compact JWS taken apart, as `possession.rs` takes one apart.
-    private struct Signed {
-        struct Jwk: Decodable {
-            let kty: String
-            let crv: String
-            let x: String
-            let y: String
-        }
-
-        struct Header: Decodable {
-            let alg: String
-            let typ: String
-            let jwk: Jwk
-        }
-
-        struct Claims: Decodable {
-            let ath: String
-            let jti: String
-            let rel: String
-        }
-
-        let header: Header
-        let claims: Claims
-
-        /// The bytes covered by the signature, taken from the original rather
-        /// than rebuilt: a round trip through base64 and JSON does not reproduce
-        /// them byte for byte, and the signature is over bytes.
-        let signed: Data
-        let signature: Data
+    /// A proof's protected header, which is all this needs to read itself.
+    private struct Header: Decodable {
+        let alg: String
 
         init(_ compact: String) throws {
-            let segments = compact.split(separator: ".", omittingEmptySubsequences: false)
-            guard segments.count == 3 else { throw Malformed.segments }
-
-            let decoder = JSONDecoder()
-            header = try decoder.decode(Header.self, from: try Self.decode(segments[0]))
-            claims = try decoder.decode(Claims.self, from: try Self.decode(segments[1]))
-            signed = Data("\(segments[0]).\(segments[1])".utf8)
-            signature = try Self.decode(segments[2])
-        }
-
-        private static func decode(_ segment: Substring) throws -> Data {
-            guard let bytes = Data(base64URL: String(segment)) else { throw Malformed.encoding }
-            return bytes
-        }
-
-        enum Malformed: Error {
-            case segments
-            case encoding
+            let segment = String(compact.prefix { $0 != "." })
+            guard let bytes = Data(base64URL: segment) else { throw CocoaError(.coderReadCorrupt) }
+            self = try JSONDecoder().decode(Self.self, from: bytes)
         }
     }
 }

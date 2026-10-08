@@ -1,0 +1,5 @@
+# REQUEST_ERROR 0x5: REDIRECT (0x34), retry 1, reason "moved", Redirect {URI moqt://other.example/x, moqom/acme video}.
+05 00 31 34 01 05 6d 6f 76 65 64 16 6d 6f 71 74
+3a 2f 2f 6f 74 68 65 72 2e 65 78 61 6d 70 6c 65
+2f 78 02 05 6d 6f 71 6f 6d 04 61 63 6d 65 05 76
+69 64 65 6f

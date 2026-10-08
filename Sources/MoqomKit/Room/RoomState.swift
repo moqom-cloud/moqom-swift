@@ -252,6 +252,28 @@ public enum RoomEvent: Sendable {
     /// should either restart the broadcast or tell the user they have gone silent.
     case broadcastInterrupted
 
+    /// This device's grants changed and no longer cover what it was publishing,
+    /// so the SDK has stopped it: the kinds named are the publications it ended.
+    ///
+    /// A demotion, or a move between the queue and the stage, landing on the
+    /// session already open. Nothing reconnects and the room carries on playing;
+    /// what changes is that this device is no longer on air, and an interface
+    /// should stop presenting it as though it were. A move onto the stage ends
+    /// the queue's publication too, and the application starts the stage one
+    /// with ``RoomSession/startBroadcast(from:configuration:backstage:)`` when
+    /// the participant chooses to go on.
+    case publishingRevoked(MediaKind)
+
+    /// Media from a participant is being dropped because the room requires
+    /// end-to-end encryption and this session holds no key to open it with.
+    ///
+    /// Once per participant, not once per object: the cause is a missing call to
+    /// ``RoomSession/useEncryption(_:)`` on this device, and the tile will stay
+    /// dark until that is fixed or the room's backend sets the room's policy to
+    /// optional. Also sent for this device itself when a tightened policy stops
+    /// a publication that was going out in the clear.
+    case encryptionRequired(ParticipantIdentity)
+
     /// Who the Picture in Picture window should draw, in order.
     ///
     /// Separate from ``galleryChanged`` because the two move independently: a
@@ -273,6 +295,11 @@ public enum RoomEvent: Sendable {
     /// there is no measurement without a measurer, and a timer nobody read from
     /// would be battery spent on a number nobody wanted.
     case qualityChanged(ParticipantIdentity, ConnectionQuality)
+
+    /// How a participant's media reaches this device changed: relay, a direct
+    /// path being set up, or a direct path. Only while direct paths are turned
+    /// on; see ``RoomSession/setDirect(_:)`` and ``RoomSession/directPaths``.
+    case directPathChanged(ParticipantIdentity, DirectPathState)
 
     /// The stream is over. Arrives as media, before the transport winds down.
     case terminated(TerminalEvent)

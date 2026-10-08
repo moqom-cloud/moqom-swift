@@ -66,11 +66,17 @@ public actor RoomLogPublisher {
     public private(set) var group: UInt64 = 0
 
     private let writer: any TrackWriter
+    let signer: RoomLogSigner
+    private let tenant: TenantID
+    private let room: RoomID
     private var object: UInt64 = 0
     private var changesSinceSnapshot = 0
     private var lastSnapshot: MonotonicTime?
 
     /// - Parameters:
+    ///   - signer: The authority's key. Every entry is signed with it, and a
+    ///     reader applies nothing that is not.
+    ///   - tenant: With `room`, what every signature is bound to.
     ///   - sequence: Where to carry on from. An authority that reconnects must
     ///     pass what it had reached, because restarting at zero means every
     ///     reader treats the new entries as ones it has already applied and the
@@ -78,12 +84,18 @@ public actor RoomLogPublisher {
     ///     to be increasing within a track.
     public init(
         writer: any TrackWriter,
+        signer: RoomLogSigner,
+        tenant: TenantID,
+        room: RoomID,
         state: RoomSnapshot = RoomSnapshot(),
         cadence: Cadence = .default,
         sequence: UInt64 = 0,
         group: UInt64 = 0
     ) {
         self.writer = writer
+        self.signer = signer
+        self.tenant = tenant
+        self.room = room
         self.state = state
         self.cadence = cadence
         self.sequence = sequence
@@ -186,12 +198,14 @@ public actor RoomLogPublisher {
         isKeyFrame: Bool = false
     ) async throws(MoqomError) {
         let payload: Data
+        let signature: Data
         do {
             payload = try update.encoded()
+            signature = try signer.sign(payload, tenant: tenant, room: room)
         } catch {
             sequence -= 1
             throw MoqomError.invalidState(
-                expected: "encodable room update",
+                expected: "encodable, signable room update",
                 actual: "\(error)"
             )
         }
@@ -202,7 +216,8 @@ public actor RoomLogPublisher {
                     object: object,
                     priority: Self.priority,
                     payload: payload,
-                    isKeyFrame: isKeyFrame
+                    isKeyFrame: isKeyFrame,
+                    properties: ObjectProperties(authoritySignature: signature)
                 )
             )
         } catch {
@@ -224,6 +239,7 @@ public extension RoomLogPublisher {
         room: RoomID,
         tenant: TenantID,
         on session: any TransportSession,
+        signer: RoomLogSigner,
         state: RoomSnapshot = RoomSnapshot(),
         cadence: Cadence = .default,
         sequence: UInt64 = 0,
@@ -241,6 +257,9 @@ public extension RoomLogPublisher {
         let writer = try await session.publish(track, priority: priority)
         return RoomLogPublisher(
             writer: writer,
+            signer: signer,
+            tenant: tenant,
+            room: room,
             state: state,
             cadence: cadence,
             sequence: sequence,

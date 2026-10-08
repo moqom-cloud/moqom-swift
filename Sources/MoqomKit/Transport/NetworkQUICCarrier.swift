@@ -151,6 +151,45 @@
             )
         }
 
+        /// Take over a connection a direct endpoint's listener accepted.
+        ///
+        /// The listener owns the connection's lifetime — it ends when the
+        /// listener's handler returns — so the caller keeps that handler
+        /// suspended for as long as this carrier is in use. The certificate is
+        /// the one the handshake was pinned to, and is given rather than read
+        /// because the pin is what was checked.
+        static func accepted(
+            _ connection: NetworkConnection<QUIC>,
+            alpn: String,
+            peerCertificate: String,
+            within timeout: Duration
+        ) async throws(MoqomError) -> NetworkQUICCarrier {
+            let (loss, lossIn) = AsyncStream.makeStream(
+                of: TransportFailure.self,
+                bufferingPolicy: .bufferingNewest(1)
+            )
+            let reporter = LossReporter(continuation: lossIn)
+            // Started here because an accepted connection, like a dialled one,
+            // does not run its handshake until something starts it.
+            _ = connection.start()
+            // Made before the handshake is awaited, because making it is what
+            // installs the inbound-stream handler: the dialler sends SETUP the
+            // moment its side is ready, and a stream that arrives before
+            // there is a handler is never delivered. No datagrams, because
+            // asking for the channel waits, for as long as the connection
+            // lasts, for a peer to offer one, and a direct dialler does not.
+            let carrier = NetworkQUICCarrier(
+                connection: connection,
+                datagrams: nil,
+                certificate: peerCertificate,
+                loss: loss,
+                reporter: reporter,
+                alpn: alpn
+            )
+            try await Self.waitUntilReady(connection, reporting: reporter, within: timeout)
+            return carrier
+        }
+
         /// The protocol stack, configured.
         ///
         /// Split out because the builder is a result builder and a conditional
@@ -323,6 +362,12 @@
                             break
                         }
                     }
+                    // A connection a listener accepted can be ready before a
+                    // handler is installed, and then no update says so.
+                    if case .ready = connection.state, resumed.claim() {
+                        deadline.cancel()
+                        continuation.resume()
+                    }
                 }
             } catch let error as NWError {
                 throw Self.failure(for: error)
@@ -366,14 +411,15 @@
             datagrams: QUIC.Datagrams<QUICDatagram>?,
             certificate: String?,
             loss: AsyncStream<TransportFailure>,
-            reporter: LossReporter
+            reporter: LossReporter,
+            alpn: String? = nil
         ) {
             self.connection = connection
             datagramChannel = datagrams
             peerCertificateDigest = certificate
             lossStream = loss
             self.reporter = reporter
-            alpn = connection.negotiatedALPN ?? ""
+            self.alpn = alpn ?? connection.negotiatedALPN ?? ""
             maximumDatagramSize = datagrams == nil ? 0 : connection.usableDatagramFrameSize
 
             let (bidirectional, bidirectionalIn) = AsyncStream.makeStream(

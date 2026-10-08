@@ -411,6 +411,31 @@ public struct SpaceUpdate: Hashable, Sendable, Codable {
 
     public var body: Body
 
+    /// The same instant on the authority's capture clock, when it is on camera.
+    ///
+    /// The clock its video frames are stamped with, so a viewer can draw the
+    /// board at exactly the moment of the picture it is showing. See
+    /// ``SpacePlayout``.
+    public var media: FrameTimestamp?
+
+    /// Game events, in this authority's numbering. See ``SpaceGameEvent``.
+    ///
+    /// A delta carries its group's events so far and a snapshot the epoch's
+    /// most recent, so most of these are repeats and a reader drops them.
+    public var events: [SpaceEventRecord]
+
+    /// The last event number this authority had assigned when it wrote this.
+    ///
+    /// Zero when it has assigned none. Lets a reader notice a gap even when
+    /// nothing in the gap arrived.
+    public var eventSequence: UInt64
+
+    /// Who this authority is handing the space to, on its last snapshot.
+    ///
+    /// The named participant takes over at the next epoch straight away rather
+    /// than waiting out ``SpaceSession/Configuration/quiet``.
+    public var successor: ParticipantIdentity?
+
     public enum Body: Hashable, Sendable {
         /// Everything. Applying it needs no history.
         case snapshot(SpaceSnapshot)
@@ -425,12 +450,20 @@ public struct SpaceUpdate: Hashable, Sendable, Codable {
         tick: SpaceTick,
         at: Timecode,
         body: Body,
-        version: Int = SpaceUpdate.currentVersion
+        version: Int = SpaceUpdate.currentVersion,
+        media: FrameTimestamp? = nil,
+        events: [SpaceEventRecord] = [],
+        eventSequence: UInt64 = 0,
+        successor: ParticipantIdentity? = nil
     ) {
         self.version = version
         self.tick = tick
         self.at = at
         self.body = body
+        self.media = media
+        self.events = events
+        self.eventSequence = eventSequence
+        self.successor = successor
     }
 
     public var isSnapshot: Bool {
@@ -440,6 +473,7 @@ public struct SpaceUpdate: Hashable, Sendable, Codable {
 
     private enum CodingKeys: String, CodingKey {
         case version = "v", tick = "t", at, snapshot, delta
+        case media, events, eventSequence = "seq", successor = "next"
     }
 
     public init(from decoder: any Decoder) throws {
@@ -447,6 +481,10 @@ public struct SpaceUpdate: Hashable, Sendable, Codable {
         version = try container.decode(Int.self, forKey: .version)
         tick = try container.decode(SpaceTick.self, forKey: .tick)
         at = try container.decode(Timecode.self, forKey: .at)
+        media = try container.decodeIfPresent(FrameTimestamp.self, forKey: .media)
+        events = try container.decodeIfPresent([SpaceEventRecord].self, forKey: .events) ?? []
+        eventSequence = try container.decodeIfPresent(UInt64.self, forKey: .eventSequence) ?? 0
+        successor = try container.decodeIfPresent(ParticipantIdentity.self, forKey: .successor)
         if let snapshot = try container.decodeIfPresent(SpaceSnapshot.self, forKey: .snapshot) {
             body = .snapshot(snapshot)
         } else {
@@ -463,6 +501,10 @@ public struct SpaceUpdate: Hashable, Sendable, Codable {
         case let .snapshot(snapshot): try container.encode(snapshot, forKey: .snapshot)
         case let .delta(delta): try container.encode(delta, forKey: .delta)
         }
+        try container.encodeIfPresent(media, forKey: .media)
+        if !events.isEmpty { try container.encode(events, forKey: .events) }
+        if eventSequence > 0 { try container.encode(eventSequence, forKey: .eventSequence) }
+        try container.encodeIfPresent(successor, forKey: .successor)
     }
 }
 
@@ -510,11 +552,13 @@ public enum SpaceTimeline {
         coasting: Duration = .milliseconds(250)
     ) -> Float? {
         guard now.isTrusted, start.isTrusted, end.isTrusted else { return nil }
-        let span = end.nanoseconds - start.nanoseconds
-        guard span > 0 else { return 1 }
-        let cap = end.nanoseconds &+ coasting.wholeNanoseconds
-        let sampled = min(max(now.nanoseconds, start.nanoseconds), cap)
-        return Float(Double(sampled - start.nanoseconds) / Double(span))
+        // Saturating, because all three can come off the wire.
+        return SpacePlayout.progress(
+            from: start.nanoseconds,
+            to: end.nanoseconds,
+            at: now.nanoseconds,
+            coasting: coasting.wholeNanoseconds
+        )
     }
 }
 

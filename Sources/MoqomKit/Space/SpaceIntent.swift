@@ -66,6 +66,12 @@ public struct SpaceIntent: Hashable, Sendable {
     /// Anything else the verb needs. Absolute values, as everywhere here.
     public var facts: [String: SpaceValue]
 
+    /// A kind or a name the verb needs: what to spawn, which event to send.
+    public var kind: String?
+
+    /// A whole pose, for a verb that places something rather than points at it.
+    public var pose: SpacePose?
+
     /// When the sender wanted it, on the shared timeline.
     ///
     /// The authority can use this to resolve a race by intent rather than by
@@ -82,9 +88,13 @@ public struct SpaceIntent: Hashable, Sendable {
         facts: [String: SpaceValue] = [:],
         sequence: UInt64 = 0,
         when: Timecode = .fallback(),
-        version: Int = SpaceIntent.currentVersion
+        version: Int = SpaceIntent.currentVersion,
+        kind: String? = nil,
+        pose: SpacePose? = nil
     ) {
         self.version = version
+        self.kind = kind
+        self.pose = pose
         self.sequence = sequence
         self.verb = verb
         self.subject = subject
@@ -125,6 +135,8 @@ private enum IntentTag {
     static let uncertainty: UInt32 = 7
     static let trust: UInt32 = 8
     static let fact: UInt32 = 9
+    static let kind: UInt32 = 10
+    static let pose: UInt32 = 11
 }
 
 private enum FactTag {
@@ -137,6 +149,9 @@ private enum FactTag {
 
 /// Three little-endian floats.
 private let vectorStride = 12
+
+/// Position, rotation, scale: eight little-endian floats, as on the space track.
+private let poseStride = 32
 
 public extension SpaceIntent {
     /// The bytes to publish.
@@ -155,6 +170,19 @@ public extension SpaceIntent {
                 buffer.rawFloat(at.x)
                 buffer.rawFloat(at.y)
                 buffer.rawFloat(at.z)
+            }
+        }
+        if let kind { writer.string(IntentTag.kind, kind) }
+        if let pose {
+            writer.fixedArray(IntentTag.pose, stride: poseStride, count: 1) { _, buffer in
+                buffer.rawFloat(pose.position.x)
+                buffer.rawFloat(pose.position.y)
+                buffer.rawFloat(pose.position.z)
+                buffer.rawFloat(pose.rotation.x)
+                buffer.rawFloat(pose.rotation.y)
+                buffer.rawFloat(pose.rotation.z)
+                buffer.rawFloat(pose.rotation.w)
+                buffer.rawFloat(pose.scale)
             }
         }
         writer.fixed64(IntentTag.nanoseconds, when.nanoseconds)
@@ -188,6 +216,8 @@ public extension SpaceIntent {
         var uncertainty = Duration.zero
         var trust = TimeTrust.fallback
         var facts: [String: SpaceValue] = [:]
+        var kind: String?
+        var pose: SpacePose?
 
         while let key = try reader.nextKey() {
             switch key.tag {
@@ -211,6 +241,27 @@ public extension SpaceIntent {
                         ))
                     }
                     return SpaceVector(x: float(0), y: float(4), z: float(8))
+                }
+            case IntentTag.kind:
+                kind = try reader.string()
+            case IntentTag.pose:
+                let array = try reader.fixedArray(stride: poseStride)
+                guard array.count == 1 else {
+                    throw WireError.invalid("an intent carrying \(array.count) poses")
+                }
+                // Through the normalising initialisers, so a drifted or hostile
+                // quaternion arrives as a rotation.
+                pose = array.withElement(0) { raw in
+                    func float(_ offset: Int) -> Float {
+                        Float(bitPattern: UInt32(
+                            littleEndian: raw.loadUnaligned(fromByteOffset: offset, as: UInt32.self)
+                        ))
+                    }
+                    return SpacePose(
+                        position: SpaceVector(x: float(0), y: float(4), z: float(8)),
+                        rotation: SpaceRotation(x: float(12), y: float(16), z: float(20), w: float(24)),
+                        scale: float(28)
+                    )
                 }
             case IntentTag.nanoseconds:
                 nanoseconds = try reader.fixed64()
@@ -246,7 +297,9 @@ public extension SpaceIntent {
                 uncertainty: uncertainty,
                 trust: trust
             ),
-            version: version
+            version: version,
+            kind: kind,
+            pose: pose
         )
     }
 

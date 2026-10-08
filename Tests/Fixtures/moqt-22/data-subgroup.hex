@@ -1,0 +1,2 @@
+# Subgroup stream: header type 0x10 (subgroup 0, priority present), alias 3, group 200, priority 128; objects 0 (payload aa) and 1 (payload bb cc).
+10 03 80 c8 80 00 01 aa 00 02 bb cc

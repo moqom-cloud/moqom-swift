@@ -407,6 +407,13 @@ struct ControlMessageTests {
             )
         )
 
+        // A namespace-scoped request's target MUST have an empty name, and an
+        // empty namespace and name are the literal target, not "the original
+        // track" (draft-22 §9.4.1, moq-wg #1824).
+        let empty = RequestError.Redirect(connectURI: "moqt://edge.example/", namespace: .empty, name: "")
+        try roundTrip(RequestError(code: RequestErrorCode.redirect, redirect: empty))
+        #expect(empty.track == nil)
+
         var writer = WireWriter()
         try ControlFrame.write(RequestError(code: RequestErrorCode.timeout), to: &writer)
         var reader = WireReader(writer.bytes)

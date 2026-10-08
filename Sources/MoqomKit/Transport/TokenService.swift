@@ -51,11 +51,22 @@ public struct IssuedToken: Sendable, Hashable {
 
     public var room: String
 
-    public init(token: Data, expiresAt: Date, username: String, room: String) {
+    /// What the room allows of direct paths. ``DirectRoomPolicy/default``
+    /// when the service does not say.
+    public var direct: DirectRoomPolicy
+
+    public init(
+        token: Data,
+        expiresAt: Date,
+        username: String,
+        room: String,
+        direct: DirectRoomPolicy = .default
+    ) {
         self.token = token
         self.expiresAt = expiresAt
         self.username = username
         self.room = room
+        self.direct = direct
     }
 
     /// Whether this is worth presenting, allowing for the walk to the relay.
@@ -144,12 +155,7 @@ public struct TokenService: Sendable, Hashable {
             // what the key actually hashes to — so a client whose namespace and
             // whose key disagree is told here rather than at a relay.
             "device": DeviceID.field(of: device.thumbprint),
-            "key": [
-                "kty": "EC",
-                "crv": "P-256",
-                "x": device.x,
-                "y": device.y,
-            ],
+            "key": device.jwk.members,
         ])
         // Short, because this sits in front of a connection somebody is waiting
         // for. A token service that hangs for the platform's default of sixty
@@ -198,10 +204,10 @@ public struct TokenService: Sendable, Hashable {
             token: Data(token.utf8),
             expiresAt: expires,
             username: body["username"] as? String ?? username,
-            room: body["room"] as? String ?? room
+            room: body["room"] as? String ?? room,
+            direct: DirectRoomPolicy(json: body["direct"])
         )
     }
-
     private static func instant(_ text: String) -> Date? {
         let fractional = ISO8601DateFormatter()
         fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -209,13 +215,13 @@ public struct TokenService: Sendable, Hashable {
     }
 
     /// A session and the pin it is enforcing, so the failure can be explained.
-    fileprivate struct Pinned {
+    struct Pinned {
         var session: URLSession
         var trust: PinnedTrust?
     }
 
     /// A session that trusts exactly these certificates, or the platform's.
-    fileprivate static func session(pinning hashes: [String]) -> Pinned {
+    static func session(pinning hashes: [String]) -> Pinned {
         guard !hashes.isEmpty else {
             return Pinned(session: URLSession(configuration: .ephemeral), trust: nil)
         }
@@ -329,7 +335,7 @@ extension TokenServiceError: LocalizedError {
 /// `allowsAnySSLCertificate`-shaped shortcuts: this connection carries the
 /// device's long-lived credential in a header, so accepting any certificate on it
 /// is handing that credential to whoever answers the address.
-private final class PinnedTrust: NSObject, URLSessionDelegate, Sendable {
+final class PinnedTrust: NSObject, URLSessionDelegate, Sendable {
     let hashes: [Data]
 
     /// What the handshake actually offered, for the error message.

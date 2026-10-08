@@ -1,0 +1,2 @@
+# OBJECT_DATAGRAM: type 0x01 (properties, priority present), alias 3, group 200, object 5, priority 64, properties {0x3C: 1}, payload 01 02 03.
+01 03 80 c8 05 40 02 3c 01 01 02 03

@@ -1,0 +1,2 @@
+# 0x26 length-prefixed: SetID 0, ranges 3..5 and 10..15 (§8.6's example: 3, 2, 5, 5).
+01 26 05 00 03 02 05 05
