@@ -1006,8 +1006,11 @@ public actor MoqtSession: TransportSession {
     /// produced a publisher that encoded happily into a name the relay had
     /// dropped.
     ///
-    /// A peer that is another `MoqtSession` acknowledges with `REQUEST_OK`
-    /// instead of staying quiet, so both shapes are understood rather than one.
+    /// A draft-22 relay, or a peer that is another `MoqtSession`, acknowledges
+    /// with `REQUEST_OK` instead of staying quiet. That is not the last word:
+    /// a relay whose grants change under a live announcement ends it with a
+    /// `REQUEST_ERROR` on the same stream, so the acknowledgement is passed
+    /// over and the stream read on.
     private static func verdict(
         on stream: any QUICStream,
         announcing namespace: TrackNamespace,
@@ -1024,6 +1027,7 @@ public actor MoqtSession: TransportSession {
             framer.append(chunk)
 
             while let frame = try? framer.nextRaw() {
+                if frame.code == MessageType.requestOk.rawValue { continue }
                 guard frame.code == MessageType.requestError.rawValue else { return nil }
                 let error: RequestError = switch try? dialect.decode(frame) {
                 case let .requestError(error)?: error

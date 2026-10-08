@@ -942,9 +942,20 @@ public actor RoomSession {
             for await event in stream {
                 await self.applyAnnouncement(event, under: prefix)
             }
+            if !Task.isCancelled { await self.watchEnded(prefix) }
         }
         prefixTasks.append(task)
         if rosterTask == nil { rosterTask = task }
+    }
+
+    /// A watch the relay ended. Backstage is the one that ends while the
+    /// session goes on: going live takes away the grant to read it, and nobody
+    /// is told when the people seen there leave, so they leave the roster now.
+    private func watchEnded(_ prefix: TrackNamespace) async {
+        guard prefix == (try? MoqomNamespaces.backstage(tenant: tenant, room: room)) else { return }
+        for participant in state.roster.participants where participant.slot.isBackstage && participant.id != identity {
+            await depart(participant.id, reason: .left)
+        }
     }
 
     /// Move the room onto a new transport session after a reconnect.
@@ -1739,6 +1750,10 @@ public actor RoomSession {
         let publisher = CatalogPublisher(writer: writer)
         catalogPublisher = publisher
         await refreshCatalog()
+        // Whoever is already in the room subscribes on hearing the
+        // announcement, so the write above races the relay's upstream pull:
+        // the race somebody arriving starts, from the other side.
+        restateCatalog()
     }
 
     public func stopBroadcast() async {
@@ -3284,8 +3299,18 @@ public actor RoomSession {
         // withdrawn from the other in either order. The roster holds one slot
         // per participant, so the withdrawal of the slot they left is not them
         // leaving, and the slot they moved to replaces the old one.
-        if let current = state.roster[slot.identity]?.slot, current.namespace != slot.namespace {
-            guard case .announced = event, slot.identity != identity else { return }
+        if let current = state.roster[slot.identity], current.slot.namespace != slot.namespace {
+            guard case .announced = event else { return }
+            guard slot.identity != identity else {
+                // This device's own move: the same entry, under the new slot.
+                state.roster[identity] = Participant(
+                    slot: slot, grants: current.grants, presence: current.presence, mute: current.mute,
+                    isSpotlighted: current.isSpotlighted, ladders: current.ladders, locale: current.locale
+                )
+                await refreshDirect()
+                await refreshGallery()
+                return
+            }
             await depart(slot.identity, reason: .left)
         }
 

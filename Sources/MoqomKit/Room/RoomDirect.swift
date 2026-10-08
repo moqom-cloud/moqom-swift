@@ -629,9 +629,16 @@ final class DirectMergedSubscription: SubscriptionHandle {
             guard let offers else { return nil }
             let generation = generation
             return Task { [weak self] in
-                guard let stream = try? await offers.offers(from: who) else { return }
-                for await offer in stream {
-                    await self?.received(offer, from: who, generation: generation)
+                // The peer opens its offer track with its first offer, so a
+                // subscription made before that is refused, and one to a track
+                // the peer has since replaced ends. Either way, ask again.
+                while !Task.isCancelled, self != nil {
+                    if let stream = try? await offers.offers(from: who) {
+                        for await offer in stream {
+                            await self?.received(offer, from: who, generation: generation)
+                        }
+                    }
+                    try? await Task.sleep(for: Self.resend)
                 }
             }
         }
@@ -786,7 +793,9 @@ final class DirectMergedSubscription: SubscriptionHandle {
             // opened only once there is a path to meter and closed with it.
             let feed: (tickets: AsyncStream<DirectTicket>, subscription: any SubscriptionHandle)
             do {
-                let slot = try MoqomNamespaces.participant(tenant: tenant, room: room, identity: identity)
+                let slot = view.backstage
+                    ? try MoqomNamespaces.backstageParticipant(tenant: tenant, room: room, identity: identity)
+                    : try MoqomNamespaces.participant(tenant: tenant, room: room, identity: identity)
                 feed = try await DirectTicketFeed.request(from: relay, slot: slot, peer: peerName)
             } catch {
                 await direct.session.close(code: 0, reason: "no direct tickets")
