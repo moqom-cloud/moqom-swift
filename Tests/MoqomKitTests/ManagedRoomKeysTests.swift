@@ -269,9 +269,9 @@ struct ManagedRoomKeysTests {
 
         // Media sealed by one member opens for the others, with no key ever
         // having been handed to the application or the service.
-        let sealed = try alice.encryption.sender.protect(Data("hello".utf8))
-        #expect(try bob.encryption.receiver.unprotect(sealed) == Data("hello".utf8))
-        #expect(try carol.encryption.receiver.unprotect(sealed) == Data("hello".utf8))
+        let sealed = try alice.encryption.sender.protectRaw(Data("hello".utf8), aad: Data())
+        #expect(try bob.encryption.receiver.unprotectRaw(sealed, aad: Data()) == Data("hello".utf8))
+        #expect(try carol.encryption.receiver.unprotectRaw(sealed, aad: Data()) == Data("hello".utf8))
 
         let base = try #require(await alice.status).epochAuthenticator
         for blob in await service.everything { #expect(blob.range(of: base) == nil) }
@@ -297,8 +297,8 @@ struct ManagedRoomKeysTests {
         #expect(await bob.status?.cipherSuite == .mls128DHKEMX25519)
         #expect(await service.group?.cipherSuite == 0x0001)
 
-        let sealed = try bob.encryption.sender.protect(Data("classical".utf8))
-        #expect(try alice.encryption.receiver.unprotect(sealed) == Data("classical".utf8))
+        let sealed = try bob.encryption.sender.protectRaw(Data("classical".utf8), aad: Data())
+        #expect(try alice.encryption.receiver.unprotectRaw(sealed, aad: Data()) == Data("classical".utf8))
 
         for keys in [alice, bob] { await keys.stop() }
     }
@@ -322,20 +322,28 @@ struct ManagedRoomKeysTests {
         let status = try #require(await alice.status)
         #expect(status.agents == ["watchdog.rec-1/worker-01"])
         #expect(status.undisclosedAgents == ["watchdog.rec-1/worker-01"])
-        #expect(throws: SFrameError.noKey) { _ = try alice.encryption.sender.protect(Data("hi".utf8)) }
-        #expect(throws: SFrameError.noKey) { _ = try bob.encryption.sender.protect(Data("hi".utf8)) }
+        #expect(throws: SFrameError.noKey) { _ = try alice.encryption.sender.protectRaw(Data("hi".utf8), aad: Data()) }
+        #expect(throws: SFrameError.noKey) { _ = try bob.encryption.sender.protectRaw(Data("hi".utf8), aad: Data()) }
 
         // The control log names it. Media flows, and the agent can open it.
         await alice.disclose(watchdogs: ["rec-1"])
         await bob.disclose(watchdogs: ["rec-1"])
         #expect(await alice.status?.undisclosedAgents.isEmpty == true)
-        let sealed = try alice.encryption.sender.protect(Data("recorded".utf8))
-        #expect(try recorder.encryption.receiver.unprotect(sealed) == Data("recorded".utf8))
-        #expect(try bob.encryption.receiver.unprotect(sealed) == Data("recorded".utf8))
+        let sealed = try alice.encryption.sender.protectRaw(Data("recorded".utf8), aad: Data())
+        #expect(try recorder.encryption.receiver.unprotectRaw(sealed, aad: Data()) == Data("recorded".utf8))
+        #expect(try bob.encryption.receiver.unprotectRaw(sealed, aad: Data()) == Data("recorded".utf8))
 
         // Detached on the log while still in the group: held again.
         await alice.disclose(watchdogs: [])
-        #expect(throws: SFrameError.noKey) { _ = try alice.encryption.sender.protect(Data("hi".utf8)) }
+        #expect(throws: SFrameError.noKey) { _ = try alice.encryption.sender.protectRaw(Data("hi".utf8), aad: Data()) }
+
+        // Named again in the same epoch: the same key comes back, and its
+        // counter carries on rather than repeating nonces.
+        await alice.disclose(watchdogs: ["rec-1"])
+        let again = try alice.encryption.sender.protectRaw(Data("again".utf8), aad: Data())
+        #expect(try SFrameHeader.read(from: again).0 == SFrameHeader(
+            keyID: SFrameHeader.read(from: sealed).0.keyID, counter: 1
+        ))
 
         // An ordinary username that merely looks like one is not an agent.
         #expect(ManagedRoomKeys.watchdog(of: "watchdogs/iphone") == nil)
@@ -369,20 +377,20 @@ struct ManagedRoomKeysTests {
 
         // Each publisher's frames open from the one base key, by key ID.
         for sender in [alice, bob] {
-            let sealed = try sender.encryption.sender.protect(Data("on air".utf8))
-            #expect(try carol.encryption.receiver.unprotect(sealed) == Data("on air".utf8))
-            #expect(try dave.encryption.receiver.unprotect(sealed) == Data("on air".utf8))
+            let sealed = try sender.encryption.sender.protectRaw(Data("on air".utf8), aad: Data())
+            #expect(try carol.encryption.receiver.unprotectRaw(sealed, aad: Data()) == Data("on air".utf8))
+            #expect(try dave.encryption.receiver.unprotectRaw(sealed, aad: Data()) == Data("on air".utf8))
         }
         // A viewer has nothing to send under.
-        #expect(throws: SFrameError.noKey) { _ = try carol.encryption.sender.protect(Data("hi".utf8)) }
+        #expect(throws: SFrameError.noKey) { _ = try carol.encryption.sender.protectRaw(Data("hi".utf8), aad: Data()) }
 
         // A new member moves the epoch, and viewers follow it.
         let erin = await keys("erin", "iphone-e", service)
         await erin.start()
         #expect(await eventually { await sameEpoch([alice, bob, erin], members: 3) })
         #expect(await eventually { await holds(carol, epochOf: alice) })
-        let sealed = try erin.encryption.sender.protect(Data("new epoch".utf8))
-        #expect(try carol.encryption.receiver.unprotect(sealed) == Data("new epoch".utf8))
+        let sealed = try erin.encryption.sender.protectRaw(Data("new epoch".utf8), aad: Data())
+        #expect(try carol.encryption.receiver.unprotectRaw(sealed, aad: Data()) == Data("new epoch".utf8))
 
         for keys in [alice, bob, erin] { await keys.stop() }
         await carol.stop()
@@ -408,17 +416,17 @@ struct ManagedRoomKeysTests {
         #expect(await eventually { await holds(carol, epochOf: alice) })
         #expect(await eventually { await holds(dave, epochOf: alice) })
         let before = try #require(await alice.status).epoch
-        let early = try alice.encryption.sender.protect(Data("before".utf8))
-        #expect(try dave.encryption.receiver.unprotect(early) == Data("before".utf8))
+        let early = try alice.encryption.sender.protectRaw(Data("before".utf8), aad: Data())
+        #expect(try dave.encryption.receiver.unprotectRaw(early, aad: Data()) == Data("before".utf8))
 
         await service.deafen("dave/tv")
         // With nobody joining or leaving the group, the epoch moves on a timer
         // because there is an audience.
         #expect(await eventually(timeout: .seconds(10)) { (await alice.status?.epoch ?? 0) > before })
         #expect(await eventually { await holds(carol, epochOf: alice) })
-        let late = try alice.encryption.sender.protect(Data("after".utf8))
-        #expect(try carol.encryption.receiver.unprotect(late) == Data("after".utf8))
-        #expect(throws: SFrameError.self) { _ = try dave.encryption.receiver.unprotect(late) }
+        let late = try alice.encryption.sender.protectRaw(Data("after".utf8), aad: Data())
+        #expect(try carol.encryption.receiver.unprotectRaw(late, aad: Data()) == Data("after".utf8))
+        #expect(throws: SFrameError.self) { _ = try dave.encryption.receiver.unprotectRaw(late, aad: Data()) }
 
         await alice.stop()
         await carol.stop()
@@ -487,10 +495,10 @@ struct ManagedRoomKeysTests {
         #expect(after.epoch > before)
         #expect(!after.members.contains("bob/iphone-b"))
 
-        let sealed = try alice.encryption.sender.protect(Data("after".utf8))
+        let sealed = try alice.encryption.sender.protectRaw(Data("after".utf8), aad: Data())
         let header = try SFrameHeader.read(from: sealed).0
         #expect(!bobReceiverKeys.contains(header.keyID))
-        #expect(try carol.encryption.receiver.unprotect(sealed) == Data("after".utf8))
+        #expect(try carol.encryption.receiver.unprotectRaw(sealed, aad: Data()) == Data("after".utf8))
 
         for keys in [alice, carol] { await keys.stop() }
     }
@@ -510,8 +518,8 @@ struct ManagedRoomKeysTests {
         let bob = await keys("bob", "iphone-b", service)
         await bob.start()
         #expect(await eventually { await sameEpoch([alice, bob], members: 2) })
-        let sealed = try bob.encryption.sender.protect(Data("back".utf8))
-        #expect(try alice.encryption.receiver.unprotect(sealed) == Data("back".utf8))
+        let sealed = try bob.encryption.sender.protectRaw(Data("back".utf8), aad: Data())
+        #expect(try alice.encryption.receiver.unprotectRaw(sealed, aad: Data()) == Data("back".utf8))
 
         for keys in [alice, bob] { await keys.stop() }
     }
@@ -635,7 +643,7 @@ struct ManagedKeysRoomTests {
         let relay = LoopbackRelay()
         let service = FakeKeyDelivery()
         let room = try await join("alice", relay: relay, service: service)
-        await room.useEncryption(.sharedKey(Data(repeating: 0x5A, count: 32), keyID: 1))
+        try await room.useEncryption(.sharedKey(Data(repeating: 0x5A, count: 32)))
         #expect(await room.groupKeys == nil)
         #expect(await room.isEncrypted)
     }

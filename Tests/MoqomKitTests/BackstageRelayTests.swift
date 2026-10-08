@@ -86,7 +86,7 @@
                 throw error
             }
             let room = try await session.join(room: "room-42")
-            await room.useEncryption(.sharedKey(roomKey, keyID: 1))
+            try await room.useEncryption(.sharedKey(roomKey))
             return Person(device: device, session: session, room: room)
         }
 

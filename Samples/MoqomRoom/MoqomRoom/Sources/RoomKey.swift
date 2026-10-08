@@ -21,14 +21,12 @@ enum RoomKey {
     /// Used when `--room-key` is not given. Not a secret; see above.
     static let samplePassphrase = "moqom-sample-not-a-secret"
 
-    /// Constant for the life of a room, because every participant has to
-    /// derive the same one. A real deployment rotates; this sample does not.
-    static let keyID: UInt64 = 1
-
     /// The encryption for one room, from a passphrase.
     ///
     /// The room's name is the salt, so the same passphrase gives different keys
     /// in different rooms and a key learned in one opens nothing in another.
+    /// Every participant derives the same base key; each sends under its own
+    /// random key ID. A real deployment rotates; this sample does not.
     static func encryption(room: RoomID, passphrase: String = samplePassphrase) -> RoomEncryption {
         let derived = HKDF<SHA256>.deriveKey(
             inputKeyMaterial: SymmetricKey(data: Data(passphrase.utf8)),
@@ -37,6 +35,7 @@ enum RoomKey {
             outputByteCount: 32
         )
         let base = derived.withUnsafeBytes { Data($0) }
-        return .sharedKey(base, keyID: keyID)
+        // 32 bytes is the default suite's key length, so this cannot throw.
+        return try! .sharedKey(base)
     }
 }

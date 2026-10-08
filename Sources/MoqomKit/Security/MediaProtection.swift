@@ -17,10 +17,19 @@ import MoqomCore
 @_exported import MoqomSFrame
 import MoqomWire
 
+extension SFrameTrack {
+    /// A full track name as SFrame binds it: the same UTF-8 fields the wire
+    /// carries.
+    public init(_ track: FullTrackName) {
+        self.init(namespace: track.namespace.fields, name: track.name.value)
+    }
+}
+
 extension SFrameMetadata {
-    /// A track object's position and properties, as SFrame binds them.
-    public init(_ object: TrackObject) {
+    /// A track object's track, position and properties, as SFrame binds them.
+    public init(_ object: TrackObject, on track: FullTrackName) {
         self.init(
+            track: track,
             group: object.group,
             object: object.object,
             priority: object.priority,
@@ -28,8 +37,15 @@ extension SFrameMetadata {
         )
     }
 
-    public init(group: UInt64, object: UInt64, priority: UInt8, properties: ObjectProperties) {
+    public init(
+        track: FullTrackName,
+        group: UInt64,
+        object: UInt64,
+        priority: UInt8,
+        properties: ObjectProperties
+    ) {
         self.init(
+            track: SFrameTrack(track),
             group: group,
             object: object,
             priority: priority,
@@ -42,31 +58,17 @@ extension SFrameMetadata {
         )
     }
 
-    /// The canonical bytes an object's position and metadata authenticate as.
+    /// The canonical bytes an object's track, position and metadata
+    /// authenticate as.
     ///
     /// Every field here came off, or is going onto, the wire, so it is always
     /// in range; failing to encode is a bug rather than bad input.
-    public static func encode(
-        group: UInt64,
-        object: UInt64,
-        priority: UInt8,
-        properties: ObjectProperties
-    ) -> Data {
+    public static func encode(for object: TrackObject, on track: FullTrackName) -> Data {
         do {
-            return try SFrameMetadata(group: group, object: object, priority: priority, properties: properties)
-                .encoded()
+            return try SFrameMetadata(object, on: track).encoded()
         } catch {
             preconditionFailure("object metadata out of wire range")
         }
-    }
-
-    public static func encode(for object: TrackObject) -> Data {
-        encode(
-            group: object.group,
-            object: object.object,
-            priority: object.priority,
-            properties: object.properties
-        )
     }
 }
 
@@ -87,7 +89,7 @@ public final class ProtectedTrackWriter: TrackWriter {
     }
 
     public func write(_ object: TrackObject) async throws(MoqomError) {
-        let metadata = SFrameMetadata(object)
+        let metadata = SFrameMetadata(object, on: inner.track)
         let sealed: Data
         do {
             sealed = try sender.protect(object.payload, metadata: metadata)
@@ -179,8 +181,10 @@ public actor MediaUnprotector {
         for continuation in waiting.values { continuation.resume() }
     }
 
-    public func unprotect(_ object: TrackObject) async -> TrackObject? {
-        let metadata = SFrameMetadata(object)
+    /// An object that arrived on `track`, decrypted, or `nil` if it does not
+    /// open. One sealed for another track fails authentication.
+    public func unprotect(_ object: TrackObject, on track: FullTrackName) async -> TrackObject? {
+        let metadata = SFrameMetadata(object, on: track)
         let deadline = ContinuousClock.now.advanced(by: keyHold)
         while true {
             do {
@@ -226,14 +230,16 @@ public actor MediaUnprotector {
         waiters.removeValue(forKey: id)?.resume()
     }
 
-    /// The same stream, decrypted, with undecryptable objects removed.
+    /// The same stream of `track`'s objects, decrypted, with undecryptable
+    /// objects removed.
     public nonisolated func stream(
-        _ objects: AsyncStream<TrackObject>
+        _ objects: AsyncStream<TrackObject>,
+        on track: FullTrackName
     ) -> AsyncStream<TrackObject> {
         AsyncStream { continuation in
             let task = Task {
                 for await object in objects {
-                    if let plain = await self.unprotect(object) {
+                    if let plain = await self.unprotect(object, on: track) {
                         continuation.yield(plain)
                     }
                 }
@@ -266,14 +272,23 @@ public struct RoomEncryption: Sendable {
     /// removing a member requires rekeying everyone. That is fine for a small
     /// trusted call and wrong for a large room, which is what the MLS path in
     /// RFC 9605 §5.2 exists for.
+    ///
+    /// Each call sends under a fresh random 64-bit KID, and receives under any
+    /// KID by deriving its key from the same base key. A key is fixed by its
+    /// base key and KID and every sender counts from 0, so two participants, or
+    /// one participant before and after a restart, sending under one KID would
+    /// repeat nonces; random KIDs make that a 2⁻⁶⁴ event per pair.
+    ///
+    /// - Throws: ``SFrameError/invalidBaseKey`` unless `baseKey` is the suite's
+    ///   key length.
     public static func sharedKey(
         _ baseKey: Data,
-        keyID: UInt64,
         suite: SFrameCipherSuite = .aes256GcmSha512
-    ) -> RoomEncryption {
-        let key = SFrameKey(keyID: keyID, baseKey: baseKey, suite: suite)
+    ) throws(SFrameError) -> RoomEncryption {
+        let key = try SFrameKey(keyID: .random(in: .min ... .max), baseKey: baseKey, suite: suite)
         let receiver = SFrameReceiver()
         receiver.add(key)
+        receiver.setResolver { try? SFrameKey(keyID: $0, baseKey: baseKey, suite: suite) }
         return RoomEncryption(sender: SFrameSender(key: key), receiver: receiver)
     }
 }

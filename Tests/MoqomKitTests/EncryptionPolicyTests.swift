@@ -127,7 +127,7 @@ struct EncryptionPolicyMediaTests {
     func publishesWithKey() async throws {
         let relay = LoopbackRelay()
         let room = try await join("alice", e2ee: nil, relay: relay)
-        await room.useEncryption(.sharedKey(Data(repeating: 0x5A, count: 32), keyID: 1))
+        try await room.useEncryption(.sharedKey(Data(repeating: 0x5A, count: 32)))
         #expect(await room.isEncrypted)
 
         let source = FrameRelay(format: CaptureFormat(size: rung.size, frameRate: 30), depth: 16)
@@ -185,7 +185,7 @@ struct EncryptionPolicyMediaTests {
         let relay = LoopbackRelay()
         let hostRoom = try await join("alice", e2ee: .plaintextForTesting, relay: relay)
         let viewerRoom = try await join("bob", e2ee: .required, relay: relay)
-        await viewerRoom.useEncryption(.sharedKey(Data(repeating: 0x5A, count: 32), keyID: 1))
+        try await viewerRoom.useEncryption(.sharedKey(Data(repeating: 0x5A, count: 32)))
 
         let who = identity("alice")
         let source = FrameRelay(format: CaptureFormat(size: rung.size, frameRate: 30), depth: 16)

@@ -264,7 +264,7 @@ struct SealedCatalogTests {
         let transport = try await LoopbackTransport(relay: relay).connect(
             to: RelayEndpoint(host: "loopback"), credentials: credentials("alice")
         )
-        let key = SFrameKey(keyID: 9, baseKey: Data(repeating: 0x5A, count: 32))
+        let key = try SFrameKey(keyID: 9, baseKey: Data(repeating: 0x5A, count: 32))
         let publisher = CatalogPublisher(
             writer: ProtectedTrackWriter(
                 wrapping: try await transport.publish(track, priority: CatalogPublisher.priority),
@@ -281,7 +281,7 @@ struct SealedCatalogTests {
         let receiver = SFrameReceiver()
         receiver.add(key)
         let unprotector = MediaUnprotector(receiver: receiver)
-        let opened = try #require(await unprotector.unprotect(sealed))
+        let opened = try #require(await unprotector.unprotect(sealed, on: track))
         let reader = CatalogReader()
         #expect(await reader.apply(opened) == catalog)
 
@@ -292,14 +292,14 @@ struct SealedCatalogTests {
             payload: sealed.payload, isKeyFrame: true,
             properties: ObjectProperties(disclosure: Data(#"{"tracks":[],"version":1}"#.utf8))
         )
-        #expect(await unprotector.unprotect(forged) == nil)
+        #expect(await unprotector.unprotect(forged, on: track) == nil)
 
         // Nor can it substitute a plaintext catalog of its own.
         let plaintext = TrackObject(
             group: 1, object: 0, payload: try catalog.encoded(), isKeyFrame: true,
             properties: ObjectProperties(disclosure: catalog.disclosure())
         )
-        #expect(await unprotector.unprotect(plaintext) == nil)
+        #expect(await unprotector.unprotect(plaintext, on: track) == nil)
     }
 }
 

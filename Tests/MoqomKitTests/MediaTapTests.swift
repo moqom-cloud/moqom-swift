@@ -515,7 +515,7 @@ struct ReceiveTapTests {
             relay: relay,
             host: "erin",
             viewer: "frank",
-            encryption: RoomEncryption.sharedKey(key, keyID: 1)
+            encryption: try RoomEncryption.sharedKey(key)
         )
 
         let tap = await room.tapVideo(

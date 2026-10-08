@@ -1,4 +1,5 @@
 import Foundation
+import MoqomCore
 import Testing
 
 @testable import MoqomKit
@@ -31,8 +32,9 @@ struct MLSGroupTests {
         // Alice has moved; Bob has not processed her commit yet.
         let sender = SFrameSender(key: update.next.sframeKey(for: alice.ownLeaf, suite: .aes256GcmSha512))
         let object = TrackObjectFixture.object(payload: Data("new epoch".utf8))
-        let sealed = try sender.protect(object.payload, metadata: SFrameMetadata.encode(for: object))
-        let early = Task { await unprotector.unprotect(TrackObjectFixture.object(payload: sealed)) }
+        let track = TrackObjectFixture.track
+        let sealed = try sender.protect(object.payload, metadata: SFrameMetadata(object, on: track))
+        let early = Task { await unprotector.unprotect(TrackObjectFixture.object(payload: sealed), on: track) }
 
         try await Task.sleep(for: .milliseconds(50))
         guard case let .advanced(bobNext) = try bob.process(update.message) else {
@@ -48,6 +50,10 @@ struct MLSGroupTests {
 }
 
 enum TrackObjectFixture {
+    static let track = try! FullTrackName(
+        namespace: TrackNamespace(["moqom", "room", "alice"]), name: TrackName("video")
+    )
+
     static func object(payload: Data) -> TrackObject {
         TrackObject(group: 1, object: 0, priority: 128, payload: payload, isKeyFrame: true)
     }

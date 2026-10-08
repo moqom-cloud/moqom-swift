@@ -587,6 +587,14 @@ public struct FetchRequest: Hashable, Sendable {
         /// the end is resolved against the edge.
         case joiningFrom(subscription: any SubscriptionHandle, group: UInt64)
 
+        /// The track the range is in.
+        public var track: FullTrackName {
+            switch self {
+            case let .standalone(track, _, _): track
+            case let .joining(subscription, _), let .joiningFrom(subscription, _): subscription.track
+            }
+        }
+
         public static func == (lhs: Range, rhs: Range) -> Bool {
             switch (lhs, rhs) {
             case let (.standalone(a, b, c), .standalone(x, y, z)):

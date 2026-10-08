@@ -213,7 +213,7 @@ struct Draft16SessionTests {
 
         // Encrypted as a room would: E2EE sits above the transport, so what has
         // to survive draft-16 is the payload and the properties it binds.
-        let key = SFrameKey(keyID: 3, baseKey: Data(repeating: 0x42, count: 32))
+        let key = try SFrameKey(keyID: 3, baseKey: Data(repeating: 0x42, count: 32))
         let writer = ProtectedTrackWriter(
             wrapping: try await session.publish(name, priority: 64),
             sender: SFrameSender(key: key)
@@ -248,7 +248,8 @@ struct Draft16SessionTests {
                 priority: header.priority ?? 128,
                 payload: bytes,
                 properties: ObjectProperties(sealed.properties)
-            )
+            ),
+            on: name
         )
         #expect(opened?.payload == Data("frame".utf8))
         #expect(opened?.properties == properties)

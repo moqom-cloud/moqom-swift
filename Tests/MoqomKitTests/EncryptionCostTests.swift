@@ -26,10 +26,19 @@ struct EncryptionCostTests {
         return Double(end - start) / Double(iterations)
     }
 
+    /// Key ID 1, the smallest header, which the overhead check counts on.
+    private func encryption(_ byte: UInt8) throws -> RoomEncryption {
+        let key = try SFrameKey(keyID: 1, baseKey: Data(repeating: byte, count: 32))
+        let receiver = SFrameReceiver()
+        receiver.add(key)
+        return RoomEncryption(sender: SFrameSender(key: key), receiver: receiver)
+    }
+
     @Test("sealing and opening an object, at the sizes that actually occur")
     func costPerObject() throws {
-        let encryption = RoomEncryption.sharedKey(Data(repeating: 0x11, count: 32), keyID: 1)
-        let metadata = SFrameMetadata.encode(
+        let encryption = try encryption(0x11)
+        let metadata = SFrameMetadata(
+            track: TrackObjectFixture.track,
             group: 42,
             object: 7,
             priority: 64,
@@ -105,9 +114,9 @@ struct EncryptionCostTests {
         // subgroups on separate QUIC streams, so arrival order is not send
         // order. A strict "counter must increase" rule would turn ordinary
         // reordering into dropped media that looks like packet loss.
-        let encryption = RoomEncryption.sharedKey(Data(repeating: 0x33, count: 32), keyID: 1)
-        let metadata = SFrameMetadata.encode(
-            group: 1, object: 1, priority: 64, properties: ObjectProperties()
+        let encryption = try encryption(0x33)
+        let metadata = SFrameMetadata(
+            track: TrackObjectFixture.track, group: 1, object: 1, priority: 64, properties: ObjectProperties()
         )
         let payload = Data(repeating: 0xEE, count: 512)
 
@@ -137,12 +146,12 @@ struct EncryptionCostTests {
         // an actor hop is not free. Worth knowing separately from the cipher,
         // because it is the part that would scale with participant count if it
         // were large.
-        let encryption = RoomEncryption.sharedKey(Data(repeating: 0x22, count: 32), keyID: 1)
+        let encryption = try encryption(0x22)
         let unprotector = MediaUnprotector(receiver: encryption.receiver)
 
         let payload = Data(repeating: 0xCD, count: 2_048)
-        let metadata = SFrameMetadata.encode(
-            group: 1, object: 1, priority: 64, properties: ObjectProperties()
+        let metadata = SFrameMetadata(
+            track: TrackObjectFixture.track, group: 1, object: 1, priority: 64, properties: ObjectProperties()
         )
 
         let warmup = 200
@@ -161,10 +170,10 @@ struct EncryptionCostTests {
             )
         }
 
-        for index in 0 ..< warmup { _ = await unprotector.unprotect(objects[index]) }
+        for index in 0 ..< warmup { _ = await unprotector.unprotect(objects[index], on: TrackObjectFixture.track) }
 
         let start = DispatchTime.now().uptimeNanoseconds
-        for index in warmup ..< objects.count { _ = await unprotector.unprotect(objects[index]) }
+        for index in warmup ..< objects.count { _ = await unprotector.unprotect(objects[index], on: TrackObjectFixture.track) }
         let end = DispatchTime.now().uptimeNanoseconds
 
         print(

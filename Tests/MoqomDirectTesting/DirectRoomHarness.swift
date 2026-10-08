@@ -181,7 +181,7 @@ public enum DirectRooms {
         )
         try await session.connect(to: RelayEndpoint(host: "loopback"))
         let room = try await session.join(room: "room-42")
-        if let sharedKey { await room.useEncryption(.sharedKey(sharedKey, keyID: 1)) }
+        if let sharedKey { try await room.useEncryption(.sharedKey(sharedKey)) }
         return DirectRoomPerson(device: device, session: session, room: room)
     }
 }

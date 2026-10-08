@@ -715,9 +715,14 @@ public actor RoomSession {
     /// replay cannot disagree about what a room's policy permits. With a key,
     /// everything must decrypt — plaintext fails authentication like any other
     /// forgery. Without one, everything is dropped, and said so once per
-    /// participant.
-    private func open(_ object: TrackObject, from who: ParticipantIdentity) async -> TrackObject? {
-        if let unprotector { return await unprotector.unprotect(object) }
+    /// participant. An object is opened as belonging to the track it arrived
+    /// on, so one sealed for another track fails authentication.
+    private func open(
+        _ object: TrackObject,
+        on track: FullTrackName,
+        from who: ParticipantIdentity
+    ) async -> TrackObject? {
+        if let unprotector { return await unprotector.unprotect(object, on: track) }
         guard encryptionPolicy.allowsPlaintext else {
             if refusedUnencrypted.insert(who).inserted {
                 logger.warning(.media, "dropping media: the room requires end-to-end encryption", [
@@ -3629,7 +3634,7 @@ public actor RoomSession {
                         watchdog.cancel()
                         attempt = 0
                     }
-                    await session.applyCatalog(object, from: who)
+                    await session.applyCatalog(object, on: subscription.track, from: who)
                 }
                 watchdog.cancel()
                 await subscription.cancel()
@@ -3654,8 +3659,12 @@ public actor RoomSession {
         }
     }
 
-    private func applyCatalog(_ object: TrackObject, from who: ParticipantIdentity) async {
-        guard let object = await open(object, from: who) else { return }
+    private func applyCatalog(
+        _ object: TrackObject,
+        on track: FullTrackName,
+        from who: ParticipantIdentity
+    ) async {
+        guard let object = await open(object, on: track, from: who) else { return }
         let reader = catalogs[who] ?? CatalogReader()
         catalogs[who] = reader
         guard let catalog = await reader.apply(object) else { return }
@@ -3849,20 +3858,21 @@ public actor RoomSession {
         audioPumps[who] = Task { [weak self] in
             for await object in objects {
                 guard let self else { return }
-                await self.receiveAudio(object, from: who, into: sink)
+                await self.receiveAudio(object, on: full, from: who, into: sink)
             }
         }
     }
 
     private func receiveAudio(
         _ object: TrackObject,
+        on track: FullTrackName,
         from who: ParticipantIdentity,
         into sink: AudioSink
     ) async {
         estimator.record(object, at: .nanoseconds(DispatchTime.now().uptimeNanoseconds))
         lastObject[who] = now()
 
-        guard let plain = await open(object, from: who) else { return }
+        guard let plain = await open(object, on: track, from: who) else { return }
 
         let arrival = MonotonicTime.nanoseconds(DispatchTime.now().uptimeNanoseconds)
 
@@ -3983,10 +3993,11 @@ public actor RoomSession {
         media[who] = sink
 
         let objects = subscription.objects
+        let track = subscription.track
         pumps[who] = Task { [weak self] in
             for await object in objects {
                 guard let self else { return }
-                await self.receive(object, from: who, into: sink)
+                await self.receive(object, on: track, from: who, into: sink)
             }
         }
     }
@@ -4015,10 +4026,11 @@ public actor RoomSession {
         media[who] = sink
 
         catchUps[who]?.cancel()
+        let track = subscription.track
         catchUps[who] = Task { [weak self] in
             for await record in fetch.records {
                 guard let self else { return }
-                await self.receive(record, from: who, into: sink)
+                await self.receive(record, on: track, from: who, into: sink)
             }
         }
     }
@@ -4121,9 +4133,10 @@ public actor RoomSession {
 
         let id = UUID()
         replayDepacketisers[id] = depacketiser
+        let track = range.track
         replayTasks[id] = Task { [weak self] in
             for await record in fetch.records {
-                await self?.receiveReplay(record, from: who, id: id, into: continuation)
+                await self?.receiveReplay(record, on: track, from: who, id: id, into: continuation)
             }
             await self?.endReplay(id: id, continuation: continuation)
         }
@@ -4132,6 +4145,7 @@ public actor RoomSession {
 
     private func receiveReplay(
         _ record: FetchedRecord,
+        on track: FullTrackName,
         from who: ParticipantIdentity,
         id: UUID,
         into continuation: AsyncStream<DepacketisedFrame>.Continuation
@@ -4146,7 +4160,7 @@ public actor RoomSession {
             // as spare capacity.
             estimator.record(object, at: .nanoseconds(DispatchTime.now().uptimeNanoseconds))
 
-            guard let plain = await open(object, from: who) else { return }
+            guard let plain = await open(object, on: track, from: who) else { return }
             if let frame = depacketiser.accept(plain) { continuation.yield(frame) }
         case let .missing(through), let .unknown(through):
             depacketiser.skip(through: through.object)
@@ -4166,6 +4180,7 @@ public actor RoomSession {
 
     private func receive(
         _ record: FetchedRecord,
+        on track: FullTrackName,
         from who: ParticipantIdentity,
         into sink: MediaSink
     ) async {
@@ -4175,7 +4190,7 @@ public actor RoomSession {
             // are decrypted with the same keys, counted in the same statistics,
             // and reassembled by the same depacketiser. A second path would be a
             // second place for the pre-keyframe rule to be wrong.
-            await receive(object, from: who, into: sink)
+            await receive(object, on: track, from: who, into: sink)
         case let .missing(through), let .unknown(through):
             // A gap in history is final, so the depacketiser is told rather than
             // left waiting for objects that were never published.
@@ -4189,6 +4204,7 @@ public actor RoomSession {
 
     private func receive(
         _ object: TrackObject,
+        on track: FullTrackName,
         from who: ParticipantIdentity,
         into sink: MediaSink
     ) async {
@@ -4204,7 +4220,7 @@ public actor RoomSession {
         // key mismatch.
         lastObject[who] = now()
 
-        guard let plain = await open(object, from: who) else { return }
+        guard let plain = await open(object, on: track, from: who) else { return }
 
         sink.objectsContinuation.yield(plain)
 

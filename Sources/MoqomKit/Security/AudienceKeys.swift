@@ -91,8 +91,8 @@ actor AudienceKeys {
         unprotector = MediaUnprotector(receiver: receiver, keyHold: ManagedRoomKeys.keyHold)
         let bases = bases
         receiver.setResolver { keyID in
-            bases.key(forTag: MLSSFrameKeys.epochTag(ofKeyID: keyID)).map {
-                SFrameKey(keyID: keyID, baseKey: $0, suite: suite)
+            bases.key(forTag: MLSSFrameKeys.epochTag(ofKeyID: keyID)).flatMap {
+                try? SFrameKey(keyID: keyID, baseKey: $0, suite: suite)
             }
         }
     }
