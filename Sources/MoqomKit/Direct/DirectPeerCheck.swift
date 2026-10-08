@@ -63,9 +63,10 @@ public struct DirectVerificationKey: Hashable, Sendable {
         )
     }
 
-    /// The same key, as `MoqomToken` verifies with it.
-    var tokenKey: MoqomToken.PublicKey {
-        MoqomToken.PublicKey(
+    /// The same key, as `MoqomToken` verifies with it, or nil for a key of the
+    /// wrong length, which verifies nothing.
+    var tokenKey: MoqomToken.PublicKey? {
+        try? MoqomToken.PublicKey(
             id: id,
             algorithm: algorithm == .mlDSA65 ? .mlDSA65 : .ed25519,
             rawRepresentation: key
@@ -74,7 +75,7 @@ public struct DirectVerificationKey: Hashable, Sendable {
 
     /// Whether `signature` is this key's over `message`, by its own algorithm.
     func verifies(_ signature: Data, for message: Data) -> Bool {
-        tokenKey.isValidSignature(signature, for: message)
+        tokenKey?.isValidSignature(signature, for: message) ?? false
     }
 
     /// Read the JWK set the control plane serves and a relay is configured
@@ -205,7 +206,7 @@ public final class DirectPeerCheck: DirectPeerVerifying, @unchecked Sendable {
     /// - Parameter issuer: the `iss` every token must carry. Empty accepts any,
     ///   which is for tests, as on the relay.
     public init(keys: [DirectVerificationKey], issuer: String = "") {
-        tokens = MoqomToken.Verifier(issuer: issuer, keys: keys.map(\.tokenKey))
+        tokens = MoqomToken.Verifier(issuer: issuer, keys: keys.compactMap(\.tokenKey))
     }
 
     public func verify(
