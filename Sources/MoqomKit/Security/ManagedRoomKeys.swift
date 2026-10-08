@@ -32,6 +32,20 @@
 // until the key arrives; see ``MediaUnprotector/keyHold``. Neither direction
 // drops a frame across an ordinary epoch change.
 //
+// # Agents
+//
+// A recorder or classifier that has to see media joins the group like a device,
+// under a username the control plane mints only for a watchdog attached to the
+// room: `watchdog.<id>`. It holds the keys, so it decrypts — on the tenant's
+// side, wherever the tenant runs it — and MOQOM's servers still see only
+// ciphertext. What it cannot do is be in the group unannounced. Every member
+// sees every leaf, and the epoch authenticator proves they all see the same
+// ones, so an agent leaf is visible to everyone whatever a server says. Until
+// the room's signed control log discloses the watchdog that leaf names, this
+// device withholds its own sending key: its media is dropped rather than sent
+// to a group with an agent nobody was told about. The key is reinstated as soon
+// as the watchdog is disclosed or the agent leaves.
+//
 // # Cipher suites
 //
 // A device founds in its own suite, the hybrid one unless it was built to do
@@ -55,6 +69,14 @@ public struct GroupKeyStatus: Sendable, Hashable {
 
     /// Every device in the group, as `username/device`.
     public let members: [String]
+
+    /// The members that are watchdog agents: recorders, classifiers, archivers
+    /// that hold the room's keys. A subset of ``members``.
+    public let agents: [String]
+
+    /// Agents whose watchdog the room's control log has not disclosed. While
+    /// this is not empty, this device sends no media.
+    public let undisclosedAgents: [String]
 
     /// Equal on every member's device for the same epoch. Two people who read
     /// the same value to each other know that nobody is in the group that one
@@ -111,6 +133,10 @@ actor ManagedRoomKeys {
     private var retiring: Task<Void, Never>?
     private var workSince: ContinuousClock.Instant?
     private var loop: Task<Void, Never>?
+    /// Watchdogs the room's control log has disclosed, by ID.
+    private var disclosed: Set<String> = []
+    /// Agents this device is withholding its key over, as last reported.
+    private var withheldFor: [String] = []
 
     init(
         identity: ParticipantIdentity,
@@ -134,6 +160,54 @@ actor ManagedRoomKeys {
         unprotector = MediaUnprotector(receiver: receiver, keyHold: Self.keyHold)
     }
 
+    /// The username prefix the control plane reserves for watchdog agents.
+    static let agentPrefix = "watchdog."
+
+    /// The watchdog ID an agent member names, or `nil` for anybody else.
+    static func watchdog(of member: String) -> String? {
+        guard member.hasPrefix(agentPrefix) else { return nil }
+        let username = member.split(separator: "/", maxSplits: 1).first.map(String.init) ?? member
+        let id = String(username.dropFirst(agentPrefix.count))
+        return id.isEmpty ? nil : id
+    }
+
+    private func undisclosedAgents(in members: [String]) -> [String] {
+        members.filter { member in
+            guard let id = Self.watchdog(of: member) else { return false }
+            return !disclosed.contains(id)
+        }
+    }
+
+    /// Take the watchdogs the room's control log now discloses, and send or
+    /// withhold accordingly.
+    func disclose(watchdogs ids: Set<String>) {
+        disclosed = ids
+        if let group { send(under: group) }
+    }
+
+    /// Install this device's key for `group`'s epoch, unless the group holds an
+    /// agent nobody has been told about.
+    private func send(under group: MLSGroup) {
+        let undisclosed = undisclosedAgents(in: group.roster.map(\.member.identityString))
+        defer { withheldFor = undisclosed }
+        guard undisclosed.isEmpty else {
+            encryption.sender.clearKey()
+            if undisclosed != withheldFor {
+                logger.warning(.room, "withholding media: the group holds an undisclosed agent", [
+                    LogField("agents", .text(undisclosed.joined(separator: ","))),
+                ])
+            }
+            return
+        }
+        if !withheldFor.isEmpty {
+            logger.info(.room, "sending again: every agent in the group is disclosed")
+        }
+        let own = group.sframeKeys(suite: suite).first {
+            $0.keyID == MLSSFrameKeys.keyID(leaf: group.ownLeaf, epoch: group.epoch)
+        }
+        if let own { encryption.sender.rekey(own) }
+    }
+
     /// The identity a device has inside the group, matching the control plane's
     /// `username/device`.
     static func name(of identity: ParticipantIdentity) -> String {
@@ -142,10 +216,13 @@ actor ManagedRoomKeys {
 
     var status: GroupKeyStatus? {
         guard let group else { return nil }
+        let members = group.roster.map(\.member.identityString)
         return GroupKeyStatus(
             epoch: group.epoch,
             cipherSuite: group.cipherSuite,
-            members: group.roster.map(\.member.identityString),
+            members: members,
+            agents: members.filter { Self.watchdog(of: $0) != nil },
+            undisclosedAgents: undisclosedAgents(in: members),
             epochAuthenticator: group.epochAuthenticator,
             directOfferSecret: group.export(label: "MOQOM direct offer", length: 32)
         )
@@ -440,9 +517,7 @@ actor ManagedRoomKeys {
         for key in keys { receiver.add(key) }
         currentKeys = fresh
         previousKeys = previous
-        if let own = keys.first(where: { $0.keyID == MLSSFrameKeys.keyID(leaf: next.ownLeaf, epoch: next.epoch) }) {
-            encryption.sender.rekey(own)
-        }
+        send(under: next)
         if !previous.isEmpty {
             let sleep = sleep
             retiring = Task { [weak self] in

@@ -609,6 +609,7 @@ public actor RoomSession {
         encryption = keys.encryption
         unprotector = keys.unprotector
         refusedUnencrypted.removeAll()
+        await keys.disclose(watchdogs: Set(state.watchdogs.all.map(\.id.value)))
         await keys.start()
         logger.info(.room, "end-to-end encryption keys are managed by MLS")
     }
@@ -2380,7 +2381,7 @@ public actor RoomSession {
         case let .stop(id):
             state.watchdogs.setHealth(.failed, for: id)
         }
-        eventContinuation.yield(.watchdogChanged(state.watchdogs))
+        await watchdogsChanged()
         await announce(.watchdogs(state.watchdogs.all))
     }
 
@@ -2947,6 +2948,14 @@ public actor RoomSession {
         }
     }
 
+    /// Tell the application, and the room's keys, that the disclosed
+    /// watchdogs changed. The keys withhold this device's media from a group
+    /// holding an agent that is not among them.
+    private func watchdogsChanged() async {
+        eventContinuation.yield(.watchdogChanged(state.watchdogs))
+        await managedKeys?.disclose(watchdogs: Set(state.watchdogs.all.map(\.id.value)))
+    }
+
     /// Replace everything the control track owns with a complete state.
     ///
     /// Participants the snapshot does not mention are reset rather than left as
@@ -2969,7 +2978,7 @@ public actor RoomSession {
         adopt(audiences: snapshot.audiences)
 
         eventContinuation.yield(.stageChanged(state.stage))
-        eventContinuation.yield(.watchdogChanged(state.watchdogs))
+        await watchdogsChanged()
         await adopt(lifecycle: snapshot.lifecycle)
         await refreshGallery()
     }
@@ -3023,7 +3032,7 @@ public actor RoomSession {
             await adopt(lifecycle: lifecycle)
         case let .watchdogs(watchdogs):
             state.watchdogs = WatchdogSet(watchdogs, limit: state.watchdogs.limit)
-            eventContinuation.yield(.watchdogChanged(state.watchdogs))
+            await watchdogsChanged()
         case let .evicted(who):
             waiting.removeValue(forKey: who)
             if who == identity {

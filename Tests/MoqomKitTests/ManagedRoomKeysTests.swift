@@ -211,6 +211,48 @@ struct ManagedRoomKeysTests {
         for keys in [alice, bob] { await keys.stop() }
     }
 
+    @Test("an agent decrypts as a member, and nobody sends to it until its watchdog is disclosed")
+    func agentsAreDisclosedBeforeTheyHear() async throws {
+        let service = FakeKeyDelivery()
+        let alice = await keys("alice", "iphone-a", service)
+        let bob = await keys("bob", "iphone-b", service)
+        await alice.start()
+        #expect(await eventually { await alice.status != nil })
+        await bob.start()
+        #expect(await eventually { await sameEpoch([alice, bob], members: 2) })
+
+        let recorder = await keys("watchdog.rec-1", "worker-01", service)
+        await recorder.start()
+        #expect(await eventually { await sameEpoch([alice, bob, recorder], members: 3) })
+
+        // In the group, visible to everyone as an agent, and not yet disclosed:
+        // nobody sends.
+        let status = try #require(await alice.status)
+        #expect(status.agents == ["watchdog.rec-1/worker-01"])
+        #expect(status.undisclosedAgents == ["watchdog.rec-1/worker-01"])
+        #expect(throws: SFrameError.noKey) { _ = try alice.encryption.sender.protect(Data("hi".utf8)) }
+        #expect(throws: SFrameError.noKey) { _ = try bob.encryption.sender.protect(Data("hi".utf8)) }
+
+        // The control log names it. Media flows, and the agent can open it.
+        await alice.disclose(watchdogs: ["rec-1"])
+        await bob.disclose(watchdogs: ["rec-1"])
+        #expect(await alice.status?.undisclosedAgents.isEmpty == true)
+        let sealed = try alice.encryption.sender.protect(Data("recorded".utf8))
+        #expect(try recorder.encryption.receiver.unprotect(sealed) == Data("recorded".utf8))
+        #expect(try bob.encryption.receiver.unprotect(sealed) == Data("recorded".utf8))
+
+        // Detached on the log while still in the group: held again.
+        await alice.disclose(watchdogs: [])
+        #expect(throws: SFrameError.noKey) { _ = try alice.encryption.sender.protect(Data("hi".utf8)) }
+
+        // An ordinary username that merely looks like one is not an agent.
+        #expect(ManagedRoomKeys.watchdog(of: "watchdogs/iphone") == nil)
+        #expect(ManagedRoomKeys.watchdog(of: "watchdog./iphone") == nil)
+        #expect(ManagedRoomKeys.watchdog(of: "watchdog.rec-1/worker-01") == "rec-1")
+
+        for keys in [alice, bob, recorder] { await keys.stop() }
+    }
+
     @Test("a group in a suite this build does not implement is not joined")
     func unknownSuiteNotJoined() async throws {
         let service = FakeKeyDelivery()
