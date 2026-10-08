@@ -163,6 +163,7 @@ public actor RoomSession {
     private var estimator = BandwidthEstimator()
     private var rosterTask: Task<Void, Never>?
     private var prefixTasks: [Task<Void, Never>] = []
+    private var watchesBackstage = false
     private var followed: Set<TrackNamespace> = []
     private var ownReferences: [TrackNamespace] = []
     private var ownInvitations: [StageInvitationRecord] = []
@@ -490,15 +491,19 @@ public actor RoomSession {
         private func directView() async -> DirectRoomView {
             var view = DirectRoomView()
             view.encrypted = encryption != nil && !encryptionPolicy.allowsPlaintext
-            // Direct offers travel on the stage slot, so a publication backstage
-            // leaves this device in the audience as far as direct paths go.
+            // Offers travel in the slot this device publishes in, and it pairs
+            // only with the others publishing there: a stage device cannot
+            // necessarily read backstage, and a backstage one is not on stage.
             let stage = try? slotNamespace(backstage: false)
-            view.publishing = stage != nil && (broadcast?.namespace == stage || audio?.track.namespace == stage)
+            let backstage = try? slotNamespace(backstage: true)
+            let published = [broadcast?.namespace, audio?.track.namespace].compactMap { $0 }
+            let onStage = stage.map(published.contains) ?? false
+            view.backstage = !onStage && (backstage.map(published.contains) ?? false)
+            view.publishing = onStage || view.backstage
             view.watchdogs = !state.watchdogs.all.isEmpty
-            view.peers = Set(
-                state.roster.participants.filter { $0.id != identity && !$0.slot.isBackstage }.map(\.id)
-            )
-            view.optedIn = directOptedIn.intersection(view.peers)
+            let others = state.roster.participants.filter { $0.id != identity }
+            view.peers = Set(others.filter { $0.slot.isBackstage == view.backstage }.map(\.id))
+            view.optedIn = directOptedIn.intersection(others.map(\.id))
             if let managedKeys, let status = await managedKeys.status {
                 view.members = Set(status.members)
                 view.audience = status.audience
@@ -907,11 +912,21 @@ public actor RoomSession {
         await startManagedKeysIfNeeded()
         guard prefixTasks.isEmpty else { return }
         watchPrefix(namespace)
+        if watchesBackstage { watchBackstage() }
         if let channel, let personal = try? MoqomNamespaces.personalPrefix(
             tenant: tenant, username: channel
         ) {
             watchPrefix(personal)
         }
+    }
+
+    /// Watch who else is backstage, from the moment this device publishes
+    /// there: the prefix needs a backstage grant, and a cohost waiting there is
+    /// who it shares the green room with.
+    private func watchBackstage() {
+        guard channel == nil, let prefix = try? MoqomNamespaces.backstage(tenant: tenant, room: room) else { return }
+        watchesBackstage = true
+        watchPrefix(prefix)
     }
 
     /// Watch announcements under `prefix` and fold them into the roster.
@@ -1519,6 +1534,7 @@ public actor RoomSession {
 
         let announcement = try await connection.announce(publishNamespace)
         watchForRefusal(of: announcement)
+        if backstage, !watchesBackstage { watchBackstage() }
 
         var writers: [LayerID: any TrackWriter] = [:]
         var encoders: [LayerID: any FrameEncoder] = [:]
@@ -1782,6 +1798,7 @@ public actor RoomSession {
         let announcement = try await connection.announce(publishNamespace)
         watchForRefusal(of: announcement)
         audioAnnouncement = announcement
+        if backstage, !watchesBackstage { watchBackstage() }
 
         let writer = try await protectedWriter(for: name, priority: configuration.priority)
 
@@ -3255,12 +3272,21 @@ public actor RoomSession {
         under prefix: TrackNamespace? = nil
     ) async {
         let prefix = prefix ?? namespace
-        let slot = ParticipantSlot(announced: event.namespace, under: prefix)
+        let backstage = prefix == (try? MoqomNamespaces.backstage(tenant: tenant, room: room))
+        let slot = ParticipantSlot(announced: event.namespace, under: prefix, isBackstage: backstage)
             ?? ParticipantSlot(personal: event.namespace)
         guard let slot else {
             // A namespace this client does not model. The relay is entitled to
             // announce those and it is not an error to ignore them.
             return
+        }
+        // Going live is a move from backstage to stage, announced on one and
+        // withdrawn from the other in either order. The roster holds one slot
+        // per participant, so the withdrawal of the slot they left is not them
+        // leaving, and the slot they moved to replaces the old one.
+        if let current = state.roster[slot.identity]?.slot, current.namespace != slot.namespace {
+            guard case .announced = event, slot.identity != identity else { return }
+            await depart(slot.identity, reason: .left)
         }
 
         switch event {

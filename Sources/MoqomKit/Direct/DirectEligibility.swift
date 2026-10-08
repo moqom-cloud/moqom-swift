@@ -38,18 +38,24 @@ public struct DirectEligibility: Hashable, Sendable {
     /// This session is a viewer in an audience rather than a participant.
     public var audience: Bool
 
+    /// The room's own limit on participants, from its policy. Never above
+    /// ``maximumParticipants``.
+    public var limit: Int
+
     public init(
         endToEndEncrypted: Bool,
         participants: Int,
         everyoneOptedIn: Bool,
         watchdogRequired: Bool = false,
-        audience: Bool = false
+        audience: Bool = false,
+        limit: Int = Self.maximumParticipants
     ) {
         self.endToEndEncrypted = endToEndEncrypted
         self.participants = participants
         self.everyoneOptedIn = everyoneOptedIn
         self.watchdogRequired = watchdogRequired
         self.audience = audience
+        self.limit = limit
     }
 
     /// Whether a direct path is allowed.
@@ -61,7 +67,7 @@ public struct DirectEligibility: Hashable, Sendable {
         if !endToEndEncrypted { throw .notEncrypted }
         if watchdogRequired { throw .watchdogRequired }
         if participants < 2 { throw .alone }
-        if participants > Self.maximumParticipants { throw .tooManyParticipants(participants) }
+        if participants > min(limit, Self.maximumParticipants) { throw .tooManyParticipants(participants) }
         if !everyoneOptedIn { throw .notEveryoneOptedIn }
     }
 }
@@ -83,7 +89,7 @@ public enum DirectIneligibility: Error, Hashable, Sendable, CustomStringConverti
         switch self {
         case .notEncrypted: "the room is not end-to-end encrypted"
         case let .tooManyParticipants(count):
-            "\(count) participants is more than the \(DirectEligibility.maximumParticipants) direct mode allows"
+            "\(count) participants is more than direct mode allows in this room"
         case .alone: "there is no other participant"
         case .notEveryoneOptedIn: "not every participant has opted in"
         case .watchdogRequired: "the room requires a watchdog"

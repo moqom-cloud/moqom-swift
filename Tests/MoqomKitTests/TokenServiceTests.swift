@@ -73,6 +73,24 @@ struct TokenServiceTests {
             username: "u", room: "r", device: key, session: session
         )
         #expect(issued.expiresAt.timeIntervalSince1970 == 1_785_953_700)
+        #expect(issued.direct == .default)
+    }
+
+    @Test("the room's direct policy comes back with the token")
+    func directPolicy() async throws {
+        let (service, session) = self.service(.ok("""
+        {"token":"a.b.c","expiresAt":"2026-08-05T18:15:00Z","room":"r","username":"u",
+         "direct":{"allowed":true,"maxParticipants":2}}
+        """))
+        let issued = try await service.token(username: "u", room: "r", device: key, session: session)
+        #expect(issued.direct == DirectRoomPolicy(allowed: true, maximumParticipants: 2))
+
+        let (refusing, again) = self.service(.ok("""
+        {"token":"a.b.c","expiresAt":"2026-08-05T18:15:00Z","direct":{"allowed":false}}
+        """))
+        let relayOnly = try await refusing.token(username: "u", room: "r", device: key, session: again)
+        #expect(!relayOnly.direct.allowed)
+        #expect(DirectRoomPolicy(allowed: true, maximumParticipants: 40).maximumParticipants == 4)
     }
 
     @Test("what the device asks for is what it sends")

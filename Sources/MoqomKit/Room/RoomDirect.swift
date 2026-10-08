@@ -32,12 +32,12 @@ import MoqomCore
 
 /// How a room may use direct (peer-to-peer) paths.
 ///
-/// Off unless an application passes one of these to
-/// ``RoomSession/setDirect(_:)`` or ``MoqomSession/join(room:seatPolicy:direct:)``,
-/// and even then only used where ``DirectEligibility`` allows: an end-to-end
-/// encrypted room of at most ``DirectEligibility/maximumParticipants``, with no
-/// watchdog, where this device is publishing on stage and every participant has
-/// opted in. Opting in is published on this device's catalog
+/// Built by ``MoqomSession`` from its ``DirectPolicy``, or passed by an
+/// application to ``RoomSession/setDirect(_:)`` or
+/// ``DirectPolicy/custom(_:)``, and only used where ``DirectEligibility``
+/// allows: an end-to-end encrypted room of at most ``maximumParticipants``,
+/// with no watchdog, where this device is publishing and every participant
+/// has opted in. Opting in is published on this device's catalog
 /// (``Catalog/direct``), which is how the others count it.
 public struct DirectRoomOptions: Sendable {
     /// The acknowledgement that peers will learn this device's IP addresses.
@@ -81,6 +81,11 @@ public struct DirectRoomOptions: Sendable {
     /// The wait before trying again after an attempt fails, doubling on each
     /// failure up to a minute.
     public var retry: Duration
+
+    /// The most participants this room may have and still use direct paths:
+    /// the room policy's limit, never above
+    /// ``DirectEligibility/maximumParticipants``.
+    public var maximumParticipants = DirectEligibility.maximumParticipants
 
     public init(
         exposure: DirectIPExposure,
@@ -387,11 +392,14 @@ final class DirectMergedSubscription: SubscriptionHandle {
     struct DirectRoomView: Equatable, Sendable {
         /// The room requires end-to-end encryption and this device has it.
         var encrypted = false
-        /// This device is publishing on stage.
+        /// This device is publishing, on stage or backstage.
         var publishing = false
+        /// It is publishing backstage, so its offers and its peers are there.
+        var backstage = false
         /// A watchdog is attached to the room.
         var watchdogs = false
-        /// Everyone else on stage.
+        /// Everyone else publishing where this device is: on stage, or
+        /// backstage.
         var peers: Set<ParticipantIdentity> = []
         /// Those of them whose catalog says they opted in.
         var optedIn: Set<ParticipantIdentity> = []
@@ -427,6 +435,7 @@ final class DirectMergedSubscription: SubscriptionHandle {
         private var view = DirectRoomView()
         private var offers: DirectOffers?
         private var offerKey: Data?
+        private var offersBackstage = false
         private var generation = 0
         private var peers: [ParticipantIdentity: Peer] = [:]
         private var stopped = false
@@ -551,7 +560,7 @@ final class DirectMergedSubscription: SubscriptionHandle {
                 return
             }
 
-            if let key = view.secret, key != offerKey { rekey(key) }
+            if let key = view.secret, key != offerKey || view.backstage != offersBackstage { rekey(key) }
             for who in view.peers.sorted(by: { DirectParticipant.name(of: $0) < DirectParticipant.name(of: $1) }) {
                 if peers[who] == nil { peers[who] = Peer() }
                 if peers[who]?.reader == nil { peers[who]?.reader = reading(who) }
@@ -581,7 +590,8 @@ final class DirectMergedSubscription: SubscriptionHandle {
                 participants: participants,
                 everyoneOptedIn: optedIn,
                 watchdogRequired: view.watchdogs,
-                audience: !view.publishing
+                audience: !view.publishing,
+                limit: options.maximumParticipants
             )
         }
 
@@ -594,6 +604,7 @@ final class DirectMergedSubscription: SubscriptionHandle {
             offers = nil
             generation += 1
             offerKey = key
+            offersBackstage = view.backstage
             guard let secret = try? DirectRoomSecret(secret: key, tenant: tenant, room: room) else { return }
             let next = DirectOffers(
                 tenant: tenant,
@@ -601,7 +612,8 @@ final class DirectMergedSubscription: SubscriptionHandle {
                 identity: identity,
                 connection: relay,
                 secret: secret,
-                announces: false
+                announces: false,
+                backstage: view.backstage
             )
             Task { await old?.close() }
             offers = next

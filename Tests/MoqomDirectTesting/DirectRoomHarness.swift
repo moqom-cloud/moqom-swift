@@ -159,21 +159,25 @@ public enum DirectRooms {
         publish: Int = 0x0F,
         sharedKey: Data? = nil,
         keyDelivery: (@Sendable (ParticipantIdentity) async -> any MLSDeliveryService)? = nil,
-        backend: DirectBackend = .networkFramework
+        backend: DirectBackend = .networkFramework,
+        directPolicy: DirectPolicy = .automatic,
+        authorityKeys: [DirectVerificationKey] = []
     ) async throws -> DirectRoomPerson {
         let device = DirectDevice(user: user)
         let base = try device.credentials(DirectTokens.mint(user: user, key: device.key, publish: publish))
-        let credentials = DeviceCredentials(
+        var credentials = DeviceCredentials(
             identity: base.identity,
             token: base.token,
             deviceKey: device.key,
             keyDelivery: await keyDelivery?(base.identity)
         )
+        credentials.authorityKeys = authorityKeys
         let session = MoqomSession(
             transport: LoopbackTransport(relay: relay),
             credentials: credentials,
             tenant: "acme",
-            directBackend: backend
+            directBackend: backend,
+            directPolicy: directPolicy
         )
         try await session.connect(to: RelayEndpoint(host: "loopback"))
         let room = try await session.join(room: "room-42")
@@ -208,13 +212,14 @@ public final class DirectCamera: Sendable {
 
     /// Go live with this camera on `room`'s stage.
     @discardableResult
-    public func broadcast(on room: RoomSession) async throws -> Broadcast {
+    public func broadcast(on room: RoomSession, backstage: Bool = false) async throws -> Broadcast {
         try await room.startBroadcast(
             from: source,
             configuration: BroadcastConfiguration(
                 ladder: LayerLadder(rungs: [DirectRooms.rung]),
                 encoderFactory: { SyntheticEncoder(configuration: $0) }
-            )
+            ),
+            backstage: backstage
         )
     }
 

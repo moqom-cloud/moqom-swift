@@ -51,11 +51,22 @@ public struct IssuedToken: Sendable, Hashable {
 
     public var room: String
 
-    public init(token: Data, expiresAt: Date, username: String, room: String) {
+    /// What the room allows of direct paths. ``DirectRoomPolicy/default``
+    /// when the service does not say.
+    public var direct: DirectRoomPolicy
+
+    public init(
+        token: Data,
+        expiresAt: Date,
+        username: String,
+        room: String,
+        direct: DirectRoomPolicy = .default
+    ) {
         self.token = token
         self.expiresAt = expiresAt
         self.username = username
         self.room = room
+        self.direct = direct
     }
 
     /// Whether this is worth presenting, allowing for the walk to the relay.
@@ -193,10 +204,10 @@ public struct TokenService: Sendable, Hashable {
             token: Data(token.utf8),
             expiresAt: expires,
             username: body["username"] as? String ?? username,
-            room: body["room"] as? String ?? room
+            room: body["room"] as? String ?? room,
+            direct: DirectRoomPolicy(json: body["direct"])
         )
     }
-
     private static func instant(_ text: String) -> Date? {
         let fractional = ISO8601DateFormatter()
         fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]

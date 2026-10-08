@@ -57,7 +57,9 @@ struct DirectRoomTests {
         bobDirect: Bool = true,
         managedKeys: Bool = true,
         tickets: DirectTicketSettings? = nil,
-        lifetime: TimeInterval = 90
+        lifetime: TimeInterval = 90,
+        sessionPolicy: DirectPolicy? = nil,
+        backstage: Bool = false
     ) async throws -> Call {
         let relay = LoopbackRelay()
         let service = FakeKeyDelivery()
@@ -66,10 +68,12 @@ struct DirectRoomTests {
         let delivery: (@Sendable (ParticipantIdentity) async -> any MLSDeliveryService)? =
             managedKeys ? { @Sendable in await service.client($0) } : nil
         let alice = try await DirectRooms.join(
-            "alice", relay: relay, sharedKey: managedKeys ? nil : key, keyDelivery: delivery
+            "alice", relay: relay, sharedKey: managedKeys ? nil : key, keyDelivery: delivery,
+            directPolicy: sessionPolicy ?? .automatic
         )
         let bob = try await DirectRooms.join(
-            "bob", relay: relay, sharedKey: managedKeys ? nil : key, keyDelivery: delivery
+            "bob", relay: relay, sharedKey: managedKeys ? nil : key, keyDelivery: delivery,
+            directPolicy: sessionPolicy ?? .automatic
         )
 
         let desk = DirectTicketDesk(relay: relay, lifetime: lifetime)
@@ -78,14 +82,14 @@ struct DirectRoomTests {
         try await desk.open()
 
         let cameras = [DirectCamera(), DirectCamera()]
-        try await cameras[0].broadcast(on: alice.room)
-        try await cameras[1].broadcast(on: bob.room)
+        try await cameras[0].broadcast(on: alice.room, backstage: backstage)
+        try await cameras[1].broadcast(on: bob.room, backstage: backstage)
 
         let base = DirectRooms.options(offerSecret: managedKeys ? nil : secret)
         var options = base
         if let tickets { options.tickets = tickets }
-        if aliceDirect { try await alice.room.setDirect(options) }
-        if bobDirect { try await bob.room.setDirect(options) }
+        if sessionPolicy == nil, aliceDirect { try await alice.room.setDirect(options) }
+        if sessionPolicy == nil, bobDirect { try await bob.room.setDirect(options) }
 
         let a = alice.identity, b = bob.identity
         #expect(await eventually(timeout: .seconds(20)) {
@@ -188,6 +192,66 @@ struct DirectRoomTests {
         try await call.bob.room.setDirect(DirectRooms.options())
         #expect(await eventually(timeout: .seconds(30)) { await state(call.alice.room, of: b) == .direct })
         await call.hangUp()
+    }
+
+    @Test("a session's direct policy applies to the rooms it joins, with no call to setDirect")
+    func sessionPolicyGoesDirect() async throws {
+        let call = try await call(sessionPolicy: .custom(DirectRooms.options()))
+        #expect(await call.alice.room.isDirectEnabled)
+        #expect(await eventually(timeout: .seconds(30)) { await bothDirect(call) })
+        await call.hangUp()
+    }
+
+    @Test("two cohosts backstage go direct with each other")
+    func backstageGoesDirect() async throws {
+        let call = try await call(backstage: true)
+        let a = call.alice.identity
+        #expect(await eventually(timeout: .seconds(30)) { await bothDirect(call) })
+        #expect(await eventually(timeout: .seconds(10)) {
+            (await call.bob.room.directPaths[a]?.objectsOverDirect ?? 0) > 10
+        })
+        // Offered backstage, and nothing on stage.
+        let backstage = try MoqomNamespaces.backstageParticipant(tenant: "acme", room: "room-42", identity: a)
+        let stage = try MoqomNamespaces.participant(tenant: "acme", room: "room-42", identity: a)
+        let backstageOffers = try FullTrackName(namespace: backstage, name: TrackName(".direct"))
+        let stageOffers = try FullTrackName(namespace: stage, name: TrackName(".direct"))
+        #expect(!(await call.relay.objects(on: backstageOffers)).isEmpty)
+        #expect(await call.relay.objects(on: stageOffers).isEmpty)
+        await call.hangUp()
+    }
+
+    @Test("automatic is on by default, relay-only and a room that forbids it are not")
+    func policies() async throws {
+        let relay = LoopbackRelay()
+        let keys = DirectTokens.keys
+        let automatic = try await DirectRooms.join("alice", relay: relay, authorityKeys: keys)
+        #expect(await automatic.room.isDirectEnabled)
+        let options = await automatic.session.directOptions(for: .automatic)
+        #expect(options?.maximumParticipants == DirectEligibility.maximumParticipants)
+        #expect(options?.tokenKeys.count == keys.count)
+
+        let relayOnly = try await DirectRooms.join("bob", relay: relay, directPolicy: .relayOnly, authorityKeys: keys)
+        #expect(await !relayOnly.room.isDirectEnabled)
+
+        // Nothing to verify a peer with, so nothing to go direct on.
+        let unkeyed = try await DirectRooms.join("carol", relay: relay)
+        #expect(await !unkeyed.room.isDirectEnabled)
+
+        // A renewed token restating the room's policy reaches the room in progress.
+        let token = DirectTokens.mint(user: "alice", key: automatic.device.key)
+        func issue(_ direct: DirectRoomPolicy) -> IssuedToken {
+            IssuedToken(token: token, expiresAt: Date().addingTimeInterval(600), username: "alice", room: "room-42", direct: direct)
+        }
+        try await automatic.session.updateCredential(issue(DirectRoomPolicy(allowed: true, maximumParticipants: 2)))
+        #expect(await automatic.room.isDirectEnabled)
+        #expect(await automatic.session.directOptions(for: .automatic)?.maximumParticipants == 2)
+        try await automatic.session.updateCredential(issue(DirectRoomPolicy(allowed: false)))
+        #expect(await !automatic.room.isDirectEnabled)
+        #expect(await automatic.session.directOptions(for: .custom(DirectRooms.options())) == nil)
+        try await automatic.session.updateCredential(issue(.default))
+        #expect(await automatic.room.isDirectEnabled)
+
+        for person in [automatic, relayOnly, unkeyed] { await person.session.close() }
     }
 
     @Test("a direct path that dies falls back to the relay at once, and comes back")

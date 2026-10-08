@@ -229,6 +229,10 @@ public struct DeviceCredentials: Sendable {
     /// because an entry nobody can verify is one the relay could have written.
     public var authorityKeys: [DirectVerificationKey] = []
 
+    /// What the control plane allows of direct paths in the token's room, as
+    /// it stated with the token (``IssuedToken/direct``).
+    public var directRoom: DirectRoomPolicy = .default
+
     /// See ``EncryptionPolicy/plaintextForTesting``.
     var plaintextForTesting = false
 
@@ -264,6 +268,7 @@ public struct DeviceCredentials: Sendable {
         )
         replaced.authorityKeys = authorityKeys
         replaced.plaintextForTesting = plaintextForTesting
+        replaced.directRoom = issued.direct
         return replaced
     }
 }

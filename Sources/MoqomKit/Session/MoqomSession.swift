@@ -29,6 +29,10 @@ public actor MoqomSession {
     /// ``bindDirectEndpoint(_:eligibility:exposure:)``.
     public nonisolated let directBackend: DirectBackend
 
+    /// Whether rooms joined through this session use direct (peer-to-peer)
+    /// paths; ``DirectPolicy/automatic`` unless the session was made otherwise.
+    public nonisolated let directPolicy: DirectPolicy
+
     private let transport: any Transport
 
     /// The credential in force, which is not the one this session was built
@@ -43,6 +47,11 @@ public actor MoqomSession {
     private var machine: SessionStateMachine
     private var connection: (any TransportSession)?
     private var rooms: [RoomID: RoomSession] = [:]
+    private var roomPolicies: [RoomID: DirectPolicy] = [:]
+    /// The room limit each room's direct paths were last set up with, `nil`
+    /// for none, so a renewal that restates the same policy leaves live paths
+    /// alone.
+    private var appliedDirect: [RoomID: Int?] = [:]
 
     /// The endpoint to redial.
     ///
@@ -72,6 +81,9 @@ public actor MoqomSession {
     ///   - directBackend: the socket direct paths run on. Network.framework by
     ///     default; `.rust` from the `MoqomDirectRust` module where it is
     ///     built.
+    ///   - directPolicy: whether rooms use direct paths. Automatic by
+    ///     default, which tells the other participants of a qualifying room
+    ///     this device's IP addresses; ``DirectPolicy/relayOnly`` never does.
     public init(
         transport: any Transport,
         credentials: DeviceCredentials,
@@ -79,6 +91,7 @@ public actor MoqomSession {
         reconnectPolicy: ReconnectPolicy = .default,
         logger: MoqomLogger = .silent,
         directBackend: DirectBackend = .networkFramework,
+        directPolicy: DirectPolicy = .automatic,
         clock: @escaping @Sendable () -> MonotonicTime = MoqomSession.systemClock,
         sleeper: @escaping @Sendable (Duration) async -> Void = MoqomSession.systemSleeper
     ) {
@@ -87,6 +100,7 @@ public actor MoqomSession {
         self.tenant = tenant
         self.logger = logger
         self.directBackend = directBackend
+        self.directPolicy = directPolicy
         self.clock = clock
         self.sleeper = sleeper
         identity = credentials.identity
@@ -263,6 +277,7 @@ public actor MoqomSession {
             for room in rooms.values {
                 await room.applyEncryptionPolicy(policy)
             }
+            await reapplyDirect()
 
             if let connection {
                 do {
@@ -340,6 +355,7 @@ public actor MoqomSession {
             )
             credentials.authorityKeys = previous.authorityKeys
             credentials.plaintextForTesting = previous.plaintextForTesting
+            credentials.directRoom = issued.direct
         } else {
             credentials = credentials.replacing(with: issued)
         }
@@ -348,6 +364,7 @@ public actor MoqomSession {
         for room in rooms.values {
             await room.applyEncryptionPolicy(policy)
         }
+        await reapplyDirect()
         // The deadline belongs to the token, and this one has its own.
         scheduleRenewal()
 
@@ -366,27 +383,47 @@ public actor MoqomSession {
     ///   - seatPolicy: how long a participant whose session vanishes keeps
     ///     their place in the roster. See ``SeatPolicy``.
     ///   - direct: direct (peer-to-peer) paths for this room, where it
-    ///     qualifies; `nil` keeps everything on the relay. The same as calling
-    ///     ``RoomSession/setDirect(_:)`` once joined, and applied to a room
-    ///     already open too.
+    ///     qualifies; `nil` keeps everything on the relay. The same as
+    ///     ``join(room:seatPolicy:directPolicy:)`` with
+    ///     ``DirectPolicy/custom(_:)`` or ``DirectPolicy/relayOnly``.
     public func join(
         room: RoomID,
         seatPolicy: SeatPolicy = .default,
         direct: DirectRoomOptions?
     ) async throws(MoqomError) -> RoomSession {
-        let session = try await join(room: room, seatPolicy: seatPolicy)
-        try await session.setDirect(direct)
-        return session
+        try await join(room: room, seatPolicy: seatPolicy, directPolicy: direct.map(DirectPolicy.custom) ?? .relayOnly)
     }
 
-    /// Join a room, or return the session already open on it, with every
-    /// participant's media on the relay.
+    /// Join a room, or return the session already open on it.
+    ///
+    /// Media starts on the relay. Under ``directPolicy`` (automatic unless the
+    /// session was made otherwise) a 1:1 call or a small private room moves to
+    /// direct paths where it qualifies.
     /// - Parameter seatPolicy: how long a participant whose session vanishes
     ///   keeps their place in the roster. See ``SeatPolicy``.
     public func join(
         room: RoomID,
         seatPolicy: SeatPolicy = .default
     ) async throws(MoqomError) -> RoomSession {
+        try await join(room: room, seatPolicy: seatPolicy, directPolicy: directPolicy)
+    }
+
+    /// Join a room, or return the session already open on it, with its own
+    /// ``DirectPolicy`` in place of the session's. Applied to a room already
+    /// open too.
+    public func join(
+        room: RoomID,
+        seatPolicy: SeatPolicy = .default,
+        directPolicy: DirectPolicy
+    ) async throws(MoqomError) -> RoomSession {
+        let session = try await open(room: room, seatPolicy: seatPolicy)
+        roomPolicies[room] = directPolicy
+        appliedDirect[room] = nil
+        try await applyDirect(to: room)
+        return session
+    }
+
+    private func open(room: RoomID, seatPolicy: SeatPolicy) async throws(MoqomError) -> RoomSession {
         if let existing = rooms[room] { return existing }
         guard let connection else {
             throw MoqomError.invalidState(expected: "connected", actual: machine.state.description)
@@ -489,7 +526,59 @@ public actor MoqomSession {
         return session
     }
 
+    /// The options `room`'s policy comes to under the credential in force, or
+    /// `nil` for the relay alone.
+    func directOptions(for policy: DirectPolicy) -> DirectRoomOptions? {
+        let limits = credentials.directRoom
+        guard limits.allowed, limits.maximumParticipants >= 2 else { return nil }
+        switch policy.mode {
+        case .relayOnly:
+            return nil
+        case var .custom(options):
+            options.maximumParticipants = min(options.maximumParticipants, limits.maximumParticipants)
+            return options
+        case let .automatic(stun):
+            guard !credentials.authorityKeys.isEmpty else { return nil }
+            var options = DirectRoomOptions(
+                exposure: .peersWillLearnMyIPAddresses(),
+                tokenKeys: credentials.authorityKeys,
+                stun: stun
+            )
+            options.maximumParticipants = limits.maximumParticipants
+            return options
+        }
+    }
+
+    private func applyDirect(to room: RoomID) async throws(MoqomError) {
+        guard let session = rooms[room], let policy = roomPolicies[room] else { return }
+        let options = directOptions(for: policy)
+        let applied = options?.maximumParticipants
+        if let previous = appliedDirect[room], previous == applied { return }
+        do {
+            try await session.setDirect(options)
+        } catch {
+            // Automatic is a default, not a demand: a room that cannot have
+            // direct paths here carries on through the relay.
+            guard case .custom = policy.mode else {
+                appliedDirect[room] = .some(nil)
+                logger.info(.room, "direct paths unavailable", [LogField("error", .text("\(error)"))])
+                return
+            }
+            throw error
+        }
+        appliedDirect[room] = .some(applied)
+    }
+
+    /// A new credential can restate the room's direct policy.
+    private func reapplyDirect() async {
+        for room in roomPolicies.keys {
+            try? await applyDirect(to: room)
+        }
+    }
+
     public func leave(room: RoomID) async {
+        roomPolicies[room] = nil
+        appliedDirect[room] = nil
         guard let session = rooms.removeValue(forKey: room) else { return }
         await session.end()
         logger.info(.room, "left", [LogField("room", .text(room.value))])

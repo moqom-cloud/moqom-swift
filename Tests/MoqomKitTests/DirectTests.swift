@@ -133,6 +133,9 @@ struct DirectEligibilityTests {
         #expect(reason { $0.watchdogRequired = true } == .watchdogRequired)
         #expect(reason { $0.participants = 1 } == .alone)
         #expect(reason { $0.participants = 5 } == .tooManyParticipants(5))
+        #expect(reason { $0.limit = 2; $0.participants = 3 } == .tooManyParticipants(3))
+        #expect(reason { $0.limit = 2; $0.participants = 2 } == nil)
+        #expect(reason { $0.limit = 40; $0.participants = 5 } == .tooManyParticipants(5))
         #expect(reason { $0.everyoneOptedIn = false } == .notEveryoneOptedIn)
         #expect(DirectIneligibility.audience.description == "viewers never use direct paths")
     }

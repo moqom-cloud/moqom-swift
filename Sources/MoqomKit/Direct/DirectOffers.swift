@@ -2,7 +2,8 @@
 // read them.
 //
 // No signalling server and nothing new at the relay: each participant publishes
-// its sealed offers on a track of its own, under its own stage namespace, which
+// its sealed offers on a track of its own, under its own stage (or backstage)
+// namespace, which
 // is a name the relay already lets it publish and lets the room read. A peer
 // subscribes to that track the way it subscribes to a camera, opens what is
 // addressed to it, and ignores the rest. Viewers in the room can fetch the
@@ -26,6 +27,7 @@ public actor DirectOffers {
     private let connection: any TransportSession
     private let secret: DirectRoomSecret
     private let announces: Bool
+    private let backstage: Bool
 
     private var writer: (any TrackWriter)?
     private var announcement: (any AnnouncementHandle)?
@@ -37,13 +39,18 @@ public actor DirectOffers {
     ///   would keep the participant listed after their own publication ends,
     ///   and withdrawing it, on a relay that does not count announcements per
     ///   namespace, would take them off the roster while they are still live.
+    /// - Parameter backstage: whether offers travel under backstage namespaces,
+    ///   this participant's and its peers', rather than stage ones. Backstage
+    ///   participants pair with each other, and only those holding a backstage
+    ///   grant can read there.
     public init(
         tenant: TenantID,
         room: RoomID,
         identity: ParticipantIdentity,
         connection: any TransportSession,
         secret: DirectRoomSecret,
-        announces: Bool = true
+        announces: Bool = true,
+        backstage: Bool = false
     ) {
         self.tenant = tenant
         self.room = room
@@ -51,6 +58,7 @@ public actor DirectOffers {
         self.connection = connection
         self.secret = secret
         self.announces = announces
+        self.backstage = backstage
     }
 
     /// The name offers to this device are addressed by.
@@ -88,7 +96,7 @@ public actor DirectOffers {
         let track: FullTrackName
         do {
             track = try FullTrackName(
-                namespace: MoqomNamespaces.participant(tenant: tenant, room: room, identity: peer),
+                namespace: slot(of: peer),
                 name: TrackName(Self.trackName)
             )
         } catch {
@@ -131,7 +139,7 @@ public actor DirectOffers {
         let namespace: TrackNamespace
         let track: FullTrackName
         do {
-            namespace = try MoqomNamespaces.participant(tenant: tenant, room: room, identity: identity)
+            namespace = try slot(of: identity)
             track = try FullTrackName(namespace: namespace, name: TrackName(Self.trackName))
         } catch {
             throw MoqomError.invalidName(error)
@@ -142,5 +150,11 @@ public actor DirectOffers {
         let opened = try await connection.publish(track, priority: Self.priority)
         writer = opened
         return opened
+    }
+
+    private func slot(of who: ParticipantIdentity) throws(NameError) -> TrackNamespace {
+        backstage
+            ? try MoqomNamespaces.backstageParticipant(tenant: tenant, room: room, identity: who)
+            : try MoqomNamespaces.participant(tenant: tenant, room: room, identity: who)
     }
 }
