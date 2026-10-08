@@ -296,7 +296,7 @@ struct RoomStatisticsTests {
         #expect(stats.control.needsSnapshot)
         #expect(!stats.control.hasGap)
 
-        let publisher = try await room.assumeAuthority()
+        let publisher = try await room.assumeAuthority(signer: testAuthority)
         try await publisher.snapshot()
 
         #expect(await eventually { await room.logPosition > 0 })

@@ -63,6 +63,10 @@ public enum MoqomObjectProperty {
     /// else. SFrame authenticates it with the ciphertext, so a relay can read it
     /// and cannot change it.
     public static let catalogDisclosure: UInt64 = 0x7D
+
+    /// The room authority's ML-DSA-65 signature over a `.control` entry; see
+    /// ``RoomLogSigner``. Odd, so it carries bytes.
+    public static let authoritySignature: UInt64 = 0x7F
 }
 
 extension ObjectProperties {
@@ -105,6 +109,14 @@ extension ObjectProperties {
         {
             items.append(parameter)
         }
+        if let authoritySignature, !authoritySignature.isEmpty,
+           let parameter = try? Parameter.bytes(
+               MoqomObjectProperty.authoritySignature,
+               authoritySignature
+           )
+        {
+            items.append(parameter)
+        }
         return Parameters(items)
     }
 
@@ -126,7 +138,8 @@ extension ObjectProperties {
             // stays `nil` rather than becoming `false` so a video object does
             // not start claiming to be audible.
             isSilence: silence.map { $0 != 0 },
-            disclosure: parameters.bytes(MoqomObjectProperty.catalogDisclosure)
+            disclosure: parameters.bytes(MoqomObjectProperty.catalogDisclosure),
+            authoritySignature: parameters.bytes(MoqomObjectProperty.authoritySignature)
         )
     }
 }

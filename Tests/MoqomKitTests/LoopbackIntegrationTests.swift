@@ -68,8 +68,12 @@ func credentials(
         deviceKey: nil
     )
     credentials.plaintextForTesting = e2ee == .plaintextForTesting
+    credentials.authorityKeys = [testAuthority.verificationKey]
     return credentials
 }
+
+/// The room authority every test room trusts, from a fixed seed.
+let testAuthority = try! RoomLogSigner(seed: Data(repeating: 0xA7, count: 32))
 
 /// An unsigned token carrying the claims the SDK reads. The loopback relay
 /// verifies nothing, so the signature segment is a placeholder.

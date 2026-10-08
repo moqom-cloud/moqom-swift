@@ -329,6 +329,7 @@ public actor MoqomSession {
         renewingWith renew: (@Sendable () async throws -> IssuedToken)? = nil
     ) async throws(MoqomError) {
         if let renew {
+            let previous = credentials
             credentials = DeviceCredentials(
                 identity: credentials.identity,
                 token: issued.token,
@@ -337,6 +338,8 @@ public actor MoqomSession {
                 renew: renew,
                 keyDelivery: credentials.keyDelivery
             )
+            credentials.authorityKeys = previous.authorityKeys
+            credentials.plaintextForTesting = previous.plaintextForTesting
         } else {
             credentials = credentials.replacing(with: issued)
         }
@@ -403,6 +406,7 @@ public actor MoqomSession {
             logger: logger,
             seatPolicy: seatPolicy,
             encryptionPolicy: credentials.encryptionPolicy,
+            authorityKeys: credentials.authorityKeys,
             keyDelivery: credentials.keyDelivery,
             currentToken: { [weak self] in await self?.credentials.token ?? Data() },
             updateCredential: { [weak self] issued, renew throws(MoqomError) in
@@ -471,6 +475,7 @@ public actor MoqomSession {
             seatPolicy: seatPolicy,
             channel: username,
             encryptionPolicy: credentials.encryptionPolicy,
+            authorityKeys: credentials.authorityKeys,
             updateCredential: { [weak self] issued, renew throws(MoqomError) in
                 guard let self else {
                     throw MoqomError.invalidState(expected: "an open session", actual: "closed")

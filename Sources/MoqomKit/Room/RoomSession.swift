@@ -247,11 +247,13 @@ public actor RoomSession {
         seatPolicy: SeatPolicy = .default,
         channel: Username? = nil,
         encryptionPolicy: EncryptionPolicy = .required,
+        authorityKeys: [DirectVerificationKey] = [],
         keyDelivery: (any MLSDeliveryService)? = nil,
         currentToken: (@Sendable () async -> Data)? = nil,
         updateCredential: CredentialUpdate? = nil
     ) {
         self.encryptionPolicy = encryptionPolicy
+        self.authorityKeys = authorityKeys
         self.keyDelivery = keyDelivery
         self.currentToken = currentToken
         presentCredential = updateCredential
@@ -1074,6 +1076,7 @@ public actor RoomSession {
                 room: room,
                 tenant: tenant,
                 on: session,
+                signer: authority.signer,
                 state: await authority.state,
                 cadence: await authority.cadence,
                 sequence: await authority.sequence,
@@ -2564,6 +2567,16 @@ public actor RoomSession {
     /// What the room's authority has told this client, in order.
     private var log = RoomLog()
 
+    /// What control entries must be signed by. See ``DeviceCredentials/authorityKeys``.
+    private let authorityKeys: [DirectVerificationKey]
+
+    /// Whether an unverifiable control entry has been reported, so a relay
+    /// sending a stream of them produces one warning rather than a log flood.
+    private var reportedUnsigned = false
+
+    /// Control entries dropped because they did not verify.
+    public private(set) var controlEntriesRefused = 0
+
     private var controlTask: Task<Void, Never>?
     private var controlSubscription: (any SubscriptionHandle)?
     private var controlRepair: Task<Void, Never>?
@@ -2599,7 +2612,7 @@ public actor RoomSession {
 
     /// The authority this session holds over the room's log, if it has taken it.
     ///
-    /// Worth reading rather than holding what ``assumeAuthority(cadence:)``
+    /// Worth reading rather than holding what ``assumeAuthority(signer:cadence:)``
     /// returned: a reconnect replaces the publisher, because its writer was a
     /// stream on a connection that is gone.
     public var roomAuthority: RoomLogPublisher? { authority }
@@ -2788,6 +2801,26 @@ public actor RoomSession {
     }
 
     private func receiveControl(_ object: TrackObject) async {
+        guard RoomLogSignature.verifies(
+            object.properties.authoritySignature,
+            entry: object.payload,
+            tenant: tenant,
+            room: room,
+            keys: authorityKeys
+        ) else {
+            controlEntriesRefused += 1
+            if !reportedUnsigned {
+                reportedUnsigned = true
+                logger.warning(
+                    .control,
+                    authorityKeys.isEmpty
+                        ? "ignoring the control log: no authority keys to verify it with"
+                        : "dropping a control entry the room authority did not sign",
+                    [LogField("payload", .redacted(bytes: object.payload.count))]
+                )
+            }
+            return
+        }
         guard let update = try? RoomUpdate.decode(object.payload) else {
             logger.warning(
                 .control,
@@ -2857,6 +2890,7 @@ public actor RoomSession {
     /// protocol contract, and because a test has to be able to be the authority.
     @discardableResult
     public func assumeAuthority(
+        signer: RoomLogSigner,
         cadence: RoomLogPublisher.Cadence = .default
     ) async throws(MoqomError) -> RoomLogPublisher {
         if let authority { return authority }
@@ -2864,6 +2898,7 @@ public actor RoomSession {
             room: room,
             tenant: tenant,
             on: connection,
+            signer: signer,
             state: controlState,
             cadence: cadence
         )

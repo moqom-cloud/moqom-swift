@@ -220,6 +220,15 @@ public struct DeviceCredentials: Sendable {
     /// publishes nothing until the application supplies a key. ``TokenService/keyDelivery`` is MOQOM's.
     public let keyDelivery: (any MLSDeliveryService)?
 
+    /// The keys the room's control log is signed with: the control plane's
+    /// ML-DSA-65 keys, as its JWK set publishes them (see
+    /// ``DirectVerificationKey/parseSet(_:)``).
+    ///
+    /// A room applies only control entries signed by one of these. Empty, and
+    /// the control log is ignored — nobody is promoted, muted or ended by it —
+    /// because an entry nobody can verify is one the relay could have written.
+    public var authorityKeys: [DirectVerificationKey] = []
+
     /// See ``EncryptionPolicy/plaintextForTesting``.
     var plaintextForTesting = false
 
@@ -253,6 +262,7 @@ public struct DeviceCredentials: Sendable {
             renew: renew,
             keyDelivery: keyDelivery
         )
+        replaced.authorityKeys = authorityKeys
         replaced.plaintextForTesting = plaintextForTesting
         return replaced
     }
@@ -759,22 +769,28 @@ public struct ObjectProperties: Hashable, Sendable {
     /// secret from the relay. See ``Catalog/disclosure()``.
     public var disclosure: Data?
 
+    /// On a `.control` entry, the room authority's signature over it. See
+    /// ``RoomLogSigner``.
+    public var authoritySignature: Data?
+
     public init(
         captureTime: FrameTimestamp? = nil,
         configuration: Data? = nil,
         temporalLayer: Int? = nil,
         isSilence: Bool? = nil,
-        disclosure: Data? = nil
+        disclosure: Data? = nil,
+        authoritySignature: Data? = nil
     ) {
         self.captureTime = captureTime
         self.configuration = configuration
         self.temporalLayer = temporalLayer
         self.isSilence = isSilence
         self.disclosure = disclosure
+        self.authoritySignature = authoritySignature
     }
 
     public var isEmpty: Bool {
         captureTime == nil && configuration == nil && temporalLayer == nil && isSilence == nil
-            && disclosure == nil
+            && disclosure == nil && authoritySignature == nil
     }
 }
