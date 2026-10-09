@@ -1,7 +1,7 @@
 # MoqomKit
 
 The Apple-platform client SDK for [MOQOM](https://github.com/moqom-cloud/moqom),
-the Media Over QUIC Orchestration Mesh. iOS, visionOS, macOS, and tvOS.
+the Media Over [QUIC](https://www.rfc-editor.org/rfc/rfc9000) Orchestration Mesh. iOS, visionOS, macOS, and tvOS.
 
 Documentation is at [moqom.dev](https://moqom.dev), starting with the
 [iOS & macOS guide](https://moqom.dev/guides/ios-macos/).
@@ -82,15 +82,15 @@ SDK.
 | Target | What it is |
 | --- | --- |
 | `MoqomCore` | Namespaces, identity, layer ladders, frame and audio types, logging |
-| `MoqomWire` | The MoQ Transport codecs for drafts 16, 19 and 22: varints, parameters, control messages, datagrams, subgroup streams |
-| `MoqomKit` | Session, MOQT transport, rooms, publishing, subscribing, layer selection, SFrame, platform capture |
-| `MoqomLoopback` | An in-memory relay and an in-memory QUIC carrier, so the tests exercise the whole stack |
+| `MoqomWire` | The [MoQ Transport](https://datatracker.ietf.org/doc/draft-ietf-moq-transport/) codecs for drafts 16, 19 and 22: varints, parameters, control messages, datagrams, subgroup streams |
+| `MoqomKit` | Session, MOQT transport, rooms, publishing, subscribing, layer selection, [SFrame](https://www.rfc-editor.org/rfc/rfc9605), platform capture |
+| `MoqomLoopback` | An in-memory relay and an in-memory [QUIC](https://www.rfc-editor.org/rfc/rfc9000) carrier, so the tests exercise the whole stack |
 | `MoqomDirectRust` | Optional. Direct paths over the Rust `moqom-direct-ffi` instead of `Network.framework`; present only when its xcframework is (see [Direct backends](#direct-backends)) |
 
 ## Status
 
 There is a transport, and it has talked to something that is not itself.
-`MoqtSession` speaks draft-19 over anything that provides QUIC streams,
+`MoqtSession` speaks draft-19 over anything that provides [QUIC](https://www.rfc-editor.org/rfc/rfc9000) streams,
 `NetworkQUICCarrier` provides them from `Network.framework`, and `MemoryCarrier`
 provides them from a buffer so the session is testable without a socket.
 `Transport` remains a protocol and `MoqomLoopback` remains one of its
@@ -170,7 +170,7 @@ top of `Sources/MoqomKit/Transport/Transport.swift`.
   roster and this device announces itself, so the natural loop asks the relay to
   send back the catalog it just published; a few hundred bytes is small enough
   that only a test would notice.
-- **The wire codec.** Varints against the RFC 9000 vectors, delta-encoded
+- **The wire codec.** Varints against the [RFC 9000](https://www.rfc-editor.org/rfc/rfc9000) vectors, delta-encoded
   parameters, control message framing and its 64 KiB body limit, object
   datagrams, and subgroup streams with their delta-encoded object IDs. Byte
   sequences are pinned against the Rust implementation's output rather than
@@ -220,7 +220,7 @@ top of `Sources/MoqomKit/Transport/Transport.swift`.
   for. Untested here is the graph itself, which needs a device; what is tested is
   the decision, because choosing wrongly does not look like a configuration bug
   from outside — a video call on the earpiece reads as broken hardware.
-- **SFrame (RFC 9605).** Header encoding, key derivation, and AEAD against the
+- **SFrame ([RFC 9605](https://www.rfc-editor.org/rfc/rfc9605)).** Header encoding, key derivation, and AEAD against the
   RFC's test vectors; then through the room path, where the relay is asserted
   to see only ciphertext and tampering with an object's group, object number,
   priority, or properties is asserted to fail authentication. Also what it
@@ -235,7 +235,7 @@ top of `Sources/MoqomKit/Transport/Transport.swift`.
   (`MOQOM_RELAY_POSSESSION=required`), so a token presented without a proof from
   the key it is bound to is refused. Tested: that a session presents a proof beside its token at
   SETUP and a fresh one on every renewal, and that the proof verifies: the
-  signature is checked under the key the proof carries, the RFC 7638 thumbprint
+  signature is checked under the key the proof carries, the [RFC 7638](https://www.rfc-editor.org/rfc/rfc7638) thumbprint
   of that key is recomputed canonically, and the claims are matched — which is
   the relay's own check, written a second time in Swift so a client-side
   encoding mistake fails in `swift test` rather than as a refused handshake with
@@ -323,7 +323,7 @@ top of `Sources/MoqomKit/Transport/Transport.swift`.
   own SFrame keys. Senders switch the moment a removal is ordered, so a removed
   member's last key stops being used, and an ordinary epoch change drops no
   frames.
-  `MLSGroup` is a deliberately small subset of MLS (RFC 9420). The primitives
+  `MLSGroup` is a deliberately small subset of MLS ([RFC 9420](https://www.rfc-editor.org/rfc/rfc9420)). The primitives
   and key schedule are RFC 9420 and are checked against its test vectors
   (`MLSConformanceTests`); the group protocol keeps the RFC's epochs, commits,
   Welcomes and transcript hashes but uses a flat member list instead of a
@@ -333,7 +333,7 @@ top of `Sources/MoqomKit/Transport/Transport.swift`.
   lowest live leaf, with a fallback, so there is no election.
   Groups are founded in a hybrid post-quantum suite,
   `MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519` from
-  draft-ietf-mls-pq-ciphersuites (the X-Wing KEM: ML-KEM-768 with X25519).
+  [draft-ietf-mls-pq-ciphersuites](https://datatracker.ietf.org/doc/draft-ietf-mls-pq-ciphersuites/) (the X-Wing KEM: [ML-KEM-768](https://csrc.nist.gov/pubs/fips/203/final) with X25519).
   The draft has no code point yet, so MoqomKit uses `0xF0A1` from RFC 9420's
   private-use range, and no other MLS implementation will recognise it. Every
   commit secret and joiner secret is sealed to X-Wing, so the epoch secrets
@@ -345,7 +345,7 @@ top of `Sources/MoqomKit/Transport/Transport.swift`.
   group keeps one suite for its whole life, and a key package in another suite
   is refused. X-Wing makes a key package about 2.5 KB and adds about 1.2 KB per
   member to each commit and Welcome. `MLSHybridSuiteTests` checks CryptoKit's
-  X-Wing against the HPKE working group's KEM `0x647a` test vector.
+  X-Wing against the [HPKE](https://www.rfc-editor.org/rfc/rfc9180) working group's KEM `0x647a` test vector.
 - **Direct (peer-to-peer) calls**, in `Sources/MoqomKit/Direct/`. Wire-compatible
   with the Rust client's `moqom_client::direct`, so either SDK can be either
   end:
@@ -356,7 +356,7 @@ top of `Sources/MoqomKit/Transport/Transport.swift`.
     sealed with AES-256-GCM under a key from the room's MLS group and sent on
     the participant's own track. The relay carries them and cannot read or
     forge them.
-  - `DirectEndpoint`: one UDP port, STUN, hole-punching (the lower certificate
+  - `DirectEndpoint`: one UDP port, [STUN](https://www.rfc-editor.org/rfc/rfc8489), hole-punching (the lower certificate
     hash dials), then pinned mutual TLS against the hash in the offer, and a
     MOQT SETUP carrying the MOQOM token plus a proof bound to the peer's
     certificate.
@@ -405,7 +405,7 @@ top of `Sources/MoqomKit/Transport/Transport.swift`.
   room's policy says so), and
   every one of them opted in. Participants are everyone publishing where this
   device publishes (on stage, or backstage with the other cohosts there) plus
-  every member of the room's MLS group, so a viewer holding the room's keys
+  every member of the room's [MLS](https://www.rfc-editor.org/rfc/rfc9420) group, so a viewer holding the room's keys
   keeps the room on the relay. While the rules hold, for each other
   participant the room:
 
@@ -467,7 +467,7 @@ top of `Sources/MoqomKit/Transport/Transport.swift`.
     on it unchanged.
   - `.rust`, from `MoqomDirectRust`, is quinn behind `moqom-direct-ffi` in
     `moqom-engine`. One socket listens and dials at once, so it probes on
-    both sides for the whole of establishment, and it carries QUIC datagrams.
+    both sides for the whole of establishment, and it carries [QUIC](https://www.rfc-editor.org/rfc/rfc9000) datagrams.
     `RustDirectBackend.isCompatible` checks the library's ABI version; a
     mismatch fails `bind` instead of calling into it.
   - `.custom(_:)` takes any other `DirectSocketProvider`.
@@ -610,7 +610,7 @@ somebody demonstrates. Both are built and wired; neither has been seen.
 - Direct paths in a room are on by default (`DirectPolicy.automatic`) and
   still partial:
   - Automatic needs `DeviceCredentials.authorityKeys` to verify a peer with;
-    a session without them stays on the relay. MOQOM's relays answer STUN,
+    a session without them stays on the relay. MOQOM's relays answer [STUN](https://www.rfc-editor.org/rfc/rfc8489),
     and the token service's `direct.stun` names one, so automatic offers this
     device's public address as well as its own. `.automatic(stun:)` names a
     different server instead. A NAT that maps each destination to a new port
@@ -627,7 +627,7 @@ somebody demonstrates. Both are built and wired; neither has been seen.
     backstage one stay on the relay with each other.
   - The Rust client runs the same room behaviour in
     `moqom_client::direct::DirectRoom`, pausing the relay copy the same way,
-    but has no MLS or catalog, so its caller supplies the offer key and who
+    but has no [MLS](https://www.rfc-editor.org/rfc/rfc9420) or catalog, so its caller supplies the offer key and who
     opted in.
   - On the loopback relay `FORWARD=0` does nothing, so the 500 ms quiet resume
     is covered only by the `DualSubscription` tests in `DirectTests`.
@@ -645,7 +645,7 @@ somebody demonstrates. Both are built and wired; neither has been seen.
   client asks and answers fetches, and the relay retains groups to answer with —
   but the interop tests do not yet cover the pair, so the evidence that they
   agree is still two test suites rather than one.
-- Round-trip time. `Network.framework` does not surface a QUIC RTT estimate, so
+- Round-trip time. `Network.framework` does not surface a [QUIC](https://www.rfc-editor.org/rfc/rfc9000) RTT estimate, so
   the client reports the one-way delay gradient it can measure and leaves true
   RTT to the relay, which has the QUIC state machine in reach. Pairing a client
   snapshot with the relay's view of the same session is the intended way to
@@ -680,7 +680,7 @@ another city. What remains unobserved is narrower than it was, and specific:
   sample rather than by reading it. The first said the enclave path had never
   run: it has, on both phones, and a relay set to
   `MOQOM_RELAY_POSSESSION=required` admitted them and relayed between them —
-  which it does only after recomputing the RFC 7638 thumbprint of the key that
+  which it does only after recomputing the [RFC 7638](https://www.rfc-editor.org/rfc/rfc7638) thumbprint of the key that
   signed the proof and matching it to the token's `cnf.jkt`. So an enclave key
   was generated, signed, and had its signature verified by another
   implementation.
@@ -706,7 +706,7 @@ another city. What remains unobserved is narrower than it was, and specific:
 
 ## MoQ Transport drafts
 
-The draft is chosen by ALPN during the QUIC handshake. Three are spoken:
+The draft is chosen by ALPN during the [QUIC](https://www.rfc-editor.org/rfc/rfc9000) handshake. Three are spoken:
 
 | ALPN | Session | Used for |
 | --- | --- | --- |
@@ -881,7 +881,7 @@ encode rather than a namespace with no media behind it.
 - **A second draft-19 implementation.** `MoqomWire` is a port of the Rust
   codec, not a binding to it. Two implementations of a wire format is a thing
   to regret, and the alternative was a C ABI, a Rust runtime on every device,
-  and a build that cross-compiles for four Apple platforms — to reach a QUIC
+  and a build that cross-compiles for four Apple platforms — to reach a [QUIC](https://www.rfc-editor.org/rfc/rfc9000)
   stack that `Network.framework` already provides. The mitigation is that the
   tests pin bytes the Rust side produced rather than bytes we produced.
 - **A Rust runtime after all, for direct paths only, and optional.** The

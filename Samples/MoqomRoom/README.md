@@ -29,7 +29,7 @@ locally.
 
 ## What it actually does
 
-It dials the compiled-in relay on Compute Engine over QUIC, through
+It dials the compiled-in relay on Compute Engine over [QUIC](https://www.rfc-editor.org/rfc/rfc9000), through
 `NetworkQUICCarrier`, and falls back to `MoqomLoopback` — an in-memory relay —
 only when no host is configured. That is a change from what this paragraph used
 to say, which was that the loopback was all there was because `moqom-transport`
@@ -428,7 +428,7 @@ means.
 ### The key under your name
 
 The join screen prints a short string beneath the username, and says whether it
-came from the Secure Enclave or from the Keychain. That is the RFC 7638
+came from the Secure Enclave or from the Keychain. That is the [RFC 7638](https://www.rfc-editor.org/rfc/rfc7638)
 thumbprint of a P-256 key this installation generated the first time it ran, and
 it is the device's identity in three places at once: the last field of every
 namespace it publishes under, the `cnf.jkt` of every token it is issued, and the
