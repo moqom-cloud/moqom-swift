@@ -2,8 +2,7 @@
 // read them.
 //
 // No signalling server and nothing new at the relay: each participant publishes
-// its sealed offers on a track of its own, under its own stage (or backstage)
-// namespace, which
+// its sealed offers on a track of its own, under its own stage namespace, which
 // is a name the relay already lets it publish and lets the room read. A peer
 // subscribes to that track the way it subscribes to a camera, opens what is
 // addressed to it, and ignores the rest. Viewers in the room can fetch the
@@ -27,7 +26,6 @@ public actor DirectOffers {
     private let connection: any TransportSession
     private let secret: DirectRoomSecret
     private let announces: Bool
-    private let backstage: Bool
 
     private var writer: (any TrackWriter)?
     private var announcement: (any AnnouncementHandle)?
@@ -39,18 +37,13 @@ public actor DirectOffers {
     ///   would keep the participant listed after their own publication ends,
     ///   and withdrawing it, on a relay that does not count announcements per
     ///   namespace, would take them off the roster while they are still live.
-    /// - Parameter backstage: whether offers travel under backstage namespaces,
-    ///   this participant's and its peers', rather than stage ones. Backstage
-    ///   participants pair with each other, and only those holding a backstage
-    ///   grant can read there.
     public init(
         tenant: TenantID,
         room: RoomID,
         identity: ParticipantIdentity,
         connection: any TransportSession,
         secret: DirectRoomSecret,
-        announces: Bool = true,
-        backstage: Bool = false
+        announces: Bool = true
     ) {
         self.tenant = tenant
         self.room = room
@@ -58,7 +51,6 @@ public actor DirectOffers {
         self.connection = connection
         self.secret = secret
         self.announces = announces
-        self.backstage = backstage
     }
 
     /// The name offers to this device are addressed by.
@@ -153,8 +145,6 @@ public actor DirectOffers {
     }
 
     private func slot(of who: ParticipantIdentity) throws(NameError) -> TrackNamespace {
-        backstage
-            ? try MoqomNamespaces.backstageParticipant(tenant: tenant, room: room, identity: who)
-            : try MoqomNamespaces.participant(tenant: tenant, room: room, identity: who)
+        try MoqomNamespaces.participant(tenant: tenant, room: room, identity: who)
     }
 }

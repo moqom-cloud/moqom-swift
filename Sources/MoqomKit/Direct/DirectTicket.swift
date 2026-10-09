@@ -150,8 +150,7 @@ public enum DirectTicketCheck {
 /// The relay's tickets for one direct path, as a stream.
 public enum DirectTicketFeed {
     /// The ticket track for a direct path to `peer` (`user/device`), under a
-    /// participant's own slot: the stage slot, or the backstage one while
-    /// backstage, as the relay checks.
+    /// participant's own stage slot, as the relay checks.
     public static func track(slot: TrackNamespace, peer: String) throws(NameError) -> FullTrackName {
         try FullTrackName(namespace: slot, name: TrackName(".direct/\(peer)"))
     }

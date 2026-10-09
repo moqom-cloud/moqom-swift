@@ -202,20 +202,18 @@ struct DirectRoomTests {
         await call.hangUp()
     }
 
-    @Test("two cohosts backstage go direct with each other")
-    func backstageGoesDirect() async throws {
+    @Test("cohosts backstage stay on the relay and offer nothing")
+    func backstageStaysOnTheRelay() async throws {
         let call = try await call(backstage: true)
         let a = call.alice.identity
-        #expect(await eventually(timeout: .seconds(30)) { await bothDirect(call) })
-        #expect(await eventually(timeout: .seconds(10)) {
-            (await call.bob.room.directPaths[a]?.objectsOverDirect ?? 0) > 10
-        })
-        // Offered backstage, and nothing on stage.
+        try await Task.sleep(for: .seconds(2))
+        #expect(await !bothDirect(call))
+        #expect(await call.bob.room.directPaths[a] == nil)
         let backstage = try MoqomNamespaces.backstageParticipant(tenant: "acme", room: "room-42", identity: a)
         let stage = try MoqomNamespaces.participant(tenant: "acme", room: "room-42", identity: a)
         let backstageOffers = try FullTrackName(namespace: backstage, name: TrackName(".direct"))
         let stageOffers = try FullTrackName(namespace: stage, name: TrackName(".direct"))
-        #expect(!(await call.relay.objects(on: backstageOffers)).isEmpty)
+        #expect(await call.relay.objects(on: backstageOffers).isEmpty)
         #expect(await call.relay.objects(on: stageOffers).isEmpty)
         await call.hangUp()
     }

@@ -84,6 +84,9 @@ public enum DirectIneligibility: Error, Hashable, Sendable, CustomStringConverti
     case watchdogRequired
     /// Direct paths would hand a viewer the publisher's network address.
     case audience
+    /// Backstage is already on the relay with the broadcast it feeds, and direct paths are for
+    /// calls and small private rooms.
+    case backstage
 
     public var description: String {
         switch self {
@@ -94,6 +97,7 @@ public enum DirectIneligibility: Error, Hashable, Sendable, CustomStringConverti
         case .notEveryoneOptedIn: "not every participant has opted in"
         case .watchdogRequired: "the room requires a watchdog"
         case .audience: "viewers never use direct paths"
+        case .backstage: "backstage stays on the relay"
         }
     }
 }

@@ -491,18 +491,17 @@ public actor RoomSession {
         private func directView() async -> DirectRoomView {
             var view = DirectRoomView()
             view.encrypted = encryption != nil && !encryptionPolicy.allowsPlaintext
-            // Offers travel in the slot this device publishes in, and it pairs
-            // only with the others publishing there: a stage device cannot
-            // necessarily read backstage, and a backstage one is not on stage.
+            // Only the stage pairs. Backstage feeds a broadcast that is on the
+            // relay anyway.
             let stage = try? slotNamespace(backstage: false)
             let backstage = try? slotNamespace(backstage: true)
             let published = [broadcast?.namespace, audio?.track.namespace].compactMap { $0 }
             let onStage = stage.map(published.contains) ?? false
             view.backstage = !onStage && (backstage.map(published.contains) ?? false)
-            view.publishing = onStage || view.backstage
+            view.publishing = onStage
             view.watchdogs = !state.watchdogs.all.isEmpty
             let others = state.roster.participants.filter { $0.id != identity }
-            view.peers = Set(others.filter { $0.slot.isBackstage == view.backstage }.map(\.id))
+            view.peers = Set(others.filter { !$0.slot.isBackstage }.map(\.id))
             view.optedIn = directOptedIn.intersection(others.map(\.id))
             if let managedKeys, let status = await managedKeys.status {
                 view.members = Set(status.members)

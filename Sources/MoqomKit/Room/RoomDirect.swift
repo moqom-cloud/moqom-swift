@@ -393,14 +393,13 @@ final class DirectMergedSubscription: SubscriptionHandle {
     struct DirectRoomView: Equatable, Sendable {
         /// The room requires end-to-end encryption and this device has it.
         var encrypted = false
-        /// This device is publishing, on stage or backstage.
+        /// This device is publishing on stage.
         var publishing = false
-        /// It is publishing backstage, so its offers and its peers are there.
+        /// It is publishing backstage, which never goes direct.
         var backstage = false
         /// A watchdog is attached to the room.
         var watchdogs = false
-        /// Everyone else publishing where this device is: on stage, or
-        /// backstage.
+        /// Everyone else publishing on stage.
         var peers: Set<ParticipantIdentity> = []
         /// Those of them whose catalog says they opted in.
         var optedIn: Set<ParticipantIdentity> = []
@@ -436,7 +435,6 @@ final class DirectMergedSubscription: SubscriptionHandle {
         private var view = DirectRoomView()
         private var offers: DirectOffers?
         private var offerKey: Data?
-        private var offersBackstage = false
         private var generation = 0
         private var peers: [ParticipantIdentity: Peer] = [:]
         private var stopped = false
@@ -561,7 +559,7 @@ final class DirectMergedSubscription: SubscriptionHandle {
                 return
             }
 
-            if let key = view.secret, key != offerKey || view.backstage != offersBackstage { rekey(key) }
+            if let key = view.secret, key != offerKey { rekey(key) }
             for who in view.peers.sorted(by: { DirectParticipant.name(of: $0) < DirectParticipant.name(of: $1) }) {
                 if peers[who] == nil { peers[who] = Peer() }
                 if peers[who]?.reader == nil { peers[who]?.reader = reading(who) }
@@ -571,6 +569,7 @@ final class DirectMergedSubscription: SubscriptionHandle {
 
         /// Why the room may not use direct paths right now, or `nil` if it may.
         private func refusal() -> DirectFallback? {
+            if view.backstage { return .ineligible(.backstage) }
             let others = Set(view.peers.map(DirectParticipant.name(of:)))
             let everyone = others.union(view.members ?? []).union([me])
             let opted = Set(view.optedIn.map(DirectParticipant.name(of:)))
@@ -605,7 +604,6 @@ final class DirectMergedSubscription: SubscriptionHandle {
             offers = nil
             generation += 1
             offerKey = key
-            offersBackstage = view.backstage
             guard let secret = try? DirectRoomSecret(secret: key, tenant: tenant, room: room) else { return }
             let next = DirectOffers(
                 tenant: tenant,
@@ -613,8 +611,7 @@ final class DirectMergedSubscription: SubscriptionHandle {
                 identity: identity,
                 connection: relay,
                 secret: secret,
-                announces: false,
-                backstage: view.backstage
+                announces: false
             )
             Task { await old?.close() }
             offers = next
@@ -793,9 +790,7 @@ final class DirectMergedSubscription: SubscriptionHandle {
             // opened only once there is a path to meter and closed with it.
             let feed: (tickets: AsyncStream<DirectTicket>, subscription: any SubscriptionHandle)
             do {
-                let slot = view.backstage
-                    ? try MoqomNamespaces.backstageParticipant(tenant: tenant, room: room, identity: identity)
-                    : try MoqomNamespaces.participant(tenant: tenant, room: room, identity: identity)
+                let slot = try MoqomNamespaces.participant(tenant: tenant, room: room, identity: identity)
                 feed = try await DirectTicketFeed.request(from: relay, slot: slot, peer: peerName)
             } catch {
                 await direct.session.close(code: 0, reason: "no direct tickets")
