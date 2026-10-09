@@ -586,6 +586,8 @@ public actor MoqomSession {
         }
     }
 
+    var openRooms: Set<RoomID> { Set(rooms.keys) }
+
     public func leave(room: RoomID) async {
         roomPolicies[room] = nil
         appliedDirect[room] = nil

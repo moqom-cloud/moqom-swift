@@ -748,6 +748,23 @@ import MoqomCore
         private var sharedFormat: CMFormatDescription?
         private var isSharing = false
 
+        /// The newest picture the shared decode produced, for a presenter that arrives between
+        /// keyframes. A reference to one IOSurface, like every other copy of it here.
+        private var latest: CMSampleBuffer?
+
+        /// Decode every frame once here, from the first keyframe, so a view added later shows
+        /// the current picture at once instead of waiting for the next keyframe.
+        ///
+        /// For a picture that is going to be in more than one place at a moment nobody can
+        /// schedule: a feed card that expands into the room, a tile lifted into the stage. Off,
+        /// the first presenter waits for a keyframe (up to a group, about two seconds) because
+        /// the display layer's own decoder has no pictures to hand over. On, the cost is one
+        /// decompression session per renderer whether or not anything is mirrored, which is the
+        /// same cost the display layer was paying internally.
+        ///
+        /// Takes effect at the next keyframe.
+        public var mirrorsInstantly = false
+
         public struct Drawing: Sendable, Hashable {
             /// Frames handed to the display layer.
             public var enqueued = 0
@@ -1035,12 +1052,35 @@ import MoqomCore
         /// Draw this renderer's picture in another place as well.
         ///
         /// The returned presenter's layer is the caller's to parent and lay out, exactly as
-        /// ``layer`` is. Nothing is drawn into it until the next keyframe: see ``Presenter``.
+        /// ``layer`` is. It shows the current picture straight away when this renderer is
+        /// already decoding once (``mirrorsInstantly``, or another presenter attached since the
+        /// last keyframe); otherwise nothing is drawn into it until the next keyframe.
         public func addPresenter() -> Presenter {
             let presenter = Presenter()
             extras.append(presenter)
             synchroniser.addRenderer(presenter.layer.sampleBufferRenderer)
+            if isSharing, let latest, let now = Self.immediate(latest) {
+                presenter.enqueue(now)
+            }
             return presenter
+        }
+
+        /// A copy of a decoded sample that displays on arrival rather than at its timestamp,
+        /// which by now is in the past. The copy shares the picture.
+        private static func immediate(_ sample: CMSampleBuffer) -> CMSampleBuffer? {
+            var copy: CMSampleBuffer?
+            guard CMSampleBufferCreateCopy(allocator: kCFAllocatorDefault, sampleBuffer: sample, sampleBufferOut: &copy) == noErr,
+                  let copy,
+                  let attachments = CMSampleBufferGetSampleAttachmentsArray(copy, createIfNecessary: true),
+                  CFArrayGetCount(attachments) > 0
+            else { return nil }
+            let first = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
+            CFDictionarySetValue(
+                first,
+                Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+                Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
+            )
+            return copy
         }
 
         /// Stop drawing into a presenter. Idempotent, and safe to call from a view teardown.
@@ -2188,6 +2228,7 @@ import MoqomCore
             sharedDecoder = nil
             sharedFormat = nil
             isSharing = false
+            latest = nil
 
             // Dropped along with the frames it was scheduling. What arrives next is a new
             // keyframe from a group that may be some way from where the timeline had reached,
@@ -2239,7 +2280,7 @@ import MoqomCore
         /// host who is on screen more than once.
         private func draw(_ sample: CMSampleBuffer, isKeyFrame: Bool) -> Bool {
             let renderer = layer.sampleBufferRenderer
-            let wanted = !extras.isEmpty
+            let wanted = !extras.isEmpty || mirrorsInstantly
 
             // At a keyframe and nowhere else, because both halves of the switch need one. A
             // decompression session that has not seen an IDR has no references to build a
@@ -2269,6 +2310,7 @@ import MoqomCore
             // one host in three places costs one decoder slot instead of three.
             renderer.enqueue(raw)
             for presenter in extras { presenter.enqueue(raw) }
+            latest = raw
             return true
         }
 
@@ -2283,6 +2325,7 @@ import MoqomCore
             sharedDecoder = sharing ? VideoDecodeSession() : nil
             sharedFormat = nil
             isSharing = sharing
+            latest = nil
             drawing.changeovers += 1
         }
 
