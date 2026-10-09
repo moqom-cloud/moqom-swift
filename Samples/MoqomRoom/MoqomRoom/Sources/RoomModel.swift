@@ -2038,6 +2038,10 @@ final class RoomModel {
                         Journal.shared.say(
                             "SPACE authority=\(who?.username.value ?? "nobody")"
                         )
+                    case let .event(record):
+                        Journal.shared.say("SPACE event=\(record)")
+                    case let .eventsMissed(epoch, sequences):
+                        Journal.shared.say("SPACE missed epoch=\(epoch) sequences=\(sequences)")
                     }
                 }
             }

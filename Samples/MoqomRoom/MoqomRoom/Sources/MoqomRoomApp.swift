@@ -328,6 +328,8 @@ extension MoqomError {
             // Deliberately not "try again". Reconnecting into the same
             // violation is how one bug on the other end becomes a loop here.
             "The relay is speaking a protocol this app does not understand."
+        case let .unsupportedByRelay(feature, _):
+            "This relay does not support \(feature)."
         case .encryptionFailed:
             "Could not encrypt the stream, so nothing was sent."
         case .encryptionRequired:
