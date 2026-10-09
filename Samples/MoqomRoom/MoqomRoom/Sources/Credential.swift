@@ -1,116 +1,25 @@
-// The credential this device dials with, and what it says about itself.
+// The secrets this device keeps between launches.
 //
 // Kept out of the defaults database. Everything else on the join screen is an address, and
-// this one authorises; a sample is a thing people copy, and a token in `UserDefaults` is a
-// token in a plist that an unencrypted backup carries off intact. The Keychain costs thirty
+// these authorise; a sample is a thing people copy, and a secret in `UserDefaults` is a
+// secret in a plist that an unencrypted backup carries off intact. The Keychain costs thirty
 // lines here and is the habit worth demonstrating.
 //
-// The claims are read for display and never for a decision. A client cannot verify its own
-// token — it holds no key, and a client that held one could mint rather than verify — so
-// nothing below is trusted for anything. What it buys is a screen that can say "this expired
-// forty minutes ago", which is the difference between a saved credential being a convenience
-// and being the puzzle this file's earlier absence was avoiding: an app that worked in the
-// morning and stopped by lunchtime with nothing on screen having changed.
+// Nothing here reads a token. Tokens are sealed by the control plane and opaque to the
+// device holding them, so what the interface says about one — who it names, which room, when
+// it dies — comes from what the token server said when it issued it (`IssuedToken`), and a
+// token pasted in by hand is just bytes.
 
 import Foundation
 import Security
 
-/// What a token asserts, as far as the interface needs to say it.
+/// Where secrets are kept between launches.
 ///
-/// Unverified, and the naming is deliberate about that: this is what the token *says*.
-struct Credential {
-    var subject: String
-    var tenant: String
-    var room: String
-    var expires: Date
-
-    /// The device key this token is bound to, from `cnf.jkt`, untruncated.
-    ///
-    /// Read for the same reason the room is: a token bound to a key this phone
-    /// does not hold is refused by a relay requiring proof of possession, and the
-    /// symptom without this is a Join that fails with the reason sealed inside
-    /// the credential. Empty for a token minted before binding meant anything.
-    var device: String
-
-    /// Read the claims out of a JWT without checking the signature. See the file comment.
-    init?(_ token: Data) {
-        let parts = token.split(separator: UInt8(ascii: "."))
-        guard parts.count == 3, let payload = Self.unpad(parts[1]) else { return nil }
-
-        // Named for the wire rather than for Swift, because these names are the format. The
-        // room lives under `moqt` with the rest of what a relay enforces.
-        struct Claims: Decodable {
-            struct Scope: Decodable { var room: String? }
-            struct Confirmation: Decodable { var jkt: String? }
-            var sub: String?
-            var aud: String?
-            var exp: Double?
-            var moqt: Scope?
-            var cnf: Confirmation?
-        }
-
-        guard
-            let claims = try? JSONDecoder().decode(Claims.self, from: payload),
-            let expires = claims.exp
-        else { return nil }
-
-        subject = claims.sub ?? ""
-        tenant = claims.aud ?? ""
-        room = claims.moqt?.room ?? ""
-        device = claims.cnf?.jkt ?? ""
-        self.expires = Date(timeIntervalSince1970: expires)
-    }
-
-    /// base64url, which is base64 with two characters exchanged and the padding left off.
-    private static func unpad(_ text: Data) -> Data? {
-        var encoded = String(decoding: text, as: UTF8.self)
-            .replacingOccurrences(of: "-", with: "+")
-            .replacingOccurrences(of: "_", with: "/")
-        encoded += String(repeating: "=", count: (4 - encoded.count % 4) % 4)
-        return Data(base64Encoded: encoded)
-    }
-
-    var hasExpired: Bool { expires <= .now }
-
-    /// One line for the join screen, and the only reason the claims are read at all.
-    var summary: String {
-        let when = expires.formatted(.relative(presentation: .numeric))
-        let who = subject.isEmpty ? "somebody" : subject
-        let where_ = room.isEmpty ? "no room" : "room \(room)"
-        return "\(who) in \(tenant), \(where_) — \(hasExpired ? "expired" : "expires") \(when)"
-    }
-
-    /// Why this credential will not do for the room being joined, if it will not.
-    ///
-    /// The failure it names cost an evening: a token minted for one room, a room field saying
-    /// another, and a relay that refuses the pair — which on the phone is a Join that fails
-    /// and a Go live that does nothing, with the reason sitting unread in the token itself.
-    func complaint(joining room: String, as username: String, on device: String = "") -> String? {
-        if hasExpired { return "This token expired \(expires.formatted(.relative(presentation: .numeric)))." }
-        if !self.room.isEmpty, self.room != room {
-            return "This token is for room \(self.room), not \(room)."
-        }
-        if !subject.isEmpty, subject != username {
-            return "This token names \(subject), not \(username)."
-        }
-        // Last, because it is the newest way to be wrong and the least likely:
-        // a token minted for another phone, or minted by hand with whatever
-        // `-device` defaulted to. A relay requiring proof of possession refuses
-        // it, and this is the only place the two values are visible together.
-        if !self.device.isEmpty, !device.isEmpty, !self.device.hasPrefix(device) {
-            return "This token is bound to another device's key (\(self.device.prefix(16)))."
-        }
-        return nil
-    }
-}
-
-/// Where the token is kept between launches.
-///
-/// Filed under the host it was minted for, which does two things. A credential is never
-/// offered to a relay it does not belong to — and that is not tidiness: a relay holding
+/// Filed under the host they belong to, which does two things. A credential is never
+/// offered to a server it does not belong to — and that is not tidiness: a relay holding
 /// verification keys refuses a token it cannot verify outright, rather than admitting the
 /// session anonymously, so presenting the wrong one is worse than presenting none. And
-/// switching relays stops destroying the token for the one being left, so a laptop on the
+/// switching servers stops destroying the secret for the one being left, so a laptop on the
 /// desk and a deployment in Los Angeles can both be a tap away.
 enum TokenStore {
     private static let service = "cloud.moqom.room"
@@ -153,19 +62,25 @@ enum TokenStore {
         SecItemAdd(item as CFDictionary, nil)
     }
 
-    /// The long-lived credential this device asks for tokens with.
+    /// The enrollment the token server issued at sign-in, which this device asks for tokens
+    /// with.
     ///
-    /// Beside the tokens and under a name of its own, because the two are secrets
-    /// of different lifetimes and losing them has different consequences. A token
-    /// expires in fifteen minutes; this one is how the phone gets the next
-    /// fifteen minutes, months from now. Both belong in the Keychain and neither
-    /// belongs in a defaults database — this one more emphatically, since a
-    /// leaked token is a problem that solves itself by lunchtime.
-    static func loadJoinCredential(for host: String) -> String? {
-        load(for: "join:" + host).map { String(decoding: $0, as: UTF8.self) }
+    /// Beside any token and under a name of its own, because the two are secrets of
+    /// different lifetimes. A token expires in fifteen minutes; this is how the phone gets the
+    /// next fifteen minutes, until the server revokes it or it runs out and the person signs
+    /// in again. It is bound to this phone's key, so a copy of it is worth nothing elsewhere,
+    /// and it is still a secret.
+    static func loadEnrollment(for host: String) -> String? {
+        load(for: "enrollment:" + host).map { String(decoding: $0, as: UTF8.self) }
     }
 
-    static func saveJoinCredential(_ credential: String, for host: String) {
-        save(Data(credential.utf8), for: "join:" + host)
+    static func saveEnrollment(_ enrollment: String, for host: String) {
+        save(Data(enrollment.utf8), for: "enrollment:" + host)
+    }
+
+    /// What older builds kept under `join:` — a long-lived device credential for the
+    /// control plane's `/join`, which no longer exists. Deleted rather than read.
+    static func forgetJoinCredential(for host: String) {
+        save(Data(), for: "join:" + host)
     }
 }

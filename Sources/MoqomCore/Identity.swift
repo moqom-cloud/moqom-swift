@@ -41,7 +41,7 @@ extension Username: CustomStringConvertible {
 /// One installation of the app, identified by the key it holds.
 ///
 /// The value is derived from the JWK Thumbprint (`jkt`) of a non-exportable
-/// P-256 key generated in the Secure Enclave at install, which is also what the
+/// ML-DSA-87 key generated in the Secure Enclave at install, which is also what the
 /// token's `cnf` claim binds to. Deriving the namespace field from the
 /// thumbprint rather than from a random string is what makes a device ban and a
 /// credential revocation the same act: there is exactly one thing to revoke and

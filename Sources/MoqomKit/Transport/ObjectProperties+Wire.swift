@@ -64,7 +64,7 @@ public enum MoqomObjectProperty {
     /// and cannot change it.
     public static let catalogDisclosure: UInt64 = 0x7D
 
-    /// The room authority's ML-DSA-65 signature over a `.control` entry; see
+    /// The room authority's ML-DSA-87 signature over a `.control` entry; see
     /// ``RoomLogSigner``. Odd, so it carries bytes.
     public static let authoritySignature: UInt64 = 0x7F
 }

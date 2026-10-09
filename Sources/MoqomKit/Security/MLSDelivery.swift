@@ -8,8 +8,11 @@
 //
 // A protocol rather than a type so that a deployment running its own backend
 // can put one in front of its own store, and so the room's key management can
-// be tested without a network. ``HTTPMLSDelivery`` is MOQOM's: the control
-// plane's join listener, authenticated by the same token the relay accepts.
+// be tested without a network. ``HTTPMLSDelivery`` is MOQOM's: a control plane
+// listener with an address of its own, authenticated by the same token the
+// relay accepts. Its address is configured, not derived from where tokens come
+// from, because tokens now come from the application's backend and that is a
+// different machine run by a different party.
 //
 // Every call takes the token rather than the service holding one, because the
 // token is renewed underneath a call that lasts longer than fifteen minutes and
@@ -57,7 +60,7 @@ public struct MLSDeliverySnapshot: Sendable, Hashable {
         public init(
             id: Data,
             epoch: UInt64,
-            cipherSuite: UInt16 = MLSCipherSuite.mls128DHKEMX25519.identifier
+            cipherSuite: UInt16 = MLSCipherSuite.default.identifier
         ) {
             self.id = id
             self.epoch = epoch
@@ -247,7 +250,8 @@ public enum MLSDeliveryError: Error, Sendable, Hashable {
     case malformed(String)
 }
 
-/// The control plane's delivery service, on its join listener.
+/// The control plane's delivery service, at the address the deployment gives
+/// for it (an invitation's ``RelayInvitation/keyDelivery``, or configuration).
 ///
 /// A class holding one URL session, rather than a value making one per call
 /// as ``TokenService`` does: this is asked every few seconds for as long as a
@@ -291,12 +295,9 @@ public final class HTTPMLSDelivery: MLSDeliveryService {
         let body = try decode(SyncResponse.self, data)
         return MLSDeliverySnapshot(
             group: body.group.map {
-                // A service that does not report a suite predates suites, and
-                // every group it holds is in 0x0001.
-                MLSDeliverySnapshot.Group(
-                    id: $0.id, epoch: $0.epoch,
-                    cipherSuite: $0.cipherSuite ?? MLSCipherSuite.mls128DHKEMX25519.identifier
-                )
+                // A service that does not report a suite predates suites. Its
+                // groups are in a suite this build cannot join, and 0 says so.
+                MLSDeliverySnapshot.Group(id: $0.id, epoch: $0.epoch, cipherSuite: $0.cipherSuite ?? 0)
             },
             messages: (body.messages ?? []).map {
                 MLSDeliverySnapshot.Message(sequence: $0.seq, kind: $0.kind, data: $0.data)
@@ -509,13 +510,5 @@ public final class HTTPMLSDelivery: MLSDeliveryService {
             throw MLSDeliveryError.refused(status: status, reason: reason)
         }
         return data
-    }
-}
-
-extension TokenService {
-    /// The delivery service on the same listener this asks for tokens, pinned
-    /// the same way.
-    public var keyDelivery: HTTPMLSDelivery {
-        HTTPMLSDelivery(endpoint: endpoint, certificateHashes: certificateHashes)
     }
 }

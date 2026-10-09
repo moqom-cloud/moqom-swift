@@ -1,3 +1,4 @@
+import AuthenticationServices
 import MoqomKit
 import SwiftUI
 
@@ -103,58 +104,50 @@ struct JoinScreen: View {
                 )
             }
 
-            // Before the token, because it is what produces one. A phone with a
-            // service configured never touches the field below: it asks for a
-            // credential seconds before it dials, every time, which is the only way
-            // a fifteen-minute token is a workable thing to hold.
+            // Before the token, because it is what produces one. A phone that has
+            // signed in never touches the field below: it asks for a token seconds
+            // before it dials, every time, which is the only way a fifteen-minute
+            // token is a workable thing to hold.
             Section {
-                TextField("Token service host", text: $model.joinHost)
+                TextField("Token server URL", text: $model.tokenServerAddress)
                     #if os(iOS)
                         .textInputAutocapitalization(.never)
                         .keyboardType(.URL)
                     #endif
                     .autocorrectionDisabled()
 
-                TextField("Port", text: $model.joinPort)
-                    #if os(iOS)
-                        .keyboardType(.numberPad)
-                    #endif
-
-                TextField("Certificate hash", text: $model.joinCertificateHash)
-                    #if os(iOS)
-                        .textInputAutocapitalization(.never)
-                    #endif
-                    .autocorrectionDisabled()
-                    .font(.caption.monospaced())
-
-                // Secure, and not because anybody is shoulder-surfing a sample. It
-                // is the one durable secret on this screen, and a field that prints
-                // it back in full is a field that ends up in a screenshot in an
-                // issue.
-                SecureField("Device credential", text: $model.joinCredential)
-                    .font(.caption.monospaced())
+                if model.relay.tokenServer.isSignedIn {
+                    Button("Sign out", role: .destructive) { model.signOut() }
+                } else {
+                    SignInWithAppleButton(.signIn) { request in
+                        model.prepareSignIn(request)
+                    } onCompletion: { result in
+                        Task { await model.completeSignIn(result) }
+                    }
+                    .signInWithAppleButtonStyle(.white)
+                    .frame(height: 44)
+                    .disabled(!model.relay.tokenServer.isConfigured || model.deviceKey == nil)
+                }
             } header: {
-                Text("Token service")
+                Text("Token server")
             } footer: {
                 VStack(alignment: .leading, spacing: 4) {
-                    if let problem = model.tokenProblem {
+                    if let problem = model.signInProblem ?? model.tokenProblem {
                         Text(problem).foregroundStyle(.orange)
                     }
-                    Text(model.relay.tokenService?.summary ?? "none")
+                    Text(model.relay.tokenServer.summary
+                        + (model.signedInAs.map { " as \($0)" } ?? ""))
                     Text(
-                        "With this filled in, the phone fetches its own token just before "
-                            + "it connects and replaces it mid-call, so neither this nor the "
-                            + "call expires. The credential is not a token: it grants joining "
-                            + "rooms in one tenant, never moderation or ownership, and it is "
-                            + "kept in the Keychain."
+                        "Signed in, the phone fetches its own token just before it connects "
+                            + "and replaces it mid-call. The sign-in is bound to this phone's "
+                            + "key, asks Apple for no name or email, and what it leaves behind "
+                            + "is kept in the Keychain."
                     )
                 }
             }
 
             // Now the fallback rather than the mechanism. Kept because a relay on a
-            // desk with no control plane in front of it is still a thing people run,
-            // and because a service that is down should not make the deployment
-            // unreachable to somebody who can mint by hand.
+            // desk with no token server in front of it is still a thing people run.
             Section {
                 TextField("Token", text: $model.relayToken, axis: .vertical)
                     #if os(iOS)
@@ -166,28 +159,27 @@ struct JoinScreen: View {
             } header: {
                 Text("Pasted token")
             } footer: {
-                // What the token says about itself, read out of it and never checked — the
-                // phone holds no key and could not verify this if it wanted to. It is here
-                // because a stale token and a good one are the same four hundred characters
-                // on screen and behave nothing alike.
+                // What the server said about the token it issued, never what the token says:
+                // tokens are sealed, so a pasted one is just bytes until a relay judges it.
                 VStack(alignment: .leading, spacing: 4) {
-                    if let complaint = model.credentialComplaint {
-                        Text(complaint).foregroundStyle(.orange)
-                    }
-                    if let credential = model.credential {
-                        Text(credential.summary)
+                    if let issued = model.relay.issued {
+                        Text(
+                            "\(issued.username) in room \(issued.room), "
+                                + (issued.mayPublish ? "may publish" : "watching only") + " — "
+                                + (issued.isUsable(margin: 0) ? "expires " : "expired ")
+                                + issued.expiresAt.formatted(.relative(presentation: .numeric))
+                        )
                     } else if model.relayToken.isEmpty {
                         Text(
-                            model.relay.tokenService?.isUsable == true
+                            model.relay.tokenServer.isSignedIn
                                 ? "Empty, and it does not need filling in: one will be "
                                     + "fetched when you join."
                                 : "Without one, a deployed relay admits this device and lets "
-                                    + "it publish nothing. Mint one with deploy/tools/join.sh "
-                                    + "and paste it here; it is kept for this relay and this "
-                                    + "phone."
+                                    + "it publish nothing. Sign in above, or paste a token "
+                                    + "minted for this phone's key."
                         )
                     } else {
-                        Text("That does not read as a token.").foregroundStyle(.orange)
+                        Text("Pasted, so its expiry cannot be shown: tokens are sealed.")
                     }
                 }
             }
@@ -222,8 +214,8 @@ struct JoinScreen: View {
 /// three places — the namespace this device announces under, the `cnf.jkt` of
 /// the token it presents, and the key it signs its proof of possession with —
 /// and a mismatch is refused by the relay with the reason inside a credential
-/// nobody reads. It is also the third argument `deploy/tools/join.sh` wants, and
-/// reading it off the phone is easier than deriving it anywhere else.
+/// nobody can read. It is also the nonce a sign-in is bound to, and reading it
+/// off the phone is easier than deriving it anywhere else.
 struct DeviceKeyFooter: View {
     let model: AppModel
 
@@ -275,10 +267,6 @@ struct InvitationSection: View {
                 // is one people accept having read only the familiar half.
                 Text("Would connect to \(invitation.destination).").bold()
                 Text(invitation.identification)
-                if invitation.isStale {
-                    Text("Its credential has already expired — ask for a fresh link.")
-                        .foregroundStyle(.orange)
-                }
             }
         }
     }

@@ -36,10 +36,10 @@
             let tokenKey = DirectTokens.signer.publicKey.rawRepresentation.base64URLEncodedString
             let ticketKey = DirectTicketDesk.signer.publicKey.rawRepresentation.base64URLEncodedString
             let ticketSeed = Data(repeating: 13, count: 32).base64URLEncodedString
-            try Data(#"{"keys":[{"kty":"AKP","alg":"ML-DSA-65","kid":"test-key","pub":"\#(tokenKey)"}]}"#.utf8)
+            try Data(#"{"keys":[{"kty":"AKP","alg":"ML-DSA-87","kid":"test-key","pub":"\#(tokenKey)"}]}"#.utf8)
                 .write(to: tokens, options: .atomic)
             try Data(
-                #"{"keys":[{"kty":"AKP","alg":"ML-DSA-65","kid":"\#(DirectTicketDesk.kid)","pub":"\#(ticketKey)","priv":"\#(ticketSeed)"}]}"#
+                #"{"keys":[{"kty":"AKP","alg":"ML-DSA-87","kid":"\#(DirectTicketDesk.kid)","pub":"\#(ticketKey)","priv":"\#(ticketSeed)"}]}"#
                     .utf8
             ).write(to: tickets, options: .atomic)
             return try RelayProcess.start([

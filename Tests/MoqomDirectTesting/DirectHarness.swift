@@ -1,5 +1,5 @@
 // What the direct-path suites share: tokens minted with the Rust suite's test
-// key (an ML-DSA-65 seed of sevens, kid `test-key`) and the same claims, so a
+// key (an ML-DSA-87 seed of sevens, kid `test-key`) and the same claims, so a
 // vector that passes in one SDK's tests is one the other's would mint; devices
 // holding them; and two endpoints establishing at once, each on the backend a
 // test names.
@@ -13,8 +13,8 @@ import MoqomToken
 // MARK: - Minting
 
 public enum DirectTokens {
-    public static let signer = try! MLDSA65.PrivateKey(seedRepresentation: Data(repeating: 7, count: 32), publicKey: nil)
-    public static let keys = [DirectVerificationKey(id: "test-key", key: signer.publicKey.rawRepresentation, algorithm: .mlDSA65)]
+    public static let signer = try! MLDSA87.PrivateKey(seedRepresentation: Data(repeating: 7, count: 32), publicKey: nil)
+    public static let keys = [DirectVerificationKey(id: "test-key", key: signer.publicKey.rawRepresentation, algorithm: .mlDSA87)]
 
     public static func jws(_ header: [String: Any], _ claims: [String: Any], sign: (Data) -> Data) -> Data {
         func segment(_ object: [String: Any]) -> String {
@@ -41,7 +41,7 @@ public enum DirectTokens {
         expires: Date = Date().addingTimeInterval(600),
         issued: Date? = Date(),
         kid: String = "test-key",
-        signer: MLDSA65.PrivateKey = DirectTokens.signer,
+        signer: MLDSA87.PrivateKey = DirectTokens.signer,
         extraScope: [String: Any] = [:]
     ) -> Data {
         let claims = MoqomToken.Claims(
@@ -65,7 +65,7 @@ public enum DirectTokens {
             "moqt": scope,
         ]
         if claims.issuedAt != 0 { raw["iat"] = claims.issuedAt }
-        return jws(["alg": "ML-DSA-65", "typ": "MOQT", "kid": kid], raw) { try! signer.signature(for: $0) }
+        return jws(["alg": "ML-DSA-87", "typ": "MOQT", "kid": kid], raw) { try! signer.signature(for: $0) }
     }
 
     static func base64URL(_ data: Data) -> String {

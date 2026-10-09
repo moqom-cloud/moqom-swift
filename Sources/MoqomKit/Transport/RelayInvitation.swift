@@ -1,19 +1,23 @@
-// Everything a device needs to dial a relay, in one thing that fits in a QR code.
+// Everything a device needs to find a relay, in one thing that fits in a QR code.
 //
-// Three facts have to arrive together and none of them can be typed. An address
+// The facts have to arrive together and none of them can be typed. An address
 // can just about be read off a screen; a certificate hash is forty-four
 // characters of base64 where a single transposition produces a connection that
-// fails with no explanation; and a token is four hundred characters that expire
-// in fifteen minutes. Handing those over one at a time is how a phone ends up
-// pinned to the right certificate on the wrong port, or holding yesterday's
-// credential for today's relay.
+// fails with no explanation. Handing those over one at a time is how a phone
+// ends up pinned to the right certificate on the wrong port.
 //
-// Fifteen minutes is also what makes putting a credential in a link acceptable
-// rather than reckless. This is a bearer token — see the control plane's
-// `MaxLifetime` — so a link is worth exactly as much as the time left on it, and
-// anyone photographing one over a shoulder has a quarter of an hour to use it.
-// A longer-lived credential does not belong in something designed to be pointed
-// at with a camera.
+// What a link does not carry is anything that authorises. Not a token: a token
+// is bound to the key of the device it was minted for, so one in a link is
+// useless to whichever phone scans it. And not a long-lived credential: a link
+// is designed to be pointed at with a camera, and anything durable in it is
+// durable for whoever photographs it. A link says where the application's
+// token server is; the person holding the phone signs in there, and the token
+// that comes back is bound to that phone.
+//
+// Older links carried both — `token=`, and a device credential as `key=` beside
+// the control plane's join listener as `join=`. They still parse: the relay and
+// its hashes are read, the join listener is read as the MLS delivery service it
+// also was, and the token and the credential are dropped without being looked at.
 //
 // > Important: A link chooses which relay to trust, so accepting one is a trust
 // > decision and not a convenience. An application should show where it has been
@@ -22,7 +26,7 @@
 
 import Foundation
 
-/// Where to dial, what to trust there, and what to present on arrival.
+/// Where to dial, what to trust there, and where to sign in.
 public struct RelayInvitation: Hashable, Sendable {
     public var endpoint: RelayEndpoint
 
@@ -32,52 +36,63 @@ public struct RelayInvitation: Hashable, Sendable {
     /// certificate from a public authority wants.
     public var certificateHashes: [String]
 
-    /// The credential to present, or empty for none.
-    public var token: Data
+    /// The application's token server, as a base URL (`https://tokens.example.com`),
+    /// if the link names one.
+    ///
+    /// Where the device signs in and then asks for a token every time it dials;
+    /// the routes under it are the server's to define. HTTPS only, because the
+    /// session the device is given there travels in a header.
+    public var tokenServer: URL?
 
-    /// Where the device may fetch its own credentials, if it is allowed to.
+    /// The MLS delivery service, if the link names one: an address of its own,
+    /// with its own certificate.
     ///
-    /// The field that changes what a link is worth. A link carrying a token is
-    /// good for fifteen minutes and then it is litter; a link carrying a service
-    /// works tomorrow, because the phone fetches a fresh token every time it
-    /// dials. That is the entire reason this exists — a code printed for somebody
-    /// to scan was expiring between being printed and being scanned.
-    ///
-    /// It is also a real weakening, stated plainly because it should not be
-    /// discovered later. A device credential does not expire on its own, so a link
-    /// carrying one is durable access to joining rooms in that tenant until
-    /// somebody rotates it. Against that: it grants only joining — never
-    /// moderation, never ownership, and only in one tenant — and the alternative
-    /// in practice was people mailing each other tokens and wondering why they
-    /// stopped working.
-    public var tokenService: TokenService?
+    /// Named apart from the relay because it is a different machine. A link that
+    /// reused the relay's hashes for both would pin each to the other's, and the
+    /// symptom is two connections that fail with nothing wrong on screen.
+    public var keyDeliveryEndpoint: RelayEndpoint?
+
+    /// The hashes to pin ``keyDeliveryEndpoint`` to. Empty means platform trust.
+    public var keyDeliveryCertificateHashes: [String]
+
+    /// The room the link is for, or `nil` to leave the choice to the person.
+    public var room: String?
 
     public init(
         endpoint: RelayEndpoint,
         certificateHashes: [String] = [],
-        token: Data = Data(),
-        tokenService: TokenService? = nil
+        tokenServer: URL? = nil,
+        keyDeliveryEndpoint: RelayEndpoint? = nil,
+        keyDeliveryCertificateHashes: [String] = [],
+        room: String? = nil
     ) {
         self.endpoint = endpoint
         self.certificateHashes = certificateHashes
-        self.token = token
-        self.tokenService = tokenService
+        self.tokenServer = tokenServer
+        self.keyDeliveryEndpoint = keyDeliveryEndpoint
+        self.keyDeliveryCertificateHashes = keyDeliveryCertificateHashes
+        self.room = room
+    }
+
+    /// The delivery service the link names, pinned as it says.
+    public var keyDelivery: HTTPMLSDelivery? {
+        keyDeliveryEndpoint.map { HTTPMLSDelivery(endpoint: $0, certificateHashes: keyDeliveryCertificateHashes) }
     }
 
     // The query names. Short, because every character is another module in the
-    // QR code, and a credential is already four hundred of them.
+    // QR code.
     private enum Key {
         static let relay = "relay"
         static let certificate = "cert"
-        static let token = "token"
+        static let tokens = "tokens"
+        static let delivery = "mls"
+        static let deliveryCertificate = "mlscert"
+        static let room = "room"
 
-        // The token service's three, named apart from the relay's because they
-        // describe a different machine with a different certificate. A link that
-        // reused `cert` for both would pin each to the other's hash, and the
-        // symptom is two connections that fail with nothing wrong on screen.
-        static let service = "join"
-        static let serviceCertificate = "joincert"
-        static let credential = "key"
+        // What older links called the delivery service, when it shared the
+        // control plane's join listener. Read, never written.
+        static let legacyDelivery = "join"
+        static let legacyDeliveryCertificate = "joincert"
     }
 
     /// Read a link, or refuse it.
@@ -89,6 +104,8 @@ public struct RelayInvitation: Hashable, Sendable {
     /// that is not a port, is refused rather than half-applied. Half-applying it
     /// is worse than refusing — the phone keeps whichever fields the link did
     /// not mention, and dials a mixture of two relays that nobody configured.
+    ///
+    /// `token=` and `key=` are ignored. See the file comment.
     public init?(_ url: URL) {
         guard
             let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
@@ -106,19 +123,31 @@ public struct RelayInvitation: Hashable, Sendable {
 
         endpoint = relay
         certificateHashes = values(Key.certificate)
-        token = Data((values(Key.token).first ?? "").utf8)
+        room = values(Key.room).first
 
-        // The service is optional and, when named, has to parse. A link that
-        // mentions one and is silently read as having none produces a phone that
-        // asks nobody for a token and joins as nobody, which is the failure this
-        // field was added to remove.
-        if let named = values(Key.service).first {
-            guard let service = Self.endpoint(named, defaultPort: 8444) else { return nil }
-            tokenService = TokenService(
-                endpoint: service,
-                certificateHashes: values(Key.serviceCertificate),
-                credential: values(Key.credential).first ?? ""
-            )
+        // Optional and, when named, has to parse. A link that mentions a token
+        // server and is silently read as having none produces a phone that has
+        // nowhere to sign in and joins as nobody.
+        tokenServer = nil
+        if let named = values(Key.tokens).first {
+            guard
+                let server = URL(string: named),
+                server.scheme?.lowercased() == "https",
+                server.host?.isEmpty == false
+            else { return nil }
+            tokenServer = server
+        }
+
+        keyDeliveryEndpoint = nil
+        keyDeliveryCertificateHashes = []
+        if let named = values(Key.delivery).first {
+            guard let delivery = Self.endpoint(named, defaultPort: 8444) else { return nil }
+            keyDeliveryEndpoint = delivery
+            keyDeliveryCertificateHashes = values(Key.deliveryCertificate)
+        } else if let named = values(Key.legacyDelivery).first {
+            guard let delivery = Self.endpoint(named, defaultPort: 8444) else { return nil }
+            keyDeliveryEndpoint = delivery
+            keyDeliveryCertificateHashes = values(Key.legacyDeliveryCertificate)
         }
     }
 
@@ -155,20 +184,17 @@ public struct RelayInvitation: Hashable, Sendable {
         for hash in certificateHashes {
             items.append(URLQueryItem(name: Key.certificate, value: hash))
         }
-        if !token.isEmpty {
-            items.append(
-                URLQueryItem(name: Key.token, value: String(decoding: token, as: UTF8.self))
-            )
+        if let tokenServer {
+            items.append(URLQueryItem(name: Key.tokens, value: tokenServer.absoluteString))
         }
-        if let service = tokenService {
-            let address = "\(service.endpoint.host):\(service.endpoint.port)"
-            items.append(URLQueryItem(name: Key.service, value: address))
-            for hash in service.certificateHashes {
-                items.append(URLQueryItem(name: Key.serviceCertificate, value: hash))
+        if let delivery = keyDeliveryEndpoint {
+            items.append(URLQueryItem(name: Key.delivery, value: "\(delivery.host):\(delivery.port)"))
+            for hash in keyDeliveryCertificateHashes {
+                items.append(URLQueryItem(name: Key.deliveryCertificate, value: hash))
             }
-            if !service.credential.isEmpty {
-                items.append(URLQueryItem(name: Key.credential, value: service.credential))
-            }
+        }
+        if let room, !room.isEmpty {
+            items.append(URLQueryItem(name: Key.room, value: room))
         }
 
         components.queryItems = items

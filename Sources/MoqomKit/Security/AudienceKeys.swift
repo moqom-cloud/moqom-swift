@@ -4,11 +4,11 @@
 // A room's MLS group holds the devices that may publish, and its agents. A
 // viewer — a token with no publish grant — is not added: at broadcast scale
 // every commit would carry a ciphertext per viewer and every arrival would be a
-// commit. Instead each viewer makes an ML-KEM-768 key pair when it enters, keeps
+// commit. Instead each viewer makes an ML-KEM-1024 key pair when it enters, keeps
 // the private half in memory, and posts the public half to the delivery
 // service. The group's committer, by the same lowest-leaf rule that decides who
 // commits, seals each epoch's SFrame base key to every viewer that lacks it,
-// with HPKE over ML-KEM-768. From the base key and the key ID in a frame the
+// with HPKE over ML-KEM-1024. From the base key and the key ID in a frame the
 // viewer derives that publisher's key exactly as a member does (RFC 9605 §5.2),
 // so publishers change nothing about how they send.
 //
@@ -172,24 +172,5 @@ actor AudienceKeys {
         current = nil
         let receiver = encryption.receiver
         for keyID in receiver.keyIDs { receiver.remove(keyID: keyID) }
-    }
-}
-
-extension DeviceCredentials {
-    /// Whether the token says this device may publish: `nil` when it carries
-    /// no `moqt` scope to say either way.
-    ///
-    /// Read from the token's payload without verifying it. That is enough for
-    /// the one thing it decides, which side of sender keys this device is on:
-    /// a device that claims to publish and may not is refused by the relay, and
-    /// one that claims not to just watches.
-    static func mayPublish(token: Data) -> Bool? {
-        let parts = token.split(separator: UInt8(ascii: "."), omittingEmptySubsequences: false)
-        guard parts.count == 3, let payload = Data(base64URLEncoded: Data(parts[1])) else { return nil }
-        guard
-            let claims = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
-            let scope = claims["moqt"] as? [String: Any]
-        else { return nil }
-        return ((scope["pub"] as? NSNumber)?.intValue ?? 0) != 0
     }
 }

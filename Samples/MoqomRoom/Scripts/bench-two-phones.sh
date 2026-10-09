@@ -43,7 +43,12 @@ This script takes no arguments; everything is an environment variable.
                          on BURST — without it the only bursts are the other phone's.
   MOQOM_FLOOR_MS / MOQOM_TOLERANCE / MOQOM_STATS_MS / MOQOM_FLAT_LAYERS
   MOQOM_PUBLISHER / MOQOM_VIEWER   device names (default: iPhone Air, 15 Pro)
-  MOQOM_MINT=1           mint a token per phone from the deployed control plane
+  MOQOM_TOKEN_SERVER=https://tokens.example.com
+                         the token server both phones have signed in to (once, by hand,
+                         with Sign in with Apple); each fetches and renews its own token
+  MOQOM_PUBLISHER_TOKEN / MOQOM_VIEWER_TOKEN
+                         or a token per phone, minted for that phone's key, for a run
+                         short enough to fit inside one token's fifteen minutes
   MOQOM_TENANT=moqom     which tenant, and it must be the token's
 
 For example:
@@ -83,40 +88,24 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 # So a run against one needs a token per phone, and the tenant has to be the
 # tenant the token was minted for.
 #
-# Minted here rather than checked in, because they expire in fifteen minutes.
-# The relay against a laptop has no keys and needs none of this, which is why
-# this is off unless asked for.
+# The phones get their own. Sign each one in to the token server once, by hand —
+# Sign in with Apple needs a finger and a face, so a script cannot do it — and the
+# enrollment stays in that phone's Keychain. After that, MOQOM_TOKEN_SERVER is all
+# a run needs: each phone asks for a token before it dials and renews it mid-call,
+# for as long as the run lasts. A phone whose enrollment has lapsed says "Sign in
+# again" on its join screen and joins as nobody.
 #
-# A pasted token now bounds the run and not just the joining of it: a relay with
-# keys closes a session whose credential has lapsed, and a token handed in this
-# way cannot replace itself. That collides with the advice at the bottom of this
-# file to give a run fifteen minutes or more — so for the long runs, enrol the
-# phones with the join service instead (MOQOM_JOIN_* on the Join screen, or a
-# scanned link) and they fetch and renew their own credentials for as long as the
-# run lasts.
+# Pasted tokens still work for a short run, minted for each phone's own key (the
+# thumbprint its join screen prints under the username), but a relay with keys
+# closes a session whose credential has lapsed and a pasted token cannot replace
+# itself, so the run ends with it. The relay against a laptop has no keys and
+# needs none of this.
 TENANT="${MOQOM_TENANT:-moqom}"
 PUBLISHER_TOKEN="${MOQOM_PUBLISHER_TOKEN:-}"
 VIEWER_TOKEN="${MOQOM_VIEWER_TOKEN:-}"
-if [ -n "${MOQOM_MINT:-}" ]; then
-    JOIN="${MOQOM_JOIN:-$HERE/../../../moqom/deploy/tools/join.sh}"
-    if [ ! -x "$JOIN" ]; then
-        echo "MOQOM_MINT is set but $JOIN is not there — set MOQOM_JOIN to it" >&2
-        exit 2
-    fi
-    # Each phone's own thumbprint, which its join screen prints beneath the
-    # username. There is no default and there cannot be one: a token is bound to
-    # a key in that phone's Secure Enclave, and one minted against any other
-    # thumbprint is refused by a relay requiring proof of possession. Read them
-    # off the two screens once; they do not change.
-    if [ -z "${MOQOM_PUBLISHER_DEVICE:-}" ] || [ -z "${MOQOM_VIEWER_DEVICE:-}" ]; then
-        echo "MOQOM_MINT needs MOQOM_PUBLISHER_DEVICE and MOQOM_VIEWER_DEVICE:" >&2
-        echo "  the thumbprint each phone's join screen prints under its username" >&2
-        echo "  (or leave MOQOM_MINT unset and enrol both with the join service)" >&2
-        exit 2
-    fi
-    echo "minting a token for each phone"
-    PUBLISHER_TOKEN="$(MOQOM_TENANT=$TENANT "$JOIN" publisher "$ROOM" "$MOQOM_PUBLISHER_DEVICE")"
-    VIEWER_TOKEN="$(MOQOM_TENANT=$TENANT "$JOIN" viewer "$ROOM" "$MOQOM_VIEWER_DEVICE")"
+SIGNIN=""
+if [ -n "${MOQOM_TOKEN_SERVER:-}" ]; then
+    SIGNIN="--token-server $MOQOM_TOKEN_SERVER"
 fi
 
 # Where the relay is. The app already dials the compiled-in GCP endpoint. A host
@@ -334,7 +323,7 @@ launch() {
         # worth far more than one that gave up quietly two minutes earlier.
         attempt=1
         while [ "$attempt" -le 200 ]; do
-            # Unquoted on purpose: $WHERE is several flags, not one argument.
+            # Unquoted on purpose: $WHERE and $SIGNIN are several flags, not one argument.
             # shellcheck disable=SC2086
             # `|| true` because of `set -e` at the top, which without it makes this loop a
             # lie: the first refused launch would exit the subshell outright, so the two
@@ -343,7 +332,7 @@ launch() {
             xcrun devicectl device process launch --device "$device" --console \
                 --terminate-existing "$BUNDLE" \
                 --autojoin $MODE --username "$who" --room "$ROOM" \
-                --tenant "$TENANT" ${token:+--relay-token "$token"} $WHERE \
+                --tenant "$TENANT" ${token:+--relay-token "$token"} $WHERE $SIGNIN \
                 > "$out" 2>&1 || true
             # Printed by the console only once the process is actually up.
             if grep -q 'Waiting for the application to terminate' "$out"; then exit 0; fi

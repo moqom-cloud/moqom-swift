@@ -361,6 +361,7 @@ public actor MoqomSession {
             credentials.authorityKeys = previous.authorityKeys
             credentials.plaintextForTesting = previous.plaintextForTesting
             credentials.directRoom = issued.direct
+            credentials.publish = issued.publish ?? previous.publish
         } else {
             credentials = credentials.replacing(with: issued)
         }
@@ -451,6 +452,7 @@ public actor MoqomSession {
             authorityKeys: credentials.authorityKeys,
             keyDelivery: credentials.keyDelivery,
             currentToken: { [weak self] in await self?.credentials.token ?? Data() },
+            currentPublish: { [weak self] in await self?.credentials.publish },
             updateCredential: { [weak self] issued, renew throws(MoqomError) in
                 guard let self else {
                     throw MoqomError.invalidState(expected: "an open session", actual: "closed")

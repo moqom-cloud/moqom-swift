@@ -329,7 +329,7 @@ struct ControlTrackTests {
         let again = try RoomLogSigner(seed: Data(repeating: 0xA7, count: 32))
         #expect(again.id == testAuthority.id)
         #expect(again.verificationKey == testAuthority.verificationKey)
-        #expect(testAuthority.verificationKey.key.count == 1952)
+        #expect(testAuthority.verificationKey.key.count == 2592)
     }
 
     @Test("being removed tells the client why instead of stopping the stream")

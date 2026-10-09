@@ -68,11 +68,18 @@ targets:
     # fallback that exists precisely for simulators was the part that could not
     # run on one. The group is the default one an app always has rights to, so
     # this needs nothing enabled on the app ID.
+    #
+    # Sign in with Apple is the other line, and unlike the first it does need
+    # the capability enabled on the app ID in the developer portal: a profile
+    # without it fails to sign, and the button then fails with
+    # `ASAuthorizationError.unknown` rather than anything naming the profile.
     entitlements:
       path: MoqomRoom/MoqomRoom.entitlements
       properties:
         keychain-access-groups:
           - $(AppIdentifierPrefix)$(CFBundleIdentifier)
+        com.apple.developer.applesignin:
+          - Default
     info:
       path: MoqomRoom/Info.plist
       properties:
@@ -92,30 +99,9 @@ targets:
         # the app would otherwise be terminated on the first capture attempt.
         NSCameraUsageDescription: Publish your camera to the room.
         NSMicrophoneUsageDescription: Publish your microphone to the room.
-        # The token service, and nothing else on the internet.
-        #
-        # Its certificate is one this deployment issued itself, and App Transport
-        # Security refuses a certificate that chains to no root the system knows —
-        # separately from, and after, the application's own decision. So a pinned
-        # connection whose pin matches still fails, as `NSURLErrorDomain -1200`,
-        # with a message about TLS and nothing about trust. Two days of dev builds
-        # have died on that, once with the certificate reissued for a name it did
-        # not need, because the error says the same thing whatever the cause.
-        #
-        # Named as one address rather than lifted globally. `NSAllowsArbitraryLoads`
-        # would also fix it and would turn off ATS for every host this app ever
-        # talks to, which in a sample is the version other people copy. What is
-        # given up here is the platform's opinion about one address; what still
-        # holds there is the stronger check — `TokenService` pins the exact
-        # certificate, so this exception admits one certificate rather than any.
-        #
-        # An address and not a name because dev has no DNS for this endpoint. A
-        # deployment with a name and a public certificate needs none of this.
-        NSAppTransportSecurity:
-          NSExceptionDomains:
-            35.197.36.243:
-              NSExceptionAllowsInsecureHTTPLoads: true
-              NSIncludesSubdomains: false
+        # No App Transport Security exception. The token server is an ordinary
+        # HTTPS service behind a public certificate, and the relay is reached
+        # over QUIC, which ATS does not govern.
         # Required for Picture in Picture, and not optional in the way the name
         # suggests: without it the system refuses to start the window, and the
         # refusal arrives as a delegate error rather than as a build failure.
@@ -129,8 +115,8 @@ targets:
         # Lets the app start a Live Activity at all.
         NSSupportsLiveActivities: true
         # How a phone with no Mac attached gets a relay address, a certificate
-        # hash and a credential: `deploy/tools/invite.sh` prints a QR code
-        # holding a `moqom://join?...`, and the Camera app opens it here. See
+        # hash and a token server to sign in at: `deploy/tools/invite.sh` prints
+        # a QR code holding a `moqom://join?...`, and the Camera app opens it here. See
         # `Invitation.swift` and `RelayInvitation` in the SDK.
         #
         # A custom scheme rather than a universal link, which would be the right

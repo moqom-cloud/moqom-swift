@@ -56,8 +56,8 @@
 //
 // # Cipher suites
 //
-// A device founds in its own suite, the hybrid one unless it was built to do
-// otherwise, and joins in whichever suite the room's group is in. It publishes
+// A device founds in its own suite, MLS_256_MLKEM1024_AES256GCM_SHA512_MLDSA87
+// unless it was built to do otherwise, and joins in whichever suite the room's group is in. It publishes
 // key packages in its own suite before it knows; when a snapshot shows a group
 // in another suite it implements, it replaces them with packages in that one,
 // and is added on the committer's next pass. A group in a suite this build
@@ -554,7 +554,7 @@ actor ManagedRoomKeys {
         for start in stride(from: 0, to: work.seats.count, by: Self.envelopesPerSeal) {
             var envelopes: [String: Data] = [:]
             for seat in work.seats[start ..< min(start + Self.envelopesPerSeal, work.seats.count)] {
-                // A key that is not ML-KEM-768 is that viewer's problem, not the batch's.
+                // A key that is not ML-KEM-1024 is that viewer's problem, not the batch's.
                 envelopes[seat.device] = try? MLSAudience.seal(
                     base, to: seat.publicKey, groupID: epoch.groupID, epoch: epoch.epoch
                 )

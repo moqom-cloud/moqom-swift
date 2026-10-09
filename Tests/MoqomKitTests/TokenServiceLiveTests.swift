@@ -1,4 +1,4 @@
-// The token client against a real control plane, over real TLS.
+// The token client against a real token server, over real TLS.
 //
 // Everything else about ``TokenService`` is tested against a stubbed protocol,
 // which is the right way to test parsing and cannot test the part most likely to
@@ -9,15 +9,18 @@
 // a stub, because a stub never presents a certificate.
 //
 // Skipped unless pointed at something, so this is not a test that needs a
-// deployment to pass. To run it:
+// deployment to pass. To run it against the reference token server, with an
+// enrollment from a sign-in and the key that sign-in was bound to:
 //
-//     MOQOM_JOIN_HOST=127.0.0.1:18444 \
-//     MOQOM_JOIN_CERT_HASH="$(cat /tmp/joincheck/tls.hash)" \
-//     MOQOM_JOIN_CREDENTIAL=devicesecret \
+//     MOQOM_TOKEN_URL=https://127.0.0.1:18443/v1/token \
+//     MOQOM_TOKEN_CERT_HASH="$(cat /tmp/tokencheck/tls.hash)" \
+//     MOQOM_TOKEN_AUTHORIZATION=<enrollment> \
 //     swift test --filter TokenServiceLiveTests
 //
-// A self-signed certificate and a control plane on a laptop are enough; see
-// `deploy/tools/sync-secrets.sh` for the deployed equivalents.
+// An enrollment is bound to one device key, which these tests cannot hold, so
+// against the reference server the issuing test expects a refusal naming the
+// key rather than a token; a backend of your own that does not bind may issue.
+// The pinning test is meaningful either way.
 
 import Foundation
 import Testing
@@ -32,86 +35,75 @@ import Testing
     "The token service, live",
     .serialized,
     .enabled(
-        if: ProcessInfo.processInfo.environment["MOQOM_JOIN_HOST"] != nil,
-        "set MOQOM_JOIN_HOST and MOQOM_JOIN_CREDENTIAL to run these"
+        if: ProcessInfo.processInfo.environment["MOQOM_TOKEN_URL"] != nil,
+        "set MOQOM_TOKEN_URL and MOQOM_TOKEN_AUTHORIZATION to run these"
     )
 )
 struct TokenServiceLiveTests {
     private struct Target {
-        var endpoint: RelayEndpoint
+        var url: URL
         var hash: String
-        var credential: String
+        var authorization: String
     }
 
     private static var target: Target? {
         let environment = ProcessInfo.processInfo.environment
         guard
-            let address = environment["MOQOM_JOIN_HOST"],
-            let credential = environment["MOQOM_JOIN_CREDENTIAL"]
+            let address = environment["MOQOM_TOKEN_URL"].flatMap(URL.init(string:)),
+            let authorization = environment["MOQOM_TOKEN_AUTHORIZATION"]
         else { return nil }
-
-        let parts = address.split(separator: ":")
-        return Target(
-            endpoint: RelayEndpoint(
-                host: String(parts[0]),
-                port: parts.count > 1 ? UInt16(parts[1]) ?? 8444 : 8444
-            ),
-            hash: environment["MOQOM_JOIN_CERT_HASH"] ?? "",
-            credential: credential
-        )
+        return Target(url: address, hash: environment["MOQOM_TOKEN_CERT_HASH"] ?? "", authorization: authorization)
     }
 
-    @Test("a real endpoint issues a real token to a pinned client")
-    func issues() async throws {
-        let target = try #require(Self.target, "set MOQOM_JOIN_HOST and MOQOM_JOIN_CREDENTIAL")
-
-        // No tenant, which asks for the credential's own. Naming one here made this
-        // test a check on whether the deployment happened to be called `demo`: it
-        // was, locally, and is `moqom` in the cluster, so the first live run against
-        // the cluster failed with a refusal that had nothing to do with the client.
+    @Test("a real endpoint answers a pinned client")
+    func answers() async throws {
+        let target = try #require(Self.target, "set MOQOM_TOKEN_URL and MOQOM_TOKEN_AUTHORIZATION")
         let service = TokenService(
-            endpoint: target.endpoint,
-            certificateHashes: target.hash.isEmpty ? [] : [target.hash],
-            credential: target.credential
+            url: target.url,
+            authorization: target.authorization,
+            certificateHashes: target.hash.isEmpty ? [] : [target.hash]
         )
 
-        let issued = try await service.token(
-            username: "ada", room: "handsync", device: DeviceKey.ephemeral()
-        )
-
-        #expect(!issued.token.isEmpty)
-        #expect(issued.room == "handsync")
-        #expect(issued.isUsable())
-        // Between one and fifteen minutes. The upper bound is the control plane's
-        // cap and the lower one catches a date that failed to parse, which would
-        // otherwise look like a token that arrived already dead.
-        let remaining = issued.expiresAt.timeIntervalSinceNow
-        #expect(remaining > 60)
-        #expect(remaining <= 15 * 60 + 5)
+        do {
+            let issued = try await service.token(
+                username: "ada", room: "demo", device: DeviceKey.ephemeral()
+            )
+            #expect(!issued.token.isEmpty)
+            #expect(issued.isUsable())
+            // Between one and fifteen minutes. The upper bound is the control plane's
+            // cap and the lower one catches a date that failed to parse, which would
+            // otherwise look like a token that arrived already dead.
+            let remaining = issued.expiresAt.timeIntervalSinceNow
+            #expect(remaining > 60)
+            #expect(remaining <= 15 * 60 + 5)
+        } catch {
+            // Reached, and refused for a reason: what a binding server says to a
+            // key it did not enrol. A transport or pin failure is the bug.
+            guard case .refused = error else {
+                Issue.record("the service could not be asked: \(error)")
+                return
+            }
+        }
     }
 
     @Test("the wrong certificate is refused rather than trusted")
     func pinning() async throws {
-        let target = try #require(Self.target, "set MOQOM_JOIN_HOST and MOQOM_JOIN_CREDENTIAL")
-        try #require(!target.hash.isEmpty, "needs MOQOM_JOIN_CERT_HASH to have something to get wrong")
+        let target = try #require(Self.target, "set MOQOM_TOKEN_URL and MOQOM_TOKEN_AUTHORIZATION")
+        try #require(!target.hash.isEmpty, "needs MOQOM_TOKEN_CERT_HASH to have something to get wrong")
 
         // A syntactically valid hash of the right length that belongs to nothing.
         // The failure being checked for is the silent one: a pin that is computed,
         // compared, and then not acted on connects perfectly happily, and this is
         // the only test that can tell.
         let wrong = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-        let service = TokenService(
-            endpoint: target.endpoint,
-            certificateHashes: [wrong],
-            credential: target.credential
-        )
+        let service = TokenService(url: target.url, authorization: target.authorization, certificateHashes: [wrong])
 
         do {
             _ = try await service.token(
-                username: "ada", room: "handsync", device: DeviceKey.ephemeral()
+                username: "ada", room: "demo", device: DeviceKey.ephemeral()
             )
             Issue.record("the client trusted a certificate it was not pinned to")
-        } catch let error as TokenServiceError {
+        } catch {
             // Named as a pin failure rather than as a network one. The platform
             // reports both as "A TLS error caused the secure connection to fail",
             // and a phone shown that sentence for a wrong pin sends somebody to

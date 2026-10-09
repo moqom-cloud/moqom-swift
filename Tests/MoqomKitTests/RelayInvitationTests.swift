@@ -1,10 +1,11 @@
-// Reading a link that carries an address, a certificate and a credential.
+// Reading a link that carries an address, a certificate and a place to sign in.
 //
 // The interesting cases are all refusals. A link that parses to something
 // partial is worse than one that fails: the phone keeps whatever it already had
 // for the fields the link did not supply, and dials a mixture of two relays that
 // nobody ever configured — which is a connection failure with no bad value
-// anywhere on screen to explain it.
+// anywhere on screen to explain it. And the one thing a link never yields is
+// something that authorises, whatever an old one has in it.
 
 import Foundation
 import Testing
@@ -14,32 +15,66 @@ import Testing
 @Suite("Relay invitations")
 struct RelayInvitationTests {
     private let hash = "polQTlHHCA5xpWTb02GZUdgIJoX5b0rUh0sy+VNWUto="
+    private let deliveryHash = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 
     @Test("a link survives being written and read back")
     func roundTrip() throws {
         let invitation = RelayInvitation(
             endpoint: RelayEndpoint(host: "35.235.101.37", port: 443),
             certificateHashes: [hash],
-            token: Data("header.payload.signature".utf8)
+            tokenServer: URL(string: "https://tokens.example.com"),
+            keyDeliveryEndpoint: RelayEndpoint(host: "34.94.176.34", port: 8444),
+            keyDeliveryCertificateHashes: [deliveryHash],
+            room: "demo"
         )
 
         let url = try #require(invitation.url(scheme: "moqom"))
         let read = try #require(RelayInvitation(url))
 
-        #expect(read.endpoint.host == invitation.endpoint.host)
-        #expect(read.endpoint.port == invitation.endpoint.port)
-        #expect(read.token == invitation.token)
-
+        #expect(read == invitation)
         // The one worth asserting on its own. Base64 has `+`, `/` and `=` in it,
         // all of which mean something in a query string, and a hash that comes
         // back differing by one character is a relay that cannot be connected to
         // for a reason nothing reports.
         #expect(read.certificateHashes == [hash])
+        // The two hashes stay apart. They are certificates on different machines,
+        // and a link that crossed them would pin each connection to the other's.
+        #expect(read.keyDeliveryCertificateHashes == [deliveryHash])
+        #expect(read.keyDelivery?.endpoint == RelayEndpoint(host: "34.94.176.34", port: 8444))
+    }
+
+    @Test("a written link carries nothing that authorises")
+    func noSecrets() throws {
+        let url = try #require(RelayInvitation(
+            endpoint: RelayEndpoint(host: "r.example", port: 443),
+            tokenServer: URL(string: "https://tokens.example.com")
+        ).url(scheme: "moqom"))
+        let names = Set(try #require(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems).map(\.name))
+        #expect(names == ["relay", "tokens"])
+    }
+
+    @Test("an old link's token and credential are dropped, and its join listener is the delivery service")
+    func legacyLink() throws {
+        let url = URL(string: "moqom://join?relay=r.example&cert=\(hash)&token=header.payload.signature"
+            + "&join=c.example:8444&joincert=\(deliveryHash)&key=0f1e2d3c")!
+        let read = try #require(RelayInvitation(url))
+
+        #expect(read.endpoint == RelayEndpoint(host: "r.example", port: 443))
+        #expect(read.keyDeliveryEndpoint == RelayEndpoint(host: "c.example", port: 8444))
+        #expect(read.keyDeliveryCertificateHashes == [deliveryHash])
+        #expect(read.tokenServer == nil)
+
+        // And written back without either.
+        let rewritten = try #require(read.url(scheme: "moqom")?.absoluteString)
+        #expect(!rewritten.contains("token="))
+        #expect(!rewritten.contains("key="))
+        #expect(!rewritten.contains("0f1e2d3c"))
     }
 
     @Test("a link with no relay in it is refused")
     func noRelay() {
         #expect(RelayInvitation(URL(string: "moqom://join?token=abc")!) == nil)
+        #expect(RelayInvitation(URL(string: "moqom://join?tokens=https://tokens.example.com")!) == nil)
         #expect(RelayInvitation(URL(string: "moqom://join")!) == nil)
         #expect(RelayInvitation(URL(string: "moqom://join?relay=")!) == nil)
     }
@@ -58,6 +93,9 @@ struct RelayInvitationTests {
         let read = try #require(RelayInvitation(URL(string: "moqom://join?relay=relay.example")!))
         #expect(read.endpoint.host == "relay.example")
         #expect(read.endpoint.port == 443)
+        #expect(read.tokenServer == nil)
+        #expect(read.keyDeliveryEndpoint == nil)
+        #expect(read.room == nil)
     }
 
     @Test("an address keeps its colons when they belong to it")
@@ -78,53 +116,25 @@ struct RelayInvitationTests {
         #expect(read.certificateHashes.count == 2)
     }
 
-    @Test("a link with no credential is a link to a relay that asks for none")
-    func noToken() throws {
-        // Legitimate rather than malformed: a relay holding no verification keys
-        // admits anyone, which is every relay on a desk.
-        let read = try #require(RelayInvitation(URL(string: "moqom://join?relay=r.example")!))
-        #expect(read.token.isEmpty)
-        #expect(read.url(scheme: "moqom")?.absoluteString.contains("token") == false)
+    @Test("a token server that is named has to be an https URL")
+    func badTokenServer() {
+        // Refused rather than read as "no server", because a link that mentions
+        // one and is quietly read as having none produces a phone with nowhere
+        // to sign in.
+        #expect(RelayInvitation(URL(string: "moqom://join?relay=r.example&tokens=http://tokens.example.com")!) == nil)
+        #expect(RelayInvitation(URL(string: "moqom://join?relay=r.example&tokens=tokens.example.com")!) == nil)
     }
 
-    @Test("a link can enrol a device rather than hand it one credential")
-    func carriesAService() throws {
-        let invitation = RelayInvitation(
-            endpoint: RelayEndpoint(host: "35.235.101.37", port: 443),
-            certificateHashes: [hash],
-            tokenService: TokenService(
-                endpoint: RelayEndpoint(host: "34.94.176.34", port: 8444),
-                certificateHashes: ["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="],
-                credential: "0f1e2d3c"
-            )
-        )
-
-        let url = try #require(invitation.url(scheme: "moqom"))
-        let read = try #require(RelayInvitation(url))
-        let service = try #require(read.tokenService)
-
-        #expect(service.endpoint.host == "34.94.176.34")
-        #expect(service.endpoint.port == 8444)
-        #expect(service.credential == "0f1e2d3c")
-        // The two hashes stay apart. They are certificates on different machines,
-        // and a link that crossed them would pin each connection to the other's —
-        // two failures with nothing wrong on screen.
-        #expect(service.certificateHashes == ["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="])
-        #expect(read.certificateHashes == [hash])
-    }
-
-    @Test("a service that is named has to parse")
-    func badService() {
-        // Refused rather than read as "no service", because a link that mentions
-        // one and is quietly read as having none produces a phone that asks nobody
-        // for a token and then joins as nobody.
+    @Test("a delivery service that is named has to parse")
+    func badDelivery() {
+        #expect(RelayInvitation(URL(string: "moqom://join?relay=r.example&mls=c.example:https")!) == nil)
         #expect(RelayInvitation(URL(string: "moqom://join?relay=r.example&join=c.example:https")!) == nil)
     }
 
-    @Test("a service with no port named gets the join listener's own")
-    func serviceDefaultPort() throws {
-        let read = try #require(RelayInvitation(URL(string: "moqom://join?relay=r.example&join=c.example")!))
-        #expect(read.tokenService?.endpoint.port == 8444)
+    @Test("a delivery service with no port named gets the control plane's listener port")
+    func deliveryDefaultPort() throws {
+        let read = try #require(RelayInvitation(URL(string: "moqom://join?relay=r.example&mls=c.example")!))
+        #expect(read.keyDeliveryEndpoint?.port == 8444)
     }
 
     @Test("the scheme is the application's to choose, not the framework's")

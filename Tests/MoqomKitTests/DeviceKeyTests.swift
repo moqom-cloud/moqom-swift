@@ -30,62 +30,30 @@ struct DeviceKeyTests {
 
     // MARK: - The thumbprint
 
-    /// Pinned against RFC 7638, which is the only way to know this agrees with
-    /// every other implementation rather than only with itself. The same key and
-    /// the same expected digest appear in the relay's own test, so a change to
-    /// either side that broke the agreement would fail here and there.
-    @Test("the thumbprint follows RFC 7638")
-    func thumbprintIsSpecified() throws {
-        let jwk = ProofJWK(
-            kty: "EC",
-            crv: "P-256",
-            x: "MKBCTNIcKUSDii11ySs3526iDZ8AiTo7Tu6KPAqv7D4",
-            y: "4Etl6SRW2YiLUrN5vfvVHuhp7x8PxltmWWlbbM4IFyM"
-        )
-        #expect(try jwk.thumbprint() == "cn-I_WNMClehiVp51i_0VpOENW1upEerA8sEam5hn-s")
-    }
-
-    /// A new key is ML-DSA-65, sent as an `AKP` JWK whose canonical form is
+    /// A new key is ML-DSA-87, sent as an `AKP` JWK whose canonical form is
     /// exactly `alg`, `kty`, `pub`, and the thumbprint is over those bytes.
-    @Test("a new key is ML-DSA-65, rendered as a canonical AKP JWK")
+    @Test("a new key is ML-DSA-87, rendered as a canonical AKP JWK")
     func newKeysAreMLDSA() throws {
         let key = DeviceKey.ephemeral()
 
-        #expect(key.algorithm == .mlDSA65)
+        #expect(key.algorithm == .mlDSA87)
         #expect(key.jwk.kty == "AKP")
-        #expect(key.jwk.alg == "ML-DSA-65")
+        #expect(key.jwk.alg == "ML-DSA-87")
         let pub = try #require(key.jwk.pub)
         #expect(!pub.contains("=") && !pub.contains("+") && !pub.contains("/"))
-        #expect(Data(base64URL: pub)?.count == 1952)
-        #expect(key.publicKeyJWK == #"{"alg":"ML-DSA-65","kty":"AKP","pub":"\#(pub)"}"#)
+        #expect(Data(base64URL: pub)?.count == 2592)
+        #expect(key.publicKeyJWK == #"{"alg":"ML-DSA-87","kty":"AKP","pub":"\#(pub)"}"#)
         #expect(
             key.thumbprint == Data(SHA256.hash(data: Data(key.publicKeyJWK.utf8))).base64URLEncodedString,
             "the stored thumbprint must be the one the canonical form produces"
         )
     }
 
-    /// The coordinates are the fixed width the curve defines, unpadded, for a
-    /// P-256 key kept through the rollover.
-    @Test("an ES256 key is rendered as two fixed-width base64url coordinates")
-    func coordinatesAreCanonical() throws {
-        let key = DeviceKey.ephemeral(.es256)
-        let x = try #require(key.jwk.x)
-        let y = try #require(key.jwk.y)
-
-        for coordinate in [x, y] {
-            #expect(!coordinate.contains("="), "base64url in a JWS carries no padding")
-            #expect(Data(base64URL: coordinate)?.count == 32)
-        }
-        #expect(key.publicKeyJWK == #"{"crv":"P-256","kty":"EC","x":"\#(x)","y":"\#(y)"}"#)
-        #expect(try key.jwk.thumbprint() == key.thumbprint)
-    }
-
     // MARK: - The proof
 
-    /// Checked by `MoqomProof`'s checker, the same check the relay runs, in
-    /// both algorithms.
+    /// Checked by `MoqomProof`'s checker, the same check the relay runs.
     @Test("a proof is accepted by the relay's check, and names its token and relay",
-          arguments: [ProofAlgorithm.mlDSA65, .es256])
+          arguments: [ProofAlgorithm.mlDSA87])
     func proofVerifies(_ algorithm: ProofAlgorithm) throws {
         let key = DeviceKey.ephemeral(algorithm)
         let token = Data("a.token".utf8)
@@ -112,14 +80,14 @@ struct DeviceKeyTests {
         )
     }
 
-    /// The enclave's own ML-DSA-65 key, where there is one: the key a device
+    /// The enclave's own ML-DSA-87 key, where there is one: the key a device
     /// actually gets, and not only the software stand-in the other tests use.
     @Test("a Secure Enclave key proves possession", .enabled(if: SecureEnclave.isAvailable))
     func enclaveKeyProves() throws {
         let label = "cloud.moqom.device-key.test.\(UUID().uuidString)"
         defer { DeviceKey.forget(label: label) }
         let key = try DeviceKey.installed(label: label)
-        #expect(key.algorithm == .mlDSA65)
+        #expect(key.algorithm == .mlDSA87)
 
         let again = try DeviceKey.installed(label: label)
         #expect(again.thumbprint == key.thumbprint, "a stored key must be read back, not replaced")

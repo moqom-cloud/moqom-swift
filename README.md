@@ -331,21 +331,19 @@ top of `Sources/MoqomKit/Transport/Transport.swift`.
   `MLSDelivery` is the ordering service: it only ever sees public key packages
   and sealed commits, never anything that derives a key. The committer is the
   lowest live leaf, with a fallback, so there is no election.
-  Groups are founded in a hybrid post-quantum suite,
-  `MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519` from
-  [draft-ietf-mls-pq-ciphersuites](https://datatracker.ietf.org/doc/draft-ietf-mls-pq-ciphersuites/) (the X-Wing KEM: [ML-KEM-768](https://csrc.nist.gov/pubs/fips/203/final) with X25519).
-  The draft has no code point yet, so MoqomKit uses `0xF0A1` from RFC 9420's
-  private-use range, and no other MLS implementation will recognise it. Every
-  commit secret and joiner secret is sealed to X-Wing, so the epoch secrets
-  and the SFrame keys derived from them stay confidential unless both
-  ML-KEM-768 and X25519 are broken. Signatures are not post-quantum: MLS
-  signatures are Ed25519, device proofs are ES256, and tokens are EdDSA. They
-  authenticate members during a call, and breaking one later would not
-  decrypt recorded traffic. Suite `0x0001` still works for existing groups. A
-  group keeps one suite for its whole life, and a key package in another suite
-  is refused. X-Wing makes a key package about 2.5 KB and adds about 1.2 KB per
-  member to each commit and Welcome. `MLSHybridSuiteTests` checks CryptoKit's
-  X-Wing against the [HPKE](https://www.rfc-editor.org/rfc/rfc9180) working group's KEM `0x647a` test vector.
+  Every group is in one post-quantum suite,
+  `MLS_256_MLKEM1024_AES256GCM_SHA512_MLDSA87` (`0xF0AC`): HPKE over pure
+  [ML-KEM-1024](https://csrc.nist.gov/pubs/fips/203/final), HKDF-SHA512, AES-256-GCM, and [ML-DSA-87](https://csrc.nist.gov/pubs/fips/204/final) signatures,
+  NIST category 5 throughout. It is
+  [draft-ietf-mls-pq-ciphersuites](https://datatracker.ietf.org/doc/draft-ietf-mls-pq-ciphersuites/)' suite of that name, which has no
+  assigned value yet, so the value is from RFC 9420's private-use range and no
+  other MLS implementation will recognise it. Every commit secret and joiner
+  secret is sealed with ML-KEM-1024, and every commit, GroupInfo and key
+  package is signed with ML-DSA-87. A key package in any other suite, `0x0001`,
+  X-Wing `0xF0A1` and MOQOM's earlier `0xF0AA` and `0xF0AB` included, is
+  refused, and so is a group in one. A key package is about 10.4 KB, and each
+  member adds about 1.7 KB to a commit and 4.2 KB to a Welcome. moqom-security's `MLSPostQuantumSuiteTests` hold the suite's HPKE
+  and ML-DSA to Go's `crypto/hpke` and `crypto/mldsa`.
 - **Direct (peer-to-peer) calls**, in `Sources/MoqomKit/Direct/`. Wire-compatible
   with the Rust client's `moqom_client::direct`, so either SDK can be either
   end:

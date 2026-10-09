@@ -217,11 +217,24 @@ public struct DeviceCredentials: Sendable {
     /// Set, and the room keys itself with MLS: no key passes through the application and none
     /// reaches MOQOM's servers, which only order and forward ciphertext. A key
     /// given to ``RoomSession/useEncryption(_:)`` overrides it. `nil` and the room
-    /// publishes nothing until the application supplies a key. ``TokenService/keyDelivery`` is MOQOM's.
+    /// publishes nothing until the application supplies a key. ``HTTPMLSDelivery`` is MOQOM's.
     public let keyDelivery: (any MLSDeliveryService)?
 
+    /// What ``token`` permits this device to publish, as whoever minted it
+    /// said (``IssuedToken/publish``); `nil` when nobody said.
+    ///
+    /// Decides one thing on the device: whether a room keyed through
+    /// ``keyDelivery`` makes this device a member of its MLS group or a viewer
+    /// sealed the group's keys. An empty scope is a viewer. `nil` is a member,
+    /// as every device was before viewers were keyed apart — the token cannot
+    /// be asked, because it is opaque, and a member that may not publish is
+    /// refused by the relay rather than trusted. Set from each
+    /// ``IssuedToken`` this is renewed with, and kept when the renewal does not
+    /// say.
+    public var publish: PublishScope?
+
     /// The keys the room's control log is signed with: the control plane's
-    /// ML-DSA-65 keys, as its JWK set publishes them (see
+    /// ML-DSA-87 keys, as its JWK set publishes them (see
     /// ``DirectVerificationKey/parseSet(_:)``).
     ///
     /// A room applies only control entries signed by one of these. Empty, and
@@ -269,6 +282,7 @@ public struct DeviceCredentials: Sendable {
         replaced.authorityKeys = authorityKeys
         replaced.plaintextForTesting = plaintextForTesting
         replaced.directRoom = issued.direct
+        replaced.publish = issued.publish ?? publish
         return replaced
     }
 }

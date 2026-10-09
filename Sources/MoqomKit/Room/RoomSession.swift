@@ -68,6 +68,8 @@ public actor RoomSession {
     private var viewerKeys: AudienceKeys?
     private let keyDelivery: (any MLSDeliveryService)?
     private let currentToken: (@Sendable () async -> Data)?
+    /// The current credential's ``DeviceCredentials/publish``.
+    private let currentPublish: (@Sendable () async -> PublishScope?)?
 
     /// Hands a token to the ``MoqomSession`` this room hangs off, which owns the
     /// credential because the connection is shared by every room on it.
@@ -254,12 +256,14 @@ public actor RoomSession {
         authorityKeys: [DirectVerificationKey] = [],
         keyDelivery: (any MLSDeliveryService)? = nil,
         currentToken: (@Sendable () async -> Data)? = nil,
+        currentPublish: (@Sendable () async -> PublishScope?)? = nil,
         updateCredential: CredentialUpdate? = nil
     ) {
         self.encryptionPolicy = encryptionPolicy
         self.authorityKeys = authorityKeys
         self.keyDelivery = keyDelivery
         self.currentToken = currentToken
+        self.currentPublish = currentPublish
         presentCredential = updateCredential
         self.seatPolicy = seatPolicy
         self.tenant = tenant
@@ -650,13 +654,13 @@ public actor RoomSession {
         logger.info(.room, "end-to-end encryption keys are managed by MLS")
     }
 
-    /// A token that says this device may not publish, for anybody but an agent.
-    /// One that does not say is a member, as every device was before viewers
-    /// were keyed apart.
+    /// A credential whose issuer said this device may publish nothing, for
+    /// anybody but an agent. One whose issuer did not say is a member, as every
+    /// device was before viewers were keyed apart. See ``DeviceCredentials/publish``.
     private func isViewer() async -> Bool {
-        guard let currentToken else { return false }
+        guard let currentPublish else { return false }
         if identity.username.value.hasPrefix(ManagedRoomKeys.agentPrefix) { return false }
-        return DeviceCredentials.mayPublish(token: await currentToken()) == false
+        return await currentPublish()?.isEmpty == true
     }
 
     /// Move between the group and the audience when a renewed token grants or

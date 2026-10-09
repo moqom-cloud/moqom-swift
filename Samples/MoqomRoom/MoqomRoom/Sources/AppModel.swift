@@ -5,6 +5,7 @@
 // every view body. The concurrency lives one layer down in `MoqomSession` and
 // `RoomSession`, which are actors; this type is their main-actor mirror.
 
+import AuthenticationServices
 import Foundation
 import MoqomCore
 import MoqomKit
@@ -200,61 +201,42 @@ final class AppModel {
     /// attached to it, which made the deployed relays reachable only from a script.
     var relayToken: String {
         get { String(decoding: relay.token, as: UTF8.self) }
-        set { relay.token = Data(newValue.trimmed.utf8) }
+        set {
+            relay.token = Data(newValue.trimmed.utf8)
+            relay.issued = nil
+        }
     }
 
-    /// The token service's address, as a text field sees it.
+    /// The token server's base URL, as a text field sees it.
     ///
     /// Clearing it turns the whole mechanism off and puts the pasted token back in
-    /// charge, which is the right behaviour for a field: "no service" and "a
-    /// service whose address I have deleted" are one intention.
-    var joinHost: String {
-        get { relay.tokenService?.host ?? "" }
+    /// charge, which is the right behaviour for a field: "no server" and "a
+    /// server whose address I have deleted" are one intention. Changing it signs
+    /// out, because an enrollment belongs to the server that issued it; the one
+    /// for the new host, if this phone ever signed in there, comes back out of the
+    /// Keychain.
+    var tokenServerAddress: String {
+        get { relay.tokenServer.address }
         set {
-            var service = relay.tokenService ?? JoinService.development
-            service.host = newValue.trimmed
-            relay.tokenService = service
+            let address = newValue.trimmed
+            guard address != relay.tokenServer.address else { return }
+            var server = TokenServer(address: address, enrollment: "")
+            server.enrollment = server.host.flatMap { TokenStore.loadEnrollment(for: $0) } ?? ""
+            relay.tokenServer = server
         }
     }
 
-    var joinPort: String {
-        get { (relay.tokenService?.port).map(String.init) ?? "8444" }
-        set {
-            var service = relay.tokenService ?? JoinService.development
-            service.port = UInt16(newValue.trimmed) ?? service.port
-            relay.tokenService = service
-        }
-    }
+    /// Who the token server last said this phone is, for the sign-in section.
+    private(set) var signedInAs: String?
 
-    var joinCertificateHash: String {
-        get { relay.tokenService?.certificateHashes.first ?? "" }
-        set {
-            var service = relay.tokenService ?? JoinService.development
-            service.certificateHashes = newValue.trimmed.isEmpty ? [] : [newValue.trimmed]
-            relay.tokenService = service
-        }
-    }
-
-    /// The device's enrolment credential.
-    ///
-    /// The one field on this screen that is a durable secret. Everything else is an
-    /// address, and the pasted token above dies by lunchtime; this is what buys the
-    /// next one months from now, which is why it lives in the Keychain and why the
-    /// interface should not print it back in full.
-    var joinCredential: String {
-        get { relay.tokenService?.credential ?? "" }
-        set {
-            var service = relay.tokenService ?? JoinService.development
-            service.credential = newValue.trimmed
-            relay.tokenService = service
-        }
-    }
+    /// Why the last sign-in failed, if it failed.
+    private(set) var signInProblem: String?
 
     /// A link this app was opened with, waiting for somebody to agree to it.
     ///
     /// Held rather than applied. See ``Invitation``: a URL can arrive from
-    /// anywhere, and this one names the relay to trust and the credential to
-    /// present.
+    /// anywhere, and this one names the relay to trust and the server to sign
+    /// in to.
     var offered: Invitation?
 
     /// Read a `moqom://join?...` the app was opened with.
@@ -268,67 +250,40 @@ final class AppModel {
             Journal.shared.say("INVITE unreadable \(url.absoluteString.prefix(60))")
             return
         }
-        guard !invitation.enrolsUnpinned else {
-            Journal.shared.say("INVITE refused: enrols with an unpinned token service")
-            return
-        }
         Journal.shared.say("INVITE \(invitation.destination)")
         offered = invitation
     }
 
-    /// Take the link that arrived: address, trust, credential, and who it says
-    /// this phone is.
+    /// Take the link that arrived: address, trust, where to sign in, and the room.
     ///
-    /// The name and the room come out of the token rather than from the link's
-    /// own fields, so the two cannot contradict each other. That contradiction
-    /// is not hypothetical — a token minted for one room against a screen
-    /// showing another is a relay refusing every track, which on the phone is a
-    /// Join that works and a Go live that does nothing.
+    /// Whatever token was in hand is dropped, because it was for the relay being
+    /// left. The name is not taken from the link at all: the token server decides it
+    /// at sign-in, from who signed in.
     func acceptOffer() {
         guard let invitation = offered else { return }
         offered = nil
 
+        let server = invitation.relay.tokenServer?.absoluteString
         relay = RelayConfiguration(
             host: invitation.relay.endpoint.host,
             port: invitation.relay.endpoint.port,
             certificateHashes: invitation.relay.certificateHashes,
-            token: invitation.relay.token,
-            // Kept only when the link names one. A link with no service in it
-            // leaves whatever this phone was already enrolled with, because
-            // scanning a code for a relay on a desk should not un-enrol a phone
-            // from the deployment it can otherwise reach.
-            tokenService: invitation.relay.tokenService.map {
-                JoinService(
-                    host: $0.endpoint.host,
-                    port: $0.endpoint.port,
-                    certificateHashes: $0.certificateHashes,
-                    credential: $0.credential
-                )
-            } ?? relay.tokenService
+            token: Data(),
+            // Kept only when the link names one. A link with no server in it
+            // leaves whichever this phone already signs in to, because scanning
+            // a code for a relay on a desk should not sign a phone out of the
+            // deployment it can otherwise reach.
+            tokenServer: relay.tokenServer
         )
+        if let server { tokenServerAddress = server }
         // A pairing code left in the field would be the room on the next Join
         // and throw away the room this invitation named.
         pairingCode = ""
-
-        if let credential = invitation.credential {
-            if !credential.subject.isEmpty { username = credential.subject }
-            if !credential.room.isEmpty { roomName = credential.room }
-        }
+        if let room = invitation.relay.room { roomName = room }
         remember()
     }
 
     func declineOffer() { offered = nil }
-
-    /// What the token in hand says about itself, and whether it suits this join.
-    var credential: Credential? { relay.credential }
-
-    var credentialComplaint: String? {
-        credential?.complaint(
-            joining: destinationRoomName(pairing: pairing),
-            as: username.trimmed,
-            on: deviceName
-        )
-    }
 
     /// Where Join puts this device, given the fields as they stand.
     ///
@@ -1252,48 +1207,130 @@ final class AppModel {
     /// is unreachable".
     private(set) var tokenProblem: String?
 
-    /// Which tenant to dial as: whichever one the token in hand was minted for.
+    /// Which tenant to dial as.
     ///
-    /// Read from the credential rather than configured, because a relay compares a
-    /// broadcast's namespace against the tenant in the token and refuses the pair
-    /// when they differ. Two fields that have to agree, one of them a token nobody
-    /// reads and the other a default from before this deployment existed, is a
-    /// mismatch waiting to happen — and it happened: `demo` on the screen against a
-    /// token saying `moqom`, which connects and then publishes nothing.
-    ///
-    /// ``launch`` still decides it when there is no token, which is the relay on a
-    /// desk that verifies nothing and admits the session anyway.
+    /// A relay compares a broadcast's namespace against the tenant the token was minted
+    /// for and refuses the pair when they differ. What the token server said it minted
+    /// in, since the token cannot be read; ``launch``'s `--tenant` for a pasted token.
     var tenant: String {
-        guard let claimed = Credential(relay.token)?.tenant, !claimed.isEmpty else {
-            return launch.tenant
-        }
-        return claimed
+        if let issued = relay.issued, !issued.tenant.isEmpty { return issued.tenant }
+        return launch.tenant
     }
 
-    /// Ask for a credential, if this device is allowed to ask and needs one.
+    /// The room a sign-in is asked for: wherever Join is about to go, or `demo` for a
+    /// channel, because the sign-in route needs a room to mint the first token in.
+    private var askingRoom: String {
+        let room = destinationRoomName(pairing: pairing)
+        return room.isEmpty ? "demo" : room
+    }
+
+    /// Fill in the Sign in with Apple request.
+    ///
+    /// No scopes: the token server needs Apple's stable subject for this person, not a
+    /// name or an address. The nonce is this phone's key thumbprint, untruncated, which is
+    /// what the server checks the identity token against — so an identity token is good
+    /// only alongside this phone's key, and one lifted off the phone is good for nothing.
+    func prepareSignIn(_ request: ASAuthorizationAppleIDRequest) {
+        prepareDeviceKey()
+        signInProblem = nil
+        request.requestedScopes = []
+        request.nonce = deviceKey?.thumbprint
+    }
+
+    /// Exchange what Apple returned for an enrollment, and keep it.
+    func completeSignIn(_ result: Result<ASAuthorization, any Error>) async {
+        signInProblem = nil
+        let authorization: ASAuthorization
+        switch result {
+        case let .success(answer): authorization = answer
+        case let .failure(error):
+            // Cancelling is a decision, not a failure, and does not need a sentence.
+            if (error as? ASAuthorizationError)?.code != .canceled {
+                signInProblem = error.localizedDescription
+                Journal.shared.say("SIGNIN FAILED \(error.localizedDescription)")
+            }
+            return
+        }
+        guard
+            let apple = authorization.credential as? ASAuthorizationAppleIDCredential,
+            let identity = apple.identityToken.map({ String(decoding: $0, as: UTF8.self) })
+        else {
+            signInProblem = "Apple returned no identity token."
+            return
+        }
+        guard let deviceKey else {
+            signInProblem = "This device has no key, so a sign-in cannot be bound to it."
+            return
+        }
+        guard let url = relay.tokenServer.signInURL else {
+            signInProblem = "The token server has to be an https URL."
+            return
+        }
+
+        Journal.shared.say("SIGNIN at \(url.host() ?? "") for \(askingRoom)")
+        do {
+            let signedIn = try await TokenService.signIn(
+                url: url, identityToken: identity, room: askingRoom, device: deviceKey
+            )
+            relay.tokenServer.enrollment = signedIn.enrollment
+            take(signedIn.issued)
+            remember()
+            Journal.shared.say(
+                "SIGNIN enrolled as \(signedIn.issued.username) until \(signedIn.enrollmentExpiresAt)"
+            )
+        } catch {
+            signInProblem = error.errorDescription ?? String(describing: error)
+            Journal.shared.say("SIGNIN FAILED \(signInProblem ?? "")")
+        }
+    }
+
+    /// Forget the enrollment, and the token it bought.
+    func signOut() {
+        relay.tokenServer.enrollment = ""
+        relay.token = Data()
+        relay.issued = nil
+        signedInAs = nil
+        remember()
+    }
+
+    /// Hold a token the server just issued, and what it said about it.
+    private func take(_ issued: IssuedToken) {
+        relay.token = issued.token
+        relay.issued = issued
+        // What the server actually minted, which can differ from what was asked
+        // for: the reference server names a person from their Apple sign-in, and
+        // a phone showing what it requested while the room shows what was issued
+        // is a phone displaying the wrong person's name.
+        if !issued.username.isEmpty {
+            username = issued.username
+            signedInAs = issued.username
+        }
+    }
+
+    /// Ask for a token, if this device is signed in.
     ///
     /// Returns whether joining should continue. Three outcomes rather than two: a
-    /// token was fetched, no token was needed or could be asked for, or the ask
-    /// failed and the join is abandoned before anything is dialled. That last case
-    /// is the one worth stopping for — carrying on with a stale credential reaches
-    /// a relay that admits the session and permits it nothing, which is a room
-    /// that appears to work until somebody presses Go live.
+    /// token was fetched, no token could be asked for, or the ask failed and the join
+    /// is abandoned before anything is dialled. That last case is the one worth
+    /// stopping for — carrying on with a stale credential reaches a relay that admits
+    /// the session and permits it nothing, which is a room that appears to work until
+    /// somebody presses Go live.
+    ///
+    /// Every time, rather than when the one in hand looks stale: it cannot be looked
+    /// at, and asking costs a round trip to a server that is there to be asked.
     private func fetchATokenIfNeeded() async -> Bool {
         tokenProblem = nil
 
         let room = destinationRoomName(pairing: pairing)
         let name = username.trimmed
-        guard let service = relay.tokenService, service.isUsable else {
-            // No service configured, which is a legitimate setup: a relay on a desk
-            // asks for nothing, and a pasted token still works. Said out loud only
-            // when the token in hand will not do, because that combination is the
-            // one that produces a puzzling session rather than a working one.
-            if relay.host != nil, relay.needsAToken(joining: room, as: name, on: deviceName) {
-                Journal.shared.say("TOKEN stale and no service configured")
+        guard let service = relay.tokenServer.client() else {
+            // Not signed in, which is a legitimate setup: a relay on a desk asks for
+            // nothing, and a pasted token still works.
+            if relay.host != nil, relay.token.isEmpty {
+                Journal.shared.say("TOKEN none, and not signed in to a token server")
             }
             return true
         }
-        guard relay.needsAToken(joining: room, as: name, on: deviceName) else { return true }
 
         guard let deviceKey else {
             // Asking without a key would mint a token bound to nothing this
@@ -1304,29 +1341,31 @@ final class AppModel {
             return false
         }
 
-        Journal.shared.say("TOKEN asking \(service.host):\(service.port) for \(name) in \(room)")
+        Journal.shared.say("TOKEN asking \(service.url.host() ?? "") for \(name) in \(room)")
         do {
-            let issued = try await service.client().token(
-                username: name,
-                room: room,
-                device: deviceKey
-            )
-            relay.token = issued.token
-            // What the service actually minted, which can differ from what was
-            // asked for: a username is normalised on the way in, and a phone
-            // showing what it requested while the room shows what was issued is a
-            // phone displaying the wrong person's name.
-            if !issued.username.isEmpty { username = issued.username }
+            let issued = try await service.token(username: name, room: room, device: deviceKey)
+            take(issued)
             Journal.shared.say(
                 "TOKEN got one for \(issued.username) in \(issued.room),"
-                    + " good for \(Int(issued.expiresAt.timeIntervalSinceNow))s"
+                    + " good for \(Int(issued.expiresAt.timeIntervalSinceNow))s,"
+                    + " \(issued.mayPublish ? "may publish" : "viewer")"
             )
             return true
         } catch {
-            let complaint = (error as? LocalizedError)?.errorDescription
-                ?? String(describing: error)
-            tokenProblem = complaint
-            Journal.shared.say("TOKEN FAILED \(complaint)")
+            if error.needsSignIn {
+                // The enrollment is gone — revoked, expired, or for a key this phone
+                // no longer holds. Kept, it would be refused the same way on every
+                // join; cleared, the screen offers the button that fixes it.
+                relay.tokenServer.enrollment = ""
+                relay.token = Data()
+                relay.issued = nil
+                signedInAs = nil
+                remember()
+                tokenProblem = "Sign in again: the token server no longer accepts this phone."
+            } else {
+                tokenProblem = error.errorDescription ?? String(describing: error)
+            }
+            Journal.shared.say("TOKEN FAILED \(tokenProblem ?? "")")
             phase = .joining
             return false
         }
@@ -1376,13 +1415,11 @@ final class AppModel {
             // The relay closes a session when the credential that admitted it runs
             // out, and a token is good for fifteen minutes, so a call any longer
             // than that needs the next one fetched while it runs. Only possible
-            // where there is a service to ask: a token pasted in by
-            // `deploy/tools/join.sh` cannot replace itself, and a session on one
-            // ends when it expires, which is the honest behaviour rather than a
-            // limitation of the sample.
+            // where there is a server to ask: a pasted token cannot replace
+            // itself, and a session on one ends when it expires, which is the
+            // honest behaviour rather than a limitation of the sample.
             var renew: (@Sendable () async throws -> IssuedToken)?
-            if let mint = relay.tokenService.flatMap({ $0.isUsable ? $0.client() : nil }),
-               let key = deviceKey {
+            if let mint = relay.tokenServer.client(), let key = deviceKey, relay.issued != nil {
                 let asking = username.trimmed
                 let joining = destinationRoomName(pairing: sharedCode)
                 renew = {
@@ -1390,25 +1427,23 @@ final class AppModel {
                 }
             }
 
+            var credentials = DeviceCredentials(
+                identity: identity,
+                // Issued by the token server a moment ago, or pasted. Empty against
+                // a relay that verifies means a session that connects and may
+                // publish nothing.
+                token: relay.token,
+                deviceKey: deviceKey,
+                // What the server said, never what the token says: it cannot be read.
+                expiresAt: renew == nil ? nil : relay.issued?.expiresAt,
+                renew: renew
+            )
+            credentials.publish = relay.issued?.publish
+            credentials.directRoom = relay.issued?.direct ?? .default
+
             let session = MoqomSession(
                 transport: relay.transport(bestEffort: launch.bestEffort),
-                credentials: DeviceCredentials(
-                    identity: identity,
-                    // Minted by whatever stands in for this application's server: the
-                    // sample has none, so `deploy/tools/join.sh` mints one and passes it
-                    // in. Empty against a relay that verifies means a session that
-                    // connects and may publish nothing.
-                    token: relay.token,
-                    deviceKey: deviceKey,
-                    // Read out of the token, which the SDK would rather a caller
-                    // did not do — it prefers the expiry the minting service
-                    // stated, precisely so nobody has to decode a credential to
-                    // find out. This screen already decodes it to display the
-                    // claims, so the parsing exists either way; an app with a
-                    // server of its own should pass what that server said.
-                    expiresAt: renew == nil ? nil : Credential(relay.token)?.expires,
-                    renew: renew
-                ),
+                credentials: credentials,
                 tenant: TenantID(tenant),
                 // The sample opts in, because the sample is what an integrator
                 // reads to find out that this exists. `.hashed` even here: a

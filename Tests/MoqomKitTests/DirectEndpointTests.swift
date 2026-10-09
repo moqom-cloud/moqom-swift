@@ -51,7 +51,7 @@ struct DirectPeerCheckTests {
 
     @Test("every way a token is wrong is refused, with the relay's reason")
     func tokenRefusals() throws {
-        let other = try MLDSA65.PrivateKey(seedRepresentation: Data(repeating: 9, count: 32), publicKey: nil)
+        let other = try MLDSA87.PrivateKey(seedRepresentation: Data(repeating: 9, count: 32), publicKey: nil)
         let cases: [(Data, DirectPeerRefusal)] = [
             (DirectTokens.mint(user: "alice", key: alice.key, kid: "nope"), .unknownKey),
             (DirectTokens.mint(user: "alice", key: alice.key, signer: other), .badSignature),
@@ -127,17 +127,19 @@ struct DirectPeerCheckTests {
     @Test("a JWK set reads as the relay's does")
     func keySet() throws {
         let key = DirectTokens.signer.publicKey.rawRepresentation.base64URLEncodedString
-        let document = Data(#"{"keys":[{"kty":"AKP","alg":"ML-DSA-65","kid":"test-key","pub":"\#(key)"}]}"#.utf8)
+        let document = Data(#"{"keys":[{"kty":"AKP","alg":"ML-DSA-87","kid":"test-key","pub":"\#(key)"}]}"#.utf8)
         #expect(try DirectVerificationKey.parseSet(document) == DirectTokens.keys)
         let wrongAlgorithm = Data(#"[{"kty":"AKP","alg":"ML-DSA-44","kid":"k","pub":"\#(key)"}]"#.utf8)
         #expect(throws: DirectPeerRefusal.unverifiable) { try DirectVerificationKey.parseSet(wrongAlgorithm) }
 
-        let legacy = Curve25519.Signing.PrivateKey().publicKey.rawRepresentation
-        let x = legacy.base64URLEncodedString
-        let old = Data(#"[{"kty":"OKP","crv":"Ed25519","kid":"old","x":"\#(x)"}]"#.utf8)
-        #expect(try DirectVerificationKey.parseSet(old) == [DirectVerificationKey(id: "old", key: legacy, algorithm: .ed25519)])
-        let wrongCurve = Data(#"[{"kty":"OKP","crv":"X25519","kid":"k","x":"\#(x)"}]"#.utf8)
-        #expect(throws: DirectPeerRefusal.unverifiable) { try DirectVerificationKey.parseSet(wrongCurve) }
+        let previous = try MLDSA65.PrivateKey(seedRepresentation: Data(repeating: 7, count: 32), publicKey: nil)
+        let previousKey = previous.publicKey.rawRepresentation.base64URLEncodedString
+        let mlDSA65 = Data(#"[{"kty":"AKP","alg":"ML-DSA-65","kid":"old","pub":"\#(previousKey)"}]"#.utf8)
+        #expect(throws: DirectPeerRefusal.unverifiable) { try DirectVerificationKey.parseSet(mlDSA65) }
+
+        let x = Curve25519.Signing.PrivateKey().publicKey.rawRepresentation.base64URLEncodedString
+        let ed25519 = Data(#"[{"kty":"OKP","crv":"Ed25519","kid":"old","x":"\#(x)"}]"#.utf8)
+        #expect(throws: DirectPeerRefusal.unverifiable) { try DirectVerificationKey.parseSet(ed25519) }
     }
 }
 

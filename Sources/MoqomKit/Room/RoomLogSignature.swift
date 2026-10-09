@@ -2,7 +2,7 @@
 //
 // The log says who may publish, who is muted, whether the room has ended — the
 // state a client acts on as authorisation. The relay that carries it is not
-// trusted with it, so every entry is signed with ML-DSA-65 by the room's
+// trusted with it, so every entry is signed with ML-DSA-87 by the room's
 // authority, which is the control plane, and a client applies nothing that does
 // not verify against the authority's published keys. A relay that forwards the
 // log can drop entries, which the sequence numbers already surface as a hole;
@@ -27,7 +27,7 @@ import MoqomCore
 public struct RoomLogSigner: Sendable {
     /// The `kid` readers look the key up by.
     public let id: String
-    private let key: MLDSA65.PrivateKey
+    private let key: MLDSA87.PrivateKey
 
     /// From the 32-byte FIPS 204 seed the control plane keeps.
     ///
@@ -35,13 +35,13 @@ public struct RoomLogSigner: Sendable {
     ///   first eight bytes of the public key's SHA-256 in base64url, so a seed
     ///   names the same key wherever it is loaded.
     public init(seed: Data, id: String? = nil) throws {
-        key = try MLDSA65.PrivateKey(seedRepresentation: seed, publicKey: nil)
+        key = try MLDSA87.PrivateKey(seedRepresentation: seed, publicKey: nil)
         self.id = id ?? Self.keyID(key.publicKey.rawRepresentation)
     }
 
     /// What a reader verifies this signer's entries with.
     public var verificationKey: DirectVerificationKey {
-        DirectVerificationKey(id: id, key: key.publicKey.rawRepresentation, algorithm: .mlDSA65)
+        DirectVerificationKey(id: id, key: key.publicKey.rawRepresentation, algorithm: .mlDSA87)
     }
 
     /// The signature property for `entry`, an encoded ``RoomUpdate``, in the
@@ -88,8 +88,7 @@ enum RoomLogSignature {
 
     /// Whether `property` is a valid authority signature over `entry`.
     ///
-    /// ML-DSA-65 only. The log was never signed with anything else, so an
-    /// Ed25519 key kept for verifying old tokens verifies no entry.
+    /// ML-DSA-87 only.
     static func verifies(
         _ property: Data?,
         entry: Data,
@@ -102,7 +101,7 @@ enum RoomLogSignature {
         let idEnd = 1 + Int(length)
         guard bytes.count > idEnd,
               let id = String(data: bytes[1 ..< idEnd], encoding: .utf8),
-              let key = keys.first(where: { $0.id == id && $0.algorithm == .mlDSA65 })
+              let key = keys.first(where: { $0.id == id && $0.algorithm == .mlDSA87 })
         else { return false }
         return key.verifies(
             Data(bytes[idEnd...]),

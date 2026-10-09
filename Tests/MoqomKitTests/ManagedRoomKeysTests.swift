@@ -276,31 +276,14 @@ struct ManagedRoomKeysTests {
         let base = try #require(await alice.status).epochAuthenticator
         for blob in await service.everything { #expect(blob.range(of: base) == nil) }
 
-        // Founded in the hybrid suite, and everybody is in it.
-        #expect(await service.group?.cipherSuite == MLSCipherSuite.mls192MLKEM768MLDSA65.identifier)
+        // Founded in the ML-KEM-1024 suite, and everybody is in it.
+        #expect(await service.group?.cipherSuite == MLSCipherSuite.mls256MLKEM1024MLDSA87.identifier)
+        #expect(await service.group?.cipherSuite == 0xF0AC)
         for keys in [alice, bob, carol] {
-            #expect(await keys.status?.cipherSuite == .mls192MLKEM768MLDSA65)
+            #expect(await keys.status?.cipherSuite == .mls256MLKEM1024MLDSA87)
         }
 
         for keys in [alice, bob, carol] { await keys.stop() }
-    }
-
-    @Test("a device joining a group founded in suite 0x0001 republishes its key packages in that suite")
-    func joinsClassicalGroup() async throws {
-        let service = FakeKeyDelivery()
-        let alice = await keys("alice", "iphone-a", service, cipherSuite: .mls128DHKEMX25519)
-        let bob = await keys("bob", "iphone-b", service)
-        await alice.start()
-        #expect(await eventually { await alice.status != nil })
-        await bob.start()
-        #expect(await eventually { await sameEpoch([alice, bob], members: 2) })
-        #expect(await bob.status?.cipherSuite == .mls128DHKEMX25519)
-        #expect(await service.group?.cipherSuite == 0x0001)
-
-        let sealed = try bob.encryption.sender.protectRaw(Data("classical".utf8), aad: Data())
-        #expect(try alice.encryption.receiver.unprotectRaw(sealed, aad: Data()) == Data("classical".utf8))
-
-        for keys in [alice, bob] { await keys.stop() }
     }
 
     @Test("an agent decrypts as a member, and nobody sends to it until its watchdog is disclosed")
@@ -453,18 +436,12 @@ struct ManagedRoomKeysTests {
         #expect(throws: MLSError.self) { _ = try MLSAudience.seal(base, to: classical, groupID: group, epoch: 9) }
     }
 
-    @Test("the publish grant in a token decides member or viewer, and silence means member")
-    func publishGrant() {
-        #expect(DeviceCredentials.mayPublish(token: testToken(subject: "a", e2ee: nil, publish: true)) == true)
-        #expect(DeviceCredentials.mayPublish(token: testToken(subject: "a", e2ee: nil, publish: false)) == false)
-        #expect(DeviceCredentials.mayPublish(token: testToken(subject: "a", e2ee: nil)) == nil)
-        #expect(DeviceCredentials.mayPublish(token: Data("not a token".utf8)) == nil)
-    }
-
-    @Test("a group in a suite this build does not implement is not joined")
-    func unknownSuiteNotJoined() async throws {
+    /// An unknown suite, and MOQOM's earlier 0xF0AA (ML-KEM-768) and 0xF0AB
+    /// (ML-DSA-65), which 0xF0AC replaced.
+    @Test("a group in a suite this build does not implement is not joined", arguments: [UInt16(0x7A7A), 0xF0AA, 0xF0AB])
+    func unknownSuiteNotJoined(suite: UInt16) async throws {
         let service = FakeKeyDelivery()
-        await service.foundElsewhere(Data("future".utf8), suite: 0x7A7A, by: "zed/z")
+        await service.foundElsewhere(Data("future".utf8), suite: suite, by: "zed/z")
         let bob = await keys("bob", "iphone-b", service)
         await bob.start()
         try await Task.sleep(for: .milliseconds(200))
@@ -535,14 +512,16 @@ struct ManagedKeysRoomTests {
         _ name: String, relay: LoopbackRelay, service: FakeKeyDelivery, publish: Bool? = nil
     ) async throws -> RoomSession {
         let who = identity(name)
+        var credentials = DeviceCredentials(
+            identity: who,
+            token: testToken(subject: name, e2ee: .required),
+            deviceKey: nil,
+            keyDelivery: await service.client(who)
+        )
+        credentials.publish = publish.map { $0 ? PublishScope.full : PublishScope.none }
         let session = MoqomSession(
             transport: LoopbackTransport(relay: relay),
-            credentials: DeviceCredentials(
-                identity: who,
-                token: testToken(subject: name, e2ee: .required, publish: publish),
-                deviceKey: nil,
-                keyDelivery: await service.client(who)
-            ),
+            credentials: credentials,
             tenant: "acme"
         )
         try await session.connect(to: RelayEndpoint(host: "loopback"))

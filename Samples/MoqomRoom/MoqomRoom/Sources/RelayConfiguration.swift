@@ -20,72 +20,57 @@ import MoqomCore
 import MoqomKit
 import MoqomLoopback
 
-/// Where this device asks for a credential, and what it asks with.
+/// Where this device signs in and asks for tokens, and what it asks with.
 ///
-/// Separate from the relay's address because it is a different machine: the relay
-/// is a load balancer in front of a media fleet, and this is one route on the
-/// control plane. They have different addresses and different certificates, and
-/// conflating them produced exactly the confusion it sounds like.
-struct JoinService: Hashable {
-    var host: String
-    var port: UInt16
+/// This application's backend, standing where every application's own server stands: it
+/// knows who signed in, and it asks the control plane for a token on that person's behalf
+/// with a key the phone never sees. MOQOM's reference token server verifies Sign in with
+/// Apple; a real application puts its own here.
+///
+/// Separate from the relay's address because it is a different machine, run by a different
+/// party, behind an ordinary public certificate — so nothing here is pinned.
+struct TokenServer: Hashable {
+    /// The base URL as typed, `https://tokens.example.com`. Empty means none.
+    var address: String
 
-    /// The hash to pin, as the deployment prints it. Empty means platform trust.
-    ///
-    /// Pinned more urgently than the relay's. A relay reached through somebody
-    /// else's certificate is an eavesdropper on a broadcast; this endpoint is
-    /// handed the device's long-lived credential in a header, so the wrong
-    /// certificate here gives that away.
-    var certificateHashes: [String]
+    /// What the server issued at sign-in, sent as `Bearer` with every request for a token.
+    /// Empty means not signed in. Kept in the Keychain under the server's host.
+    var enrollment: String
 
-    /// The credential this device holds. Empty means it cannot ask.
-    var credential: String
+    static let none = TokenServer(address: "", enrollment: "")
 
-    /// The dev deployment's join listener.
-    ///
-    /// The address is `terraform output join_endpoint` and the hash is the control
-    /// plane's own certificate, which is not the relay's: pinning the relay's here
-    /// produces a connection that closes without a reason anybody can read. Both
-    /// change when the deployment is rebuilt, and the pasted token below is what
-    /// keeps working while they are stale.
-    ///
-    /// Never a credential, though. A credential compiled into a sample is a
-    /// credential in everybody's checkout, and this one does not expire on its own,
-    /// so it arrives by invitation or by hand.
-    static let development = JoinService(
-        host: "35.197.36.243",
-        port: 8444,
-        certificateHashes: ["90RDQl2ZuFuJpYVHCwYbuHO3gcCNNqIHgoRuAxr+qqg="],
-        credential: ""
-    )
-
-    /// Whether this is enough to ask with.
-    var isUsable: Bool { !host.isEmpty && !credential.isEmpty }
-
-    /// The SDK client for these settings.
-    ///
-    /// The tenant defaults to empty, which asks for the credential's own rather than
-    /// naming one. A credential belongs to exactly one tenant, so a tenant in the
-    /// request can only be redundant or wrong — and wrong is a refusal that reads
-    /// "account device is scoped to tenant moqom" on a screen whose tenant field
-    /// says `demo` because that is what a sample's default has always been.
-    func client(tenant: String = "") -> TokenService {
-        TokenService(
-            endpoint: RelayEndpoint(host: host, port: port),
-            certificateHashes: certificateHashes,
-            credential: credential,
-            tenant: tenant
-        )
+    var baseURL: URL? {
+        guard
+            let url = URL(string: address.trimmingCharacters(in: .whitespacesAndNewlines)),
+            url.scheme?.lowercased() == "https",
+            let host = url.host, !host.isEmpty
+        else { return nil }
+        return url
     }
 
-    /// What to show on the join screen, so a screenshot says which of the two
-    /// paths a run was on.
+    /// The key the enrollment is filed under.
+    var host: String? { baseURL?.host }
+
+    var signInURL: URL? { baseURL?.appending(path: "v1/sign-in") }
+
+    /// Whether there is somewhere to sign in.
+    var isConfigured: Bool { baseURL != nil }
+
+    /// Whether this device can ask for a token without anybody signing in first.
+    var isSignedIn: Bool { isConfigured && !enrollment.isEmpty }
+
+    /// The SDK client, once signed in.
+    func client() -> TokenService? {
+        guard isSignedIn, let base = baseURL else { return nil }
+        return TokenService(url: base.appending(path: "v1/token"), authorization: enrollment)
+    }
+
+    /// What to show on the join screen, so a screenshot says which path a run was on.
     var summary: String {
-        guard !host.isEmpty else { return "none — a token has to be pasted" }
-        let trust = certificateHashes.isEmpty ? "system trust" : "pinned"
-        return credential.isEmpty
-            ? "\(host):\(port), \(trust), no credential"
-            : "\(host):\(port), \(trust), enrolled"
+        guard let host else {
+            return address.isEmpty ? "none — a token has to be pasted" : "not an https URL"
+        }
+        return isSignedIn ? "\(host), signed in" : "\(host), not signed in"
     }
 }
 
@@ -105,8 +90,9 @@ struct RelayConfiguration {
     ///
     /// An application mints these on its own server, where it knows who its user is; the
     /// phone never asks the control plane for one, because a phone that could mint its own
-    /// token could mint any token. This sample has no server, so `deploy/tools/join.sh`
-    /// stands in for one and hands the result to a launch argument.
+    /// token could mint any token. With a token server configured and signed in to, this is
+    /// whatever that server issued last; otherwise it is whatever was pasted or passed as
+    /// `--relay-token`. Opaque either way: nothing here reads it.
     ///
     /// Empty is a working configuration and not a broken one. A relay with no verification
     /// keys admits the session and charges it to its address; a relay with keys admits it
@@ -115,19 +101,26 @@ struct RelayConfiguration {
     /// summary below says which of the two this is.
     var token: Data
 
-    /// Where to ask for a token, when this device is allowed to ask.
+    /// What the token server said about ``token`` when it issued it: who, where, until
+    /// when, and what it may publish. `nil` for a pasted token, about which nothing is known.
+    ///
+    /// Held in memory and never saved. It describes one token, and the next join fetches
+    /// another.
+    var issued: IssuedToken?
+
+    /// Where to sign in and ask for a token.
     ///
     /// The answer to the field above rather than a companion to it. A token is
     /// capped at fifteen minutes because it is a bearer credential, which makes it
     /// the wrong kind of thing to configure a phone with: every run began by
     /// putting a fresh one on two devices and most of them ended with at least one
-    /// having gone stale mid-session. With a service configured the phone fetches
-    /// its own, seconds before it dials, and the pasted field above becomes the
-    /// fallback rather than the mechanism.
+    /// having gone stale mid-session. Signed in, the phone fetches its own, seconds
+    /// before it dials, and the pasted field becomes the fallback rather than the
+    /// mechanism.
     ///
-    /// Nil is still a working configuration — a relay on a desk holds no
-    /// verification keys and asks for nothing.
-    var tokenService: JoinService?
+    /// ``TokenServer/none`` is still a working configuration — a relay on a desk holds
+    /// no verification keys and asks for nothing.
+    var tokenServer: TokenServer
 
     /// The relay this project is developed against.
     ///
@@ -157,11 +150,10 @@ struct RelayConfiguration {
         port: 443,
         certificateHashes: ["polQTlHHCA5xpWTb02GZUdgIJoX5b0rUh0sy+VNWUto="],
         token: Data(),
-        // The address is compiled in and the credential is not, which is the split
-        // that matters: where to ask is a deployment detail worth having by
-        // default, and what to ask with is a secret. Filled in by a scanned link,
-        // by a launch argument, or by hand.
-        tokenService: JoinService.development
+        // No token server compiled in. Which backend signs people in is the
+        // deployment's choice, and it arrives by a scanned link, a launch
+        // argument, or by hand; the enrollment is never anything but earned.
+        tokenServer: .none
     )
 
     /// Whether a script named the relay, rather than leaving the compiled-in GCP one.
@@ -182,7 +174,7 @@ struct RelayConfiguration {
         ProcessInfo.processInfo.arguments.contains("--loopback")
     }
 
-    /// Point at the compiled-in GCP relay without dropping the token or join service.
+    /// Point at the compiled-in GCP relay without dropping the token or token server.
     ///
     /// Pairing used to overwrite the host from Bonjour. A leftover LAN address in
     /// defaults would then keep sending phones at a Mac that is no longer there.
@@ -204,10 +196,8 @@ struct RelayConfiguration {
         var port: UInt16?
         var hashes: [String] = []
         var token: Data?
-        var joinHost: String?
-        var joinPort: UInt16?
-        var joinHashes: [String] = []
-        var joinCredential: String?
+        var tokenServerAddress: String?
+        var enrollment: String?
 
         var loopback = false
 
@@ -221,10 +211,8 @@ struct RelayConfiguration {
             case "--relay-port": port = value.flatMap(UInt16.init)
             case "--relay-cert-hash": value.map { hashes.append($0) }
             case "--relay-token": token = value.flatMap { $0.data(using: .utf8) }
-            case "--join-host": joinHost = value
-            case "--join-port": joinPort = value.flatMap(UInt16.init)
-            case "--join-cert-hash": value.map { joinHashes.append($0) }
-            case "--join-credential": joinCredential = value
+            case "--token-server": tokenServerAddress = value
+            case "--enrollment": enrollment = value
             default: break
             }
             index += 1
@@ -239,15 +227,23 @@ struct RelayConfiguration {
         // Written for the UI tests. They ran against the deployed relay and its
         // token service until this existed, over the internet, which made them
         // slow and made a red run ambiguous between a broken view and a bad
-        // network. No token and no service, so nothing here reaches for either.
+        // network. No token and no server, so nothing here reaches for either.
         if loopback {
             return RelayConfiguration(
                 host: nil,
                 port: 443,
                 certificateHashes: [],
                 token: Data(),
-                tokenService: nil
+                tokenServer: .none
             )
+        }
+
+        // A build that enrolled with the control plane's `/join` left a device
+        // credential in the Keychain. It buys nothing now and is a secret, so it
+        // goes.
+        if let old = defaults.string(forKey: "joinHost") {
+            TokenStore.forgetJoinCredential(for: old)
+            for key in ["joinHost", "joinPort", "joinCertificateHashes"] { defaults.removeObject(forKey: key) }
         }
 
         // Whether anything was ever saved, rather than whether what was saved is empty. The
@@ -261,54 +257,30 @@ struct RelayConfiguration {
                 port: UInt16(defaults.integer(forKey: "relayPort")).nonZero ?? 443,
                 certificateHashes: defaults.stringArray(forKey: "relayCertificateHashes") ?? [],
                 token: Data(),
-                tokenService: rememberedService(defaults)
+                tokenServer: TokenServer(address: defaults.string(forKey: "tokenServer") ?? "", enrollment: "")
             )
 
-        // Kept, like the address, and for the stronger version of the same reason: an address
-        // can at least be typed from memory, whereas a token is four hundred characters
-        // nobody can produce without a Mac and a port-forward into the cluster. Not keeping
-        // it meant a phone picked up on its own reached a deployed relay, was admitted as
-        // nobody, and was permitted nothing — a session that connects, carries no media, and
-        // explains itself nowhere.
-        //
-        // Safe to remember only because it is shown: see ``Credential``, which reads the
-        // expiry so the interface can say a token is stale rather than leaving somebody to
-        // find out by joining.
+        // Kept, like the address, for a relay that is reached with a pasted token: a token
+        // is four hundred characters nobody can produce without a Mac. Not keeping it meant
+        // a phone picked up on its own reached a deployed relay, was admitted as nobody, and
+        // was permitted nothing — a session that connects, carries no media, and explains
+        // itself nowhere. Signed in, it is replaced before every join anyway.
         let dialling = host ?? remembered.host
 
-        // The service, assembled the same way and from the same three sources. Its
-        // credential comes out of the Keychain under the service's own host rather
-        // than the relay's, because they are different machines and a phone that
-        // files one under the other is a phone that loses its enrolment the first
-        // time somebody changes relays.
-        var service = remembered.tokenService ?? JoinService.development
-        joinHost.map { service.host = $0 }
-        joinPort.map { service.port = $0 }
-        if !joinHashes.isEmpty { service.certificateHashes = joinHashes }
-        service.credential = joinCredential
-            ?? (service.host.isEmpty ? "" : TokenStore.loadJoinCredential(for: service.host))
-            ?? ""
+        // The server, assembled the same way and from the same three sources. Its
+        // enrollment comes out of the Keychain under the server's own host rather than
+        // the relay's, because they are different machines and a phone that files one
+        // under the other is a phone that signs out the first time somebody changes relays.
+        var server = remembered.tokenServer
+        tokenServerAddress.map { server.address = $0 }
+        server.enrollment = enrollment ?? server.host.flatMap { TokenStore.loadEnrollment(for: $0) } ?? ""
 
         return RelayConfiguration(
             host: dialling,
             port: port ?? remembered.port,
             certificateHashes: hashes.isEmpty ? remembered.certificateHashes : hashes,
             token: token ?? dialling.flatMap { TokenStore.load(for: $0) } ?? Data(),
-            tokenService: service
-        )
-    }
-
-    /// The service settings last saved, or nothing if none ever were.
-    private static func rememberedService(_ defaults: UserDefaults) -> JoinService? {
-        guard let host = defaults.string(forKey: "joinHost") else { return nil }
-        return JoinService(
-            host: host,
-            port: UInt16(defaults.integer(forKey: "joinPort")).nonZero ?? 8444,
-            certificateHashes: defaults.stringArray(forKey: "joinCertificateHashes") ?? [],
-            // Filled in by the caller, from the Keychain. Not here, so that there is
-            // one place a credential is read and it is not inside a function whose
-            // job is reading a defaults database.
-            credential: ""
+            tokenServer: server
         )
     }
 
@@ -326,29 +298,11 @@ struct RelayConfiguration {
         // no credential and would otherwise file one under the absence of a host.
         if let host { TokenStore.save(token, for: host) }
 
-        if let service = tokenService, !service.host.isEmpty {
-            defaults.set(service.host, forKey: "joinHost")
-            defaults.set(Int(service.port), forKey: "joinPort")
-            defaults.set(service.certificateHashes, forKey: "joinCertificateHashes")
-            TokenStore.saveJoinCredential(service.credential, for: service.host)
+        defaults.set(tokenServer.address, forKey: "tokenServer")
+        if let server = tokenServer.host {
+            TokenStore.saveEnrollment(tokenServer.enrollment, for: server)
         }
     }
-
-    /// Whether the token in hand will do for this join, or a fresh one is needed.
-    ///
-    /// The margin is the point. A token that is valid when this is asked and
-    /// expired when the relay verifies it fails in the least legible way there is:
-    /// the connection succeeds, the session is admitted as nobody, and the phone
-    /// shows a room it cannot publish into. A minute covers the walk from here to
-    /// a relay on the other side of the country.
-    func needsAToken(joining room: String, as username: String, on device: String = "") -> Bool {
-        guard let held = credential else { return true }
-        if held.expires.timeIntervalSinceNow < 60 { return true }
-        return held.complaint(joining: room, as: username, on: device) != nil
-    }
-
-    /// What the token says about itself, or nothing when there is no token to ask.
-    var credential: Credential? { token.isEmpty ? nil : Credential(token) }
 
     /// A transport that dials this relay, or the loopback where there is none.
     ///
@@ -387,10 +341,11 @@ struct RelayConfiguration {
         // identical from the outside.
         // Three states rather than two. A stale token and a fresh one look identical in a
         // screenshot and behave nothing alike, and this string is what the journal records
-        // for every join, so it is the line a failed run gets read back from.
-        let credential = switch self.credential {
-        case nil: token.isEmpty ? "no token" : "unreadable token"
-        case let held?: held.hasExpired ? "expired token" : "token"
+        // for every join, so it is the line a failed run gets read back from. Only an
+        // issued token can be called stale; a pasted one cannot be read to find out.
+        let credential = switch issued {
+        case nil: token.isEmpty ? "no token" : "pasted token"
+        case let held?: held.isUsable(margin: 0) ? "token" : "expired token"
         }
         return "\(host):\(port), \(trust), \(credential)"
     }

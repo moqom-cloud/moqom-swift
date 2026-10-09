@@ -374,62 +374,51 @@ A deployed relay holds the control plane's verification keys, which means it
 admits a session with no token and then permits it nothing. On the phone that
 is a room that joins and a **Go live** that appears to do nothing.
 
-The phone gets its own token. The join screen's **Token service** section takes
-the control plane's address, the hash of *its* certificate — not the relay's,
-which is a different machine — and a device credential, and the app fetches a
-token in the second before it dials. Fifteen minutes is a fine lifetime for
-something acquired automatically and a miserable one for something typed in.
+The phone gets its own token, from a token server — this app's stand-in for the
+backend every real application has. The phone never holds anything that can mint:
+the server knows who signed in, and asks the control plane for a token with a key
+that lives on the server. MOQOM's reference token server (on Cloud Run) verifies
+Sign in with Apple; a real application puts its own backend here, speaking the
+same two routes:
 
-The credential and the address are what `deploy/tools/invite.sh` puts in a QR
-code, below. By hand:
+- `POST /v1/sign-in` with the Apple identity token, this phone's public key and
+  a room, which returns a first token and an *enrollment*;
+- `POST /v1/token` with `Authorization: Bearer <enrollment>`, which returns a
+  fresh token. The app calls it in the second before every dial and again
+  mid-call, so a fifteen-minute token never has to be typed.
 
-```sh
-gcloud secrets versions access latest --secret=moqom-dev-device-credential
-cd deploy/envs/dev && terraform output -raw join_endpoint
-```
+The join screen's **Token server** section takes the server's base URL (a scanned
+code fills it in) and shows a **Sign in with Apple** button. The request asks for
+no name and no email, and its nonce is this phone's key thumbprint — the server
+checks that, so a sign-in is good only alongside this phone's key. The enrollment
+is kept in the Keychain under the server's host. When the server stops accepting
+it (it answers 401) the app forgets it and asks you to sign in again.
 
-The certificate is one the deployment issued itself, which iOS refuses on its
-own account after the app has accepted it by pin — App Transport Security wants
-a chain to a root the system knows, and reports its refusal as a TLS error with
-nothing in it about trust. `project.yml` therefore carries an ATS exception for
-that one address. **Moving the join endpoint means editing that address in two
-places**: the exception, and `JoinService.development`. Getting only the second
-produces `NSURLErrorDomain -1200` and an error line that says the pin matched
-and the platform refused it anyway.
+Sign in with Apple has to be enabled for the app ID in the developer portal.
+`project.yml` adds the entitlement; a provisioning profile without the
+capability fails to sign.
 
-**Pasting a token** into the **Credential** section still works and is the
-fallback when there is no service configured. It is kept in the Keychain against
-the relay it was minted for.
+**Pasting a token** into the **Pasted token** section still works and is the
+fallback when not signed in, for a relay on a desk. It has to have been minted for
+the key this screen prints under the username — on a relay that requires proof it
+is usable from nowhere else. It is kept in the Keychain against the relay it was
+pasted for.
 
-```sh
-deploy/tools/join.sh ada demo cn-I_WNMClehiVp5   # in the moqom repository
-```
+Nothing on the screen reads a token. Tokens are sealed by the control plane, so
+who one names, which room, when it expires and whether it may publish are shown
+from what the token server said when it issued it. A pasted token is just bytes,
+and its expiry cannot be shown.
 
-The third argument is this phone's key, which the join screen prints under the
-username. A token is minted against it and, on a relay that requires proof, is
-usable from nowhere else — so it has to be the thumbprint of the phone that will
-paste the token in, not of the Mac minting it or of the other phone.
-
-Filed per host, so a credential is never offered to a relay it does not belong
-to — a relay with keys refuses a token it cannot verify outright, rather than
-falling back to admitting the session anonymously.
-
-The screen reads the token's claims back to you: who it names, which room, when
-it expires, and which key it was bound to. Nothing checks the signature and
-nothing could — the phone holds no verification key — so that much is display
-only. The binding is not: the phone knows its own thumbprint, so a token minted
-for another device is caught here rather than at the relay. The rest is there
-because the control plane caps a token at fifteen minutes, and a saved credential
-that has gone stale is otherwise indistinguishable on screen from a good one. It
-will also say when the token names a different room or person than the fields
-above it, which is the mismatch that costs the most time to find by any other
-means.
+The tenant cannot be read out of the token either, and the server's answer does
+not carry it, so the app dials as `--tenant` (default `demo`). It has to match the
+token server's deployment, or the relay admits the session and refuses every
+track.
 
 ### The key under your name
 
 The join screen prints a short string beneath the username, and says whether it
 came from the Secure Enclave or from the Keychain. That is the [RFC 7638](https://www.rfc-editor.org/rfc/rfc7638)
-thumbprint of a P-256 key this installation generated the first time it ran, and
+thumbprint of an ML-DSA-87 key this installation generated the first time it ran, and
 it is the device's identity in three places at once: the last field of every
 namespace it publishes under, the `cnf.jkt` of every token it is issued, and the
 key it signs with to prove a token is its own.
@@ -442,7 +431,7 @@ so rather than looking identical. If it can produce neither, it says that too,
 and the phone falls back to bearer tokens against a relay that permits them.
 
 That cap now bounds the call and not merely the joining of it, because the relay
-closes a session whose credential has lapsed. With a service configured the phone
+closes a session whose credential has lapsed. Signed in to a token server the phone
 fetches the next token a couple of minutes ahead of that and hands it over on the
 connection it already has, so a broadcast runs for as long as it runs. A pasted
 token cannot replace itself, so a session on one ends when it expires — which is
@@ -450,41 +439,29 @@ worth knowing before starting a long run with one.
 
 ### Scanning a way in
 
-Pasting a token still needs a Mac and a way to get four hundred characters from
-it to a phone. The alternative is a QR code:
-
-```sh
-deploy/tools/invite.sh ada demo    # prints the code, and opens it as a PNG
-```
-
-That carries what a device cannot be told by hand — the relay's address, the
-hash of the certificate to pin, the token service beside it and the credential
-to spend there — as a `moqom://join?...` link. It carries no token, which is the
-point of it: whichever phone scans the code spends the credential and is issued a
-token bound to that phone's own key. A link with a token in it could only be for
-one phone, and would have to know which before anybody had scanned anything. Point the Camera app at it and
-MOQOM opens with a **Scanned link** section at the top of the join screen,
-naming the address first and what it enrols the device for second.
+A certificate hash and a server URL are miserable to type on a phone. The
+alternative is a QR code, which `deploy/tools/invite.sh` in the moqom repository
+prints. That carries what a device cannot be told by hand — the relay's address, the
+hash of the certificate to pin, the token server's URL (`tokens=`), and
+optionally the room (`room=`) and an MLS delivery service (`mls=`, `mlscert=`) —
+as a `moqom://join?...` link. It carries nothing that authorises: no token,
+which would be bound to some other phone's key, and no credential, which would be
+durable access for whoever photographs the code. Whoever scans it still signs in.
+Point the Camera app at it and MOQOM opens with a **Scanned link** section at the
+top of the join screen, naming the address first and where it would sign in
+second.
 
 It stops there. Agreeing fills the fields in and **Join** still has to be
-pressed, because a link chooses which relay this device trusts and which
-credential it presents, and a URL can arrive from a message or a web page as
-easily as from a code somebody printed. `RelayInvitation` in the SDK parses;
-consent is the application's.
+pressed, because a link chooses which relay this device trusts and which server
+it signs in to, and a URL can arrive from a message or a web page as easily as
+from a code somebody printed. `RelayInvitation` in the SDK parses; consent is the
+application's.
 
-The tenant comes out of the token rather than from a field, so the two cannot
-contradict each other — the contradiction being a relay that admits the session
-and refuses every track, which on the phone is a Join that works and a **Go
-live** that does nothing.
-
-What a code is worth has changed, and it is worth reading before printing one.
-It used to carry a token, which made it good for fifteen minutes: reassuring,
-and useless in practice, because codes were routinely stale by the time somebody
-held a phone up to one. It now carries the enrolment credential, so the phone
-fetches its own token every time and the code keeps working — for whoever
-photographs it, too, until the credential is rotated. What bounds it is what the
-credential can buy: joining rooms in one tenant, never moderation and never
-ownership, refused at the endpoint whatever is asked for.
+Older codes carried a token (`token=`) or a device credential for the control
+plane's removed `/join` (`join=`, `joincert=`, `key=`). They still scan: the
+relay is read, the old join listener is read as the MLS delivery service it also
+was, and the token and credential are ignored. The app also deletes any device
+credential an older build left in the Keychain.
 
 Los Angeles rather than Oregon on measurement: mean round trip from this desk
 was 21.8ms against 47.5ms, which is most of a frame at sixty. A recent

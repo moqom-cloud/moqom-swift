@@ -1,7 +1,7 @@
 // Direct tickets: the check against the relay's, and a peer holding the other
 // to them over a real direct session.
 //
-// Tickets are minted here as the Rust relay's tests mint them (an ML-DSA-65 seed
+// Tickets are minted here as the Rust relay's tests mint them (an ML-DSA-87 seed
 // of elevens, kid `ticket-test`), with the same header and claims.
 
 import CryptoKit
@@ -14,8 +14,8 @@ import MoqomDirectTesting
 @testable import MoqomLoopback
 
 enum DirectTickets {
-    static let signer = try! MLDSA65.PrivateKey(seedRepresentation: Data(repeating: 11, count: 32), publicKey: nil)
-    static let keys = [DirectVerificationKey(id: "ticket-test", key: signer.publicKey.rawRepresentation, algorithm: .mlDSA65)]
+    static let signer = try! MLDSA87.PrivateKey(seedRepresentation: Data(repeating: 11, count: 32), publicKey: nil)
+    static let keys = [DirectVerificationKey(id: "ticket-test", key: signer.publicKey.rawRepresentation, algorithm: .mlDSA87)]
 
     static func mint(
         holder: DirectDevice,
@@ -26,10 +26,10 @@ enum DirectTickets {
         lifetime: TimeInterval = 90,
         typ: String = DirectTicketCheck.type,
         kid: String = "ticket-test",
-        signer: MLDSA65.PrivateKey = DirectTickets.signer
+        signer: MLDSA87.PrivateKey = DirectTickets.signer
     ) -> Data {
         DirectTokens.jws(
-            ["alg": "ML-DSA-65", "typ": typ, "kid": kid],
+            ["alg": "ML-DSA-87", "typ": typ, "kid": kid],
             [
                 "ten": tenant,
                 "room": room,
@@ -45,7 +45,7 @@ enum DirectTickets {
     /// The relay's ticket object for a ticket, as `moqom-relay` writes it.
     static func object(_ ticket: Data, expires: Date) -> Data {
         let key = signer.publicKey.rawRepresentation.base64URLEncodedString
-        let keys: [[String: Any]] = [["kty": "AKP", "alg": "ML-DSA-65", "kid": "ticket-test", "pub": key]]
+        let keys: [[String: Any]] = [["kty": "AKP", "alg": "ML-DSA-87", "kid": "ticket-test", "pub": key]]
         let object: [String: Any] = [
             "version": 1,
             "ticket": String(decoding: ticket, as: UTF8.self),
@@ -102,7 +102,7 @@ struct DirectTicketCheckTests {
         let good = DirectTickets.mint(holder: alice, peer: bob)
         #expect(verify(good).map { abs($0.timeIntervalSinceNow - 90) < 2 } == .success(true))
 
-        let other = try MLDSA65.PrivateKey(seedRepresentation: Data(repeating: 9, count: 32), publicKey: nil)
+        let other = try MLDSA87.PrivateKey(seedRepresentation: Data(repeating: 9, count: 32), publicKey: nil)
         let carol = DirectDevice(user: "carol")
         var tampered = [UInt8](good)
         tampered[tampered.count - 3] = tampered[tampered.count - 3] == UInt8(ascii: "A") ? UInt8(ascii: "B") : UInt8(ascii: "A")
@@ -258,7 +258,7 @@ struct DirectTicketGuardTests {
 
         // Alice's app signs its own, with a key of its choosing and the ticket
         // keys' kid. Bob takes his keys from his relay, not from Alice.
-        let forger = try MLDSA65.PrivateKey(seedRepresentation: Data(repeating: 3, count: 32), publicKey: nil)
+        let forger = try MLDSA87.PrivateKey(seedRepresentation: Data(repeating: 3, count: 32), publicKey: nil)
         let forged = DirectTickets.mint(holder: alice, peer: bob, signer: forger)
         aliceRelay.yield(DirectTicket(compact: forged, expires: Date().addingTimeInterval(90), keys: DirectTickets.keys))
         bobRelay.yield(DirectTickets.ticket(holder: bob, peer: alice))

@@ -28,14 +28,13 @@
 // can tell whether it actually is. A silent fallback would be the same code with
 // none of the guarantee and no way to notice.
 //
-// # ML-DSA-65, and ES256 for the keys that already exist
+// # ML-DSA-87 only
 //
-// ML-DSA-65, because the enclave holds it from the 26 releases and a device key
+// ML-DSA-87, because the enclave holds it from the 26 releases and a device key
 // outlives every token bound to it: a key made today is one a quantum attacker
-// would be forging proofs for years from now. P-256 is what the enclave held
-// before, so a device that already made one keeps it — its thumbprint is its
-// identity — and the relay accepts ES256 until those keys are gone. A new key is
-// never P-256.
+// would be forging proofs for years from now. Nothing accepts an ES256 or an
+// ML-DSA-65 proof, so a P-256 or ML-DSA-65 key left by an older build is
+// replaced, and the device signs in again under its new thumbprint.
 //
 // `CryptoKit` offers Ed25519, it verifies quickly, and it holds its private key
 // in ordinary memory — where it can be dumped alongside the token by precisely
@@ -114,10 +113,10 @@ public struct DeviceKey: Sendable {
         thumbprint = prover.thumbprint
     }
 
-    /// What this key signs with: ML-DSA-65, or ES256 for a key made before it.
+    /// What this key signs with: ML-DSA-87.
     public var algorithm: ProofAlgorithm { prover.algorithm }
 
-    /// The public key as a JWK: `AKP` for ML-DSA-65, `EC` for P-256.
+    /// The public key as a JWK: `AKP` with `alg` ML-DSA-87.
     ///
     /// What the control plane is given at join so it can derive `cnf.jkt`
     /// itself. It derives rather than accepts: a thumbprint supplied by the
@@ -138,14 +137,16 @@ public struct DeviceKey: Sendable {
     ///
     /// Idempotent, and it has to be: the thumbprint is the device's identity, so
     /// a call that generated a fresh key whenever it was convenient would give
-    /// the device a new name and orphan every token issued to the old one. That
-    /// is also why a stored P-256 key is returned rather than replaced.
+    /// the device a new name and orphan every token issued to the old one. The
+    /// one exception is a P-256 or ML-DSA-65 key from an older build, which
+    /// nothing accepts a proof from any more.
     ///
     /// - Throws: ``DeviceKeyError`` when no key can be created or read back. Not
     ///   recoverable by retrying — a device that cannot hold a key cannot prove
     ///   possession, and the caller's choice is to run unproven or not at all.
     public static func installed(label: String = defaultLabel) throws(DeviceKeyError) -> DeviceKey {
         if let stored = try load(label: label) { return stored }
+        forget(label: label)
         return try create(label: label)
     }
 
@@ -154,19 +155,16 @@ public struct DeviceKey: Sendable {
     /// For tests and for a caller that wants possession within one session
     /// without leaving anything behind. Always software: the enclave's value is
     /// in surviving, and a key that is discarded has nothing to survive.
-    public static func ephemeral(_ algorithm: ProofAlgorithm = .mlDSA65) -> DeviceKey {
+    public static func ephemeral(_ algorithm: ProofAlgorithm = .mlDSA87) -> DeviceKey {
         switch algorithm {
-        case .mlDSA65:
+        case .mlDSA87:
             // Software ML-DSA key generation fails only if the system CSPRNG
             // does, and nothing can run without that.
-            DeviceKey(.mlDSA65(try! MLDSA65.PrivateKey()), storage: .software)
-        case .es256:
-            DeviceKey(.es256(P256.Signing.PrivateKey()), storage: .software)
+            DeviceKey(.mlDSA87(try! MLDSA87.PrivateKey()), storage: .software)
         }
     }
 
-    /// A key from material the caller already holds: a 32-byte ML-DSA-65 seed,
-    /// or a P-256 scalar for ES256.
+    /// A key from material the caller already holds: a 32-byte ML-DSA-87 seed.
     ///
     /// Deliberately not public. Anything that can supply key material has
     /// already given up the property the enclave exists to provide, so the only
@@ -175,18 +173,13 @@ public struct DeviceKey: Sendable {
     /// signal that an encoding changed.
     ///
     /// - Throws: ``DeviceKeyError/corrupt`` if the material is not a valid key.
-    static func material(_ raw: Data, algorithm: ProofAlgorithm = .mlDSA65) throws(DeviceKeyError) -> DeviceKey {
+    static func material(_ raw: Data, algorithm: ProofAlgorithm = .mlDSA87) throws(DeviceKeyError) -> DeviceKey {
         switch algorithm {
-        case .mlDSA65:
-            guard let key = try? MLDSA65.PrivateKey(seedRepresentation: raw, publicKey: nil) else {
+        case .mlDSA87:
+            guard let key = try? MLDSA87.PrivateKey(seedRepresentation: raw, publicKey: nil) else {
                 throw .corrupt
             }
-            return DeviceKey(.mlDSA65(key), storage: .software)
-        case .es256:
-            guard let key = try? P256.Signing.PrivateKey(rawRepresentation: raw) else {
-                throw .corrupt
-            }
-            return DeviceKey(.es256(key), storage: .software)
+            return DeviceKey(.mlDSA87(key), storage: .software)
         }
     }
 
@@ -195,14 +188,14 @@ public struct DeviceKey: Sendable {
         // process's entitlements, so the generation attempt is the real test and
         // the fallback is chosen by what actually failed.
         if SecureEnclave.isAvailable,
-           let enclave = try? SecureEnclave.MLDSA65.PrivateKey(accessControl: accessControl()) {
-            try store(enclave.dataRepresentation, label: label, tag: .secureEnclaveMLDSA65)
-            return DeviceKey(.secureEnclaveMLDSA65(enclave), storage: .secureEnclave)
+           let enclave = try? SecureEnclave.MLDSA87.PrivateKey(accessControl: accessControl()) {
+            try store(enclave.dataRepresentation, label: label, tag: .secureEnclaveMLDSA87)
+            return DeviceKey(.secureEnclaveMLDSA87(enclave), storage: .secureEnclave)
         }
 
-        guard let software = try? MLDSA65.PrivateKey() else { throw .notCreated }
-        try store(software.seedRepresentation, label: label, tag: .softwareMLDSA65)
-        return DeviceKey(.mlDSA65(software), storage: .software)
+        guard let software = try? MLDSA87.PrivateKey() else { throw .notCreated }
+        try store(software.seedRepresentation, label: label, tag: .softwareMLDSA87)
+        return DeviceKey(.mlDSA87(software), storage: .software)
     }
 
     /// The access policy for both kinds of stored key.
@@ -236,13 +229,16 @@ public struct DeviceKey: Sendable {
     /// Tagged rather than inferred from length, because an enclave blob and a
     /// raw key are both just bytes and guessing wrong means handing the
     /// enclave's ciphertext to the software initialiser and calling the result
-    /// corrupt. The tag also means a key written by an older build is read back
-    /// as what it is: 1 and 2 are P-256 keys from before ML-DSA-65.
+    /// corrupt. 1 and 2 were P-256 keys and 3 and 4 ML-DSA-65 keys, from
+    /// before ML-DSA-87; ``load(label:)`` reads them as no key, so
+    /// ``installed(label:)`` makes a new one.
     private enum Tag: UInt8 {
-        case secureEnclaveES256 = 1
-        case softwareES256 = 2
-        case secureEnclaveMLDSA65 = 3
-        case softwareMLDSA65 = 4
+        case retiredSecureEnclaveES256 = 1
+        case retiredSoftwareES256 = 2
+        case retiredSecureEnclaveMLDSA65 = 3
+        case retiredSoftwareMLDSA65 = 4
+        case secureEnclaveMLDSA87 = 5
+        case softwareMLDSA87 = 6
     }
 
     private static func query(label: String) -> [String: Any] {
@@ -282,18 +278,15 @@ public struct DeviceKey: Sendable {
         let material = Data(stored.dropFirst())
         let key: DeviceKey?
         switch Tag(rawValue: first) {
-        case .secureEnclaveMLDSA65:
-            key = (try? SecureEnclave.MLDSA65.PrivateKey(dataRepresentation: material))
-                .map { DeviceKey(.secureEnclaveMLDSA65($0), storage: .secureEnclave) }
-        case .softwareMLDSA65:
-            key = (try? MLDSA65.PrivateKey(seedRepresentation: material, publicKey: nil))
-                .map { DeviceKey(.mlDSA65($0), storage: .software) }
-        case .secureEnclaveES256:
-            key = (try? SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: material))
-                .map { DeviceKey(.secureEnclaveES256($0), storage: .secureEnclave) }
-        case .softwareES256:
-            key = (try? P256.Signing.PrivateKey(rawRepresentation: material))
-                .map { DeviceKey(.es256($0), storage: .software) }
+        case .secureEnclaveMLDSA87:
+            key = (try? SecureEnclave.MLDSA87.PrivateKey(dataRepresentation: material))
+                .map { DeviceKey(.secureEnclaveMLDSA87($0), storage: .secureEnclave) }
+        case .softwareMLDSA87:
+            key = (try? MLDSA87.PrivateKey(seedRepresentation: material, publicKey: nil))
+                .map { DeviceKey(.mlDSA87($0), storage: .software) }
+        case .retiredSecureEnclaveES256, .retiredSoftwareES256,
+             .retiredSecureEnclaveMLDSA65, .retiredSoftwareMLDSA65:
+            return nil
         case nil:
             key = nil
         }

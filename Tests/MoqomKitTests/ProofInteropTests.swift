@@ -8,17 +8,15 @@
 // and it presents as a handshake refused at connect time with the reason in
 // somebody else's log.
 //
-// So this writes what the relay reads. Device keys with fixed material, in
-// ML-DSA-65 and ES256, proofs over fixed tokens made at a fixed time, and
-// thumbprint vectors that include the cases an implementation gets wrong
-// quietly — a coordinate with a leading zero byte, one whose high bit is set —
-// committed into the engine repository next to the verifier. `moqom-relay`'s own tests check every proof here verifies and every
+// So this writes what the relay reads. ML-DSA-87 device keys with fixed
+// material, proofs over fixed tokens made at a fixed time, and their
+// thumbprints, committed into the engine repository next to the verifier. `moqom-relay`'s own tests check every proof here verifies and every
 // thumbprint here is the one it computes; the Go control plane checks the
 // thumbprints too, because it is the side that derives `cnf.jkt` and a
 // disagreement there would mint tokens naming a device that does not exist.
 //
 // Regenerate with MOQOM_WRITE_FIXTURES=1. Note what does *not* survive that:
-// ML-DSA and ECDSA both sign with fresh randomness, and every proof has a fresh
+// ML-DSA signs with fresh randomness, and every proof has a fresh
 // identifier, so regenerating produces different claims and signature bytes for
 // the same key over the same input. The fixture pins the encoding, the token
 // binding and the keys — not the bytes of a proof — and a diff showing only
@@ -66,16 +64,16 @@ struct ProofInteropTests {
         }
     }
 
-    /// The devices this fixture speaks for: an ML-DSA-65 key, as every new
-    /// device has, and a P-256 key, as a device from before it keeps.
+    /// The devices this fixture speaks for: two ML-DSA-87 keys, so a verifier
+    /// that cached the first key it saw would refuse the second.
     ///
     /// Fixed material, so regeneration names the same devices. Small and
     /// repetitive rather than plausible-looking: a value that looked like real
     /// key material would invite somebody to wonder whether it was.
     private static func devices() throws -> [(String, DeviceKey)] {
         [
-            ("ml-dsa-65", try DeviceKey.material(Data(repeating: 0x07, count: 32))),
-            ("es256", try DeviceKey.material(Data(repeating: 0x07, count: 32), algorithm: .es256)),
+            ("ml-dsa-87", try DeviceKey.material(Data(repeating: 0x07, count: 32))),
+            ("second ml-dsa-87", try DeviceKey.material(Data(repeating: 0x08, count: 32))),
         ]
     }
 
@@ -112,49 +110,11 @@ struct ProofInteropTests {
 
     // MARK: - Building it
 
-    /// Thumbprint vectors, in the order they are worth having.
-    ///
-    /// The first is the anchor: RFC 7638's canonicalisation applied to the EC key
-    /// from RFC 7517 §A.1, which is the only vector here whose expected value
-    /// comes from outside this codebase. The next two are coordinates an
-    /// implementation mishandles without noticing — a leading zero byte that a
-    /// big-integer encoder would trim, and a high bit set, which is where a
-    /// signed representation grows a pad byte. Then the devices' own keys, the
-    /// ML-DSA-65 one being the `AKP` form every new token names.
+    /// The devices' keys and the thumbprints the relay and the control plane
+    /// must compute for them.
     private func keys(_ devices: [(String, DeviceKey)]) throws -> [Fixture.Key] {
-        var vectors: [(String, ProofJWK)] = [
-            (
-                "rfc 7517 §a.1, thumbprinted per rfc 7638",
-                ProofJWK(
-                    kty: "EC", crv: "P-256",
-                    x: "MKBCTNIcKUSDii11ySs3526iDZ8AiTo7Tu6KPAqv7D4",
-                    y: "4Etl6SRW2YiLUrN5vfvVHuhp7x8PxltmWWlbbM4IFyM"
-                )
-            )
-        ]
-
-        // Synthetic points rather than real ones, because a thumbprint is a hash
-        // of four strings and never touches the curve — so these exercise the
-        // encoding without needing to be points at all, and a real key with a
-        // leading zero coordinate would take a few thousand generations to find.
-        var leadingZero = Data(repeating: 0x5A, count: 32)
-        leadingZero[0] = 0x00
-        var highBit = Data(repeating: 0x11, count: 32)
-        highBit[0] = 0xFF
-        vectors.append((
-            "a coordinate whose first byte is zero",
-            ProofJWK(kty: "EC", crv: "P-256", x: leadingZero.base64URLEncodedString, y: highBit.base64URLEncodedString)
-        ))
-        vectors.append((
-            "a coordinate whose high bit is set",
-            ProofJWK(kty: "EC", crv: "P-256", x: highBit.base64URLEncodedString, y: leadingZero.base64URLEncodedString)
-        ))
-        for (name, device) in devices {
-            vectors.append(("the \(name) device key", device.jwk))
-        }
-
-        return try vectors.map { name, jwk in
-            Fixture.Key(name: name, jwk: jwk, thumbprint: try jwk.thumbprint())
+        try devices.map { name, device in
+            Fixture.Key(name: "the \(name) device key", jwk: device.jwk, thumbprint: try device.jwk.thumbprint())
         }
     }
 
@@ -266,7 +226,7 @@ struct ProofInteropTests {
             )
             algorithms.insert(try Header(proof.proof).alg)
         }
-        #expect(algorithms == ["ML-DSA-65", "ES256"], "the fixture must carry both algorithms")
+        #expect(algorithms == ["ML-DSA-87"], "every proof is ML-DSA-87")
 
         // Distinct, or the relay's replay cache would refuse the second of them
         // and a fleet would see every other connection fail.

@@ -23,28 +23,26 @@ import Foundation
 import MoqomProof
 import MoqomToken
 
-/// A public key tokens and tickets are signed with: ML-DSA-65, as the control
-/// plane mints and relays sign, or Ed25519 for what was signed before the move.
+/// A public key tokens and tickets are signed with: ML-DSA-87, as the control
+/// plane mints and relays sign.
 public struct DirectVerificationKey: Hashable, Sendable {
     /// What a key verifies with. A property of the key, not of what it checks:
     /// a token or ticket must name its key's algorithm, so neither can be made
     /// to verify with the other's.
     public enum Algorithm: Hashable, Sendable {
-        case mlDSA65
-        case ed25519
+        case mlDSA87
 
         /// The JOSE `alg` a JWS signed with this key carries.
         public var jose: String {
             switch self {
-            case .mlDSA65: "ML-DSA-65"
-            case .ed25519: "EdDSA"
+            case .mlDSA87: "ML-DSA-87"
             }
         }
     }
 
     /// The `kid` naming it.
     public let id: String
-    /// The raw public key: 1,952 bytes for ML-DSA-65, 32 for Ed25519.
+    /// The raw public key: 2,592 bytes for ML-DSA-87.
     public let key: Data
     /// What it verifies with.
     public let algorithm: Algorithm
@@ -59,7 +57,7 @@ public struct DirectVerificationKey: Hashable, Sendable {
         self.init(
             id: key.id,
             key: key.rawRepresentation,
-            algorithm: key.algorithm == .mlDSA65 ? .mlDSA65 : .ed25519
+            algorithm: .mlDSA87
         )
     }
 
@@ -68,7 +66,7 @@ public struct DirectVerificationKey: Hashable, Sendable {
     var tokenKey: MoqomToken.PublicKey? {
         try? MoqomToken.PublicKey(
             id: id,
-            algorithm: algorithm == .mlDSA65 ? .mlDSA65 : .ed25519,
+            algorithm: .mlDSA87,
             rawRepresentation: key
         )
     }
@@ -253,6 +251,7 @@ public final class DirectPeerCheck: DirectPeerVerifying, @unchecked Sendable {
             case .wrongIssuer: .wrongIssuer
             // No tenant is pinned here; ``directAdmissible`` compares it.
             case .wrongTenant: .anotherRoom
+            case .wrongPool: .anotherRoom
             case .incomplete: .incomplete
             case .thumbprint: .malformedToken("thumbprint")
             }

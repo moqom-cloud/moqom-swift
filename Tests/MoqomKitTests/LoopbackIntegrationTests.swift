@@ -75,14 +75,14 @@ func credentials(
 /// The room authority every test room trusts, from a fixed seed.
 let testAuthority = try! RoomLogSigner(seed: Data(repeating: 0xA7, count: 32))
 
-/// An unsigned token carrying the claims the SDK reads. The loopback relay
-/// verifies nothing, so the signature segment is a placeholder.
-func testToken(subject: String, e2ee: EncryptionPolicy?, publish: Bool? = nil) -> Data {
+/// An unsigned token in the shape a minted one once had. The SDK reads nothing
+/// out of it and the loopback relay verifies nothing, so the signature segment
+/// is a placeholder.
+func testToken(subject: String, e2ee: EncryptionPolicy?) -> Data {
     var claims = #"{"sub":"\#(subject)""#
     if let e2ee { claims += #","e2ee":"\#(e2ee.rawValue)""# }
-    if let publish { claims += #","moqt":{"room":"room-42","pub":\#(publish ? 1 : 0)}"# }
     claims += "}"
-    let header = Data(#"{"alg":"EdDSA","typ":"MOQT"}"#.utf8).base64URLEncodedString
+    let header = Data(#"{"alg":"ML-DSA-87","typ":"MOQT"}"#.utf8).base64URLEncodedString
     return Data((header + "." + Data(claims.utf8).base64URLEncodedString + ".sig").utf8)
 }
 

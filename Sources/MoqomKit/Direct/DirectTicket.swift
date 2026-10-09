@@ -11,7 +11,7 @@
 // relay. An app that drops its relay session therefore loses its direct path
 // as well; only two modified apps that both skip the check could keep one.
 //
-// A ticket is checked as a token is, an ML-DSA-65 compact JWS by `kid`, against a
+// A ticket is checked as a token is, an ML-DSA-87 compact JWS by `kid`, against a
 // separate set of keys: the ticket keys, which each side takes from the ticket
 // objects its own relay sends. A key the peer handed over would prove nothing.
 

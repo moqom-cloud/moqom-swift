@@ -15,7 +15,7 @@ struct EncryptionPolicyClaimTests {
     func everyTokenIsRequired() {
         #expect(policy(testToken(subject: "alice", e2ee: nil)) == .required)
         #expect(policy(testToken(subject: "alice", e2ee: .required)) == .required)
-        let header = Data(#"{"alg":"EdDSA"}"#.utf8).base64URLEncodedString
+        let header = Data(#"{"alg":"ML-DSA-87"}"#.utf8).base64URLEncodedString
         for value in ["optional", "OPTIONAL", "off", "", "none", "plaintext-for-testing"] {
             let claims = Data(#"{"e2ee":"\#(value)"}"#.utf8).base64URLEncodedString
             #expect(policy(Data("\(header).\(claims).sig".utf8)) == .required, "\(value)")
