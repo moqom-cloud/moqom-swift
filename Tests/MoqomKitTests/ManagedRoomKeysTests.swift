@@ -276,11 +276,11 @@ struct ManagedRoomKeysTests {
         let base = try #require(await alice.status).epochAuthenticator
         for blob in await service.everything { #expect(blob.range(of: base) == nil) }
 
-        // Founded in the ML-KEM-1024 suite, and everybody is in it.
-        #expect(await service.group?.cipherSuite == MLSCipherSuite.mls256MLKEM1024MLDSA87.identifier)
-        #expect(await service.group?.cipherSuite == 0xF0AC)
+        // Founded in the ML-KEM-768 suite, and everybody is in it.
+        #expect(await service.group?.cipherSuite == MLSCipherSuite.mls192MLKEM768MLDSA65.identifier)
+        #expect(await service.group?.cipherSuite == 0xF0AA)
         for keys in [alice, bob, carol] {
-            #expect(await keys.status?.cipherSuite == .mls256MLKEM1024MLDSA87)
+            #expect(await keys.status?.cipherSuite == .mls192MLKEM768MLDSA65)
         }
 
         for keys in [alice, bob, carol] { await keys.stop() }

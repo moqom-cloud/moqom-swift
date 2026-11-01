@@ -8,7 +8,7 @@
 // and it presents as a handshake refused at connect time with the reason in
 // somebody else's log.
 //
-// So this writes what the relay reads. ML-DSA-87 device keys with fixed
+// So this writes what the relay reads. ML-DSA-65 device keys with fixed
 // material, proofs over fixed tokens made at a fixed time, and their
 // thumbprints, committed into the engine repository next to the verifier. `moqom-relay`'s own tests check every proof here verifies and every
 // thumbprint here is the one it computes; the Go control plane checks the
@@ -64,7 +64,7 @@ struct ProofInteropTests {
         }
     }
 
-    /// The devices this fixture speaks for: two ML-DSA-87 keys, so a verifier
+    /// The devices this fixture speaks for: two ML-DSA-65 keys, so a verifier
     /// that cached the first key it saw would refuse the second.
     ///
     /// Fixed material, so regeneration names the same devices. Small and
@@ -226,7 +226,7 @@ struct ProofInteropTests {
             )
             algorithms.insert(try Header(proof.proof).alg)
         }
-        #expect(algorithms == ["ML-DSA-87"], "every proof is ML-DSA-87")
+        #expect(algorithms == ["ML-DSA-65"], "every proof is ML-DSA-65")
 
         // Distinct, or the relay's replay cache would refuse the second of them
         // and a fleet would see every other connection fail.

@@ -166,7 +166,10 @@ struct RoomStatisticsTests {
         let hostRoom = try await host.join(room: "room-42")
         let viewerRoom = try await viewer.join(room: "room-42")
 
-        _ = try await hostRoom.startBroadcast(from: source())
+        _ = try await hostRoom.startBroadcast(
+            from: source(),
+            configuration: syntheticTestBroadcastConfiguration
+        )
         #expect(await eventually { await viewerRoom.roster.count == 1 })
 
         let hostStats = await hostRoom.statistics
@@ -191,7 +194,10 @@ struct RoomStatisticsTests {
         let hostRoom = try await host.join(room: "room-42")
         let viewerRoom = try await viewer.join(room: "room-42")
 
-        _ = try await hostRoom.startBroadcast(from: source())
+        _ = try await hostRoom.startBroadcast(
+            from: source(),
+            configuration: syntheticTestBroadcastConfiguration
+        )
         #expect(await eventually { await viewerRoom.roster.count == 1 })
 
         let stats = await viewerRoom.statistics

@@ -26,7 +26,7 @@ struct RoomAgentTests {
         let source = FrameRelay(
             format: CaptureFormat(size: PixelSize(width: 1280, height: 720), frameRate: 30)
         )
-        _ = try await hostRoom.startBroadcast(from: source)
+        _ = try await hostRoom.startBroadcast(from: source, configuration: syntheticTestBroadcastConfiguration)
 
         let worker = MoqomSession(
             transport: LoopbackTransport(relay: relay),

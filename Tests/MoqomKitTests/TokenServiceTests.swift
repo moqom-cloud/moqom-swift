@@ -175,7 +175,7 @@ struct TokenServiceTests {
         // is the one that notices if that regresses.
         let sentKey = try #require(decoded["key"] as? [String: String])
         #expect(sentKey == key.jwk.members)
-        #expect(sentKey == ["kty": "AKP", "alg": "ML-DSA-87", "pub": try #require(key.jwk.pub)])
+        #expect(sentKey == ["kty": "AKP", "alg": "ML-DSA-65", "pub": try #require(key.jwk.pub)])
 
         // Truncated the way a namespace field is, since that is what the device
         // announces under and what the control plane checks the key against.

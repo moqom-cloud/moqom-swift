@@ -75,6 +75,10 @@ func credentials(
 /// The room authority every test room trusts, from a fixed seed.
 let testAuthority = try! RoomLogSigner(seed: Data(repeating: 0xA7, count: 32))
 
+let syntheticTestBroadcastConfiguration = BroadcastConfiguration(
+    encoderFactory: { SyntheticEncoder(configuration: $0) }
+)
+
 /// An unsigned token in the shape a minted one once had. The SDK reads nothing
 /// out of it and the loopback relay verifies nothing, so the signature segment
 /// is a placeholder.
@@ -82,7 +86,7 @@ func testToken(subject: String, e2ee: EncryptionPolicy?) -> Data {
     var claims = #"{"sub":"\#(subject)""#
     if let e2ee { claims += #","e2ee":"\#(e2ee.rawValue)""# }
     claims += "}"
-    let header = Data(#"{"alg":"ML-DSA-87","typ":"MOQT"}"#.utf8).base64URLEncodedString
+    let header = Data(#"{"alg":"ML-DSA-65","typ":"MOQT"}"#.utf8).base64URLEncodedString
     return Data((header + "." + Data(claims.utf8).base64URLEncodedString + ".sig").utf8)
 }
 
@@ -213,7 +217,7 @@ struct RoomSessionIntegrationTests {
         let source = FrameRelay(
             format: CaptureFormat(size: PixelSize(width: 1280, height: 720), frameRate: 30)
         )
-        _ = try await hostRoom.startBroadcast(from: source)
+        _ = try await hostRoom.startBroadcast(from: source, configuration: syntheticTestBroadcastConfiguration)
 
         let appeared = await eventually {
             await viewerRoom.roster.count == 1
@@ -237,7 +241,11 @@ struct RoomSessionIntegrationTests {
         let source = FrameRelay(
             format: CaptureFormat(size: PixelSize(width: 1280, height: 720), frameRate: 30)
         )
-        _ = try await guestRoom.startBroadcast(from: source, backstage: true)
+        _ = try await guestRoom.startBroadcast(
+            from: source,
+            configuration: syntheticTestBroadcastConfiguration,
+            backstage: true
+        )
 
         // Give any announcement a chance to arrive before asserting absence.
         try await Task.sleep(for: .milliseconds(50))
@@ -260,7 +268,7 @@ struct RoomSessionIntegrationTests {
         let source = FrameRelay(
             format: CaptureFormat(size: PixelSize(width: 1280, height: 720), frameRate: 30)
         )
-        _ = try await hostRoom.startBroadcast(from: source)
+        _ = try await hostRoom.startBroadcast(from: source, configuration: syntheticTestBroadcastConfiguration)
         _ = await eventually { await viewerRoom.roster.count == 1 }
 
         await hostRoom.stopBroadcast()
@@ -362,7 +370,7 @@ struct RoomSessionIntegrationTests {
         let source = FrameRelay(
             format: CaptureFormat(size: PixelSize(width: 1280, height: 720), frameRate: 30)
         )
-        _ = try await hostRoom.startBroadcast(from: source)
+        _ = try await hostRoom.startBroadcast(from: source, configuration: syntheticTestBroadcastConfiguration)
         _ = await eventually { await hostRoom.roster.count == 1 }
 
         // Long enough for a subscription to have been made if one were going to
@@ -402,7 +410,7 @@ struct RoomSessionIntegrationTests {
         let source = FrameRelay(
             format: CaptureFormat(size: PixelSize(width: 1280, height: 720), frameRate: 30)
         )
-        _ = try await hostRoom.startBroadcast(from: source)
+        _ = try await hostRoom.startBroadcast(from: source, configuration: syntheticTestBroadcastConfiguration)
         _ = await eventually { await viewerRoom.roster.count == 1 }
 
         // The roster filling is not the last thing joining does. Learning about
@@ -449,7 +457,7 @@ struct RoomSessionIntegrationTests {
         let source = FrameRelay(
             format: CaptureFormat(size: PixelSize(width: 1280, height: 720), frameRate: 30)
         )
-        _ = try await hostRoom.startBroadcast(from: source)
+        _ = try await hostRoom.startBroadcast(from: source, configuration: syntheticTestBroadcastConfiguration)
         _ = await eventually { await viewerRoom.roster.count == 1 }
 
         await relay.clearLog()
@@ -485,7 +493,7 @@ struct RoomSessionIntegrationTests {
         let source = FrameRelay(
             format: CaptureFormat(size: PixelSize(width: 1280, height: 720), frameRate: 30)
         )
-        _ = try await hostRoom.startBroadcast(from: source)
+        _ = try await hostRoom.startBroadcast(from: source, configuration: syntheticTestBroadcastConfiguration)
         _ = await eventually { await hostRoom.roster.count == 1 }
 
         let changes = await hostRoom.updateLayout([
@@ -515,7 +523,7 @@ struct RoomSessionIntegrationTests {
         let source = FrameRelay(
             format: CaptureFormat(size: PixelSize(width: 1280, height: 720), frameRate: 30)
         )
-        _ = try await room.startBroadcast(from: source)
+        _ = try await room.startBroadcast(from: source, configuration: syntheticTestBroadcastConfiguration)
         _ = await eventually { await room.roster.count == 1 }
 
         try await room.manageWatchdog(

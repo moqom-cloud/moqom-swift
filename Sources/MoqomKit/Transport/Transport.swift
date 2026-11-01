@@ -234,7 +234,7 @@ public struct DeviceCredentials: Sendable {
     public var publish: PublishScope?
 
     /// The keys the room's control log is signed with: the control plane's
-    /// ML-DSA-87 keys, as its JWK set publishes them (see
+    /// ML-DSA-65 keys, as its JWK set publishes them (see
     /// ``DirectVerificationKey/parseSet(_:)``).
     ///
     /// A room applies only control entries signed by one of these. Empty, and

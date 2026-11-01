@@ -56,7 +56,7 @@
 //
 // # Cipher suites
 //
-// A device founds in its own suite, MLS_256_MLKEM1024_AES256GCM_SHA512_MLDSA87
+// A device founds in its own suite, MLS_256_MLKEM1024_AES256GCM_SHA512_MLDSA65
 // unless it was built to do otherwise, and joins in whichever suite the room's group is in. It publishes
 // key packages in its own suite before it knows; when a snapshot shows a group
 // in another suite it implements, it replaces them with packages in that one,

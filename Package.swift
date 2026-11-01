@@ -40,10 +40,8 @@ let package = Package(
         // codec without the SDK on top of it.
         .library(name: "MoqomWire", targets: ["MoqomWire"]),
     ],
-    // A sibling checkout until moqom-security has a published tag; then this
-    // becomes `.package(url: "https://github.com/moqom-cloud/moqom-security", from: ...)`.
     dependencies: [
-        .package(path: "../moqom-security"),
+        .package(url: "https://github.com/moqom-cloud/moqom-security", from: "0.1.0"),
     ],
     targets: [
         .target(name: "MoqomCore", swiftSettings: strict),

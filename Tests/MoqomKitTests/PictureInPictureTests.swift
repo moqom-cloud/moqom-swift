@@ -285,7 +285,7 @@ struct PictureInPictureStageTests {
         let source = FrameRelay(
             format: CaptureFormat(size: PixelSize(width: 1280, height: 720), frameRate: 30)
         )
-        _ = try await hostRoom.startBroadcast(from: source)
+        _ = try await hostRoom.startBroadcast(from: source, configuration: syntheticTestBroadcastConfiguration)
 
         #expect(await eventually { await viewerRoom.pictureInPictureSlots.count == 1 })
         #expect(await viewerRoom.pictureInPictureSlots.first?.identity.username.value == "ana")
@@ -335,7 +335,7 @@ struct PictureInPictureStageTests {
         let source = FrameRelay(
             format: CaptureFormat(size: PixelSize(width: 1280, height: 720), frameRate: 30)
         )
-        _ = try await hostRoom.startBroadcast(from: source)
+        _ = try await hostRoom.startBroadcast(from: source, configuration: syntheticTestBroadcastConfiguration)
 
         #expect(await window.value.count == 1)
         await application.value

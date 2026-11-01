@@ -46,7 +46,10 @@ struct SeatHoldingTests {
         let hosting = try await host.join(room: "room-42")
         let viewing = try await viewer.join(room: "room-42", seatPolicy: seatPolicy)
 
-        _ = try await hosting.startBroadcast(from: broadcaster())
+        _ = try await hosting.startBroadcast(
+            from: broadcaster(),
+            configuration: syntheticTestBroadcastConfiguration
+        )
         #expect(await eventually { await viewing.roster.count == 1 })
 
         return (host, viewer, viewing)
@@ -94,7 +97,10 @@ struct SeatHoldingTests {
             seatPolicy: SeatPolicy(viewer: .seconds(30))
         )
 
-        let broadcast = try await hosting.startBroadcast(from: broadcaster())
+        let broadcast = try await hosting.startBroadcast(
+            from: broadcaster(),
+            configuration: syntheticTestBroadcastConfiguration
+        )
         let alice = identity("alice")
         #expect(await eventually { await viewing.roster.count == 1 })
 
@@ -163,7 +169,10 @@ struct SeatHoldingTests {
             seatPolicy: SeatPolicy(viewer: .seconds(30))
         )
 
-        _ = try await hosting.startBroadcast(from: broadcaster())
+        _ = try await hosting.startBroadcast(
+            from: broadcaster(),
+            configuration: syntheticTestBroadcastConfiguration
+        )
         #expect(await eventually { await viewing.roster.count == 1 })
 
         let alice = identity("alice")
@@ -190,7 +199,10 @@ struct SeatHoldingTests {
         // reconnect looks like from here.
         let returning = try await session("alice", relay: relay)
         let rejoined = try await returning.join(room: "room-42")
-        _ = try await rejoined.startBroadcast(from: broadcaster())
+        _ = try await rejoined.startBroadcast(
+            from: broadcaster(),
+            configuration: syntheticTestBroadcastConfiguration
+        )
 
         #expect(await eventually { await viewing.roster[alice]?.presence == .connected })
         #expect(await departures.count == 0, "the seat was released and re-taken")
